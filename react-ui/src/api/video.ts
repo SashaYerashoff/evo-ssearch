@@ -1,4 +1,5 @@
 import { api } from './client'
+import type { IncidentDraftInput } from './incidents'
 
 // One capture stream (video or analytics/probe) as returned inside /luxriot/streams.
 export interface Stream {
@@ -91,6 +92,18 @@ export interface SummaryBookmarkInput {
   severity: 'normal'
   state: 'new'
   timestamp_ms?: number
+}
+
+export function buildIncidentDraftFromSummary(entry: SummaryEntry): IncidentDraftInput | null {
+  const channelId = Number(entry.channel_id)
+  const anchorId = Number(entry.thumbnail_detection_id)
+  if (!Number.isInteger(channelId) || channelId <= 0 || !Number.isInteger(anchorId) || anchorId <= 0) {
+    return null
+  }
+  return {
+    channel_id: channelId,
+    anchor_detection_id: anchorId,
+  }
 }
 
 export function buildSummaryBookmarkInput(entry: SummaryEntry): SummaryBookmarkInput | null {

@@ -24,6 +24,7 @@ from inference_queue import (
     LuxriotInferenceQueueRuntime,
 )
 from archive_store import PostgresRuntimeStateStore
+from attention_policy import AttentionMode, CostBudgetState
 from luxriot_connector import LuxriotCaptureSession, LuxriotManager
 
 
@@ -1019,6 +1020,135 @@ def _capture_max_coalesce() -> int:
     from luxriot_connector import _SUMMARY_COALESCE_MAX_BATCHES
 
     return _SUMMARY_COALESCE_MAX_BATCHES
+
+
+class LuxriotIncidentFocusRuntimeTests(unittest.TestCase):
+    def test_focus_raises_l0_profile_and_degraded_source_stays_degraded(self):
+        with tempfile.TemporaryDirectory() as temp:
+            manager = build_manager(Path(temp))
+            manager.start_incident_focus(
+                "incident-7",
+                [7],
+                level="follow",
+                ttl_seconds=30,
+            )
+            mode, priority, digest = manager.apply_incident_focus(
+                7,
+                "quiet",
+                0.1,
+            )
+            self.assertEqual(mode.value, "active")
+            self.assertGreaterEqual(priority, 0.65)
+            self.assertEqual(digest["incident_ids"], ["incident-7"])
+
+            session = LuxriotCaptureSession(
+                manager,
+                channel_id=7,
+                batch_size=12,
+                prompt="Describe.",
+            )
+            focused_frame = {
+                "captured_at": 1.0,
+                "attention_mode": mode.value,
+                "incident_focus": digest,
+            }
+            self.assertEqual(
+                session._summary_cadence_for_frame(focused_frame),
+                2.5,
+            )
+            session.frames = [
+                {
+                    **focused_frame,
+                    "captured_at": float(index),
+                }
+                for index in range(1, 13)
+            ]
+            self.assertEqual(session._summary_profile_locked().mode.value, "active")
+            enqueued = []
+
+            def enqueue(**kwargs):
+                enqueued.append(kwargs)
+                session.frames.clear()
+                return True
+
+            with patch.object(session, "_enqueue_summary_batch", side_effect=enqueue):
+                session._summarize_if_ready()
+            self.assertEqual(enqueued[0]["workload_class"], "event")
+            self.assertEqual(enqueued[0]["frame_limit"], 12)
+
+            degraded, degraded_priority, degraded_digest = (
+                manager.apply_incident_focus(7, "degraded", 0.0)
+            )
+            self.assertEqual(degraded.value, "degraded")
+            self.assertEqual(degraded_priority, 0.0)
+            self.assertEqual(
+                degraded_digest["suppressed"],
+                "degraded_source",
+            )
+
+    def test_critical_focus_uses_burst_floor_and_stop_restores_mode(self):
+        with tempfile.TemporaryDirectory() as temp:
+            manager = build_manager(Path(temp))
+            manager.start_incident_focus(
+                "incident-critical",
+                [7],
+                level="critical",
+                ttl_seconds=30,
+            )
+            mode, priority, _digest = manager.apply_incident_focus(7, "watch", 0.2)
+            self.assertEqual(mode.value, "burst")
+            self.assertGreaterEqual(priority, 1.1)
+            self.assertTrue(manager.stop_incident_focus("incident-critical"))
+            mode, priority, digest = manager.apply_incident_focus(7, "watch", 0.2)
+            self.assertEqual(mode.value, "watch")
+            self.assertEqual(priority, 0.2)
+            self.assertIsNone(digest)
+
+    def test_critical_focus_does_not_jump_an_older_coverage_waiter(self):
+        with tempfile.TemporaryDirectory() as temp:
+            manager = build_manager(
+                Path(temp),
+                config_overrides={
+                    "LUXRIOT_ATTENTION_SCHEDULER_ENABLED": True,
+                },
+            )
+            now_ms = int(time.time() * 1000.0)
+            config = manager._l0_cost_budget_config
+            manager._l0_cost_budget_state = CostBudgetState(
+                timestamp_ms=now_ms,
+                available_tokens=-config.token_borrow_limit,
+                available_slot_seconds=-config.slot_seconds_borrow_limit,
+            )
+            self.assertFalse(
+                manager.reserve_l0_cost_budget(
+                    channel_id=8,
+                    mode=AttentionMode.QUIET,
+                    frame_count=8,
+                    coverage_overdue=True,
+                )
+            )
+            manager.start_incident_focus(
+                "incident-critical",
+                [7],
+                level="critical",
+                ttl_seconds=30,
+            )
+            focused_mode, _priority, _digest = manager.apply_incident_focus(
+                7,
+                AttentionMode.QUIET,
+                0.0,
+            )
+            self.assertFalse(
+                manager.reserve_l0_cost_budget(
+                    channel_id=7,
+                    mode=focused_mode,
+                    frame_count=8,
+                )
+            )
+            self.assertEqual(
+                manager.l0_cost_budget_status()["waiting_channel_ids"],
+                [7, 8],
+            )
 
 
 class LuxriotCaptureAttentionSignalTests(unittest.TestCase):
@@ -4481,8 +4611,20 @@ class LuxriotCaptureDispatchTests(unittest.TestCase):
                 }
 
         with tempfile.TemporaryDirectory() as temp:
-            manager = build_manager(Path(temp))
+            manager = build_manager(
+                Path(temp),
+                config_overrides={
+                    "LUXRIOT_ATTENTION_SCHEDULER_ENABLED": True,
+                },
+            )
             manager.probe_manager = ProbeManager()
+            manager.link_attention_snapshot(
+                channel_id=7,
+                timestamp_ms=1_000,
+                snapshot_id="snapshot-1",
+                embedding_ref="embedding://7/snapshot-1",
+                frame_hash="hash-1",
+            )
             emitted = []
             manager.set_attention_event_callback(
                 lambda event_type, payload: emitted.append(
@@ -4510,6 +4652,17 @@ class LuxriotCaptureDispatchTests(unittest.TestCase):
             self.assertFalse(
                 any(event_type == "probe_scores" for event_type, _ in emitted)
             )
+            shadow_decision = manager.observe_attention_cv(
+                channel_id=7,
+                timestamp_ms=1_100,
+                motion_score=0.0,
+                activity_x=0.0,
+                mode="quiet",
+            )
+            self.assertEqual(
+                shadow_decision.state.vector.probe_positive,
+                0.0,
+            )
 
             emitted.clear()
             frames[0].pop("attention_probe_scores", None)
@@ -4526,6 +4679,21 @@ class LuxriotCaptureDispatchTests(unittest.TestCase):
             )
             self.assertTrue(
                 any(event_type == "probe_scores" for event_type, _ in emitted)
+            )
+            regulatory_decision = manager.observe_attention_cv(
+                channel_id=7,
+                timestamp_ms=1_200,
+                motion_score=0.0,
+                activity_x=0.0,
+                mode="quiet",
+            )
+            self.assertEqual(
+                regulatory_decision.state.vector.probe_positive,
+                0.42,
+            )
+            self.assertEqual(
+                regulatory_decision.state.vector.probe_margin,
+                0.24,
             )
 
     def test_siglip2_probe_stays_shadow_until_embedding_space_is_stamped(self):

@@ -28,6 +28,7 @@ _ROLE_DESCRIPTIONS = {
 _WRITE_PERMISSIONS = {
     Permission.BOOKMARKS_CREATE,
     Permission.CAPTURE_MANAGE,
+    Permission.INCIDENTS_MANAGE,
     Permission.MODELS_MANAGE,
     Permission.PROBES_MANAGE,
     Permission.PROMPTS_MANAGE,

@@ -353,6 +353,7 @@ export default function App() {
               drive={drive}
               noAnim={noAnim}
               canReportFeedback={hasPermission(user, PERMISSION.bookmarksCreate)}
+              canReportIncidents={hasPermission(user, PERMISSION.incidentsManage)}
               canExport={hasPermission(user, PERMISSION.dataExport)}
               onFilters={setArchiveFilters}
               onRefreshChannels={refreshChannels}
@@ -376,6 +377,7 @@ export default function App() {
               canCapture={hasPermission(user, PERMISSION.captureManage)}
               canManagePrompts={hasPermission(user, PERMISSION.promptsManage)}
               canCreateBookmarks={hasPermission(user, PERMISSION.bookmarksCreate)}
+              canReportIncidents={hasPermission(user, PERMISSION.incidentsManage)}
               canExport={hasPermission(user, PERMISSION.dataExport)}
               onReviewSummary={handleReviewVideoSummary}
             />

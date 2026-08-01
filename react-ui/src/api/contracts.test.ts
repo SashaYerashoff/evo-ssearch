@@ -15,6 +15,12 @@ import {
 import { mapUser } from './auth'
 import { apiErrorMessage, shouldAttachCsrf } from './client'
 import {
+  incidentExportUrl,
+  incidentPath,
+  normalizeIncidentDraftInput,
+  normalizeIncidentFollowInput,
+} from './incidents'
+import {
   buildArchiveFilterPayload,
   buildArchiveListQuery,
   buildArchiveSearchPayload,
@@ -33,6 +39,7 @@ import {
 } from './settings'
 import {
   attentionStreamUrl,
+  buildIncidentDraftFromSummary,
   buildSummaryBookmarkInput,
   buildCaptureInput,
   buildPromptSettingsPayload,
@@ -161,6 +168,41 @@ describe('React/backend contract normalizers', () => {
     expect(attentionStreamUrl(112, 8)).toBe(
       '/luxriot/attention_stream/112?max_age_sec=60&request=8',
     )
+  })
+
+  it('builds an incident draft from a grounded VLM summary anchor', () => {
+    expect(buildIncidentDraftFromSummary({
+      channel_id: 112,
+      thumbnail_detection_id: 401,
+      batch_start_ms: 1_785_000_000_000,
+      batch_end_ms: 1_785_000_060_000,
+    })).toEqual({
+      channel_id: 112,
+      anchor_detection_id: 401,
+    })
+    expect(buildIncidentDraftFromSummary({ channel_id: 112 })).toBeNull()
+  })
+
+  it('normalizes incident draft and export contracts', () => {
+    expect(normalizeIncidentDraftInput({
+      channel_id: 112,
+      anchor_detection_id: 401,
+      from_ts: 10,
+      to_ts: 20,
+    })).toEqual({
+      channel_id: 112,
+      anchor_detection_id: 401,
+      from_ts: 10,
+      to_ts: 20,
+    })
+    expect(() => normalizeIncidentDraftInput({ channel_id: 0 })).toThrow('valid incident channel')
+    expect(() => normalizeIncidentDraftInput({ channel_id: 112, from_ts: 20, to_ts: 10 })).toThrow('cannot precede')
+    expect(incidentExportUrl('case/7', 'xml')).toBe('/incidents/case%2F7/export?format=xml')
+    expect(incidentPath('case/7')).toBe('/incidents/case%2F7')
+    expect(incidentPath('case/7', '/follow')).toBe('/incidents/case%2F7/follow')
+    expect(incidentPath('case/7', '/stop-follow')).toBe('/incidents/case%2F7/stop-follow')
+    expect(normalizeIncidentFollowInput('critical', 30)).toEqual({ mode: 'critical', ttl_seconds: 60 })
+    expect(API_PREFIXES).toContain('/incidents')
   })
 
   it('builds the same bounded L0 bookmark payload as the legacy console', () => {

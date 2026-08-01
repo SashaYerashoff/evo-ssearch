@@ -52,7 +52,7 @@ def _expected_version() -> str:
 
 
 EXPECTED_VERSION = _expected_version()
-EXPECTED_SCHEMA = "20260727_0010"
+EXPECTED_SCHEMA = "20260801_0011"
 DEFAULT_APP_DIR = Path("/opt/eva-ai/evo-ssearch")
 DEFAULT_ENV_FILE = Path("/etc/eva-ai/eva-ai.env")
 DEFAULT_BACKUP_ROOT = Path("/var/backups/eva-ai")

@@ -37,7 +37,7 @@ from urllib.parse import urlsplit
 
 
 VERSION = "β 0.8.5"
-EXPECTED_SCHEMA = "20260727_0010"
+EXPECTED_SCHEMA = "20260801_0011"
 DEFAULT_ROOT = Path("/opt/eva-ai")
 DEFAULT_DATA = Path("/var/lib/eva-ai")
 DEFAULT_CONFIG = Path("/etc/eva-ai")
@@ -512,7 +512,7 @@ def verify_critical_payload(bundle_root: Path, manifest: Mapping) -> None:
     required = (
         "repo/VERSION",
         "repo/alembic.ini",
-        "repo/migrations/versions/20260727_0010_audit_hash_chain.py",
+        "repo/migrations/versions/20260801_0011_incidents.py",
         "wheelhouse",
         "apt/Packages.gz",
         "models/qwen3-vl-4b-awq/model.safetensors",

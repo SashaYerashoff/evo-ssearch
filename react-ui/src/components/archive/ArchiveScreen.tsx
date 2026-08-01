@@ -64,12 +64,13 @@ function agentHoursFromArgs(args: any): string | null {
 const DEFAULT_FILTERS: ArchiveFilters = { source: '', hours: '24', sortBy: 'similarity', rows: '24' }
 
 export function ArchiveScreen({
-  channels, drive, noAnim, canReportFeedback, canExport, onFilters, onRefreshChannels,
+  channels, drive, noAnim, canReportFeedback, canReportIncidents, canExport, onFilters, onRefreshChannels,
 }: {
   channels: Channel[]
   drive?: AgentDrive | null
   noAnim?: boolean
   canReportFeedback?: boolean
+  canReportIncidents?: boolean
   canExport?: boolean
   onFilters?: (f: ArchiveFilters) => void
   onRefreshChannels?: () => Promise<void> | void
@@ -460,6 +461,7 @@ export function ArchiveScreen({
           d={selected}
           channels={channels}
           canReportFeedback={!!canReportFeedback}
+          canReportIncidents={!!canReportIncidents}
           canExport={!!canExport}
           onClose={() => setSelected(null)}
           onFindSimilar={runSimilar}

@@ -7,6 +7,7 @@ export const PERMISSION = {
   agentUse: 'agent:use',
   probesRun: 'probes:run',
   bookmarksCreate: 'bookmarks:create',
+  incidentsManage: 'incidents:manage',
   probesManage: 'probes:manage',
   promptsManage: 'prompts:manage',
   modelsManage: 'models:manage',

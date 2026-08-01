@@ -6,14 +6,17 @@ import {
   IconChevronRight,
   IconCopy,
   IconDownload,
+  IconFileDescription,
   IconSwitchHorizontal,
   IconVideoOff,
   IconX,
 } from '@tabler/icons-react'
 import type { Channel } from '../../api/types'
 import type { ConsoleDrive } from '../../App'
+import type { IncidentDraftInput } from '../../api/incidents'
 import {
   attentionStreamUrl,
+  buildIncidentDraftFromSummary,
   buildSummaryBookmarkInput,
   buildCaptureInput,
   fullLiveMediaUrl,
@@ -28,6 +31,7 @@ import type { DropOption } from '../shell/Dropdown'
 import { renderMarkdown } from '../agent/markdown'
 import { StreamControl, type VideoWorkspaceTab } from './StreamControl'
 import { PromptSettingsModal } from './PromptSettingsModal'
+import { IncidentModal } from '../incidents/IncidentModal'
 import {
   SUMMARY_SEVERITIES,
   resolveSummaryResolution,
@@ -150,17 +154,21 @@ function SummaryCard({
   selectedDepth,
   collapsed,
   canCreateBookmarks,
+  canReportIncidents,
   canExport,
   onToggle,
   onImage,
+  onReportIncident,
 }: {
   entry: SummaryEntry
   selectedDepth: string
   collapsed: boolean
   canCreateBookmarks: boolean
+  canReportIncidents: boolean
   canExport: boolean
   onToggle: () => void
   onImage: (src: string, title: string) => void
+  onReportIncident: (input: IncidentDraftInput) => void
 }) {
   const [bookmarkState, setBookmarkState] = useState<'idle' | 'saving' | 'saved' | 'failed'>('idle')
   const level = summaryLevel(entry, selectedDepth)
@@ -192,6 +200,7 @@ function SummaryCard({
   const bookmarkInput = level === 'L0' && !entry.coverage_gap
     ? buildSummaryBookmarkInput(entry)
     : null
+  const incidentInput = !entry.coverage_gap ? buildIncidentDraftFromSummary(entry) : null
 
   async function bookmarkSummary() {
     if (!bookmarkInput) return
@@ -265,6 +274,11 @@ function SummaryCard({
                     : 'Bookmark'}
             </button>
           )}
+          {canReportIncidents && incidentInput && (
+            <button className="btn compact" onClick={() => onReportIncident(incidentInput)}>
+              <IconFileDescription size={13} /> Report incident
+            </button>
+          )}
         </div>
       </div>
 
@@ -316,6 +330,7 @@ export function VideoScreen({
   canCapture,
   canManagePrompts,
   canCreateBookmarks,
+  canReportIncidents,
   canExport,
   onReviewSummary,
 }: {
@@ -325,6 +340,7 @@ export function VideoScreen({
   canCapture: boolean
   canManagePrompts: boolean
   canCreateBookmarks: boolean
+  canReportIncidents: boolean
   canExport: boolean
   onReviewSummary?: (entry: SummaryEntry) => void
 }) {
@@ -362,6 +378,7 @@ export function VideoScreen({
   const [modelOptions, setModelOptions] = useState<DropOption[]>([{ value: 'auto', label: 'Auto (balance)' }])
   const [collapsedSummaries, setCollapsedSummaries] = useState<Set<string>>(new Set())
   const [summaryImage, setSummaryImage] = useState<{ src: string; title: string } | null>(null)
+  const [incidentDraft, setIncidentDraft] = useState<IncidentDraftInput | null>(null)
   const feedRef = useRef<HTMLDivElement>(null)
   const feedRequestRef = useRef(0)
   const modelPreviewRef = useRef<HTMLImageElement>(null)
@@ -903,6 +920,7 @@ export function VideoScreen({
                   selectedDepth={renderedDepth}
                   collapsed={collapsedSummaries.has(key)}
                   canCreateBookmarks={canCreateBookmarks}
+                  canReportIncidents={canReportIncidents}
                   canExport={canExport}
                   onToggle={() => toggleSummary(key)}
                   onImage={(src, title) => {
@@ -912,6 +930,7 @@ export function VideoScreen({
                       setSummaryImage({ src, title })
                     }
                   }}
+                  onReportIncident={setIncidentDraft}
                 />
               )
             })}
@@ -1009,6 +1028,13 @@ export function VideoScreen({
             <IconX size={22} />
           </button>
         </div>
+      )}
+      {incidentDraft && (
+        <IncidentModal
+          draftInput={incidentDraft}
+          canExport={canExport}
+          onClose={() => setIncidentDraft(null)}
+        />
       )}
     </div>
   )

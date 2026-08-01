@@ -8,7 +8,7 @@ BASE_URL="${EVA_BASE_URL:-http://127.0.0.1:5000}"
 BACKUP_ROOT="${EVA_BACKUP_ROOT:-/var/backups/eva-ai}"
 PG_DATABASE="${EVA_PG_DATABASE:-eva}"
 EXPECTED_VERSION="${EVA_EXPECTED_VERSION:-}"
-EXPECTED_SCHEMA="${EVA_EXPECTED_SCHEMA:-20260727_0010}"
+EXPECTED_SCHEMA="${EVA_EXPECTED_SCHEMA:-20260801_0011}"
 BUNDLE_DIR=""
 STRICT=false
 CHECK_SERVICE=true
@@ -51,7 +51,7 @@ Options:
   --backup-root DIR       Backup root to check. Default: /var/backups/eva-ai.
   --pg-database NAME      Local PostgreSQL database fallback. Default: eva.
   --expected-version STR  Expected patch/app version, for example "β 0.8.5".
-  --expected-schema REV   Expected Alembic revision. Default: 20260727_0010.
+  --expected-schema REV   Expected Alembic revision. Default: 20260801_0011.
   --min-backup-free-mb N  Warn if backup filesystem has less free space.
   --user-service          Check a per-user systemd service with systemctl --user.
   --skip-service          Do not check systemd service state.

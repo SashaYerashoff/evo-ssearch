@@ -22,6 +22,12 @@ from uuid import NAMESPACE_URL, uuid4, uuid5
 import requests
 from PIL import Image, ImageChops, ImageFilter, ImageStat
 from requests.auth import HTTPDigestAuth
+from incident_focus import (
+    FocusDirective,
+    FocusLease,
+    FocusLevel,
+    IncidentFocusLeaseManager,
+)
 from attention_policy import (
     AggregationConfig as AttentionAggregationConfig,
     ApexMarker as AttentionApexMarker,
@@ -3378,7 +3384,9 @@ class LuxriotCaptureSession:
         return True
 
     def _summary_cadence_for_frame(self, frame: Mapping[str, Any]) -> float:
-        if bool(getattr(self.manager, "attention_scheduler_enabled", False)):
+        if bool(getattr(self.manager, "attention_scheduler_enabled", False)) or bool(
+            frame.get("incident_focus")
+        ):
             mode = self._summary_attention_mode_for_frame(frame)
             return float(profile_for_mode(mode).cadence_ms) / 1000.0
         mode = self._frame_capture_mode(frame)
@@ -3441,7 +3449,7 @@ class LuxriotCaptureSession:
         source_ms = int(round(self._frame_captured_at(frame) * 1000.0))
         adaptive_cadence = bool(
             getattr(self.manager, "attention_scheduler_enabled", False)
-        )
+        ) or bool(frame.get("incident_focus"))
         cadence_ms = max(
             1,
             int(round(self._summary_cadence_for_frame(frame) * 1000.0)),
@@ -3644,12 +3652,35 @@ class LuxriotCaptureSession:
             sharpness=attention_sharpness_score,
             source_health=0.0 if self.frozen_signal else 1.0,
         )
-        if attention_decision is not None:
-            frame["attention_mode"] = attention_decision.mode.value
-            frame["attention_priority"] = round(
-                float(attention_decision.priority),
-                6,
+        focus_mode = (
+            attention_decision.mode
+            if attention_decision is not None
+            else AttentionMode.DEGRADED
+            if frame.get("frozen_signal")
+            else AttentionMode.BURST
+            if attention_mode == "burst"
+            else AttentionMode.WATCH
+            if attention_mode in {"normal", "watch"}
+            else AttentionMode.QUIET
+        )
+        focus_priority = (
+            float(attention_decision.priority)
+            if attention_decision is not None
+            else 0.0
+        )
+        focus_mode, focus_priority, focus_digest = (
+            self.manager.apply_incident_focus(
+                self.channel_id,
+                focus_mode,
+                focus_priority,
             )
+        )
+        if attention_decision is not None or focus_digest is not None:
+            frame["attention_mode"] = focus_mode.value
+            frame["attention_priority"] = round(focus_priority, 6)
+        if focus_digest is not None:
+            frame["incident_focus"] = focus_digest
+        if attention_decision is not None:
             frame["attention_coverage_debt"] = round(
                 float(attention_decision.coverage_debt),
                 6,
@@ -3672,7 +3703,7 @@ class LuxriotCaptureSession:
                 pending_age_sec = self._summary_pending_age_locked()
                 adaptive = bool(
                     getattr(self.manager, "attention_scheduler_enabled", False)
-                )
+                ) or any(bool(frame.get("incident_focus")) for frame in self.frames)
                 workload_class = "heartbeat"
                 budget_mode = AttentionMode.QUIET
                 if adaptive:
@@ -5178,6 +5209,7 @@ class LuxriotManager:
                 ),
             )
         )
+        self.incident_focus_leases = IncidentFocusLeaseManager()
         self._attention_scheduler_stop = threading.Event()
         self._attention_scheduler_thread: Optional[threading.Thread] = None
         self._attention_scheduler_lock = threading.RLock()
@@ -6684,6 +6716,91 @@ class LuxriotManager:
     ) -> None:
         self.attention_event_callback = callback
 
+    def start_incident_focus(
+        self,
+        incident_id: str,
+        channel_ids: Iterable[int],
+        *,
+        level: FocusLevel | str = FocusLevel.FOLLOW,
+        ttl_seconds: float = 5 * 60,
+    ) -> FocusLease:
+        """Start or refresh a process-local focus lease.
+
+        HTTP, authorization, persistence, and agent schemas intentionally live
+        outside this runtime seam.
+        """
+
+        return self.incident_focus_leases.start(
+            incident_id,
+            channel_ids,
+            level=level,
+            ttl_seconds=ttl_seconds,
+        )
+
+    def stop_incident_focus(self, incident_id: str) -> bool:
+        return self.incident_focus_leases.stop(incident_id)
+
+    def incident_focus_status(self) -> Dict[str, Any]:
+        return dict(self.incident_focus_leases.compact_digest())
+
+    def incident_focus_for_channel(
+        self,
+        channel_id: int,
+    ) -> Optional[FocusDirective]:
+        return self.incident_focus_leases.directive_for_channel(channel_id)
+
+    def apply_incident_focus(
+        self,
+        channel_id: int,
+        mode: AttentionMode | str,
+        priority: float,
+    ) -> Tuple[AttentionMode, float, Optional[Dict[str, Any]]]:
+        """Apply a lease as a mode floor without masking degraded coverage."""
+
+        raw_mode = str(mode.value if isinstance(mode, AttentionMode) else mode).strip().lower()
+        aliases = {
+            "normal": AttentionMode.WATCH,
+            "disabled": AttentionMode.WATCH,
+        }
+        if raw_mode in aliases:
+            effective_mode = aliases[raw_mode]
+        else:
+            try:
+                effective_mode = AttentionMode(raw_mode)
+            except ValueError:
+                effective_mode = AttentionMode.QUIET
+        effective_priority = max(0.0, min(2.0, float(priority)))
+        directive = self.incident_focus_for_channel(channel_id)
+        if directive is None:
+            return effective_mode, effective_priority, None
+        # Focus cannot make a frozen or unhealthy source look observable.
+        if effective_mode is AttentionMode.DEGRADED:
+            return effective_mode, effective_priority, {
+                "level": directive.level.value,
+                "incident_ids": list(directive.incident_ids[:4]),
+                "suppressed": "degraded_source",
+            }
+        rank = {
+            AttentionMode.QUIET: 0,
+            AttentionMode.WATCH: 1,
+            AttentionMode.ACTIVE: 2,
+            AttentionMode.BURST: 3,
+        }
+        floor_mode = (
+            AttentionMode.BURST
+            if directive.level is FocusLevel.CRITICAL
+            else AttentionMode.ACTIVE
+        )
+        if rank[effective_mode] < rank[floor_mode]:
+            effective_mode = floor_mode
+        priority_floor = (
+            1.1 if directive.level is FocusLevel.CRITICAL else 0.65
+        )
+        return effective_mode, max(effective_priority, priority_floor), {
+            "level": directive.level.value,
+            "incident_ids": list(directive.incident_ids[:4]),
+        }
+
     def emit_attention_event(
         self,
         event_type: str,
@@ -6756,6 +6873,63 @@ class LuxriotManager:
         except ValueError as exc:
             with self._attention_scheduler_lock:
                 self._attention_last_error = _safe_error_text(exc, 240)
+            return None
+
+    def link_attention_probe_scores(
+        self,
+        *,
+        channel_id: int,
+        snapshot_id: str,
+        probe_scores: Iterable[Mapping[str, Any]],
+    ) -> Optional[AttentionEmbeddingSnapshot]:
+        """Feed only confirmed regulatory P/N/M into attention state.
+
+        Shadow, automatic, temporary, and attention-only probes remain useful
+        prompt-side cues but cannot regulate cadence or scheduling through this
+        seam.
+        """
+
+        if not self.attention_scheduler_enabled:
+            return None
+        accepted: List[AttentionProbeScore] = []
+        for score in probe_scores:
+            if not isinstance(score, Mapping):
+                continue
+            if str(score.get("attention_authority") or "").strip().lower() != "regulatory":
+                continue
+            if bool(score.get("temporary")) or bool(score.get("attention_only")):
+                continue
+            if str(score.get("origin") or "").strip().lower() not in {
+                "operator",
+                "agent",
+            }:
+                continue
+            probe_id = str(score.get("probe_id") or "").strip()
+            if not probe_id:
+                continue
+            try:
+                accepted.append(
+                    AttentionProbeScore(
+                        probe_id=probe_id,
+                        positive=float(score.get("p", score.get("positive", 0.0))),
+                        negative=float(score.get("n", score.get("negative", 0.0))),
+                        margin=float(score.get("m", score.get("margin", 0.0))),
+                        probe_version=str(score.get("probe_version") or ""),
+                    )
+                )
+            except (TypeError, ValueError):
+                continue
+        if not accepted:
+            return None
+        try:
+            return self.attention_coordinator.attach_probe_scores(
+                str(int(channel_id)),
+                str(snapshot_id),
+                accepted,
+            )
+        except ValueError:
+            # A late summary callback may outlive the coordinator's bounded
+            # snapshot ring. Durable P/N/M storage still succeeds independently.
             return None
 
     def link_attention_apex(
@@ -6974,6 +7148,7 @@ class LuxriotManager:
                 "last_plan": dict(self._attention_last_plan),
             }
         runtime["l0_cost_budget"] = self.l0_cost_budget_status()
+        runtime["incident_focus"] = self.incident_focus_status()
         runtime["coordinator"] = self.attention_coordinator.status()
         runtime["clip_async_dispatch"] = self.probe_embedding_dispatch_status()
         return runtime
@@ -10804,6 +10979,7 @@ class LuxriotManager:
                             "attention_authority": attention_authority,
                             "authority_reason": authority_reason,
                             "temporary": bool(probe.get("temporary")),
+                            "attention_only": bool(probe.get("attention_only")),
                             "timestamp_ms": int(timestamp_ms or 0),
                             "p": round(p_score, 6),
                             "n": round(n_score, 6),
@@ -10819,6 +10995,11 @@ class LuxriotManager:
                             snapshot_id
                             and attention_authority == "regulatory"
                         ):
+                            self.link_attention_probe_scores(
+                                channel_id=int(channel_id),
+                                snapshot_id=snapshot_id,
+                                probe_scores=(compact_score,),
+                            )
                             persisted_scores.append(
                                 {
                                     "id": str(

@@ -6,6 +6,7 @@ import {
   IconChevronRight,
   IconCopy,
   IconDownload,
+  IconFileDescription,
   IconFlag,
   IconMessage,
   IconPhoto,
@@ -23,6 +24,8 @@ import {
   saveAlertFeedback,
   type AlertFeedbackReason,
 } from '../../api/detections'
+import type { IncidentDraftInput } from '../../api/incidents'
+import { IncidentModal } from '../incidents/IncidentModal'
 
 const FALLBACK_REASONS: AlertFeedbackReason[] = [
   { code: 'no_relevant_event', label: 'No relevant event' },
@@ -80,6 +83,7 @@ export function InspectorModal({
   d,
   channels,
   canReportFeedback,
+  canReportIncidents,
   canExport,
   onClose,
   onFindSimilar,
@@ -87,6 +91,7 @@ export function InspectorModal({
   d: Detection
   channels: Channel[]
   canReportFeedback: boolean
+  canReportIncidents: boolean
   canExport: boolean
   onClose: () => void
   onFindSimilar: (d: Detection) => void
@@ -106,6 +111,7 @@ export function InspectorModal({
   const [feedbackReason, setFeedbackReason] = useState('')
   const [feedbackNote, setFeedbackNote] = useState('')
   const [hasFeedback, setHasFeedback] = useState(false)
+  const [incidentDraft, setIncidentDraft] = useState<IncidentDraftInput | null>(null)
 
   const active = frames[activeIndex] || d
   const previewSrc = detImageSrc(active)
@@ -116,6 +122,12 @@ export function InspectorModal({
     && Number.isInteger(Number(d.id))
     && Number(d.id) > 0
     ? Number(d.id)
+    : null
+  const incidentAnchorId = Number.isInteger(Number(active.id)) && Number(active.id) > 0
+    ? Number(active.id)
+    : null
+  const incidentChannelId = Number.isInteger(Number(active.channelId)) && Number(active.channelId) > 0
+    ? Number(active.channelId)
     : null
   const scores = [
     active.posScore != null && `P ${active.posScore.toFixed(2)}`,
@@ -326,6 +338,17 @@ export function InspectorModal({
               <button className="btn" onClick={() => onFindSimilar(active)} disabled={!detImageSrc(active)}>
                 <IconCopy size={15} /> Find similar
               </button>
+              {canReportIncidents && incidentAnchorId && incidentChannelId && (
+                <button
+                  className="btn incident-report-open"
+                  onClick={() => setIncidentDraft({
+                    channel_id: incidentChannelId,
+                    anchor_detection_id: incidentAnchorId,
+                  })}
+                >
+                  <IconFileDescription size={15} /> Report incident
+                </button>
+              )}
               {alertDetectionId && canReportFeedback && (
                 <button className="btn archive-feedback-open" onClick={() => setFeedbackOpen((open) => !open)}>
                   <IconFlag size={15} /> {hasFeedback ? 'Edit false-positive report' : 'Report false positive'}
@@ -393,6 +416,13 @@ export function InspectorModal({
             <IconX size={22} />
           </button>
         </div>
+      )}
+      {incidentDraft && (
+        <IncidentModal
+          draftInput={incidentDraft}
+          canExport={canExport}
+          onClose={() => setIncidentDraft(null)}
+        />
       )}
     </div>
   )

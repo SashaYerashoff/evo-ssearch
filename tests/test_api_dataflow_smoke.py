@@ -322,6 +322,13 @@ class ApiDataflowSmokeTests(unittest.TestCase):
             "/audit/events",
             "/image",
             "/image/<path:filepath>",
+            # The production React client builds these paths through its typed
+            # incidents API rather than direct fetch() calls in the legacy bundle.
+            "/incidents/draft",
+            "/incidents/<incident_id>",
+            "/incidents/<incident_id>/follow",
+            "/incidents/<incident_id>/stop-follow",
+            "/incidents/<incident_id>/export",
             "/js/app.js",
             "/lm/admission",
             "/lm/models",

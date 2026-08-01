@@ -68,7 +68,7 @@ pip install --upgrade pip && pip install -r requirements.txt
 # create roles/schemas, then migrate to head
 set -a; . /etc/eva-ai/eva-ai.env; set +a
 alembic upgrade head
-alembic current   # expect: 20260727_0010
+alembic current   # expect: 20260801_0011
 ```
 
 Use `scripts/bootstrap_db_roles.py` for the separated runtime roles `[VERIFY]`.
@@ -145,7 +145,7 @@ Single worker is **required** (in-process schedulers). See
 - **DB-touching patch:** run `alembic upgrade head` explicitly; the installer must
   refuse unsafe startup if DB revision < code-expected revision.
 - **β 0.8.4 → β 0.8.5:** back up PostgreSQL and apply Alembic revisions
-  `20260725_0007` through `20260727_0010`; this is not a code-only update.
+  `20260725_0007` through `20260801_0011`; this is not a code-only update.
 - Always reversible via `scripts/rollback.sh`.
 - For closed-network field patches via USB, follow the offline patch SOP
   (internal field-rollout doc).

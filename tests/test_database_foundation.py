@@ -53,6 +53,9 @@ VLM_BATCH_IDENTITY_MIGRATION = ROOT / "migrations" / "versions" / (
 AUDIT_HASH_CHAIN_MIGRATION = ROOT / "migrations" / "versions" / (
     "20260727_0010_audit_hash_chain.py"
 )
+INCIDENTS_MIGRATION = ROOT / "migrations" / "versions" / (
+    "20260801_0011_incidents.py"
+)
 
 
 class DatabaseSettingsTests(unittest.TestCase):
@@ -471,7 +474,7 @@ class MigrationContentTests(unittest.TestCase):
             encoding="utf-8"
         )
         self.assertIn(
-            f'revision: str = "{CURRENT_SCHEMA_REVISION}"',
+            'revision: str = "20260727_0010"',
             audit_hash_chain_source,
         )
         self.assertIn(
@@ -490,6 +493,19 @@ class MigrationContentTests(unittest.TestCase):
             "octet_length(event_hash) = 32",
             audit_hash_chain_source,
         )
+        incidents_source = INCIDENTS_MIGRATION.read_text(encoding="utf-8")
+        self.assertIn(
+            f'revision: str = "{CURRENT_SCHEMA_REVISION}"',
+            incidents_source,
+        )
+        self.assertIn(
+            'down_revision: str | None = "20260727_0010"',
+            incidents_source,
+        )
+        self.assertIn("CREATE TABLE archive.incidents", incidents_source)
+        self.assertIn("archive_incidents_tenant_isolation", incidents_source)
+        self.assertIn("'incidents:manage'", incidents_source)
+        self.assertNotIn("thumbnail_b64", incidents_source)
         self.assertIn(
             "CREATE TABLE archive.attention_probe_scores",
             attention_storage_source,
