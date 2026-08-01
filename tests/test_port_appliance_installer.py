@@ -47,9 +47,12 @@ def test_usb_builder_builds_react_for_node_free_runtime():
         assert local_only_pattern in builder
 
 
-def test_port_profile_keeps_gpu_for_vllm_and_clip_on_cpu():
-    assert installer.PORT_ENV["CUDA_VISIBLE_DEVICES"] == "-1"
+def test_port_profile_shares_bounded_gpu_with_siglip2():
+    assert installer.PORT_ENV["CUDA_VISIBLE_DEVICES"] == "0"
     assert installer.PORT_ENV["EVOSSEARCH_EMBEDDER"] == "clip"
+    assert installer.PORT_ENV["EVOSSEARCH_CLIP_MODEL"] == "google/siglip2-base-patch16-224"
+    assert installer.PORT_ENV["EVOSSEARCH_CLIP_DEVICE"] == "cuda"
+    assert installer.PORT_ENV["EVOSSEARCH_EXPERIMENTAL_EMBEDDERS_ENABLED"] == "true"
     assert installer.PORT_ENV["EVOSSEARCH_LUXRIOT_ATTENTION_EMBED_ALL_CHANNELS"] == "true"
     assert installer.PORT_ENV["EVOSSEARCH_LUXRIOT_ATTENTION_EMBEDDING_CADENCE_MS"] == "1000"
     assert installer.PORT_ENV["EVOSSEARCH_LUXRIOT_SUMMARY_MAX_BATCH_FRAMES"] == "16"
@@ -182,7 +185,7 @@ def test_hardware_detection_falls_back_to_linux_pci_sysfs(tmp_path):
     assert hardware.gpu_lines == []
 
 
-def test_external_inference_does_not_install_nvidia_driver(tmp_path, capsys):
+def test_offline_apt_can_explicitly_filter_nvidia_driver(tmp_path, capsys):
     apt = tmp_path / "apt"
     apt.mkdir()
     (apt / "package-names.txt").write_text(
@@ -200,6 +203,45 @@ def test_external_inference_does_not_install_nvidia_driver(tmp_path, capsys):
     assert "python3" in commands
     assert "postgresql" in commands
     assert "nvidia-driver-590-open" not in commands
+
+
+def test_external_vlm_still_requires_nvidia_for_local_siglip2_cuda(tmp_path):
+    answers = installer.Answers(
+        install_root=tmp_path / "opt",
+        data_root=tmp_path / "data",
+        config_root=tmp_path / "etc",
+        evo_url="http://evo.local",
+        evo_username="operator",
+        evo_password="secret",
+        local_vlm=False,
+        vlm_url="http://external-vlm.local/v1",
+        vlm_model="external-vlm",
+    )
+
+    assert installer.local_siglip2_cuda_selected() is True
+    assert installer.requires_local_nvidia(answers) is True
+
+    values = installer.render_runtime_env(
+        answers,
+        {},
+        {
+            "EVA_MIGRATOR_PASSWORD": "a" * 64,
+            "EVA_API_PASSWORD": "b" * 64,
+            "EVA_AUDIT_PASSWORD": "c" * 64,
+            "EVA_WORKER_PASSWORD": "d" * 64,
+            "EVA_BACKUP_PASSWORD": "e" * 64,
+        },
+    )
+    assert values["EVOSSEARCH_LM_PROFILE_VLM_BASE_URL"] == answers.vlm_url
+    assert values["EVOSSEARCH_CLIP_DEVICE"] == "cuda"
+
+
+def test_cpu_siglip_profile_does_not_require_nvidia_with_external_vlm():
+    cpu_env = {
+        **installer.PORT_ENV,
+        "EVOSSEARCH_CLIP_DEVICE": "cpu",
+    }
+    assert installer.local_siglip2_cuda_selected(cpu_env) is False
 
 
 def test_external_inference_skips_local_model_payloads(tmp_path, capsys):

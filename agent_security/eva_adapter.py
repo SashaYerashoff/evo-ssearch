@@ -50,6 +50,9 @@ _PREVIEW_ONLY_TOOLS = frozenset(
         "update_prompt_settings",
         "restore_video_summary_history",
         "apply_deployment_plan",
+        "draft_incident",
+        "follow_incident",
+        "stop_incident_follow",
     }
 )
 _HIDDEN_UNTIL_APPROVALS = frozenset({"create_bookmark"})
@@ -119,6 +122,10 @@ _TOOL_PERMISSIONS: dict[str, Permission] = {
     "apply_deployment_plan": Permission.SETTINGS_MANAGE,
     "get_deployment_status": Permission.REPORTS_VIEW,
     "query_counted_state_metric": Permission.DETECTIONS_VIEW,
+    "get_incident": Permission.REPORTS_VIEW,
+    "draft_incident": Permission.INCIDENTS_MANAGE,
+    "follow_incident": Permission.INCIDENTS_MANAGE,
+    "stop_incident_follow": Permission.INCIDENTS_MANAGE,
 }
 
 _WRITE_TOOLS = _PREVIEW_ONLY_TOOLS | _HIDDEN_UNTIL_APPROVALS
@@ -136,6 +143,10 @@ _CHANNEL_REQUIRED_TOOLS = frozenset(
         "survey_deployment",
         "apply_deployment_plan",
         "query_counted_state_metric",
+        "get_incident",
+        "draft_incident",
+        "follow_incident",
+        "stop_incident_follow",
     }
 )
 
@@ -185,6 +196,17 @@ class EvaAgentToolAdapter:
             if name == "query_counted_state_metric":
                 # Resolved server-side from the durable metric profile.
                 allowed_arguments.add("channel_id")
+            if name in {
+                "get_incident",
+                "draft_incident",
+                "follow_incident",
+                "stop_incident_follow",
+            }:
+                # Ownership/revision/digest bindings are resolved by the
+                # adapter and never entrusted to the model.
+                allowed_arguments.update(
+                    {"channel_ids", "expected_revision", "expected_draft_digest"}
+                )
             policy = ToolPolicy(
                 required_permission=_TOOL_PERMISSIONS[name].value,
                 risk=(
@@ -314,6 +336,10 @@ class EvaAgentToolAdapter:
         return {
             "search_archive": 2_000_000,
             "get_detections": 2_000_000,
+            "get_incident": 32_000,
+            "draft_incident": 32_000,
+            "follow_incident": 8_000,
+            "stop_incident_follow": 8_000,
         }.get(name, 96_000)
 
     @staticmethod
@@ -493,6 +519,13 @@ class EvaAgentToolAdapter:
             return result
         apply_arguments = dict(prepared_arguments)
         apply_arguments["preview"] = False
+        if name == "draft_incident":
+            digest = str(result.get("draft_digest") or "").strip()
+            if not digest:
+                raise InvalidToolArgumentsError(
+                    "incident draft preview has no evidence digest"
+                )
+            apply_arguments["expected_draft_digest"] = digest
         plan = self.gateway.create_plan(name, apply_arguments, context)
         enriched = dict(result)
         enriched["approval"] = {
@@ -553,8 +586,12 @@ class EvaAgentToolAdapter:
         ) -> Any:
             set_perms = getattr(self._legacy_tools, "_set_trusted_permissions", None)
             clear_perms = getattr(self._legacy_tools, "_clear_trusted_permissions", None)
+            set_context = getattr(self._legacy_tools, "_set_trusted_execution_context", None)
+            clear_context = getattr(self._legacy_tools, "_clear_trusted_execution_context", None)
             if callable(set_perms):
                 set_perms(context.permissions)
+            if callable(set_context):
+                set_context(context)
             try:
                 result = self._legacy_tools.execute(
                     name,
@@ -565,6 +602,8 @@ class EvaAgentToolAdapter:
             finally:
                 if callable(clear_perms):
                     clear_perms()
+                if callable(clear_context):
+                    clear_context()
 
         return execute_legacy
 
@@ -577,6 +616,19 @@ class EvaAgentToolAdapter:
         if name not in self._schemas:
             return dict(arguments)
         prepared = copy.deepcopy(dict(arguments))
+
+        if name in {
+            "get_incident",
+            "draft_incident",
+            "follow_incident",
+            "stop_incident_follow",
+        }:
+            required = _TOOL_PERMISSIONS[name].value
+            if required not in context.permissions:
+                raise PermissionDeniedError(
+                    f"tool requires permission {required}",
+                    details={"required_permission": required},
+                )
 
         if name == "lookup_help":
             # Permissions never travel through model/tool args; strip any attempt.
@@ -615,6 +667,7 @@ class EvaAgentToolAdapter:
         self._prepare_deployment_arguments(name, prepared, context)
 
         self._resolve_channel_reference(prepared)
+        self._prepare_incident_arguments(name, prepared, context)
         if name == "describe_frame":
             self._resolve_detection_channel(prepared)
         if name == "update_probe":
@@ -797,6 +850,103 @@ class EvaAgentToolAdapter:
                 "detection has no channel ownership metadata"
             )
         arguments["channel_id"] = channel_id
+
+    def _prepare_incident_arguments(
+        self,
+        name: str,
+        arguments: dict[str, Any],
+        context: ToolExecutionContext,
+    ) -> None:
+        if name not in {
+            "get_incident",
+            "draft_incident",
+            "follow_incident",
+            "stop_incident_follow",
+        }:
+            return
+        # Hidden concurrency/evidence bindings may only originate here or in
+        # the immutable approval plan, never in model output.
+        arguments.pop("expected_revision", None)
+        arguments.pop("expected_draft_digest", None)
+
+        if name == "draft_incident":
+            channel_id = arguments.get("channel_id")
+            anchor_id = arguments.get("anchor_detection_id")
+            if anchor_id is not None:
+                try:
+                    normalized_id = int(anchor_id)
+                except (TypeError, ValueError) as exc:
+                    raise InvalidToolArgumentsError(
+                        "anchor_detection_id must be an integer"
+                    ) from exc
+                records = self._legacy_tools._ds.fetch_detections_by_ids(
+                    [normalized_id],
+                    include_vectors=False,
+                )
+                if not records:
+                    raise InvalidToolArgumentsError(
+                        "anchor detection does not exist"
+                    )
+                actual_channel = records[0].get("channel_id")
+                if actual_channel is None:
+                    raise InvalidToolArgumentsError(
+                        "anchor detection has no channel ownership metadata"
+                    )
+                if (
+                    "*" not in context.allowed_channel_ids
+                    and str(actual_channel) not in context.allowed_channel_ids
+                ):
+                    raise ChannelAccessDeniedError(
+                        "anchor detection is outside the authorized channel scope"
+                    )
+                if channel_id is not None and str(channel_id) != str(actual_channel):
+                    raise InvalidToolArgumentsError(
+                        "anchor detection belongs to a different channel"
+                    )
+                channel_id = actual_channel
+                arguments["channel_id"] = actual_channel
+            if channel_id is None:
+                raise InvalidToolArgumentsError(
+                    "draft_incident requires a channel or grounded anchor detection"
+                )
+            arguments["channel_ids"] = [channel_id]
+            return
+
+        incident_id = str(arguments.get("incident_id") or "").strip()
+        if not incident_id:
+            raise InvalidToolArgumentsError("incident_id is required")
+        service = getattr(self._legacy_tools, "_incident_commands", None)
+        if service is None:
+            raise InvalidToolArgumentsError(
+                "incident reporting is unavailable on this deployment"
+            )
+        try:
+            incident = service.get(incident_id)
+        except (LookupError, ValueError) as exc:
+            raise InvalidToolArgumentsError(str(exc)) from exc
+        channel_ids = [
+            value
+            for value in incident.get("channel_ids") or []
+            if str(value).strip()
+        ]
+        if not channel_ids:
+            raise InvalidToolArgumentsError(
+                "incident has no channel ownership metadata"
+            )
+        arguments["channel_ids"] = channel_ids
+        if name in {"follow_incident", "stop_incident_follow"}:
+            revision = incident.get("revision")
+            try:
+                revision = int(revision)
+            except (TypeError, ValueError) as exc:
+                raise InvalidToolArgumentsError(
+                    "incident has no valid optimistic revision"
+                ) from exc
+            if revision <= 0:
+                raise InvalidToolArgumentsError(
+                    "incident has no valid optimistic revision"
+                )
+            arguments["expected_revision"] = revision
 
     def _resolve_update_probe_channel(self, arguments: dict[str, Any]) -> None:
         probes = self._legacy_tools._ps.list_probes()

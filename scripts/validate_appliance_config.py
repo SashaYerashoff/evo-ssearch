@@ -126,9 +126,35 @@ def validate(values: Mapping[str, str], *, check_files: bool = True) -> list[str
         errors.append("migration and runtime DSNs must use distinct roles")
 
     if check_files:
-        clip_cache = str(values.get("EVOSSEARCH_OPENAI_CLIP_CACHE_DIR") or "").strip()
-        if clip_cache and not (Path(clip_cache) / "ViT-B-32.pt").is_file():
-            errors.append("CLIP ViT-B-32.pt is missing from the configured offline cache")
+        clip_model = str(values.get("EVOSSEARCH_CLIP_MODEL") or "").strip()
+        if "siglip2" in clip_model.lower():
+            model_cache = str(values.get("EVOSSEARCH_MODEL_CACHE_DIR") or "").strip()
+            revision = str(values.get("EVOSSEARCH_CLIP_MODEL_REVISION") or "").strip()
+            snapshot = (
+                Path(model_cache)
+                / "models--google--siglip2-base-patch16-224"
+                / "snapshots"
+                / revision
+            ) if model_cache and revision else None
+            required = (
+                "config.json",
+                "model.safetensors",
+                "preprocessor_config.json",
+                "tokenizer.json",
+                "tokenizer_config.json",
+            )
+            if snapshot is None or any(
+                not (snapshot / filename).is_file()
+                for filename in required
+            ):
+                errors.append(
+                    "SigLIP2 model, processor and tokenizer are missing from "
+                    "the configured offline Hugging Face cache/revision"
+                )
+        else:
+            clip_cache = str(values.get("EVOSSEARCH_OPENAI_CLIP_CACHE_DIR") or "").strip()
+            if clip_cache and not (Path(clip_cache) / "ViT-B-32.pt").is_file():
+                errors.append("CLIP ViT-B-32.pt is missing from the configured offline cache")
     return errors
 
 

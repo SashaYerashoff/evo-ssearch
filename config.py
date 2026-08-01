@@ -180,11 +180,14 @@ class Config:
     # Embedder configuration
     EXPERIMENTAL_EMBEDDERS_ENABLED = _get_bool_env(
         'EVOSSEARCH_EXPERIMENTAL_EMBEDDERS_ENABLED',
-        'False',
+        'True',
     )
     PRODUCTION_CLIP_MODEL = (
-        os.getenv('EVOSSEARCH_PRODUCTION_CLIP_MODEL', 'ViT-B/32').strip()
-        or 'ViT-B/32'
+        os.getenv(
+            'EVOSSEARCH_PRODUCTION_CLIP_MODEL',
+            'google/siglip2-base-patch16-224',
+        ).strip()
+        or 'google/siglip2-base-patch16-224'
     )
     EMBEDDER = os.getenv('EVOSSEARCH_EMBEDDER', 'clip').strip().lower()
     EMBEDDER_EAGER_LOAD = _get_bool_env(
@@ -203,6 +206,10 @@ class Config:
         or 'auto'
     )
     CLIP_MODEL = os.getenv('EVOSSEARCH_CLIP_MODEL', PRODUCTION_CLIP_MODEL).strip() or PRODUCTION_CLIP_MODEL
+    CLIP_MODEL_REVISION = os.getenv(
+        'EVOSSEARCH_CLIP_MODEL_REVISION',
+        '75de2d55ec2d0b4efc50b3e9ad70dba96a7b2fa2',
+    ).strip()
     if not EXPERIMENTAL_EMBEDDERS_ENABLED:
         EMBEDDER = 'clip'
         CLIP_MODEL = PRODUCTION_CLIP_MODEL
@@ -1490,19 +1497,26 @@ class Config:
     )
 
     # Probe / CLIP monitoring
+    _PROBE_SIGLIP2_DEFAULTS = "siglip2" in CLIP_MODEL.lower()
     try:
         PROBE_POS_FLOOR_DEFAULT = float(
-            os.getenv('EVOSSEARCH_PROBE_POS_FLOOR_DEFAULT', '0.28')
+            os.getenv(
+                'EVOSSEARCH_PROBE_POS_FLOOR_DEFAULT',
+                '0.05' if _PROBE_SIGLIP2_DEFAULTS else '0.28',
+            )
         )
     except (TypeError, ValueError):
-        PROBE_POS_FLOOR_DEFAULT = 0.28
+        PROBE_POS_FLOOR_DEFAULT = 0.05 if _PROBE_SIGLIP2_DEFAULTS else 0.28
     PROBE_POS_FLOOR_DEFAULT = min(1.0, max(-1.0, PROBE_POS_FLOOR_DEFAULT))
     try:
         PROBE_MARGIN_DEFAULT = float(
-            os.getenv('EVOSSEARCH_PROBE_MARGIN_DEFAULT', '0.08')
+            os.getenv(
+                'EVOSSEARCH_PROBE_MARGIN_DEFAULT',
+                '0.02' if _PROBE_SIGLIP2_DEFAULTS else '0.08',
+            )
         )
     except (TypeError, ValueError):
-        PROBE_MARGIN_DEFAULT = 0.08
+        PROBE_MARGIN_DEFAULT = 0.02 if _PROBE_SIGLIP2_DEFAULTS else 0.08
     PROBE_MARGIN_DEFAULT = min(2.0, max(0.0, PROBE_MARGIN_DEFAULT))
     try:
         PROBE_CAPTURE_WARMUP_SEC = float(

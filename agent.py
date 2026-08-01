@@ -60,6 +60,9 @@ from lm_admission import (
     get_lm_admission_controller,
     normalize_lm_resource,
 )
+from incident_store import IncidentRevisionConflict
+from embedding_space import embedding_spaces_match
+from config import config
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -112,6 +115,7 @@ AGENT_INTENT_TOOL_CALL_LIMITS: Dict[str, int] = {
     "probe_management": 16,
     "bookmark": 6,
     "summary_restore": 8,
+    "incident_control": 4,
 }
 AGENT_SKILL_TOOL_CALL_LIMITS: Dict[str, int] = {
     "archive_research": 12,
@@ -222,6 +226,90 @@ _TOOL_SCHEMAS: List[Dict[str, Any]] = [
                     },
                 },
                 "required": ["query"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_incident",
+            "description": (
+                "Load one previously reported EVA incident by its server-issued ID. "
+                "Use for an explicit request to inspect a known incident; use video "
+                "research tools to discover events when no incident ID is known."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "incident_id": {
+                        "type": "string",
+                        "description": "Exact incident ID copied from a prior tool result or operator message.",
+                    }
+                },
+                "required": ["incident_id"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "draft_incident",
+            "description": (
+                "Build a bounded, evidence-linked incident draft around an archive "
+                "detection or explicit time window. This is a mutation preview: the "
+                "model must send preview=true and the operator applies it in the UI."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "channel_id": {"type": "integer", "description": "Authorized channel ID."},
+                    "channel_ref": {"type": "string", "description": "Channel title or #ID when channel_id is unknown."},
+                    "anchor_detection_id": {"type": "integer", "description": "Preferred grounded archive detection anchor."},
+                    "relative_range": {"type": "string", "description": "Operator-provided relative window, for example 'last two hours'."},
+                    "from_ts": {"type": "number", "description": "Optional Unix seconds or milliseconds copied from a normalized time result."},
+                    "to_ts": {"type": "number", "description": "Optional Unix seconds or milliseconds copied from a normalized time result."},
+                    "preview": {"type": "boolean", "description": "Must be true for model calls."},
+                },
+                "required": ["preview"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "follow_incident",
+            "description": (
+                "Preview bounded higher-density attention for a known incident. "
+                "The server resolves its channels and revision; the model supplies "
+                "only a copied incident ID, a closed focus mode, and TTL."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "incident_id": {"type": "string", "description": "Exact server-issued incident ID."},
+                    "mode": {"type": "string", "enum": ["follow", "critical"], "description": "Bounded attention level."},
+                    "ttl_seconds": {"type": "integer", "description": "Focus lifetime from 60 to 28800 seconds."},
+                    "preview": {"type": "boolean", "description": "Must be true for model calls."},
+                },
+                "required": ["incident_id", "preview"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "stop_incident_follow",
+            "description": (
+                "Preview stopping active focus for a known incident. The server "
+                "resolves its channels and optimistic revision."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "incident_id": {"type": "string", "description": "Exact server-issued incident ID."},
+                    "preview": {"type": "boolean", "description": "Must be true for model calls."},
+                },
+                "required": ["incident_id", "preview"],
             },
         },
     },
@@ -2506,6 +2594,7 @@ class AgentTools:
         search_detections_fn: Callable[..., List[Dict[str, Any]]],
         channel_group_store: Any | None = None,
         deployment_store: ProtocolDeploymentStore | None = None,
+        incident_command_service: Any | None = None,
         embedding_metadata_fn: Optional[
             Callable[[], Mapping[str, Any]]
         ] = None,
@@ -2520,6 +2609,7 @@ class AgentTools:
         self._search_folder    = search_indexed_folder_fn
         self._search_det       = search_detections_fn
         self._channel_groups = channel_group_store
+        self._incident_commands = incident_command_service
         self._embedding_metadata_fn = embedding_metadata_fn
         self._deployment_store = deployment_store or ProtocolDeploymentStore(
             getattr(luxriot_manager, "runtime_state_store", None)
@@ -2549,7 +2639,7 @@ class AgentTools:
         if not isinstance(raw, Mapping):
             return {}
         result: Dict[str, Any] = {}
-        for key in ("backend", "model", "dimension"):
+        for key in ("backend", "model", "revision", "fingerprint", "dimension"):
             value = raw.get(key)
             if value is None:
                 continue
@@ -2574,6 +2664,19 @@ class AgentTools:
 
     def _clear_trusted_permissions(self) -> None:
         self._local.granted_permissions = None
+
+    def _set_trusted_execution_context(self, context: ToolExecutionContext) -> None:
+        self._local.execution_context = context
+
+    def _clear_trusted_execution_context(self) -> None:
+        self._local.execution_context = None
+
+    def _trusted_actor_id(self) -> str:
+        context = getattr(self._local, "execution_context", None)
+        actor_id = str(getattr(context, "actor_id", "") or "").strip()
+        if not actor_id:
+            raise ToolError("Incident mutations require an authenticated operator context.")
+        return actor_id
 
     def _prune_workflow_jobs_locked(self, now: Optional[float] = None) -> None:
         now = time.time() if now is None else float(now)
@@ -2633,6 +2736,10 @@ class AgentTools:
         """Dispatch to the named tool. Returns a dict always."""
         dispatch = {
             "lookup_help":          self._lookup_help,
+            "get_incident":         self._get_incident,
+            "draft_incident":       self._draft_incident,
+            "follow_incident":      self._follow_incident,
+            "stop_incident_follow": self._stop_incident_follow,
             "search_archive":       self._search_archive,
             "get_visual_window_signals": self._get_visual_window_signals,
             "calibrate_probe_from_archive": self._calibrate_probe_from_archive,
@@ -2675,6 +2782,177 @@ class AgentTools:
             return fn(args)
         finally:
             self._local.progress_cb = None
+
+    def _require_incident_commands(self) -> Any:
+        if self._incident_commands is None:
+            raise ToolError("Incident reporting is not available on this deployment.")
+        return self._incident_commands
+
+    def _get_incident(self, args: Dict[str, Any]) -> Dict[str, Any]:
+        service = self._require_incident_commands()
+        incident_id = str(args.get("incident_id") or "").strip()
+        if not incident_id:
+            raise ToolError("'incident_id' is required.")
+        try:
+            record = service.get(incident_id)
+            return {
+                "status": "ok",
+                "incident": _compact_incident_for_model(
+                    service.public_record(record)
+                ),
+            }
+        except (LookupError, ValueError) as exc:
+            raise ToolError(str(exc)) from exc
+
+    def _incident_draft_inputs(
+        self,
+        args: Dict[str, Any],
+    ) -> Tuple[int, Optional[int], Optional[int], Optional[int]]:
+        channel_id = _opt_int(args.get("channel_id"))
+        if channel_id is None or channel_id <= 0:
+            raise ToolError("Choose one channel for the incident draft.")
+        anchor_id = _opt_int(args.get("anchor_detection_id"))
+        if anchor_id is not None and anchor_id <= 0:
+            raise ToolError("anchor_detection_id must be positive.")
+        has_window = any(
+            args.get(key) is not None
+            for key in ("relative_range", "from_ts", "to_ts", "since_ms", "until_ms")
+        )
+        since_ms: Optional[int] = None
+        until_ms: Optional[int] = None
+        if has_window:
+            _from_ts, _to_ts, window = self._resolve_summary_time_window(
+                args,
+                default_since_hours=1.0,
+            )
+            since_ms = _opt_int(window.get("since_ms"))
+            until_ms = _opt_int(window.get("until_ms"))
+        if anchor_id is None and (since_ms is None or until_ms is None):
+            raise ToolError(
+                "Provide anchor_detection_id or an explicit/relative time window."
+            )
+        return int(channel_id), anchor_id, since_ms, until_ms
+
+    def _draft_incident(self, args: Dict[str, Any]) -> Dict[str, Any]:
+        service = self._require_incident_commands()
+        channel_id, anchor_id, since_ms, until_ms = self._incident_draft_inputs(args)
+        try:
+            draft = service.build_draft(
+                channel_id=channel_id,
+                anchor_detection_id=anchor_id,
+                since_ms=since_ms,
+                until_ms=until_ms,
+            )
+            digest = service.draft_digest(draft)
+            if args.get("preview", True) is True:
+                return {
+                    "status": "preview",
+                    "action": "draft_incident",
+                    "draft_digest": digest,
+                    "incident": _compact_incident_for_model(draft),
+                }
+            expected_digest = str(args.get("expected_draft_digest") or "").strip()
+            if not expected_digest or expected_digest != digest:
+                raise ToolError(
+                    "Incident evidence changed after preview; prepare a fresh draft preview."
+                )
+            stored = service.store_draft(draft, actor_id=self._trusted_actor_id())
+            return {
+                "status": "applied",
+                "action": "draft_incident",
+                "incident": _compact_incident_for_model(
+                    service.public_record(stored)
+                ),
+            }
+        except ToolError:
+            raise
+        except (LookupError, ValueError) as exc:
+            raise ToolError(str(exc)) from exc
+
+    def _follow_incident(self, args: Dict[str, Any]) -> Dict[str, Any]:
+        service = self._require_incident_commands()
+        incident_id = str(args.get("incident_id") or "").strip()
+        mode = str(args.get("mode") or "follow").strip().lower()
+        ttl_seconds = int(args.get("ttl_seconds") or 300)
+        try:
+            current = service.get(incident_id)
+            if args.get("preview", True) is True:
+                return {
+                    "status": "preview",
+                    "action": "follow_incident",
+                    "incident": _compact_incident_for_model(
+                        service.public_record(current),
+                        timeline_limit=4,
+                        evidence_limit=2,
+                        uncertainty_limit=4,
+                    ),
+                    "proposed_follow": {
+                        "mode": mode,
+                        "ttl_seconds": ttl_seconds,
+                    },
+                }
+            updated, _lease = service.follow(
+                incident_id,
+                actor_id=self._trusted_actor_id(),
+                mode=mode,
+                ttl_seconds=ttl_seconds,
+                expected_revision=_opt_int(args.get("expected_revision")),
+            )
+            return {
+                "status": "applied",
+                "action": "follow_incident",
+                "incident": _compact_incident_for_model(
+                    service.public_record(updated),
+                    timeline_limit=4,
+                    evidence_limit=2,
+                    uncertainty_limit=4,
+                ),
+            }
+        except IncidentRevisionConflict as exc:
+            raise ToolError(
+                f"Incident changed to revision {exc.actual_revision}; prepare a fresh follow preview."
+            ) from exc
+        except (LookupError, ValueError) as exc:
+            raise ToolError(str(exc)) from exc
+
+    def _stop_incident_follow(self, args: Dict[str, Any]) -> Dict[str, Any]:
+        service = self._require_incident_commands()
+        incident_id = str(args.get("incident_id") or "").strip()
+        try:
+            current = service.get(incident_id)
+            if args.get("preview", True) is True:
+                return {
+                    "status": "preview",
+                    "action": "stop_incident_follow",
+                    "incident": _compact_incident_for_model(
+                        service.public_record(current),
+                        timeline_limit=4,
+                        evidence_limit=2,
+                        uncertainty_limit=4,
+                    ),
+                }
+            updated, removed = service.stop_follow(
+                incident_id,
+                actor_id=self._trusted_actor_id(),
+                expected_revision=_opt_int(args.get("expected_revision")),
+            )
+            return {
+                "status": "applied",
+                "action": "stop_incident_follow",
+                "runtime_lease_removed": bool(removed),
+                "incident": _compact_incident_for_model(
+                    service.public_record(updated),
+                    timeline_limit=4,
+                    evidence_limit=2,
+                    uncertainty_limit=4,
+                ),
+            }
+        except IncidentRevisionConflict as exc:
+            raise ToolError(
+                f"Incident changed to revision {exc.actual_revision}; prepare a fresh stop preview."
+            ) from exc
+        except (LookupError, ValueError) as exc:
+            raise ToolError(str(exc)) from exc
 
     # ── search_archive ──────────────────────────────────────────────────────
 
@@ -3007,49 +3285,29 @@ class AgentTools:
                     if isinstance(raw_payload.get("embedding_space"), Mapping)
                     else {}
                 )
-                expected_backend = str(
-                    embedding_space.get("backend") or ""
+                expected_revision = str(
+                    embedding_space.get("revision") or ""
                 ).strip()
-                expected_model = str(
-                    embedding_space.get("model") or ""
+                expected_fingerprint = str(
+                    embedding_space.get("fingerprint") or ""
                 ).strip()
-                expected_dimension = _opt_int(
-                    embedding_space.get("dimension")
-                )
-                archived_backend = str(
-                    archived_space.get("backend") or ""
+                archived_revision = str(
+                    archived_space.get("revision") or ""
                 ).strip()
-                archived_model = str(
-                    archived_space.get("model") or ""
+                archived_fingerprint = str(
+                    archived_space.get("fingerprint") or ""
                 ).strip()
-                archived_dimension = _opt_int(
-                    archived_space.get("dimension")
+                incompatible = not embedding_spaces_match(
+                    embedding_space,
+                    archived_space,
                 )
-                explicit_identity_required = (
-                    expected_backend not in {"", "openai_clip"}
-                    or "siglip" in expected_model.lower()
-                )
-                incompatible = (
-                    (
-                        bool(archived_backend)
-                        and bool(expected_backend)
-                        and archived_backend != expected_backend
-                    )
-                    or (
-                        bool(archived_model)
-                        and bool(expected_model)
-                        and archived_model != expected_model
-                    )
-                    or (
-                        archived_dimension is not None
-                        and expected_dimension is not None
-                        and archived_dimension != expected_dimension
-                    )
-                    or (
-                        explicit_identity_required
-                        and (not archived_backend or not archived_model)
-                    )
-                )
+                if expected_revision and archived_revision != expected_revision:
+                    incompatible = True
+                if (
+                    expected_fingerprint
+                    and archived_fingerprint != expected_fingerprint
+                ):
+                    incompatible = True
                 if incompatible:
                     rejected_embedding_space += 1
                     continue
@@ -4972,8 +5230,16 @@ class AgentTools:
             "channel_id": int(raw_probe.get("channel_id") or 0),
             "positives": positives,
             "negatives": negatives,
-            "pos_floor": float(raw_probe.get("pos_floor") or 0.20),
-            "margin": float(raw_probe.get("margin") or 0.05),
+            "pos_floor": float(
+                raw_probe.get("pos_floor")
+                if raw_probe.get("pos_floor") is not None
+                else config.PROBE_POS_FLOOR_DEFAULT
+            ),
+            "margin": float(
+                raw_probe.get("margin")
+                if raw_probe.get("margin") is not None
+                else config.PROBE_MARGIN_DEFAULT
+            ),
             "bookmark_cooldown_sec": 20.0,
             "bookmark_dedupe_window_sec": 60.0,
             "top_k": max(1, int(raw_probe.get("top_k") or 6)),
@@ -5626,13 +5892,19 @@ class AgentTools:
                                 "from_ts": float(applied_at_ms) / 1000.0,
                                 "to_ts": float(now_ms) / 1000.0,
                                 "positive_floor": float(
-                                    thresholds.get("pos_floor") or 0.20
+                                    thresholds.get("pos_floor")
+                                    if thresholds.get("pos_floor") is not None
+                                    else config.PROBE_POS_FLOOR_DEFAULT
                                 ),
                                 "negative_floor": float(
-                                    thresholds.get("pos_floor") or 0.20
+                                    thresholds.get("pos_floor")
+                                    if thresholds.get("pos_floor") is not None
+                                    else config.PROBE_POS_FLOOR_DEFAULT
                                 ),
                                 "margin_threshold": float(
-                                    thresholds.get("margin_thr") or 0.05
+                                    thresholds.get("margin_thr")
+                                    if thresholds.get("margin_thr") is not None
+                                    else config.PROBE_MARGIN_DEFAULT
                                 ),
                                 "min_state_samples": 2,
                                 "min_state_duration_sec": 2.0,
@@ -5948,8 +6220,8 @@ class AgentTools:
             "channel_id": channel_id,
             "positives": positives,
             "negatives": negatives,
-            "pos_floor": _opt_float(args.get("pos_floor")) if args.get("pos_floor") is not None else 0.2,
-            "margin": _opt_float(args.get("margin_thr")) if args.get("margin_thr") is not None else 0.05,
+            "pos_floor": _opt_float(args.get("pos_floor")) if args.get("pos_floor") is not None else config.PROBE_POS_FLOOR_DEFAULT,
+            "margin": _opt_float(args.get("margin_thr")) if args.get("margin_thr") is not None else config.PROBE_MARGIN_DEFAULT,
             "bookmark_cooldown_sec": _opt_float(args.get("bookmark_cooldown_sec")) if args.get("bookmark_cooldown_sec") is not None else 8.0,
             "bookmark_dedupe_window_sec": _opt_float(args.get("bookmark_dedupe_window_sec")) if args.get("bookmark_dedupe_window_sec") is not None else 20.0,
             "top_k": max(1, int(args.get("top_k") or 6)),
@@ -9160,6 +9432,12 @@ _TOOL_INTENT_GROUPS: Dict[str, frozenset[str]] = {
         "restore_video_summary_history",
         "get_video_summary_restore_status",
     }),
+    "incident_control": frozenset({
+        "get_incident",
+        "draft_incident",
+        "follow_incident",
+        "stop_incident_follow",
+    }),
 }
 
 
@@ -9198,6 +9476,15 @@ def _classify_tool_intents(user_text: Any, context: Mapping[str, Any]) -> List[s
         add("deployment")
         return intents
     if re.search(
+        r"\b(?:report|create|draft|follow|stop|show|get|open)\s+(?:the\s+|this\s+|an?\s+)?incident\b|"
+        r"\bincident\s+(?:id|draft|follow|focus)\b|"
+        r"(?:созда|состав|оформ|покаж|откро|след|сопровож|останов).{0,28}инцидент|"
+        r"инцидент.{0,28}(?:созда|чернов|покаж|откро|след|сопровож|останов)",
+        text,
+    ):
+        add("incident_control")
+        return intents
+    if re.search(
         r"\bhow\s+(?:many\s+times|long)\b|\bcount(?:ed)?\s+(?:state|event|transition)s?\b|"
         r"сколько\s+(?:раз|времени)|как\s+долго|сч[её]тчик\w*\s+(?:состоян|событ)",
         text,
@@ -9224,7 +9511,7 @@ def _classify_tool_intents(user_text: Any, context: Mapping[str, Any]) -> List[s
     if (
         context.get("focus_video_summaries")
         or re.search(
-            r"\b(?:vlm|video|camera|alert|alerts|summary|summaries|notable|coverage|went quiet|what happened|report|incident|event|events)\b"
+            r"\b(?:vlm|video|camera|alert|alerts|summary|summaries|notable|coverage|went quiet|what happened|report|incidents?|event|events)\b"
             r"|видео|камер|алерт|суммар|описан|событи|инцидент|что\s+произош|отч[её]т|покрыти|замолчал",
             text,
         )
@@ -9576,6 +9863,7 @@ _TURN_CACHEABLE_READ_TOOLS = frozenset(
         "list_probes",
         "get_prompt_settings",
         "get_video_summary_restore_status",
+        "get_incident",
     }
 )
 
@@ -9631,6 +9919,7 @@ def _apply_turn_tool_context(tool_name: str, args: Dict[str, Any], context: Dict
         "list_video_summary_channels",
         "restore_video_summary_history",
         "generate_report",
+        "draft_incident",
     }
     if operator_relative_range and tool_name in summary_tools:
         prepared["relative_range"] = operator_relative_range
@@ -9688,6 +9977,7 @@ def _apply_turn_tool_context(tool_name: str, args: Dict[str, Any], context: Dict
         "generate_report",
         "get_prompt_settings",
         "update_prompt_settings",
+        "draft_incident",
     } and not _has_any_arg(prepared, ("channel_id", "channel_ids", "channel_ref", "channel", "channel_title", "channel_name")):
         prepared["channel_id"] = channel_id
 
@@ -9750,6 +10040,23 @@ def _remember_turn_tool_result(tool_name: str, result: Any, context: Dict[str, A
     if not isinstance(result, Mapping):
         return
     if result.get("error"):
+        return
+
+    if tool_name in {
+        "get_incident",
+        "draft_incident",
+        "follow_incident",
+        "stop_incident_follow",
+    }:
+        incident = result.get("incident")
+        if isinstance(incident, Mapping):
+            incident_id = str(
+                incident.get("incident_id") or incident.get("id") or ""
+            ).strip()
+            if incident_id:
+                context["incident_id"] = incident_id
+            if incident.get("revision") is not None:
+                context["incident_revision"] = incident.get("revision")
         return
 
     if tool_name == "normalize_time_window":
@@ -9873,6 +10180,13 @@ def _trusted_action_receipt_from_result(plan_id: str, result: Any) -> Dict[str, 
             receipt.setdefault("probe_name", result.get("probe_name"))
         if result.get("channel_id") is not None:
             receipt.setdefault("channel_id", result.get("channel_id"))
+        incident = result.get("incident")
+        if isinstance(incident, Mapping):
+            incident_id = incident.get("incident_id") or incident.get("id")
+            if incident_id is not None:
+                receipt.setdefault("incident_id", incident_id)
+            if incident.get("revision") is not None:
+                receipt.setdefault("incident_revision", incident.get("revision"))
     else:
         receipt = {}
     safe: Dict[str, Any] = {
@@ -9894,7 +10208,13 @@ def _trusted_action_receipt_from_result(plan_id: str, result: Any) -> Dict[str, 
             else None
         ),
     }
-    for key in ("probe_id", "probe_name", "channel_id"):
+    for key in (
+        "probe_id",
+        "probe_name",
+        "channel_id",
+        "incident_id",
+        "incident_revision",
+    ):
         value = receipt.get(key)
         if value is not None and str(value).strip():
             safe[key] = _compact_signal_value(value, 120)
@@ -9913,6 +10233,8 @@ def _format_trusted_action_receipt_for_model(receipt: Mapping[str, Any]) -> str:
             "probe_id": receipt.get("probe_id"),
             "probe_name": receipt.get("probe_name"),
             "channel_id": receipt.get("channel_id"),
+            "incident_id": receipt.get("incident_id"),
+            "incident_revision": receipt.get("incident_revision"),
         }.items()
         if value is not None
     }
@@ -9990,6 +10312,40 @@ def _record_turn_signal_ledger(
             "errors",
             {"tool": tool_name, "error": _compact_signal_value(result.get("error"), 220)},
         )
+        return
+
+    if tool_name in {
+        "get_incident",
+        "draft_incident",
+        "follow_incident",
+        "stop_incident_follow",
+    }:
+        incident = result.get("incident") if isinstance(result.get("incident"), Mapping) else {}
+        _signal_ledger_append(
+            ledger,
+            "actions",
+            {
+                "tool": tool_name,
+                "status": result.get("status"),
+                "incident_id": incident.get("incident_id") or incident.get("id"),
+                "revision": incident.get("revision"),
+                "state": incident.get("state"),
+            },
+            limit=6,
+        )
+        timeline = incident.get("timeline") or incident.get("timeline_refs") or []
+        if timeline:
+            _signal_ledger_append(
+                ledger,
+                "evidence",
+                {
+                    "tool": tool_name,
+                    "timeline_items": min(16, len(timeline)),
+                    "coverage": (incident.get("coverage") or {}).get("status")
+                    if isinstance(incident.get("coverage"), Mapping)
+                    else None,
+                },
+            )
         return
 
     if tool_name == "normalize_time_window":
@@ -10619,6 +10975,7 @@ class AgentRunner:
         tool_approval_store: Any | None = None,
         channel_group_store: Any | None = None,
         deployment_store: ProtocolDeploymentStore | None = None,
+        incident_command_service: Any | None = None,
         embedding_metadata_fn: Optional[
             Callable[[], Mapping[str, Any]]
         ] = None,
@@ -10647,6 +11004,7 @@ class AgentRunner:
             search_detections_fn=search_detections_fn,
             channel_group_store=channel_group_store,
             deployment_store=deployment_store,
+            incident_command_service=incident_command_service,
             embedding_metadata_fn=embedding_metadata_fn,
         )
         self._secure_tools = (
@@ -13200,8 +13558,8 @@ def _suggest_probe_thresholds_from_samples(
         warnings.append("no_contrast_margin")
     if not pos_values:
         return {
-            "pos_floor": 0.20,
-            "margin_thr": 0.03,
+            "pos_floor": float(config.PROBE_POS_FLOOR_DEFAULT),
+            "margin_thr": float(config.PROBE_MARGIN_DEFAULT),
             "confidence": "low",
             "calibration_status": "insufficient_data",
             "separation_quality": "unknown",
@@ -13981,7 +14339,14 @@ def _strip_thumbnails_deep(obj: Any) -> Any:
 def _tool_result_for_ui(tool_name: str, result: Any) -> Any:
     """Return a frontend-safe tool result without large inline images when a URL exists."""
     if (
-        tool_name in {"list_video_summary_channels", "get_video_summaries"}
+        tool_name in {
+            "list_video_summary_channels",
+            "get_video_summaries",
+            "get_incident",
+            "draft_incident",
+            "follow_incident",
+            "stop_incident_follow",
+        }
         and isinstance(result, dict)
     ):
         # These tools can carry hundreds of source windows and provenance
@@ -14243,9 +14608,137 @@ def _compact_coverage_for_model(value: Any) -> Optional[Dict[str, Any]]:
     return compact
 
 
+def _compact_incident_for_model(
+    value: Any,
+    *,
+    timeline_limit: int = 16,
+    evidence_limit: int = 12,
+    uncertainty_limit: int = 8,
+) -> Dict[str, Any]:
+    if not isinstance(value, Mapping):
+        return {}
+    timeline = value.get("timeline")
+    if not isinstance(timeline, list):
+        timeline = value.get("timeline_refs")
+    evidence = value.get("evidence")
+    if not isinstance(evidence, list):
+        evidence = value.get("evidence_refs")
+    channels = value.get("channel_ids") or value.get("channels") or []
+    qualia = value.get("qualia_digest")
+    if not isinstance(qualia, Mapping):
+        qualia = {}
+    compact_qualia: Dict[str, Any] = {
+        key: qualia.get(key)
+        for key in (
+            "ground_truth",
+            "interpretation",
+            "probe_count",
+            "motion_interval_count",
+            "motion_p95_max",
+            "motion_p95_mean",
+        )
+        if qualia.get(key) is not None
+    }
+    compact_qualia["probes"] = [
+        {
+            key: item.get(key)
+            for key in (
+                "probe_id",
+                "samples",
+                "hits",
+                "max_positive",
+                "max_negative",
+                "max_margin",
+            )
+            if item.get(key) is not None
+        }
+        for item in list(qualia.get("probes") or [])[:8]
+        if isinstance(item, Mapping)
+    ]
+    compact: Dict[str, Any] = {
+        "incident_id": value.get("incident_id") or value.get("id"),
+        "revision": value.get("revision"),
+        "state": value.get("state"),
+        "title": _compact_signal_value(value.get("title"), 240),
+        "channel_ids": list(channels)[:8] if isinstance(channels, list) else [],
+        "severity": value.get("severity"),
+        "summary": _compact_signal_value(value.get("summary"), 1200),
+        "time_bounds": dict(value.get("time_bounds") or {}),
+        "coverage": _compact_coverage_for_model(value.get("coverage")),
+        "qualia_digest": {
+            key: item
+            for key, item in compact_qualia.items()
+            if item not in (None, [], {})
+        },
+        "follow": dict(value.get("follow") or value.get("follow_policy") or {}),
+        "timeline": [
+            {
+                key: item.get(key)
+                for key in (
+                    "timestamp_ms",
+                    "semantic_key",
+                    "label",
+                    "severity",
+                    "confidence",
+                    "source",
+                    "detection_id",
+                    "summary_id",
+                )
+                if item.get(key) is not None
+            }
+            for item in (timeline or [])[: max(0, int(timeline_limit))]
+            if isinstance(item, Mapping)
+        ],
+        "evidence": [
+            {
+                key: item.get(key)
+                for key in (
+                    "kind",
+                    "role",
+                    "detection_id",
+                    "summary_id",
+                    "timestamp_ms",
+                    "channel_id",
+                    "image_url",
+                )
+                if item.get(key) is not None
+            }
+            for item in (evidence or [])[: max(0, int(evidence_limit))]
+            if isinstance(item, Mapping)
+        ],
+        "uncertainties": [
+            _compact_signal_value(item, 240)
+            for item in list(value.get("uncertainties") or [])[
+                : max(0, int(uncertainty_limit))
+            ]
+        ],
+    }
+    return {key: item for key, item in compact.items() if item not in (None, [], {})}
+
+
 def _compact_tool_result_for_model(tool_name: str, result: Any) -> Any:
     if not isinstance(result, dict):
         return result
+
+    if tool_name in {
+        "get_incident",
+        "draft_incident",
+        "follow_incident",
+        "stop_incident_follow",
+    }:
+        compact = {
+            "status": result.get("status"),
+            "action": result.get("action"),
+            "draft_digest": result.get("draft_digest"),
+            "incident": _compact_incident_for_model(result.get("incident")),
+            "proposed_follow": dict(result.get("proposed_follow") or {}),
+            "runtime_lease_removed": result.get("runtime_lease_removed"),
+            "action_receipt": result.get("action_receipt"),
+        }
+        return _attach_action_plan_hint(
+            {key: value for key, value in compact.items() if value not in (None, {}, [])},
+            result,
+        )
 
     if tool_name in {
         "start_deployment",

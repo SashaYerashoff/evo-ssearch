@@ -415,11 +415,18 @@ class ApiDataflowSmokeTests(unittest.TestCase):
         store = Store()
         embedded: List[str] = []
 
-        def embed(thumbnail: Any, embedder: str) -> str:
+        def embed(thumbnail: Any, embedder: str) -> tuple[str, Dict[str, Any]]:
             self.assertEqual(embedder, "clip")
             value = str(thumbnail)
             embedded.append(value)
-            return f"vec:{value}"
+            return f"vec:{value}", {
+                "backend": "siglip2",
+                "model": "google/siglip2-base-patch16-224",
+                "revision": "test-revision",
+                "dimension": 768,
+                "contract": "siglip2-torchvision-lower64-v1",
+                "fingerprint": "test-fingerprint",
+            }
 
         entry = {
             "channel_id": 7,
@@ -452,7 +459,7 @@ class ApiDataflowSmokeTests(unittest.TestCase):
 
         with (
             patch("oldapp.detections_store", store),
-            patch("oldapp._embed_thumbnail_b64", side_effect=embed),
+            patch("oldapp._embed_thumbnail_b64_with_space", side_effect=embed),
             patch("oldapp._apply_archive_retention", return_value={"ok": True}),
         ):
             result = _store_vlm_summary_archive_frames(entry)
@@ -913,6 +920,16 @@ class ApiDataflowSmokeTests(unittest.TestCase):
         )
 
     def test_continuous_clip_search_ranks_every_matching_shard(self) -> None:
+        embedding_space = {
+            "backend": "siglip2",
+            "model": "google/siglip2-base-patch16-224",
+            "revision": "test-revision",
+            "dimension": 2,
+        }
+        fingerprint = oldapp.embedding_space_fingerprint(embedding_space)
+        ch7_shard = f"semantic:e{fingerprint}:ch7:1970010100"
+        ch8_shard = f"semantic:e{fingerprint}:ch8:1970010100"
+
         class Index:
             def __init__(self, name):
                 self.name = name
@@ -926,7 +943,8 @@ class ApiDataflowSmokeTests(unittest.TestCase):
                 "probe_name": "Semantic snapshot",
                 "channel_id": 7,
                 "source": "semantic_snapshot",
-                "shard_key": "semantic:ch7:1970010100",
+                "shard_key": ch7_shard,
+                "payload": {"embedding_space": embedding_space},
             },
             2: {
                 "id": 2,
@@ -935,7 +953,8 @@ class ApiDataflowSmokeTests(unittest.TestCase):
                 "probe_name": "Semantic snapshot",
                 "channel_id": 7,
                 "source": "semantic_snapshot",
-                "shard_key": "semantic:ch7:1970010100",
+                "shard_key": ch7_shard,
+                "payload": {"embedding_space": embedding_space},
             },
             3: {
                 "id": 3,
@@ -944,7 +963,8 @@ class ApiDataflowSmokeTests(unittest.TestCase):
                 "probe_name": "Semantic snapshot",
                 "channel_id": 8,
                 "source": "semantic_snapshot",
-                "shard_key": "semantic:ch8:1970010100",
+                "shard_key": ch8_shard,
+                "payload": {"embedding_space": embedding_space},
             },
             4: {
                 "id": 4,
@@ -953,7 +973,8 @@ class ApiDataflowSmokeTests(unittest.TestCase):
                 "probe_name": "Semantic snapshot",
                 "channel_id": 8,
                 "source": "semantic_snapshot",
-                "shard_key": "semantic:ch8:1970010100",
+                "shard_key": ch8_shard,
+                "payload": {"embedding_space": embedding_space},
             },
         }
 
@@ -961,11 +982,11 @@ class ApiDataflowSmokeTests(unittest.TestCase):
             def summarize_shards(self, **_kwargs):
                 return [
                     {
-                        "shard_key": "semantic:ch7:1970010100",
+                        "shard_key": ch7_shard,
                         "clip_count": 2,
                     },
                     {
-                        "shard_key": "semantic:ch8:1970010100",
+                        "shard_key": ch8_shard,
                         "clip_count": 2,
                     },
                 ]
@@ -980,11 +1001,11 @@ class ApiDataflowSmokeTests(unittest.TestCase):
                 return [dict(rows[item]) for item in ids if item in rows]
 
         indexes = {
-            "semantic:ch7:1970010100": (
+            ch7_shard: (
                 Index("ch7"),
                 oldapp.np.asarray([1, 2], dtype=oldapp.np.int64),
             ),
-            "semantic:ch8:1970010100": (
+            ch8_shard: (
                 Index("ch8"),
                 oldapp.np.asarray([3, 4], dtype=oldapp.np.int64),
             ),
@@ -1011,6 +1032,10 @@ class ApiDataflowSmokeTests(unittest.TestCase):
                 side_effect=lambda key: indexes[key],
             ),
             patch("oldapp._faiss_search", side_effect=search),
+            patch(
+                "oldapp.get_probe_embedding_space",
+                return_value=embedding_space,
+            ),
         ):
             results, coverage = oldapp._search_semantic_snapshot_shards(
                 clip_query_vec=oldapp.np.asarray(

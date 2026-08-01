@@ -58,6 +58,7 @@ from attention_policy import (
 )
 from local_video_source import LocalVideoSourceRegistry
 from alert_probe_lifecycle import derive_parent_alert_id
+from embedding_space import embedding_spaces_match
 from rollup_deep_review import (
     DeepReviewClientConfig,
     OpenAICompatibleDeepReviewClient,
@@ -10867,17 +10868,23 @@ class LuxriotManager:
                 if isinstance(probe.get("embedding_space"), Mapping)
                 else {}
             )
-            probe_embedding_model = str(
-                probe_embedding_space.get("model") or ""
-            ).strip()
-            probe_embedding_backend = str(
-                probe_embedding_space.get("backend") or ""
-            ).strip().lower()
             embedding_space_compatible = (
                 not expected_siglip2
-                or (
-                    probe_embedding_backend == "siglip2"
-                    and probe_embedding_model == expected_embedding_model
+                or embedding_spaces_match(
+                    {
+                        "backend": "siglip2",
+                        "model": expected_embedding_model,
+                        "revision": str(
+                            getattr(
+                                self.config,
+                                "CLIP_MODEL_REVISION",
+                                "",
+                            )
+                            or ""
+                        ).strip(),
+                    },
+                    probe_embedding_space,
+                    allow_legacy_openai_clip=False,
                 )
             )
             attention_authority = (

@@ -1464,6 +1464,83 @@ class AgentToolLoopTests(unittest.TestCase):
         )
         self.assertNotIn("Agent context budget is near", stored_text)
 
+    def test_incident_control_intent_exposes_only_bounded_command_surface(self):
+        context = _seed_turn_tool_context(
+            "Follow incident 00000000-0000-0000-0000-000000000117"
+        )
+        exposed = {
+            row["function"]["name"]
+            for row in _select_relevant_tool_schemas(agent._TOOL_SCHEMAS, context)
+        }
+        self.assertEqual(
+            exposed,
+            {
+                "get_incident",
+                "draft_incident",
+                "follow_incident",
+                "stop_incident_follow",
+            },
+        )
+        self.assertEqual(context["tool_intents"], ["incident_control"])
+
+    def test_incident_draft_uses_harness_channel_and_relative_window(self):
+        context = _seed_turn_tool_context(
+            "Report incident on channel 112 for the last 10 minutes"
+        )
+        prepared = _apply_turn_tool_context(
+            "draft_incident",
+            {"preview": True},
+            context,
+        )
+        self.assertEqual(prepared["channel_id"], 112)
+        self.assertEqual(prepared["relative_range"], "last 10 minutes")
+
+    def test_generic_incident_research_does_not_select_incident_mutations(self):
+        context = _seed_turn_tool_context(
+            "What incidents happened on the cameras last night?"
+        )
+        exposed = {
+            row["function"]["name"]
+            for row in _select_relevant_tool_schemas(agent._TOOL_SCHEMAS, context)
+        }
+        self.assertIn("list_video_summary_channels", exposed)
+        self.assertNotIn("draft_incident", exposed)
+        self.assertNotIn("follow_incident", exposed)
+
+    def test_incident_compaction_is_bounded_and_hides_raw_approval(self):
+        raw = {
+            "status": "preview",
+            "action": "draft_incident",
+            "draft_digest": "d" * 64,
+            "incident": {
+                "title": "Port gate incident",
+                "channel_ids": [112],
+                "coverage": {"status": "covered"},
+                "timeline": [
+                    {"timestamp_ms": index, "label": f"event {index}", "payload": "x" * 1000}
+                    for index in range(40)
+                ],
+                "evidence": [
+                    {"detection_id": index, "thumbnail_b64": "pixels" * 1000}
+                    for index in range(30)
+                ],
+                "uncertainties": [f"uncertain {index}" for index in range(20)],
+            },
+            "approval": {
+                "plan_id": "plan-incident",
+                "action": "draft_incident",
+            },
+        }
+
+        compact = _compact_tool_result_for_model("draft_incident", raw)
+
+        self.assertNotIn("approval", compact)
+        self.assertEqual(compact["action_plan"]["plan_id"], "plan-incident")
+        self.assertEqual(len(compact["incident"]["timeline"]), 16)
+        self.assertEqual(len(compact["incident"]["evidence"]), 12)
+        self.assertEqual(len(compact["incident"]["uncertainties"]), 8)
+        self.assertNotIn("thumbnail_b64", json.dumps(compact))
+
 
 if __name__ == "__main__":
     unittest.main()

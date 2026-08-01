@@ -63,12 +63,12 @@ and that mode is not client-facing.
 
 | Fact | Value |
 |---|---|
-| Production embedder | CLIP `ViT-B/32` |
+| Production embedder | SigLIP2 `google/siglip2-base-patch16-224` at pinned revision `75de2d55...`; CLIP `ViT-B/32` retained for A/B and legacy archive access |
 | DINO / fusion / Mask2Former segments | Experimental, disabled in production |
 | VLM (video-description) model | Configured by `EVOSSEARCH_LM_PROFILE_VLM_MODEL`; the Ventspils eight-channel deployment target is `Qwen3-VL-4B` |
 | Agent LM model | Configured by the agent LM profile; the Ventspils eight-channel deployment initially shares `Qwen3-VL-4B` with the VLM under protected admission |
 | Optional deep L3 model | A separate proposal-only 9B-class endpoint admitted only in the operator-defined quiet window and deferred by live attention/alert debt |
-| Inference topology | VLM on dedicated vLLM host(s); app + CLIP + agent + DB on a separate host `[FIELD]` |
+| Inference topology | Scale-out: VLM on dedicated vLLM host(s). Single-4070S appliance: Qwen3-VL-4B and FP16 SigLIP2 share bounded GPU memory; app + DB remain local |
 
 ## Supported platform
 

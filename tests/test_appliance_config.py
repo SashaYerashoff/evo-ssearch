@@ -18,6 +18,23 @@ def complete_values(tmp_path: Path) -> dict[str, str]:
     clip = tmp_path / "clip"
     clip.mkdir()
     (clip / "ViT-B-32.pt").write_bytes(b"weights")
+    revision = "75de2d55ec2d0b4efc50b3e9ad70dba96a7b2fa2"
+    model_cache = tmp_path / "huggingface"
+    siglip = (
+        model_cache
+        / "models--google--siglip2-base-patch16-224"
+        / "snapshots"
+        / revision
+    )
+    siglip.mkdir(parents=True)
+    for filename in (
+        "config.json",
+        "model.safetensors",
+        "preprocessor_config.json",
+        "tokenizer.json",
+        "tokenizer_config.json",
+    ):
+        (siglip / filename).write_bytes(b"fixture")
     tenant = "903b65df-8fc7-44a6-9dff-230857df81b8"
     return {
         "EVA_DATABASE_DSN": "postgresql://api:secret@127.0.0.1/eva",
@@ -38,6 +55,9 @@ def complete_values(tmp_path: Path) -> dict[str, str]:
         "EVOSSEARCH_LM_PROFILE_VLM_BASE_URL": "http://127.0.0.1:1234/v1",
         "EVOSSEARCH_LM_PROFILE_VLM_MODEL": "qwen/qwen3-vl-4b",
         "EVOSSEARCH_OPENAI_CLIP_CACHE_DIR": str(clip),
+        "EVOSSEARCH_MODEL_CACHE_DIR": str(model_cache),
+        "EVOSSEARCH_CLIP_MODEL": "google/siglip2-base-patch16-224",
+        "EVOSSEARCH_CLIP_MODEL_REVISION": revision,
     }
 
 

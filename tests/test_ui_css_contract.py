@@ -42,8 +42,8 @@ def test_ui_has_no_runtime_google_font_dependency():
 def test_probe_editor_uses_backend_injected_threshold_defaults():
     assert "const PROBE_POS_FLOOR_DEFAULT = {probe_pos_floor_default};" in JS
     assert "const PROBE_MARGIN_DEFAULT = {probe_margin_default};" in JS
-    assert "value=\"0.28\"" in TEMPLATE
-    assert "value=\"0.08\"" in TEMPLATE
+    assert "value=\"0.05\"" in TEMPLATE
+    assert "value=\"0.02\"" in TEMPLATE
 
 
 def test_login_form_is_password_manager_friendly_and_keeps_typing_focus():

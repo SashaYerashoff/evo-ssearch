@@ -131,22 +131,24 @@ class SemanticSnapshotArchiveWriterTests(unittest.TestCase):
         self.assertTrue(
             all(
                 row["shard_key"].startswith(
-                    f"semantic:ch{row['channel_id']}:"
+                    "semantic:e"
                 )
                 for row in store.records
             )
+        )
+        self.assertTrue(
+            all(f":ch{row['channel_id']}:" in row["shard_key"] for row in store.records)
         )
         self.assertTrue(
             all(row["payload"]["independent_of_alert_or_probe_hit"] for row in store.records)
         )
         self.assertTrue(
             all(
-                row["payload"]["embedding_space"]
-                == {
-                    "backend": "siglip2",
-                    "model": "google/siglip2-base-patch16-224",
-                    "dimension": 2,
-                }
+                row["payload"]["embedding_space"]["backend"] == "siglip2"
+                and row["payload"]["embedding_space"]["model"]
+                == "google/siglip2-base-patch16-224"
+                and row["payload"]["embedding_space"]["dimension"] == 2
+                and len(row["payload"]["embedding_space"]["fingerprint"]) == 16
                 for row in store.records
             )
         )
@@ -158,7 +160,15 @@ class SemanticSnapshotArchiveWriterTests(unittest.TestCase):
 
     def test_probe_frame_adapter_reuses_embedding_and_provenance(self):
         store = RecordingDetectionsStore()
-        writer = self._writer(store)
+        writer = self._writer(
+            store,
+            embedding_space_fn=lambda: {
+                "backend": "siglip2",
+                "model": "new-model-that-must-not-restamp-the-vector",
+                "revision": "new-revision",
+                "dimension": 2,
+            },
+        )
         result = writer.submit_probe_frame(
             {
                 "channel_id": 12,
@@ -167,6 +177,13 @@ class SemanticSnapshotArchiveWriterTests(unittest.TestCase):
                 "thumbnail": "jpeg-base64",
                 "embedding_ref": "probe-buffer:12:42",
                 "frame_uid": 42,
+                "embedding_space": {
+                    "backend": "siglip2",
+                    "model": "captured-model",
+                    "revision": "captured-revision",
+                    "dimension": 2,
+                    "contract": "captured-contract-v1",
+                },
             },
             provenance={"selection_source": "capture_apex"},
         )
@@ -177,6 +194,14 @@ class SemanticSnapshotArchiveWriterTests(unittest.TestCase):
         row = store.records[0]
         self.assertEqual(row["clip_vec"], tuple(_embedding()))
         self.assertEqual(row["thumbnail_b64"], "jpeg-base64")
+        self.assertEqual(
+            row["payload"]["embedding_space"]["model"],
+            "captured-model",
+        )
+        self.assertEqual(
+            row["payload"]["embedding_space"]["revision"],
+            "captured-revision",
+        )
         self.assertEqual(
             row["payload"]["provenance"],
             {

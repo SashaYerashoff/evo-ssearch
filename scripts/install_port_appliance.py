@@ -48,6 +48,8 @@ DEFAULT_VLM_URL = "http://127.0.0.1:1234/v1"
 DEFAULT_VLM_MODEL = "qwen/qwen3-vl-4b"
 DEFAULT_DEEP_URL = "http://127.0.0.1:1236/v1"
 DEFAULT_DEEP_MODEL = "qwen3.5-9b-mtp"
+DEFAULT_SIGLIP2_MODEL = "google/siglip2-base-patch16-224"
+DEFAULT_SIGLIP2_REVISION = "75de2d55ec2d0b4efc50b3e9ad70dba96a7b2fa2"
 MIN_FREE_GIB = 45
 
 PORT_ENV = {
@@ -70,12 +72,19 @@ PORT_ENV = {
     "EVOSSEARCH_EMBEDDER": "clip",
     "EVOSSEARCH_EMBEDDER_EAGER_LOAD": "true",
     "EVOSSEARCH_INDEX_MODE": "clip",
-    "EVOSSEARCH_PRODUCTION_CLIP_MODEL": "ViT-B/32",
-    "EVOSSEARCH_CLIP_MODEL": "ViT-B/32",
-    "EVOSSEARCH_EXPERIMENTAL_EMBEDDERS_ENABLED": "false",
+    "EVOSSEARCH_PRODUCTION_CLIP_MODEL": DEFAULT_SIGLIP2_MODEL,
+    "EVOSSEARCH_CLIP_MODEL": DEFAULT_SIGLIP2_MODEL,
+    "EVOSSEARCH_CLIP_MODEL_REVISION": DEFAULT_SIGLIP2_REVISION,
+    "EVOSSEARCH_EXPERIMENTAL_EMBEDDERS_ENABLED": "true",
+    "EVOSSEARCH_CLIP_DEVICE": "cuda",
+    "EVOSSEARCH_PROBE_POS_FLOOR_DEFAULT": "0.05",
+    "EVOSSEARCH_PROBE_MARGIN_DEFAULT": "0.02",
     "EVOSSEARCH_DINO_SEGMENTS_ENABLED": "false",
     "EVOSSEARCH_M2F_ENABLED": "false",
-    "CUDA_VISIBLE_DEVICES": "-1",
+    # SigLIP2 base needs GPU placement to sustain the eight-channel 1 Hz
+    # semantic archive. It shares the 4070 Super with vLLM under a bounded
+    # vLLM allocation; CPU is an explicit fallback profile, not the default.
+    "CUDA_VISIBLE_DEVICES": "0",
     "EVOSSEARCH_ARCHIVE_STORE": "postgres",
     "EVOSSEARCH_ARCHIVE_MAX_RECORDS": "10000000",
     "EVOSSEARCH_ARCHIVE_ROW_RETENTION_DAYS": "14",
@@ -291,6 +300,28 @@ class Answers:
     admin_username: str = "admin"
     admin_display_name: str = "EVA Administrator"
     admin_password: str = field(default="", repr=False)
+
+
+def local_siglip2_cuda_selected(
+    env: Mapping[str, str] | None = None,
+) -> bool:
+    """Return whether the appliance keeps a local CUDA embedding workload."""
+
+    values = PORT_ENV if env is None else env
+    embedder = str(values.get("EVOSSEARCH_EMBEDDER") or "").strip().lower()
+    model = str(values.get("EVOSSEARCH_CLIP_MODEL") or "").strip().lower()
+    clip_device = str(values.get("EVOSSEARCH_CLIP_DEVICE") or "").strip().lower()
+    return (
+        embedder in {"clip", "fusion"}
+        and "siglip2" in model
+        and clip_device.startswith("cuda")
+    )
+
+
+def requires_local_nvidia(answers: Answers) -> bool:
+    """VLM placement is independent from the local semantic embedder."""
+
+    return bool(answers.local_vlm or local_siglip2_cuda_selected())
 
 
 class Runner:
@@ -518,6 +549,22 @@ def verify_critical_payload(bundle_root: Path, manifest: Mapping) -> None:
         "models/qwen3-vl-4b-awq/model.safetensors",
         "models/qwen3.5-9b-mtp/Qwen3.5-9B-Q4_K_M.gguf",
         "models/clip/ViT-B-32.pt",
+        (
+            "models/huggingface/models--google--siglip2-base-patch16-224/"
+            f"snapshots/{DEFAULT_SIGLIP2_REVISION}/model.safetensors"
+        ),
+        *(
+            (
+                "models/huggingface/models--google--siglip2-base-patch16-224/"
+                f"snapshots/{DEFAULT_SIGLIP2_REVISION}/{filename}"
+            )
+            for filename in (
+                "config.json",
+                "preprocessor_config.json",
+                "tokenizer.json",
+                "tokenizer_config.json",
+            )
+        ),
         "llama.cpp/CMakeLists.txt",
     )
     missing = [item for item in required if not (bundle_root / item).exists()]
@@ -775,6 +822,11 @@ def print_plan(
             if answers.local_deep
             else (f"external {answers.deep_url}" if answers.deep_url else "disabled")
         )
+    )
+    print(
+        "  Semantic embedder: local SigLIP2 on CUDA"
+        if local_siglip2_cuda_selected()
+        else "  Semantic embedder: configured without local CUDA"
     )
     print(
         "  Quiet window: "
@@ -1123,6 +1175,15 @@ def sync_payload(bundle_root: Path, answers: Answers, runner: Runner) -> None:
             answers.data_root / "models" / "clip" / "ViT-B-32.pt",
         )
     )
+    runner.run(
+        (
+            "rsync",
+            "-a",
+            "--delete",
+            str(bundle_root / "models" / "huggingface") + "/",
+            str(answers.data_root / "models" / "huggingface") + "/",
+        )
+    )
     if answers.local_deep:
         runner.run(
             (
@@ -1465,7 +1526,7 @@ Environment=HF_HUB_OFFLINE=1
 Environment=TRANSFORMERS_OFFLINE=1
 Environment=VLLM_USE_FLASHINFER_SAMPLER=0
 Environment=PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
-ExecStart={vllm} serve {model} --served-model-name {DEFAULT_VLM_MODEL} --host 127.0.0.1 --port 1234 --max-model-len 32768 --gpu-memory-utilization 0.82 --max-num-seqs 4 --max-num-batched-tokens 4096 --kv-cache-dtype fp8 --enforce-eager --attention-backend TRITON_ATTN --mm-encoder-attn-backend TRITON_ATTN --limit-mm-per-prompt.image 16 --limit-mm-per-prompt.video 0 --mm-processor-kwargs.max_pixels 100352 --enable-auto-tool-choice --tool-call-parser hermes
+ExecStart={vllm} serve {model} --served-model-name {DEFAULT_VLM_MODEL} --host 127.0.0.1 --port 1234 --max-model-len 32768 --gpu-memory-utilization 0.75 --max-num-seqs 4 --max-num-batched-tokens 4096 --kv-cache-dtype fp8 --enforce-eager --attention-backend TRITON_ATTN --mm-encoder-attn-backend TRITON_ATTN --limit-mm-per-prompt.image 16 --limit-mm-per-prompt.video 0 --mm-processor-kwargs.max_pixels 100352 --enable-auto-tool-choice --tool-call-parser hermes
 Restart=on-failure
 RestartSec=10
 TimeoutStartSec=300
@@ -1843,7 +1904,7 @@ def apply_install(
             lambda: install_offline_apt(
                 bundle_root,
                 runner,
-                include_nvidia=answers.local_vlm,
+                include_nvidia=requires_local_nvidia(answers),
             ),
         )
 
@@ -1863,12 +1924,13 @@ def apply_install(
         )
 
         def activate_gpu() -> None:
-            if not answers.local_vlm or hardware.nvidia_ready:
+            if not requires_local_nvidia(answers) or hardware.nvidia_ready:
                 return
             if not hardware.nvidia_pci:
                 raise InstallError(
-                    "Local VLM was selected but no NVIDIA GPU is visible on PCI. "
-                    "Rerun and select an external endpoint."
+                    "A local CUDA workload (VLM and/or SigLIP2) was selected, "
+                    "but no NVIDIA GPU is visible on PCI. External VLM mode "
+                    "still requires a local GPU while SigLIP2 uses CUDA."
                 )
             runner.run(("modprobe", "nvidia"), check=False)
             refreshed = detect_hardware() if not dry_run else hardware
@@ -2061,9 +2123,12 @@ def main(argv: Sequence[str] | None = None) -> int:
             schema=schema,
             required_gib=required_gib,
         )
-        if answers.local_vlm and not (hardware.nvidia_ready or hardware.nvidia_pci):
+        if requires_local_nvidia(answers) and not (
+            hardware.nvidia_ready or hardware.nvidia_pci
+        ):
             raise InstallError(
-                "Local inference was selected, but no NVIDIA GPU was detected."
+                "A local CUDA workload was selected, but no NVIDIA GPU was detected. "
+                "Using an external VLM does not move the local SigLIP2 embedder."
             )
         if db_present and schema != EXPECTED_SCHEMA:
             print(

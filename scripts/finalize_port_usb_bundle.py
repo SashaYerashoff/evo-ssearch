@@ -36,6 +36,24 @@ def main() -> int:
         "models/qwen3.5-9b-mtp/Qwen3.5-9B-Q4_K_M.gguf",
         "models/clip/ViT-B-32.pt",
         (
+            "models/huggingface/models--google--siglip2-base-patch16-224/"
+            "snapshots/75de2d55ec2d0b4efc50b3e9ad70dba96a7b2fa2/"
+            "model.safetensors"
+        ),
+        *(
+            (
+                "models/huggingface/models--google--siglip2-base-patch16-224/"
+                "snapshots/75de2d55ec2d0b4efc50b3e9ad70dba96a7b2fa2/"
+                f"{filename}"
+            )
+            for filename in (
+                "config.json",
+                "preprocessor_config.json",
+                "tokenizer.json",
+                "tokenizer_config.json",
+            )
+        ),
+        (
             "installer-deb/"
             f"eva-ai-appliance-installer_{debian_version}_amd64.deb"
         ),
@@ -68,7 +86,10 @@ def main() -> int:
         "models": {
             "live_vlm": "Qwen3-VL-4B-Instruct AWQ / vLLM 0.25.0",
             "deep_review": "Qwen3.5-9B-MTP Q4_K_M / llama.cpp CPU",
-            "semantic_index": "OpenAI CLIP ViT-B/32 CPU",
+            "semantic_index": (
+                "Google SigLIP2 base patch16 224 FP16 / shared CUDA; "
+                "OpenAI CLIP ViT-B/32 retained for comparison"
+            ),
         },
     }
     (root / "manifest.json").write_text(

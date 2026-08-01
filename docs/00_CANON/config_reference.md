@@ -22,7 +22,9 @@ EVA_DB_STRICT_RUNTIME_ROLES=true
 EVOSSEARCH_ARCHIVE_STORE=postgres
 EVOSSEARCH_EMBEDDER=clip
 EVOSSEARCH_DINO_SEGMENTS_ENABLED=false
-EVOSSEARCH_EXPERIMENTAL_EMBEDDERS_ENABLED=false
+EVOSSEARCH_EXPERIMENTAL_EMBEDDERS_ENABLED=true
+EVOSSEARCH_CLIP_MODEL=google/siglip2-base-patch16-224
+EVOSSEARCH_CLIP_MODEL_REVISION=75de2d55ec2d0b4efc50b3e9ad70dba96a7b2fa2
 EVOSSEARCH_GUNICORN_WORKERS=1
 EVOSSEARCH_GUNICORN_THREADS=8
 EVOSSEARCH_AUTH_COOKIE_SECURE=true   # when TLS terminates at app or proxy
@@ -218,8 +220,8 @@ thresholds, alert policy, live sampling, or the live routine context.
 |---|---|
 | `EVOSSEARCH_PROBE_MAX_FRAMES` (`2000`) | Per-channel probe buffer |
 | `EVOSSEARCH_PROBE_THUMB_MAX_EDGE` (`256`) | Probe thumbnail size |
-| `EVOSSEARCH_PROBE_POS_FLOOR_DEFAULT` (`0.28`) | Default positive CLIP similarity floor for newly created and ad-hoc probes; existing saved probe thresholds are preserved |
-| `EVOSSEARCH_PROBE_MARGIN_DEFAULT` (`0.08`) | Default positive-minus-negative score margin for newly created and ad-hoc probes |
+| `EVOSSEARCH_PROBE_POS_FLOOR_DEFAULT` (`0.05` for SigLIP2; `0.28` for OpenAI CLIP) | Backend-sensitive raw-cosine floor for newly created and ad-hoc probes. Scores are not transferable between embedding spaces; existing saved probes stay shadowed until their fingerprint matches and thresholds are recalibrated |
+| `EVOSSEARCH_PROBE_MARGIN_DEFAULT` (`0.02` for SigLIP2; `0.08` for OpenAI CLIP) | Backend-sensitive positive-minus-negative margin for newly created and ad-hoc probes |
 | `EVOSSEARCH_PROBE_CAPTURE_WARMUP_SEC` (`2.5`) | Maximum first-frame wait before an empty manual probe query returns an explicit capture-warming state |
 | `EVOSSEARCH_ARCHIVE_DISK_MIN_FREE_GB` (`2.0`) | Stop writing new filesystem snapshots below this free-space floor while continuing metadata rows |
 | `EVOSSEARCH_ARCHIVE_DISK_MIN_FREE_PERCENT` (`5.0`) | Stop writing new filesystem snapshots below this filesystem free-space percentage |
@@ -302,14 +304,16 @@ links, P/N/M semantics, and the deployed office profile.
 | Var (default) | Notes |
 |---|---|
 | `EVOSSEARCH_EMBEDDER` (`clip`) | Production embedder |
-| `EVOSSEARCH_PRODUCTION_CLIP_MODEL` / `EVOSSEARCH_CLIP_MODEL` (`ViT-B/32`) | CLIP model |
-| `EVOSSEARCH_CLIP_DEVICE` (`auto`) | Device for the CLIP-like attention embedder. Set `cpu` to reserve GPU VRAM for the VLM; benchmark semantic-snapshot queue lag before production |
+| `EVOSSEARCH_PRODUCTION_CLIP_MODEL` / `EVOSSEARCH_CLIP_MODEL` (`google/siglip2-base-patch16-224`) | CLIP-like semantic model; OpenAI CLIP remains a selectable legacy/A-B backend |
+| `EVOSSEARCH_CLIP_MODEL_REVISION` (`75de2d55...`) | Immutable Hugging Face revision included in the embedding-space fingerprint and offline bundle |
+| `EVOSSEARCH_CLIP_DEVICE` (`auto`; appliance `cuda`) | Device for the CLIP-like attention embedder. SigLIP2 base on CPU does not sustain the eight-channel 1 Hz target; the single-4070S appliance reserves GPU headroom for it |
 | `EVOSSEARCH_EMBEDDER_FALLBACK_ENABLED` (`false`) | Allows an explicit fallback to a different embedding model after load failure. Keep `false` in production: model changes invalidate archive vectors and probe thresholds |
 | `EVOSSEARCH_OFFLINE_MODE` (`true`) | Blocks Hugging Face/Transformers and OpenAI CLIP downloads; missing artifacts fail closed |
 | `EVOSSEARCH_MODEL_CACHE_DIR` (`~/.cache/eva-ai/models`) | Local Hugging Face/Transformers model cache |
 | `EVOSSEARCH_OPENAI_CLIP_CACHE_DIR` (`~/.cache/clip`) | Local OpenAI CLIP weights cache |
 | `EVOSSEARCH_RERANK_ENABLED` / `_TOP_K` | Re-rank toggle |
-| `EVOSSEARCH_DINO_*`, `EVOSSEARCH_M2F_*`, `EVOSSEARCH_FUSION_*` | Experimental; disabled in prod |
+| `EVOSSEARCH_EXPERIMENTAL_EMBEDDERS_ENABLED` (`true`) | Enables the production SigLIP2 path and optional DINO/fusion selectors; DINO/fusion remain disabled separately |
+| `EVOSSEARCH_DINO_*`, `EVOSSEARCH_M2F_*`, `EVOSSEARCH_FUSION_*` | Optional; disabled in the port profile |
 | `EVOSSEARCH_INDEXED_FOLDER_ENABLED` / `_OFFLINE_VIDEO_ENABLED` / `_PROBE_SNAP_ENABLED` (`false`) | Legacy/hidden feature flags |
 
 ## Feature flags off in client pilot

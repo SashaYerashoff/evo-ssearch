@@ -5,11 +5,28 @@ import numpy as np
 import pytest
 
 from embedding_batcher import (
+    EmbeddingBatchOutput,
     EmbeddingBatchError,
     EmbeddingBatchRejected,
     EmbeddingBatchTimeout,
     ImageEmbeddingBatcher,
 )
+
+
+def test_batch_metadata_is_returned_with_each_embedding():
+    batcher = ImageEmbeddingBatcher(
+        lambda images: EmbeddingBatchOutput(
+            np.ones((len(images), 2), dtype=np.float32),
+            {"fingerprint": "epoch-a", "dimension": 2},
+        ),
+        max_wait_ms=0,
+    )
+
+    vector, metadata = batcher.embed_one_with_metadata("frame")
+
+    assert batcher.stop()
+    np.testing.assert_allclose(vector, [1.0, 1.0])
+    assert metadata == {"fingerprint": "epoch-a", "dimension": 2}
 
 
 def test_eight_concurrent_channels_are_encoded_in_one_microbatch():

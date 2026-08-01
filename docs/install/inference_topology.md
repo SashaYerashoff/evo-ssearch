@@ -10,13 +10,17 @@ specifics are `[FIELD]`. Variables: [config_reference](../00_CANON/config_refere
 | Video-description (VLM) | `qwen/qwen3-vl-4b` | Dedicated vLLM host(s) `[FIELD]` | The firehose: many batches/min across channels |
 | Agent LM | `qwen3-vl-4b` in the constrained eight-channel profile; optional 9B-class scale-out | Shared protected vLLM profile or separate endpoint `[FIELD]` | Small-head tool use stays bounded by composite workflows and admission |
 | Deep L3 review | optional 9B-class model | Separate endpoint, often CPU/offloaded `[FIELD]` | Proposal-only consolidation inside an operator-defined quiet window |
-| CLIP embedding | `ViT-B/32` | App host (in-process) | Embeds every frame for search/probes; keep off the VLM GPUs |
+| Semantic embedding | `google/siglip2-base-patch16-224` (CLIP retained for A/B) | App process, GPU in the single-4070S profile | Embeds every archived cadence frame for search/probes; exact model revision defines an isolated vector epoch |
 
 For the single-4070S eight-channel appliance, agent and VLM may intentionally
 share the same Qwen3-VL-4B endpoint. EVA's admission controller reserves a
 protected agent/alert/rollup slot; L0 may borrow it only while protected work is
 not waiting. At larger scale, separate the agent endpoint so operator questions
 do not compete with the description firehose.
+
+The appliance starts vLLM at `gpu_memory_utilization=0.75`, leaving headroom for
+the in-process FP16 SigLIP2 base encoder. CPU SigLIP2 is a degraded fallback and
+cannot sustain eight channels at the default one embedding per second cadence.
 
 ## Profiles
 

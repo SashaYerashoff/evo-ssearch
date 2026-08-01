@@ -4748,6 +4748,7 @@ class LuxriotCaptureDispatchTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp:
             manager = build_manager(Path(temp))
             manager.config.CLIP_MODEL = "google/siglip2-base-patch16-224"
+            manager.config.CLIP_MODEL_REVISION = "test-siglip-revision"
             manager.probe_manager = ProbeManager()
             frames = [
                 {
@@ -4777,6 +4778,7 @@ class LuxriotCaptureDispatchTests(unittest.TestCase):
                 {
                     "backend": "siglip2",
                     "model": "google/siglip2-base-patch16-224",
+                    "revision": "test-siglip-revision",
                     "dimension": 768,
                 }
             )

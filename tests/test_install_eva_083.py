@@ -252,7 +252,12 @@ class OfflineInstallerUnitTests(unittest.TestCase):
         self.assertEqual(values["EVOSSEARCH_LUXRIOT_LIVE_SEGMENT_SECONDS"], "60")
         self.assertEqual(values["EVOSSEARCH_OFFLINE_MODE"], "true")
         self.assertEqual(values["EVOSSEARCH_TRUSTED_PROXY_HOPS"], "1")
-        self.assertEqual(values["EVOSSEARCH_PROBE_POS_FLOOR_DEFAULT"], "0.28")
+        self.assertEqual(values["EVOSSEARCH_PROBE_POS_FLOOR_DEFAULT"], "0.05")
+        self.assertEqual(values["EVOSSEARCH_PROBE_MARGIN_DEFAULT"], "0.02")
+        self.assertEqual(
+            values["EVOSSEARCH_CLIP_MODEL"],
+            "google/siglip2-base-patch16-224",
+        )
         self.assertEqual(values["EVOSSEARCH_INFERENCE_QUEUE_ENABLED"], "true")
         self.assertEqual(values["EVOSSEARCH_INFERENCE_WORKER_COUNT"], "1")
         rendered = installer.render_env_update("", updates)

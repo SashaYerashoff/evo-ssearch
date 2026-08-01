@@ -1,5 +1,7 @@
 import base64
 import tempfile
+import threading
+import time
 import unittest
 from io import BytesIO
 from pathlib import Path
@@ -35,6 +37,7 @@ class EmbeddingPolicyTests(unittest.TestCase):
             ),
             "CLIP_DEVICE": getattr(config, "CLIP_DEVICE", "auto"),
             "CLIP_MODEL": config.CLIP_MODEL,
+            "CLIP_MODEL_REVISION": getattr(config, "CLIP_MODEL_REVISION", ""),
             "INDEX_MODE": config.INDEX_MODE,
             "FUSION_ENABLED": config.FUSION_ENABLED,
             "DINO_SEGMENTS_ENABLED": config.DINO_SEGMENTS_ENABLED,
@@ -205,6 +208,22 @@ class EmbeddingPolicyTests(unittest.TestCase):
             "/var/lib/eva-ai/models/huggingface",
         )
         self.assertTrue(load_processor.call_args.kwargs["local_files_only"])
+        self.assertEqual(load_processor.call_args.kwargs["backend"], "torchvision")
+
+    def test_siglip_transformers_five_pooler_contract_and_dimension(self) -> None:
+        pooled = oldapp.torch.ones((2, 768), dtype=oldapp.torch.float32)
+        output = SimpleNamespace(pooler_output=pooled)
+        self.assertIs(oldapp._siglip_feature_tensor(output), pooled)
+
+        model = SimpleNamespace(
+            config=SimpleNamespace(
+                projection_dim=None,
+                text_config=SimpleNamespace(projection_size=768),
+                vision_config=SimpleNamespace(projection_size=768),
+            )
+        )
+        with patch.object(oldapp, "clip_model", model):
+            self.assertEqual(oldapp._siglip_projection_dimension(), 768)
 
     def test_siglip_init_fails_closed_instead_of_changing_embedding_space(self) -> None:
         config.EXPERIMENTAL_EMBEDDERS_ENABLED = True
@@ -226,6 +245,31 @@ class EmbeddingPolicyTests(unittest.TestCase):
                 oldapp.init_clip()
 
         load_clip.assert_not_called()
+
+    def test_siglip_cold_start_is_single_flight(self) -> None:
+        config.EXPERIMENTAL_EMBEDDERS_ENABLED = True
+        config.CLIP_MODEL = "google/siglip2-base-patch16-224"
+        config.EMBEDDER_FALLBACK_ENABLED = False
+        oldapp.reset_embedder_runtime_state()
+        model = Mock()
+        model.config = SimpleNamespace(_commit_hash="revision")
+        processor = Mock()
+
+        def slow_load(*_args, **_kwargs):
+            time.sleep(0.05)
+            return model, processor
+
+        with patch(
+            "oldapp._load_siglip2_clip_model",
+            side_effect=slow_load,
+        ) as load_siglip:
+            threads = [threading.Thread(target=oldapp.init_clip) for _ in range(4)]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join(timeout=2)
+
+        self.assertEqual(load_siglip.call_count, 1)
 
     def test_siglip_init_uses_clip_fallback_only_when_explicitly_enabled(self) -> None:
         config.EXPERIMENTAL_EMBEDDERS_ENABLED = True

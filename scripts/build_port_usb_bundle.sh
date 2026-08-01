@@ -7,6 +7,8 @@ STAGING_ROOT="${1:-/mnt/eva-llamacpp-lab/port-usb-staging}"
 MODEL_VLM="${EVA_PORT_VLM_MODEL_DIR:-${REPO_ROOT}/.local/inference/models/qwen3-vl-4b-awq}"
 MODEL_9B="${EVA_PORT_9B_MODEL_DIR:-/mnt/eva-llamacpp-lab/models/unsloth/Qwen3.5-9B-MTP-GGUF}"
 CLIP_WEIGHT="${EVA_PORT_CLIP_WEIGHT:-/home/sasha/.cache/clip/ViT-B-32.pt}"
+SIGLIP2_REVISION="${EVA_PORT_SIGLIP2_REVISION:-75de2d55ec2d0b4efc50b3e9ad70dba96a7b2fa2}"
+SIGLIP2_CACHE_REPO="${EVA_PORT_SIGLIP2_CACHE_REPO:-/mnt/eva-llamacpp-lab/models/huggingface/models--google--siglip2-base-patch16-224}"
 LLAMA_SOURCE="${EVA_PORT_LLAMA_SOURCE:-/mnt/eva-llamacpp-lab/src/llama.cpp}"
 REACT_UI_ROOT="${REPO_ROOT}/react-ui"
 
@@ -14,6 +16,11 @@ for required in \
     "${MODEL_VLM}/model.safetensors" \
     "${MODEL_9B}/Qwen3.5-9B-Q4_K_M.gguf" \
     "${CLIP_WEIGHT}" \
+    "${SIGLIP2_CACHE_REPO}/snapshots/${SIGLIP2_REVISION}/model.safetensors" \
+    "${SIGLIP2_CACHE_REPO}/snapshots/${SIGLIP2_REVISION}/config.json" \
+    "${SIGLIP2_CACHE_REPO}/snapshots/${SIGLIP2_REVISION}/preprocessor_config.json" \
+    "${SIGLIP2_CACHE_REPO}/snapshots/${SIGLIP2_REVISION}/tokenizer.json" \
+    "${SIGLIP2_CACHE_REPO}/snapshots/${SIGLIP2_REVISION}/tokenizer_config.json" \
     "${LLAMA_SOURCE}/CMakeLists.txt"; do
     if [[ ! -e "${required}" ]]; then
         echo "ERROR: required payload is missing: ${required}" >&2
@@ -36,6 +43,7 @@ mkdir -p "${STAGING_ROOT}/repo"
 mkdir -p "${STAGING_ROOT}/models/qwen3-vl-4b-awq"
 mkdir -p "${STAGING_ROOT}/models/qwen3.5-9b-mtp"
 mkdir -p "${STAGING_ROOT}/models/clip"
+mkdir -p "${STAGING_ROOT}/models/huggingface"
 mkdir -p "${STAGING_ROOT}/llama.cpp"
 mkdir -p "${STAGING_ROOT}/wheelhouse"
 mkdir -p "${STAGING_ROOT}/apt"
@@ -77,6 +85,9 @@ install -p -m 0644 \
     "${MODEL_9B}/Qwen3.5-9B-Q4_K_M.gguf" \
     "${STAGING_ROOT}/models/qwen3.5-9b-mtp/Qwen3.5-9B-Q4_K_M.gguf"
 install -p -m 0644 "${CLIP_WEIGHT}" "${STAGING_ROOT}/models/clip/ViT-B-32.pt"
+rsync -a --delete \
+    "${SIGLIP2_CACHE_REPO}/" \
+    "${STAGING_ROOT}/models/huggingface/models--google--siglip2-base-patch16-224/"
 rsync -a --delete \
     --exclude=.git \
     --exclude=build \

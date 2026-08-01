@@ -29,6 +29,43 @@ class _DetectionStore:
         return []
 
 
+class _IncidentCommands:
+    def __init__(self):
+        self.calls = []
+        self.channel_ids = [7]
+        self.stored_actor_ids = []
+
+    def get(self, incident_id):
+        self.calls.append(incident_id)
+        return {
+            "id": incident_id,
+            "revision": 3,
+            "state": "draft",
+            "channel_ids": list(self.channel_ids),
+        }
+
+    def build_draft(self, *, channel_id, anchor_detection_id, since_ms, until_ms):
+        return {
+            "title": "Grounded incident",
+            "channel_ids": [channel_id],
+            "anchor": {"detection_id": anchor_detection_id},
+            "time_bounds": {"observed_start_ms": 1_000, "observed_end_ms": 2_000},
+            "timeline": [],
+            "evidence": [],
+            "coverage": {"status": "covered"},
+        }
+
+    def draft_digest(self, _draft):
+        return "digest-v1"
+
+    def store_draft(self, draft, *, actor_id):
+        self.stored_actor_ids.append(actor_id)
+        return {"id": "00000000-0000-0000-0000-000000000118", "revision": 1, **draft}
+
+    def public_record(self, record):
+        return {**record, "incident_id": record.get("id")}
+
+
 class _LegacyTools:
     def __init__(self):
         self._ps = _ProbeStore()
@@ -39,6 +76,7 @@ class _LegacyTools:
         self.fail_name = None
         self.results = {}
         self._deployment_store = ProtocolDeploymentStore()
+        self._incident_commands = _IncidentCommands()
 
     def _set_trusted_permissions(self, permissions):
         self._trusted = frozenset(str(item) for item in (permissions or ()))
@@ -195,6 +233,128 @@ class EvaAgentToolAdapterTests(unittest.TestCase):
 
         self.assertIsNone(self.legacy._trusted)
         self.assertIsNotNone(self.legacy.seen_trusted)
+
+    def test_incident_follow_preview_binds_server_channels_and_revision(self):
+        schemas = {
+            item["function"]["name"]: item
+            for item in self.adapter.available_tool_schemas(self.context)
+        }
+        preview = schemas["follow_incident"]["function"]["parameters"]["properties"]["preview"]
+        self.assertEqual(preview["enum"], [True])
+
+        result = self.adapter.execute(
+            "follow_incident",
+            {
+                "incident_id": "00000000-0000-0000-0000-000000000117",
+                "mode": "critical",
+                "ttl_seconds": 300,
+                "preview": True,
+                # Untrusted values are overwritten from durable state.
+                "expected_revision": 999,
+                "channel_ids": [999],
+            },
+            self.context,
+        )
+
+        self.assertEqual(result["status"], "preview")
+        self.assertIn("approval", result)
+        name, prepared = self.legacy.calls[-1]
+        self.assertEqual(name, "follow_incident")
+        self.assertEqual(prepared["channel_ids"], ["7"])
+        self.assertEqual(prepared["expected_revision"], 3)
+
+    def test_incident_lookup_does_not_leak_before_permission_check(self):
+        no_reports = ToolExecutionContext(
+            actor_id=self.context.actor_id,
+            tenant_id=self.context.tenant_id,
+            roles={"operator"},
+            permissions={Permission.AGENT_USE.value},
+            allowed_channel_ids={"7"},
+        )
+        with self.assertRaises(PermissionDeniedError):
+            self.adapter.execute(
+                "get_incident",
+                {"incident_id": "00000000-0000-0000-0000-000000000117"},
+                no_reports,
+            )
+        self.assertEqual(self.legacy._incident_commands.calls, [])
+
+    def test_incident_channel_ownership_is_resolved_from_durable_record(self):
+        self.legacy._incident_commands.channel_ids = [8]
+        with self.assertRaises(ChannelAccessDeniedError):
+            self.adapter.execute(
+                "get_incident",
+                {"incident_id": "00000000-0000-0000-0000-000000000117"},
+                self.context,
+            )
+
+    def test_incident_draft_rejects_anchor_channel_spoofing(self):
+        all_channels = ToolExecutionContext(
+            actor_id=self.context.actor_id,
+            tenant_id=self.context.tenant_id,
+            roles=self.context.roles,
+            permissions=self.context.permissions,
+            allowed_channel_ids={"*"},
+        )
+        with self.assertRaises(InvalidToolArgumentsError):
+            self.adapter.execute(
+                "draft_incident",
+                {
+                    "channel_id": 7,
+                    "anchor_detection_id": 80,
+                    "preview": True,
+                },
+                all_channels,
+            )
+
+        with self.assertRaises(ChannelAccessDeniedError):
+            self.adapter.execute(
+                "draft_incident",
+                {"anchor_detection_id": 80, "preview": True},
+                self.context,
+            )
+
+    def test_incident_draft_apply_uses_authenticated_actor_and_preview_digest(self):
+        commands = _IncidentCommands()
+        tools = AgentTools(
+            detections_store=_DetectionStore(),
+            probes_store=_ProbeStore(),
+            luxriot_manager=None,
+            embed_text_fn=None,
+            embed_image_fn=None,
+            call_lm_fn=None,
+            encode_jpeg_fn=None,
+            search_indexed_folder_fn=None,
+            search_detections_fn=None,
+            incident_command_service=commands,
+        )
+        adapter = EvaAgentToolAdapter(
+            tools,
+            _TOOL_SCHEMAS,
+            audit_callback=self.audit_events.append,
+        )
+        self.addCleanup(adapter.close)
+        context = ToolExecutionContext(
+            actor_id=self.context.actor_id,
+            tenant_id=self.context.tenant_id,
+            roles={"operator"},
+            permissions={permission.value for permission in Permission},
+            allowed_channel_ids={"8"},
+        )
+
+        preview = adapter.execute(
+            "draft_incident",
+            {"anchor_detection_id": 80, "preview": True},
+            context,
+        )
+        applied = adapter.approve_and_execute(
+            preview["approval"]["plan_id"],
+            context,
+        )
+
+        self.assertEqual(applied["status"], "applied")
+        self.assertEqual(commands.stored_actor_ids, [self.context.actor_id])
+        self.assertEqual(applied["incident"]["channel_ids"], [8])
 
     def test_lookup_help_real_agent_tools_keeps_permissions_across_executor(self):
         tools = AgentTools(

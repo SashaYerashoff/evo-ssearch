@@ -37,7 +37,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable, Dict, Iterable, List, Mapping, Optional, Sequence, Set, Tuple, Union, cast
 from urllib.parse import unquote, urlencode
 from urllib.parse import urlparse
-from threading import Lock
+from threading import Lock, RLock
 
 _EVA_RUNTIME_PYTHON = Path(__file__).resolve().parent / ".eva-runtime" / "python"
 if _EVA_RUNTIME_PYTHON.is_dir():
@@ -96,16 +96,22 @@ from inference_queue import (
 )
 from incident_service import (
     IncidentDraftAssembler,
-    IncidentDraftRequest,
     incident_report_markdown,
     incident_report_xml,
 )
+from incident_commands import IncidentCommandService
 from incident_store import (
     IncidentRevisionConflict,
     IncidentStoreNotReady,
     PostgresIncidentStore,
 )
-from embedding_batcher import ImageEmbeddingBatcher
+from embedding_batcher import EmbeddingBatchOutput, ImageEmbeddingBatcher
+from embedding_space import (
+    embedding_space_fingerprint,
+    embedding_space_requires_identity,
+    embedding_spaces_match,
+    identified_embedding_space,
+)
 from lm_admission import (
     configured_lm_capacity,
     get_lm_admission_controller,
@@ -159,8 +165,12 @@ clip_preprocess = None
 clip_processor: Optional[Any] = None
 clip_backend_kind = "openai_clip"
 clip_runtime_model = ""
+clip_runtime_revision = ""
 clip_runtime_device = device
 _clip_module: Optional[Any] = None
+_clip_init_lock = RLock()
+_clip_reset_lock = Lock()
+_clip_resetting = False
 _live_clip_batcher: Optional[ImageEmbeddingBatcher] = None
 _live_clip_batcher_lock = Lock()
 dino_encoder: Optional[DINOEncoder] = None
@@ -1544,8 +1554,15 @@ def payload_too_large(_: Exception):
 
 
 def init_clip() -> None:
+    """Single-flight initialization for concurrent channel cold starts."""
+
+    with _clip_init_lock:
+        _init_clip_locked()
+
+
+def _init_clip_locked() -> None:
     """Load the CLIP-like model lazily for embedding extraction."""
-    global clip_model, clip_preprocess, clip_processor, clip_backend_kind, clip_runtime_model, clip_runtime_device
+    global clip_model, clip_preprocess, clip_processor, clip_backend_kind, clip_runtime_model, clip_runtime_revision, clip_runtime_device
     if clip_model is not None:
         if clip_backend_kind == "openai_clip" and clip_preprocess is not None:
             return
@@ -1566,6 +1583,11 @@ def init_clip() -> None:
             clip_preprocess = None
             clip_backend_kind = "siglip2"
             clip_runtime_model = requested_model
+            clip_runtime_revision = str(
+                getattr(getattr(model_obj, "config", None), "_commit_hash", None)
+                or getattr(config, "CLIP_MODEL_REVISION", "")
+                or ""
+            ).strip()
             clip_runtime_device = preferred_device
             return
         except Exception as exc:
@@ -1602,6 +1624,7 @@ def init_clip() -> None:
             clip_processor = None
             clip_backend_kind = "openai_clip"
             clip_runtime_model = fallback_model
+            clip_runtime_revision = ""
             clip_runtime_device = fallback_device
             if fallback_error is not None:
                 print(f"CLIP fallback recovered on {fallback_device} after initial failure: {fallback_error}")
@@ -1624,6 +1647,7 @@ def init_clip() -> None:
     clip_processor = None
     clip_backend_kind = "openai_clip"
     clip_runtime_model = requested_model
+    clip_runtime_revision = ""
     clip_runtime_device = fallback_device
     if initial_error is not None:
         print(f"CLIP model '{requested_model}' loaded on {fallback_device} after retry: {initial_error}")
@@ -1715,24 +1739,79 @@ def _load_openai_clip_model(model_name: str, target_device: str) -> Tuple[torch.
 
 def _load_siglip2_clip_model(model_name: str, target_device: str) -> Tuple[torch.nn.Module, Any]:
     local_only = bool(getattr(config, "OFFLINE_MODE", True))
+    revision = str(getattr(config, "CLIP_MODEL_REVISION", "") or "").strip()
+    model_kwargs: Dict[str, Any] = {
+        "local_files_only": local_only,
+        "cache_dir": str(getattr(config, "MODEL_CACHE_DIR", "") or "") or None,
+    }
+    processor_kwargs: Dict[str, Any] = {
+        "backend": "torchvision",
+        "local_files_only": local_only,
+        "cache_dir": str(getattr(config, "MODEL_CACHE_DIR", "") or "") or None,
+    }
+    if revision:
+        model_kwargs["revision"] = revision
+        processor_kwargs["revision"] = revision
+    if str(target_device).startswith("cuda"):
+        model_kwargs["dtype"] = torch.float16
     model = AutoModel.from_pretrained(
         model_name,
-        local_files_only=local_only,
-        cache_dir=str(getattr(config, "MODEL_CACHE_DIR", "") or "") or None,
+        **model_kwargs,
     )
     cast(torch.nn.Module, model).to(target_device)
     cast(torch.nn.Module, model).eval()
     processor = AutoProcessor.from_pretrained(
         model_name,
-        use_fast=True,
-        local_files_only=local_only,
-        cache_dir=str(getattr(config, "MODEL_CACHE_DIR", "") or "") or None,
+        **processor_kwargs,
     )
     return cast(torch.nn.Module, model), processor
 
 
 def _normalize_l2_embeddings(features: torch.Tensor) -> torch.Tensor:
     return features / features.norm(dim=-1, keepdim=True).clamp_min(1e-12)
+
+
+def _clip_embedding_contract_locked() -> str:
+    if clip_backend_kind == "siglip2":
+        return "siglip2-torchvision-lower64-v1"
+    return "openai-clip-default-v1"
+
+
+def _siglip_feature_tensor(value: Any) -> torch.Tensor:
+    """Normalize Transformers 4.x/5.x SigLIP feature return contracts."""
+
+    if isinstance(value, torch.Tensor):
+        return value
+    pooled = getattr(value, "pooler_output", None)
+    if isinstance(pooled, torch.Tensor):
+        return pooled
+    if isinstance(value, (tuple, list)):
+        for item in value:
+            if isinstance(item, torch.Tensor) and item.ndim == 2:
+                return item
+            pooled = getattr(item, "pooler_output", None)
+            if isinstance(pooled, torch.Tensor):
+                return pooled
+    raise RuntimeError(
+        "SigLIP2 feature API returned no pooled two-dimensional tensor"
+    )
+
+
+def _siglip_projection_dimension() -> Optional[int]:
+    model_config = getattr(clip_model, "config", None)
+    candidates = (
+        getattr(model_config, "projection_dim", None),
+        getattr(getattr(model_config, "text_config", None), "projection_size", None),
+        getattr(getattr(model_config, "vision_config", None), "projection_size", None),
+    )
+    for raw_value in candidates:
+        try:
+            dimension = int(raw_value)
+        except (TypeError, ValueError):
+            continue
+        if dimension > 0:
+            return dimension
+    return None
 
 
 def _processor_to_device(batch: Mapping[str, Any], target_device: str) -> Dict[str, Any]:
@@ -1745,26 +1824,68 @@ def _processor_to_device(batch: Mapping[str, Any], target_device: str) -> Dict[s
     return moved
 
 
-def _clip_image_embeddings_from_pils(images: Sequence[Image.Image]) -> np.ndarray:
-    ensure_embedder_loaded("clip")
-    if not images:
-        return np.zeros((0, 0), dtype=np.float32)
+def _current_clip_embedding_space_locked() -> Dict[str, Any]:
+    dimension: Optional[int] = None
+    if clip_backend_kind == "siglip2":
+        dimension = _siglip_projection_dimension()
+    else:
+        output_dim = getattr(
+            getattr(clip_model, "visual", None),
+            "output_dim",
+            None,
+        )
+        if output_dim:
+            dimension = int(output_dim)
+    payload: Dict[str, Any] = {
+        "backend": str(clip_backend_kind or "unknown"),
+        "model": str(clip_runtime_model or config.CLIP_MODEL or "unknown"),
+        "contract": _clip_embedding_contract_locked(),
+    }
+    if clip_runtime_revision:
+        payload["revision"] = clip_runtime_revision
+    if dimension is not None:
+        payload["dimension"] = dimension
+    return identified_embedding_space(payload)
 
-    normalized_images = [img.convert("RGB") for img in images]
-    with torch.no_grad():
-        if clip_backend_kind == "siglip2":
-            if clip_processor is None or clip_model is None:
-                raise RuntimeError("SigLIP2 clip backend is not initialized")
-            processor_inputs = cast(Any, clip_processor)(images=normalized_images, return_tensors="pt")
-            model_inputs = _processor_to_device(cast(Mapping[str, Any], processor_inputs), clip_runtime_device)
-            image_features = cast(Any, clip_model).get_image_features(**model_inputs)
-        else:
-            if clip_preprocess is None or clip_model is None:
-                raise RuntimeError("CLIP backend is not initialized")
-            image_batch = torch.stack([clip_preprocess(img) for img in normalized_images], dim=0).to(clip_runtime_device)  # type: ignore[operator]
-            image_features = cast(Any, clip_model).encode_image(image_batch)
-        image_features = _normalize_l2_embeddings(cast(torch.Tensor, image_features))
-    return image_features.cpu().numpy().astype(np.float32, copy=False)
+
+def _clip_image_batch_with_space(
+    images: Sequence[Image.Image],
+) -> EmbeddingBatchOutput:
+    """Encode a whole microbatch under one immutable model-generation lock."""
+
+    with _clip_init_lock:
+        ensure_embedder_loaded("clip")
+        if not images:
+            return EmbeddingBatchOutput(
+                np.zeros((0, 0), dtype=np.float32),
+                _current_clip_embedding_space_locked(),
+            )
+
+        normalized_images = [img.convert("RGB") for img in images]
+        with torch.no_grad():
+            if clip_backend_kind == "siglip2":
+                if clip_processor is None or clip_model is None:
+                    raise RuntimeError("SigLIP2 clip backend is not initialized")
+                processor_inputs = cast(Any, clip_processor)(images=normalized_images, return_tensors="pt")
+                model_inputs = _processor_to_device(cast(Mapping[str, Any], processor_inputs), clip_runtime_device)
+                image_features = _siglip_feature_tensor(
+                    cast(Any, clip_model).get_image_features(**model_inputs)
+                )
+            else:
+                if clip_preprocess is None or clip_model is None:
+                    raise RuntimeError("CLIP backend is not initialized")
+                image_batch = torch.stack([clip_preprocess(img) for img in normalized_images], dim=0).to(clip_runtime_device)  # type: ignore[operator]
+                image_features = cast(Any, clip_model).encode_image(image_batch)
+            image_features = _normalize_l2_embeddings(cast(torch.Tensor, image_features))
+        matrix = image_features.cpu().numpy().astype(np.float32, copy=False)
+        return EmbeddingBatchOutput(
+            matrix,
+            _current_clip_embedding_space_locked(),
+        )
+
+
+def _clip_image_embeddings_from_pils(images: Sequence[Image.Image]) -> np.ndarray:
+    return _clip_image_batch_with_space(images).embeddings
 
 
 def _get_live_clip_batcher() -> ImageEmbeddingBatcher:
@@ -1777,9 +1898,11 @@ def _get_live_clip_batcher() -> ImageEmbeddingBatcher:
 
     global _live_clip_batcher
     with _live_clip_batcher_lock:
+        if _clip_resetting:
+            raise RuntimeError("embedding runtime reset is in progress")
         if _live_clip_batcher is None:
             _live_clip_batcher = ImageEmbeddingBatcher(
-                _clip_image_embeddings_from_pils,
+                _clip_image_batch_with_space,
                 max_batch_size=int(getattr(config, "LIVE_CLIP_BATCH_SIZE", 8)),
                 max_wait_ms=float(
                     getattr(config, "LIVE_CLIP_BATCH_WAIT_MS", 75.0)
@@ -1796,33 +1919,36 @@ def _get_live_clip_batcher() -> ImageEmbeddingBatcher:
 
 
 def _clip_text_embeddings(texts: Sequence[str]) -> np.ndarray:
-    ensure_embedder_loaded("clip")
     prepared = [str(text or "").strip() for text in texts if str(text or "").strip()]
     if not prepared:
         return np.zeros((0, 0), dtype=np.float32)
 
-    with torch.no_grad():
-        if clip_backend_kind == "siglip2":
-            if clip_processor is None or clip_model is None:
-                raise RuntimeError("SigLIP2 clip backend is not initialized")
-            # SigLIP2 tokenization quality is better when text is lower-cased and max_length=64.
-            normalized_texts = [text.lower() for text in prepared]
-            processor_inputs = cast(Any, clip_processor)(
-                text=normalized_texts,
-                padding="max_length",
-                truncation=True,
-                max_length=64,
-                return_tensors="pt",
-            )
-            model_inputs = _processor_to_device(cast(Mapping[str, Any], processor_inputs), clip_runtime_device)
-            text_features = cast(Any, clip_model).get_text_features(**model_inputs)
-        else:
-            if clip_model is None:
-                raise RuntimeError("CLIP backend is not initialized")
-            text_tokens = _get_clip_module().tokenize(prepared).to(clip_runtime_device)
-            text_features = cast(Any, clip_model).encode_text(text_tokens)
-        text_features = _normalize_l2_embeddings(cast(torch.Tensor, text_features))
-    return text_features.cpu().numpy().astype(np.float32, copy=False)
+    with _clip_init_lock:
+        ensure_embedder_loaded("clip")
+        with torch.no_grad():
+            if clip_backend_kind == "siglip2":
+                if clip_processor is None or clip_model is None:
+                    raise RuntimeError("SigLIP2 clip backend is not initialized")
+                # This preprocessing is part of the persisted embedding contract.
+                normalized_texts = [text.lower() for text in prepared]
+                processor_inputs = cast(Any, clip_processor)(
+                    text=normalized_texts,
+                    padding="max_length",
+                    truncation=True,
+                    max_length=64,
+                    return_tensors="pt",
+                )
+                model_inputs = _processor_to_device(cast(Mapping[str, Any], processor_inputs), clip_runtime_device)
+                text_features = _siglip_feature_tensor(
+                    cast(Any, clip_model).get_text_features(**model_inputs)
+                )
+            else:
+                if clip_model is None:
+                    raise RuntimeError("CLIP backend is not initialized")
+                text_tokens = _get_clip_module().tokenize(prepared).to(clip_runtime_device)
+                text_features = cast(Any, clip_model).encode_text(text_tokens)
+            text_features = _normalize_l2_embeddings(cast(torch.Tensor, text_features))
+        return text_features.cpu().numpy().astype(np.float32, copy=False)
 
 
 def init_dino() -> None:
@@ -1871,23 +1997,38 @@ def ensure_embedder_loaded(embedder: Optional[str] = None) -> None:
         raise ValueError(f"Unsupported embedder: {target}")
 
 
-# Appliances index every channel continuously.  Loading the configured
-# embedder while the worker boots makes /ready meaningful and prevents the
-# first archive frame from paying (or discovering) the model-load failure.
-if bool(getattr(config, "EMBEDDER_EAGER_LOAD", False)):
-    ensure_embedder_loaded(active_embedder)
-
-
 def reset_embedder_runtime_state() -> None:
     """Clear loaded embedding backends so they can be re-initialized."""
-    global clip_model, clip_preprocess, clip_processor, clip_backend_kind, clip_runtime_model, clip_runtime_device, dino_encoder
-    clip_model = None
-    clip_preprocess = None
-    clip_processor = None
-    clip_backend_kind = "openai_clip"
-    clip_runtime_model = ""
-    clip_runtime_device = device
-    dino_encoder = None
+    global clip_model, clip_preprocess, clip_processor, clip_backend_kind, clip_runtime_model, clip_runtime_revision, clip_runtime_device, _clip_resetting, _live_clip_batcher, dino_encoder
+    with _clip_reset_lock:
+        with _live_clip_batcher_lock:
+            _clip_resetting = True
+            batcher = _live_clip_batcher
+            _live_clip_batcher = None
+        try:
+            if batcher is not None and not batcher.stop(timeout_sec=15.0):
+                raise RuntimeError(
+                    "embedding batch worker did not stop; refusing unsafe model reset"
+                )
+            # Direct image/text calls and the batch worker hold this lifecycle
+            # lock for the full inference. Clearing can therefore never expose
+            # partially-reset globals or unload a model still in use.
+            with _clip_init_lock:
+                clip_model = None
+                clip_preprocess = None
+                clip_processor = None
+                clip_backend_kind = "openai_clip"
+                clip_runtime_model = ""
+                clip_runtime_revision = ""
+                clip_runtime_device = device
+                dino_encoder = None
+                manager = globals().get("probe_manager")
+                clear_all = getattr(manager, "clear_all", None)
+                if callable(clear_all):
+                    clear_all()
+        finally:
+            with _live_clip_batcher_lock:
+                _clip_resetting = False
 
 
 def warm_start_embedder() -> Optional[str]:
@@ -2031,6 +2172,19 @@ def get_probe_image_embedding_from_pil(pil_image: Image.Image) -> np.ndarray:
     return _get_live_clip_batcher().embed_one(pil_image)
 
 
+def get_probe_image_embedding_with_space(
+    pil_image: Image.Image,
+) -> Tuple[np.ndarray, Mapping[str, Any]]:
+    """Return vector and encoder identity captured by the same microbatch."""
+
+    embedding, metadata = _get_live_clip_batcher().embed_one_with_metadata(
+        pil_image
+    )
+    if not metadata:
+        raise RuntimeError("embedding batch returned no vector-space identity")
+    return embedding, metadata
+
+
 def get_probe_text_embedding(text: str) -> np.ndarray:
     """Probe text embeddings always use the CLIP-like backend so they remain available outside clip search mode."""
     return get_clip_text_embedding(text)
@@ -2039,54 +2193,36 @@ def get_probe_text_embedding(text: str) -> np.ndarray:
 def get_probe_embedding_space() -> Dict[str, Any]:
     """Return the exact live vector space used by semantic search and probes."""
 
-    ensure_embedder_loaded("clip")
-    dimension: Optional[int] = None
-    if clip_backend_kind == "siglip2":
-        projection_dim = getattr(
-            getattr(clip_model, "config", None),
-            "projection_dim",
-            None,
-        )
-        if projection_dim:
-            dimension = int(projection_dim)
-    else:
-        output_dim = getattr(
-            getattr(clip_model, "visual", None),
-            "output_dim",
-            None,
-        )
-        if output_dim:
-            dimension = int(output_dim)
-    payload: Dict[str, Any] = {
-        "backend": str(clip_backend_kind or "unknown"),
-        "model": str(clip_runtime_model or config.CLIP_MODEL or "unknown"),
-    }
-    if dimension is not None:
-        payload["dimension"] = dimension
-    return payload
+    with _clip_init_lock:
+        ensure_embedder_loaded("clip")
+        return _current_clip_embedding_space_locked()
 
 
 def _build_index_metadata(embedder: str, additional: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     ensure_embedder_loaded(embedder)
     base: Dict[str, Any]
     if embedder == "clip":
-        runtime_model = str(clip_runtime_model or config.CLIP_MODEL or "unknown")
-        if clip_backend_kind == "siglip2":
-            projection_dim = getattr(getattr(clip_model, "config", None), "projection_dim", 1152)
-            embed_dim = int(projection_dim if projection_dim else 1152)
-            library = "google/siglip2"
-        else:
-            embed_dim = int(getattr(getattr(clip_model, "visual", None), "output_dim", 512))  # type: ignore[union-attr]
-            library = "openai/CLIP"
-        base = {
-            "embedder": "clip",
-            "model": runtime_model,
-            "requested_model": str(config.CLIP_MODEL),
-            "embedding_dim": embed_dim,
-            "library": library,
-            "backend": clip_backend_kind,
-            "device": clip_runtime_device,
-        }
+        with _clip_init_lock:
+            embedding_space = _current_clip_embedding_space_locked()
+            runtime_model = str(clip_runtime_model or config.CLIP_MODEL or "unknown")
+            if clip_backend_kind == "siglip2":
+                embed_dim = int(_siglip_projection_dimension() or 0)
+                library = "google/siglip2"
+            else:
+                embed_dim = int(getattr(getattr(clip_model, "visual", None), "output_dim", 512))  # type: ignore[union-attr]
+                library = "openai/CLIP"
+            base = {
+                "embedder": "clip",
+                "model": runtime_model,
+                "requested_model": str(config.CLIP_MODEL),
+                "embedding_dim": embed_dim,
+                "library": library,
+                "backend": clip_backend_kind,
+                "device": clip_runtime_device,
+                "revision": clip_runtime_revision or None,
+                "embedding_space": embedding_space,
+                "embedding_fingerprint": embedding_space.get("fingerprint"),
+            }
     else:
         assert dino_encoder is not None
         base = {
@@ -2104,19 +2240,26 @@ def _build_index_metadata(embedder: str, additional: Optional[Dict[str, Any]] = 
 
 
 def _index_metadata_compatible(embedder: str, meta: Mapping[str, Any]) -> bool:
-    if not meta:
-        return True
     if embedder == "clip":
-        expected_model = _normalize_clip_model_for_policy(config.CLIP_MODEL)
-        meta_model = str(meta.get("model") or meta.get("requested_model") or "").strip()
-        if meta_model and meta_model != expected_model:
-            return False
-        if not _experimental_embedding_models_enabled():
-            backend = str(meta.get("backend") or "").strip().lower()
-            if backend and backend != "openai_clip":
-                return False
-        return True
+        expected_space = get_probe_embedding_space()
+        archived_space = (
+            meta.get("embedding_space")
+            if isinstance(meta.get("embedding_space"), Mapping)
+            else {
+                "backend": meta.get("backend"),
+                "model": meta.get("model") or meta.get("requested_model"),
+                "revision": meta.get("revision"),
+                "dimension": meta.get("embedding_dim"),
+            }
+        )
+        return embedding_spaces_match(
+            expected_space,
+            archived_space,
+            allow_legacy_openai_clip=True,
+        )
     if embedder == "dino":
+        if not meta:
+            return True
         if not _experimental_embedding_models_enabled():
             return False
         meta_model = str(meta.get("config_model") or meta.get("model") or "").strip()
@@ -2791,149 +2934,16 @@ def _incident_timestamp_ms(value: Any, field_name: str) -> Optional[int]:
     return int(round(timestamp if timestamp >= 1_000_000_000_000 else timestamp * 1000.0))
 
 
-def _incident_narrative(incident: Mapping[str, Any]) -> str:
-    timeline = [
-        item
-        for item in incident.get("timeline_refs") or incident.get("timeline") or []
-        if isinstance(item, Mapping) and str(item.get("label") or "").strip()
-    ]
-    coverage = incident.get("coverage") if isinstance(incident.get("coverage"), Mapping) else {}
-    if not timeline:
-        return (
-            "No grounded event transition was recovered around the selected anchor. "
-            f"Archive coverage is {str(coverage.get('status') or 'unknown')}; operator review is required."
-        )
-    labels = [str(item.get("label") or "").strip() for item in timeline[:4]]
-    narrative = " → ".join(labels)
-    if len(timeline) > len(labels):
-        narrative += f" → {len(timeline) - len(labels)} more grounded timeline item(s)"
-    return (
-        f"EVA connected {len(timeline)} evidence-linked timeline item(s): {narrative}. "
-        f"Archive coverage is {str(coverage.get('status') or 'unknown')}; "
-        "P/N/M and motion values remain attention signals, not visual proof."
+def _incident_command_service() -> IncidentCommandService:
+    """Build against current globals so tests/runtime swaps cannot go stale."""
+
+    return IncidentCommandService(
+        incident_store,
+        detections_store,
+        _attention_store,
+        luxriot_manager,
+        draft_assembler_factory=IncidentDraftAssembler,
     )
-
-
-def _incident_public_record(record: Mapping[str, Any]) -> Dict[str, Any]:
-    channel_ids = [
-        int(value)
-        for value in record.get("channel_ids") or []
-        if _to_optional_int(value) is not None and int(value) > 0
-    ]
-    timeline = [dict(item) for item in record.get("timeline_refs") or [] if isinstance(item, Mapping)]
-    evidence = [dict(item) for item in record.get("evidence_refs") or [] if isinstance(item, Mapping)]
-    report = dict(record.get("report") or {}) if isinstance(record.get("report"), Mapping) else {}
-    qualia_refs = [dict(item) for item in record.get("qualia_refs") or [] if isinstance(item, Mapping)]
-    follow = dict(record.get("follow_policy") or {}) if isinstance(record.get("follow_policy"), Mapping) else {}
-    if follow.get("active") is True:
-        expires_at_ms = _to_optional_int(follow.get("expires_at_ms"))
-        inactive_reason: Optional[str] = None
-        if expires_at_ms is not None and expires_at_ms <= int(time.time() * 1000.0):
-            inactive_reason = "ttl_expired"
-        lease_manager = getattr(luxriot_manager, "incident_focus_leases", None)
-        lease_getter = getattr(lease_manager, "get", None)
-        if inactive_reason is None and callable(lease_getter):
-            try:
-                if lease_getter(str(record.get("id") or "")) is None:
-                    inactive_reason = "runtime_lease_absent"
-            except Exception:
-                pass
-        if inactive_reason is not None:
-            follow["active"] = False
-            follow["inactive_reason"] = inactive_reason
-    bounds = {
-        "possible_start": record.get("possible_start_ms"),
-        "possible_start_ms": record.get("possible_start_ms"),
-        "observed_start": record.get("observed_start_ms"),
-        "observed_start_ms": record.get("observed_start_ms"),
-        "apex": report.get("apex_ms"),
-        "apex_ms": report.get("apex_ms"),
-        "observed_end": record.get("observed_end_ms"),
-        "observed_end_ms": record.get("observed_end_ms"),
-        "possible_end": record.get("possible_end_ms"),
-        "possible_end_ms": record.get("possible_end_ms"),
-    }
-    semantic_keys = list(
-        dict.fromkeys(
-            str(item.get("semantic_key") or "").strip()
-            for item in timeline
-            if str(item.get("semantic_key") or "").strip()
-        )
-    )
-    public = {
-        **dict(record),
-        "incident_id": str(record.get("id") or ""),
-        "channel_id": channel_ids[0] if channel_ids else None,
-        "channels": channel_ids,
-        "channel_ids": channel_ids,
-        "severity": str(report.get("severity") or "info"),
-        "summary": str(report.get("summary") or "").strip(),
-        "time_bounds": bounds,
-        "timeline": timeline,
-        "events": timeline,
-        "evidence": evidence,
-        "qualia_digest": qualia_refs[0] if qualia_refs else {},
-        "semantic_keys": semantic_keys,
-        "follow": follow,
-        "follow_policy": follow,
-    }
-    if public.get("state") == "following" and follow.get("active") is False:
-        public["state"] = "draft"
-    if not public["summary"]:
-        public["summary"] = _incident_narrative(public)
-    return public
-
-
-def _incident_storage_record(draft: Mapping[str, Any]) -> Dict[str, Any]:
-    bounds = draft.get("time_bounds") if isinstance(draft.get("time_bounds"), Mapping) else {}
-    report = {
-        "severity": str(draft.get("severity") or "info"),
-        "apex_ms": bounds.get("apex_ms"),
-        "provenance": dict(draft.get("provenance") or {}),
-        "qualia_digest": dict(draft.get("qualia_digest") or {}),
-    }
-    provisional = {
-        "timeline_refs": list(draft.get("timeline") or []),
-        "coverage": dict(draft.get("coverage") or {}),
-    }
-    report["summary"] = _incident_narrative(provisional)
-    return {
-        "state": "draft",
-        "title": str(draft.get("title") or "Incident draft")[:200],
-        "channel_ids": list(draft.get("channel_ids") or []),
-        "possible_start_ms": bounds.get("possible_start_ms"),
-        "observed_start_ms": bounds.get("observed_start_ms"),
-        "observed_end_ms": bounds.get("observed_end_ms"),
-        "possible_end_ms": bounds.get("possible_end_ms"),
-        "anchor_ref": dict(draft.get("anchor") or {}),
-        "timeline_refs": list(draft.get("timeline") or []),
-        "evidence_refs": list(draft.get("evidence") or []),
-        "qualia_refs": [dict(draft.get("qualia_digest") or {})],
-        "coverage": dict(draft.get("coverage") or {}),
-        "uncertainties": list(draft.get("uncertainties") or []),
-        "report": report,
-        "follow_policy": {},
-    }
-
-
-def _incident_focus_payload(lease: Any, ttl_seconds: int) -> Dict[str, Any]:
-    # The runtime lease clock is monotonic by design; persistence and UI need a
-    # wall-clock deadline that survives serialization and renders correctly.
-    now_ms = int(time.time() * 1000.0)
-    return {
-        "active": True,
-        "mode": str(getattr(getattr(lease, "level", None), "value", None) or "follow"),
-        "channel_ids": [int(value) for value in getattr(lease, "channel_ids", ())],
-        "started_at_ms": now_ms,
-        "updated_at_ms": now_ms,
-        "expires_at_ms": now_ms + int(ttl_seconds) * 1000,
-        "ttl_seconds": int(ttl_seconds),
-    }
-
-
-def _incident_load_or_404(incident_id: str) -> Optional[Dict[str, Any]]:
-    incident = incident_store.get_incident(incident_id)
-    return dict(incident) if isinstance(incident, Mapping) else None
 
 
 @app.route('/incidents/draft', methods=['POST'])
@@ -2951,16 +2961,11 @@ def incident_draft():
             raise ValueError("anchor_detection_id must be positive")
         since_ms = _incident_timestamp_ms(data.get("from_ts"), "from_ts")
         until_ms = _incident_timestamp_ms(data.get("to_ts"), "to_ts")
-        draft = IncidentDraftAssembler(detections_store, _attention_store).assemble(
-            IncidentDraftRequest(
-                channel_id=channel_id,
-                anchor_detection_id=anchor_id,
-                since_ms=since_ms,
-                until_ms=until_ms,
-            )
-        )
-        stored = incident_store.create_incident(
-            _incident_storage_record(draft),
+        stored = _incident_command_service().create_draft(
+            channel_id=channel_id,
+            anchor_detection_id=anchor_id,
+            since_ms=since_ms,
+            until_ms=until_ms,
             actor_id=_feedback_actor_id(),
         )
     except ValueError as exc:
@@ -2989,23 +2994,23 @@ def incident_draft():
     )
     if audit_error is not None:
         return audit_error
-    return jsonify({"success": True, "incident": _incident_public_record(stored)}), 201
+    return jsonify({"success": True, "incident": _incident_command_service().public_record(stored)}), 201
 
 
 @app.route('/incidents/<incident_id>', methods=['GET'])
 def incident_detail(incident_id: str):
     try:
-        incident = _incident_load_or_404(incident_id)
+        incident = _incident_command_service().get(incident_id)
     except ValueError as exc:
         return jsonify({"error": str(exc)}), 400
+    except LookupError:
+        return jsonify({"error": "incident_not_found"}), 404
     except (IncidentStoreNotReady, ArchiveStoreNotReady) as exc:
         return _incident_store_not_ready_response(exc)
     except Exception:
         app.logger.exception("Incident load failed request_id=%s", getattr(g, "request_id", ""))
         return jsonify({"error": "incident_load_failed"}), 500
-    if incident is None:
-        return jsonify({"error": "incident_not_found"}), 404
-    return jsonify({"success": True, "incident": _incident_public_record(incident)})
+    return jsonify({"success": True, "incident": _incident_command_service().public_record(incident)})
 
 
 @app.route('/incidents/<incident_id>/follow', methods=['POST'])
@@ -3021,31 +3026,19 @@ def incident_follow(incident_id: str):
         ttl_seconds = int(data.get("ttl_seconds") or 300)
         if ttl_seconds < 60 or ttl_seconds > 8 * 60 * 60:
             raise ValueError("ttl_seconds must be between 60 and 28800")
-        incident = _incident_load_or_404(incident_id)
-        if incident is None:
-            return jsonify({"error": "incident_not_found"}), 404
-        channel_ids = [int(value) for value in incident.get("channel_ids") or []]
-        lease = luxriot_manager.start_incident_focus(
+        expected_revision = _to_optional_int(data.get("expected_revision"))
+        updated, _lease = _incident_command_service().follow(
             incident_id,
-            channel_ids,
-            level=mode,
+            actor_id=_feedback_actor_id(),
+            mode=mode,
             ttl_seconds=ttl_seconds,
+            expected_revision=expected_revision,
         )
-        try:
-            updated = incident_store.update_incident(
-                incident_id,
-                expected_revision=int(incident.get("revision") or 0),
-                changes={
-                    "state": "following",
-                    "follow_policy": _incident_focus_payload(lease, ttl_seconds),
-                },
-                actor_id=_feedback_actor_id(),
-            )
-        except Exception:
-            luxriot_manager.stop_incident_focus(incident_id)
-            raise
+        channel_ids = [int(value) for value in updated.get("channel_ids") or []]
     except ValueError as exc:
         return jsonify({"error": str(exc)}), 400
+    except LookupError:
+        return jsonify({"error": "incident_not_found"}), 404
     except IncidentRevisionConflict as exc:
         return jsonify({"error": "incident_revision_conflict", "revision": exc.actual_revision}), 409
     except (IncidentStoreNotReady, ArchiveStoreNotReady) as exc:
@@ -3062,7 +3055,7 @@ def incident_follow(incident_id: str):
     )
     if audit_error is not None:
         return audit_error
-    return jsonify({"success": True, "incident": _incident_public_record(updated)})
+    return jsonify({"success": True, "incident": _incident_command_service().public_record(updated)})
 
 
 @app.route('/incidents/<incident_id>/stop-follow', methods=['POST'])
@@ -3070,28 +3063,19 @@ def incident_stop_follow(incident_id: str):
     guard = _mutation_guard_error()
     if guard is not None:
         return guard
+    data = _json_body()
     try:
-        incident = _incident_load_or_404(incident_id)
-        if incident is None:
-            return jsonify({"error": "incident_not_found"}), 404
-        channel_ids = [int(value) for value in incident.get("channel_ids") or []]
-        stopped = luxriot_manager.stop_incident_focus(incident_id)
-        previous_follow = dict(incident.get("follow_policy") or {})
-        previous_follow.update(
-            {
-                "active": False,
-                "stopped_at_ms": int(time.time() * 1000.0),
-                "stop_reason": "operator",
-            }
-        )
-        updated = incident_store.update_incident(
+        expected_revision = _to_optional_int(data.get("expected_revision"))
+        updated, stopped = _incident_command_service().stop_follow(
             incident_id,
-            expected_revision=int(incident.get("revision") or 0),
-            changes={"state": "draft", "follow_policy": previous_follow},
             actor_id=_feedback_actor_id(),
+            expected_revision=expected_revision,
         )
+        channel_ids = [int(value) for value in updated.get("channel_ids") or []]
     except ValueError as exc:
         return jsonify({"error": str(exc)}), 400
+    except LookupError:
+        return jsonify({"error": "incident_not_found"}), 404
     except IncidentRevisionConflict as exc:
         return jsonify({"error": "incident_revision_conflict", "revision": exc.actual_revision}), 409
     except (IncidentStoreNotReady, ArchiveStoreNotReady) as exc:
@@ -3108,7 +3092,7 @@ def incident_stop_follow(incident_id: str):
     )
     if audit_error is not None:
         return audit_error
-    return jsonify({"success": True, "incident": _incident_public_record(updated)})
+    return jsonify({"success": True, "incident": _incident_command_service().public_record(updated)})
 
 
 @app.route('/incidents/<incident_id>/export', methods=['GET'])
@@ -3117,17 +3101,17 @@ def incident_export(incident_id: str):
     if export_format not in {"md", "xml"}:
         return jsonify({"error": "format must be md or xml"}), 400
     try:
-        incident = _incident_load_or_404(incident_id)
+        incident = _incident_command_service().get(incident_id)
     except ValueError as exc:
         return jsonify({"error": str(exc)}), 400
+    except LookupError:
+        return jsonify({"error": "incident_not_found"}), 404
     except (IncidentStoreNotReady, ArchiveStoreNotReady) as exc:
         return _incident_store_not_ready_response(exc)
     except Exception:
         app.logger.exception("Incident export failed request_id=%s", getattr(g, "request_id", ""))
         return jsonify({"error": "incident_export_failed"}), 500
-    if incident is None:
-        return jsonify({"error": "incident_not_found"}), 404
-    public = _incident_public_record(incident)
+    public = _incident_command_service().public_record(incident)
     date_label = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     content = incident_report_xml(public) if export_format == "xml" else incident_report_markdown(public)
     response = Response(
@@ -4968,6 +4952,8 @@ probe_manager = ProbeManager(
     embed_image_fn=get_probe_image_embedding_from_pil,
     embed_text_fn=get_probe_text_embedding,
     jpeg_encoder=_encode_jpeg,
+    embed_image_with_metadata_fn=get_probe_image_embedding_with_space,
+    embedding_space_fn=get_probe_embedding_space,
 )
 luxriot_manager.probe_manager = probe_manager
 probe_daemon_thread: Optional[threading.Thread] = None
@@ -5164,6 +5150,7 @@ if bool(getattr(config, "SEMANTIC_SNAPSHOT_ARCHIVE_ENABLED", True)):
             getattr(config, "SEMANTIC_SNAPSHOT_ARCHIVE_BATCH_SIZE", 32)
         ),
         embedding_space_fn=get_probe_embedding_space,
+        autostart=False,
     )
 luxriot_manager.semantic_snapshot_writer = semantic_snapshot_writer
 channel_group_store = ChannelGroupStore(
@@ -5264,6 +5251,7 @@ def _build_attention_writer() -> BufferedAttentionWriter:
         max_batches=256,
         max_records=8192,
         write_batch_records=512,
+        autostart=False,
     )
 
 
@@ -5486,15 +5474,24 @@ def _admit_alert_derived_probes(
             rejected += 1
             continue
         fallback = any(probe.generated_fallback for probe in admission.probes)
+        siglip_defaults = "siglip2" in str(
+            getattr(config, "CLIP_MODEL", "") or ""
+        ).lower()
         for store_payload, probe in zip(
             admission.store_payloads(
                 pos_floor=(
-                    max(0.32, float(config.PROBE_POS_FLOOR_DEFAULT))
+                    max(
+                        0.08 if siglip_defaults else 0.32,
+                        float(config.PROBE_POS_FLOOR_DEFAULT),
+                    )
                     if fallback
                     else float(config.PROBE_POS_FLOOR_DEFAULT)
                 ),
                 margin=(
-                    max(0.10, float(config.PROBE_MARGIN_DEFAULT))
+                    max(
+                        0.04 if siglip_defaults else 0.10,
+                        float(config.PROBE_MARGIN_DEFAULT),
+                    )
                     if fallback
                     else float(config.PROBE_MARGIN_DEFAULT)
                 ),
@@ -5576,12 +5573,20 @@ def _embedder_loaded_state() -> Dict[str, Any]:
         )
     else:
         return _component_result(False, "unsupported", embedder=active_embedder)
+    embedding_space: Dict[str, Any] = {}
+    if loaded and active_embedder in {"clip", "fusion"}:
+        try:
+            embedding_space = get_probe_embedding_space()
+        except Exception:
+            embedding_space = {}
     return _component_result(
         loaded,
         "loaded" if loaded else "not_loaded",
         embedder=active_embedder,
         clip_model=clip_runtime_model or None,
         backend=clip_backend_kind if clip_model is not None else None,
+        device=clip_runtime_device if clip_model is not None else None,
+        embedding_space=embedding_space or None,
     )
 
 
@@ -5915,6 +5920,20 @@ def _check_auth_ready() -> Dict[str, Any]:
 def _check_inference_queue_ready() -> Dict[str, Any]:
     if not bool(getattr(config, "INFERENCE_QUEUE_ENABLED", False)):
         return _component_result(False, "disabled", required=False)
+    if _runtime_embedder_result.get("status") in {
+        "load_failed",
+        "writer_failed",
+    }:
+        blocked_status = (
+            "blocked_embedder"
+            if _runtime_embedder_result.get("status") == "load_failed"
+            else "blocked_writer"
+        )
+        return _component_result(
+            False,
+            blocked_status,
+            error=_runtime_embedder_result.get("error"),
+        )
     try:
         runtime = _configure_inference_queue()
         if runtime is None:
@@ -6204,16 +6223,115 @@ def _check_luxriot_ready(timeout_sec: float = 2.0) -> Dict[str, Any]:
         return _component_result(False, "error", error=str(exc), base_url=base_url)
 
 
-_configure_inference_queue()
-_luxriot_restore_result: Dict[str, Any] = {}
-try:
-    _luxriot_restore_result = luxriot_manager.restore_desired_live_sessions()
-except Exception as exc:
-    _luxriot_restore_result = {
-        "ok": False,
-        "status": "error",
-        "error": type(exc).__name__,
-    }
+_runtime_services_lock = Lock()
+_runtime_services_initialized = False
+_runtime_embedder_result: Dict[str, Any] = {
+    "ok": False,
+    "status": "not_initialized",
+}
+_luxriot_restore_result: Dict[str, Any] = {
+    "ok": False,
+    "status": "not_initialized",
+}
+
+
+def _runtime_capture_bootstrap_allowed() -> bool:
+    """Fail closed when the configured embedding space did not initialize."""
+
+    return bool(_runtime_embedder_result.get("ok"))
+
+
+def initialize_runtime_services() -> None:
+    """Start process runtime only from an explicit server entry point.
+
+    Importing ``oldapp`` is used by tests, migrations and administrative
+    scripts. It must not restore cameras, start inference workers or write
+    archive rows as a side effect.
+    """
+
+    global _runtime_services_initialized, _runtime_embedder_result
+    global _luxriot_restore_result
+    with _runtime_services_lock:
+        if _runtime_services_initialized:
+            return
+        # Appliances index every channel continuously. Load the configured
+        # embedder at explicit server bootstrap so /ready is meaningful while
+        # keeping imports, migrations and test collection side-effect free.
+        if bool(getattr(config, "EMBEDDER_EAGER_LOAD", False)):
+            try:
+                ensure_embedder_loaded(active_embedder)
+                _runtime_embedder_result = {
+                    "ok": True,
+                    "status": "loaded",
+                    "embedder": active_embedder,
+                }
+            except Exception as exc:
+                # Liveness must survive a missing/corrupt model or unavailable
+                # CUDA runtime. Stay explicitly unready and do not start the
+                # queue or restore desired captures: either could persist data
+                # in a different embedding space after a partial fallback.
+                _runtime_embedder_result = {
+                    "ok": False,
+                    "status": "load_failed",
+                    "embedder": active_embedder,
+                    "error": type(exc).__name__,
+                    "detail": str(exc)[:500],
+                }
+                _luxriot_restore_result = {
+                    "ok": False,
+                    "status": "blocked_embedder",
+                    "error": type(exc).__name__,
+                }
+                app.logger.error(
+                    "Runtime bootstrap embedder load failed; inference and "
+                    "capture restore remain blocked: %s",
+                    exc,
+                )
+                _runtime_services_initialized = True
+                return
+        else:
+            _runtime_embedder_result = {
+                "ok": True,
+                "status": "not_eager",
+                "embedder": active_embedder,
+            }
+        try:
+            if _attention_writer is not None:
+                _attention_writer.start()
+            if semantic_snapshot_writer is not None:
+                semantic_snapshot_writer.start()
+        except Exception as exc:
+            _runtime_embedder_result = {
+                "ok": False,
+                "status": "writer_failed",
+                "embedder": active_embedder,
+                "error": type(exc).__name__,
+                "detail": str(exc)[:500],
+            }
+            _luxriot_restore_result = {
+                "ok": False,
+                "status": "blocked_writer",
+                "error": type(exc).__name__,
+            }
+            app.logger.error(
+                "Runtime bootstrap writer start failed; inference and capture "
+                "restore remain blocked: %s",
+                exc,
+            )
+            _runtime_services_initialized = True
+            return
+        _configure_inference_queue()
+        try:
+            _luxriot_restore_result = (
+                luxriot_manager.restore_desired_live_sessions()
+            )
+        except Exception as exc:
+            _luxriot_restore_result = {
+                "ok": False,
+                "status": "error",
+                "error": type(exc).__name__,
+            }
+        _runtime_services_initialized = True
 
 
 @app.route('/health', methods=['GET'])
@@ -6254,6 +6372,19 @@ def ready():
         os.getenv("EVOSSEARCH_EMBEDDER_REQUIRED", "true") or "true"
     ).strip().lower() in TRUE_BOOL_STRINGS
 
+    embedder_check = _embedder_loaded_state()
+    if _runtime_embedder_result.get("status") in {
+        "load_failed",
+        "writer_failed",
+    }:
+        embedder_check = _component_result(
+            False,
+            str(_runtime_embedder_result.get("status")),
+            embedder=active_embedder,
+            error=_runtime_embedder_result.get("error"),
+            detail=_runtime_embedder_result.get("detail"),
+        )
+
     checks: Dict[str, Dict[str, Any]] = {
         "database": _check_database_ready(),
         "postgresql": _check_postgres_ready(),
@@ -6262,7 +6393,7 @@ def ready():
         "inference_queue": _check_inference_queue_ready(),
         "attention": _check_attention_ready(),
         "lm_profiles": _check_lm_profiles_ready(),
-        "embedder": _embedder_loaded_state(),
+        "embedder": embedder_check,
         "luxriot": _check_luxriot_ready(),
         "luxriot_restore": _component_result(
             bool(_luxriot_restore_result.get("ok", True)),
@@ -7235,6 +7366,7 @@ def _get_agent_runner() -> Any:
             tool_plan_store=approval_store,
             tool_approval_store=approval_store,
             channel_group_store=channel_group_store,
+            incident_command_service=_incident_command_service(),
         )
         return _agent_runner
 
@@ -7531,6 +7663,26 @@ def _embed_thumbnail_b64(thumbnail_b64: Any, embedder: str) -> Optional[np.ndarr
         return get_image_embedding_from_pil(pil_img, embedder=embedder)
     except Exception:
         return None
+
+
+def _embed_thumbnail_b64_with_space(
+    thumbnail_b64: Any,
+    embedder: str,
+) -> Tuple[Optional[np.ndarray], Dict[str, Any]]:
+    """Embed a persisted thumbnail and stamp the exact encoder generation."""
+
+    pil_img = _thumbnail_to_pil_image(thumbnail_b64)
+    if pil_img is None:
+        return None, {}
+    try:
+        if embedder == "clip":
+            output = _clip_image_batch_with_space([pil_img])
+            if output.embeddings.shape[0] != 1:
+                raise RuntimeError("embedding batch returned the wrong row count")
+            return output.embeddings[0], dict(output.metadata)
+        return get_image_embedding_from_pil(pil_img, embedder=embedder), {}
+    except Exception:
+        return None, {}
 
 
 def _to_float(value: Any, default: float = 0.0) -> float:
@@ -8354,6 +8506,21 @@ def _maybe_send_probe_bookmark(
     return True, gate_meta
 
 
+def _archive_embedding_shard_key(
+    source: str,
+    channel_id: int,
+    timestamp_ms: int,
+    embedding_space: Mapping[str, Any],
+) -> str:
+    fingerprint = embedding_space_fingerprint(embedding_space)
+    shard_hour = time.strftime(
+        "%Y%m%d%H",
+        time.localtime(float(timestamp_ms) / 1000.0),
+    )
+    source_key = re.sub(r"[^a-z0-9_]+", "_", str(source).lower()).strip("_")
+    return f"{source_key or 'archive'}:e{fingerprint}:ch{channel_id}:{shard_hour}"
+
+
 def _store_probe_hits(
     probe_like: Dict[str, Any],
     hits: Sequence[Dict[str, Any]],
@@ -8396,7 +8563,10 @@ def _store_probe_hits(
         margin = _to_float(hit.get("margin"), 0.0)
         thumbnail_b64 = hit.get("thumbnail")
         archive_thumbnail_b64 = _resolve_archive_thumbnail(thumbnail_b64, ts_ms)
-        clip_vec = _embed_thumbnail_b64(thumbnail_b64, "clip")
+        clip_vec, embedding_space = _embed_thumbnail_b64_with_space(
+            thumbnail_b64,
+            "clip",
+        )
         raw_image_path = str(hit.get("image_path") or hit.get("path") or "").strip() or None
         keep_record, saved_image_path, retention_meta = detection_archive.handle_hit(
             probe_id=probe_id,
@@ -8421,6 +8591,7 @@ def _store_probe_hits(
             "origin": origin_source,
             "image_path": image_path,
             "retention": retention_meta,
+            "embedding_space": embedding_space,
             "hit": {
                 "timestamp_ms": ts_ms,
                 "channel_id": channel_id,
@@ -8448,6 +8619,12 @@ def _store_probe_hits(
                 "clip_vec": clip_vec,
                 "image_path": image_path,
                 "source": archive_source,
+                "shard_key": _archive_embedding_shard_key(
+                    archive_source,
+                    channel_id,
+                    ts_ms,
+                    embedding_space,
+                ),
                 "payload": payload,
             }
         )
@@ -8742,6 +8919,10 @@ def _vlm_summary_frame_records(entry: Mapping[str, Any]) -> Tuple[List[Dict[str,
         anchor_role = str(raw_frame.get("anchor_role") or "sample").strip().lower() or "sample"
         width = _to_optional_int(raw_frame.get("width"))
         height = _to_optional_int(raw_frame.get("height"))
+        clip_vec, embedding_space = _embed_thumbnail_b64_with_space(
+            thumbnail_b64,
+            "clip",
+        )
         frame_payload = {
             **base_payload,
             "source": "vlm_summary",
@@ -8754,6 +8935,7 @@ def _vlm_summary_frame_records(entry: Mapping[str, Any]) -> Tuple[List[Dict[str,
             "width": width,
             "height": height,
             "is_cover": bool(raw_frame.get("is_cover")),
+            "embedding_space": embedding_space,
         }
         for provenance_key in (
             "source_frame_index",
@@ -8775,7 +8957,6 @@ def _vlm_summary_frame_records(entry: Mapping[str, Any]) -> Tuple[List[Dict[str,
         ):
             if raw_frame.get(provenance_key) is not None:
                 frame_payload[provenance_key] = raw_frame.get(provenance_key)
-        clip_vec = _embed_thumbnail_b64(thumbnail_b64, "clip")
         records.append(
             {
                 "dedupe_key": (
@@ -8795,6 +8976,12 @@ def _vlm_summary_frame_records(entry: Mapping[str, Any]) -> Tuple[List[Dict[str,
                 "thumbnail_b64": thumbnail_b64,
                 "clip_vec": clip_vec,
                 "source": "vlm_summary",
+                "shard_key": _archive_embedding_shard_key(
+                    "vlm_summary",
+                    channel_id,
+                    timestamp_ms,
+                    embedding_space,
+                ),
                 "payload": frame_payload,
             }
         )
@@ -8807,6 +8994,7 @@ def _vlm_summary_frame_records(entry: Mapping[str, Any]) -> Tuple[List[Dict[str,
                 "anchor_role": anchor_role,
                 "thumbnail_b64": thumbnail_b64,
                 "clip_vec": clip_vec,
+                "embedding_space": embedding_space,
                 "payload": frame_payload,
             }
         )
@@ -8879,6 +9067,9 @@ def _vlm_summary_frame_records(entry: Mapping[str, Any]) -> Tuple[List[Dict[str,
                 "alert_snapshot_indices": list(
                     alert_event.get("snapshot_indices") or []
                 )[:16],
+                "embedding_space": dict(
+                    anchor.get("embedding_space") or {}
+                ),
             }
             if snapshot_hint is not None:
                 alert_payload["anchor_snapshot_hint"] = int(snapshot_hint)
@@ -8901,6 +9092,12 @@ def _vlm_summary_frame_records(entry: Mapping[str, Any]) -> Tuple[List[Dict[str,
                     "thumbnail_b64": anchor["thumbnail_b64"],
                     "clip_vec": anchor["clip_vec"],
                     "source": "vlm_alert",
+                    "shard_key": _archive_embedding_shard_key(
+                        "vlm_alert",
+                        channel_id,
+                        int(anchor["timestamp_ms"]),
+                        dict(anchor.get("embedding_space") or {}),
+                    ),
                     "payload": alert_payload,
                 }
             )
@@ -9816,6 +10013,7 @@ def _backfill_clip_vectors_for_filters(
     expected_dim: Optional[int] = None,
     max_backfill: int = 2000,
 ) -> int:
+    expected_space = get_probe_embedding_space()
     channel_scope: Dict[str, Any] = {"channel_id": channel_id}
     if channel_ids and len(channel_ids) > 1:
         channel_scope = {"channel_ids": list(channel_ids)}
@@ -9840,6 +10038,8 @@ def _backfill_clip_vectors_for_filters(
             vector_by_id[det_id] = clip_vec
     pending: List[Tuple[int, Sequence[float]]] = []
     for item in detections:
+        if not _detection_row_matches_embedding_space(item, expected_space):
+            continue
         det_id = _to_optional_int(item.get("id"))
         if det_id is None:
             continue
@@ -10251,6 +10451,39 @@ def _detection_row_matches_filters(
     return True
 
 
+def _detection_row_embedding_space(item: Mapping[str, Any]) -> Mapping[str, Any]:
+    payload = item.get("payload")
+    if not isinstance(payload, Mapping):
+        return {}
+    space = payload.get("embedding_space")
+    return space if isinstance(space, Mapping) else {}
+
+
+def _detection_row_matches_embedding_space(
+    item: Mapping[str, Any],
+    expected_space: Mapping[str, Any],
+) -> bool:
+    return embedding_spaces_match(
+        expected_space,
+        _detection_row_embedding_space(item),
+        allow_legacy_openai_clip=True,
+    )
+
+
+def _embedding_shard_matches_space(
+    shard_key: str,
+    expected_space: Mapping[str, Any],
+) -> bool:
+    fingerprint = embedding_space_fingerprint(expected_space)
+    marker = f":e{fingerprint}:"
+    normalized_key = str(shard_key or "").strip()
+    if marker in normalized_key:
+        return True
+    if ":e" in normalized_key:
+        return False
+    return not embedding_space_requires_identity(expected_space)
+
+
 def _search_semantic_snapshot_shards(
     *,
     clip_query_vec: np.ndarray,
@@ -10274,7 +10507,7 @@ def _search_semantic_snapshot_shards(
     """
 
     try:
-        shards = detections_store.summarize_shards(
+        all_shards = detections_store.summarize_shards(
             probe_id=probe_id,
             channel_id=channel_id,
             channel_ids=channel_ids,
@@ -10286,6 +10519,23 @@ def _search_semantic_snapshot_shards(
     except AttributeError:
         return None
 
+    expected_space = get_probe_embedding_space()
+    shards = [
+        item
+        for item in all_shards
+        if isinstance(item, Mapping)
+        and _embedding_shard_matches_space(
+            str(item.get("shard_key") or ""),
+            expected_space,
+        )
+    ]
+    excluded_shards = max(0, len(all_shards) - len(shards))
+    excluded_vectors = sum(
+        max(0, int(item.get("clip_count") or 0))
+        for item in all_shards
+        if isinstance(item, Mapping)
+        and item not in shards
+    )
     total_candidates = sum(
         max(0, int(item.get("clip_count") or 0))
         for item in shards
@@ -10305,6 +10555,8 @@ def _search_semantic_snapshot_shards(
         )
         coverage["search_strategy"] = "hourly_sharded_exact"
         coverage["shards_searched"] = 0
+        coverage["embedding_space_excluded_shards"] = excluded_shards
+        coverage["embedding_space_excluded_vectors"] = excluded_vectors
         return [], coverage
 
     query_dim = (
@@ -10394,6 +10646,11 @@ def _search_semantic_snapshot_shards(
                 until_ms=until_ms,
             ):
                 continue
+            if not _detection_row_matches_embedding_space(
+                row,
+                expected_space,
+            ):
+                continue
             item = dict(row)
             candidate_map[det_id] = item
             states[shard_key]["eligible"][det_id] = item
@@ -10457,10 +10714,12 @@ def _search_semantic_snapshot_shards(
         "search_strategy": "hourly_sharded_exact",
         "shards_searched": len(states),
         "shards_failed": failed_shards,
+        "embedding_space_excluded_shards": excluded_shards,
+        "embedding_space_excluded_vectors": excluded_vectors,
         "note": (
-            "Continuous CLIP snapshots were ranked across every matching shard."
+            "Continuous semantic snapshots were ranked across every matching embedding-space shard."
             if not failed_shards
-            else "Some continuous CLIP shards could not be searched."
+            else "Some matching continuous semantic shards could not be searched."
         ),
     }
     return results, coverage
@@ -10590,6 +10849,13 @@ def _search_detections_archive(
         return (merged, coverage) if include_coverage else merged
 
     clip_dim = int(clip_query_vec.shape[0]) if clip_query_vec.ndim == 1 else None
+    expected_space = get_probe_embedding_space()
+    embedding_space_filter = {
+        "embedding_space": expected_space,
+        "allow_legacy_embedding_space": not embedding_space_requires_identity(
+            expected_space
+        ),
+    }
     channel_scope: Dict[str, Any] = {"channel_id": channel_id}
     if channel_ids and len(channel_ids) > 1:
         channel_scope = {"channel_ids": list(channel_ids)}
@@ -10601,6 +10867,7 @@ def _search_detections_archive(
             since_ms=since_ms,
             until_ms=until_ms,
             only_with_clip=True,
+            **embedding_space_filter,
             **channel_scope,
         )
     except AttributeError:
@@ -10615,8 +10882,14 @@ def _search_detections_archive(
         only_with_clip=True,
         include_vectors=False,
         include_thumbnail=False,
+        **embedding_space_filter,
         **channel_scope,
     )
+    candidates = [
+        item
+        for item in candidates
+        if _detection_row_matches_embedding_space(item, expected_space)
+    ]
     if not candidates:
         updated = _backfill_clip_vectors_for_filters(
             probe_id,
@@ -10638,8 +10911,14 @@ def _search_detections_archive(
                 only_with_clip=True,
                 include_vectors=False,
                 include_thumbnail=False,
+                **embedding_space_filter,
                 **channel_scope,
             )
+            candidates = [
+                item
+                for item in candidates
+                if _detection_row_matches_embedding_space(item, expected_space)
+            ]
     if not candidates:
         coverage = _build_detection_search_coverage(
             candidates=[],
@@ -10676,8 +10955,14 @@ def _search_detections_archive(
                 only_with_clip=True,
                 include_vectors=False,
                 include_thumbnail=False,
+                **embedding_space_filter,
                 **channel_scope,
             )
+            candidates = [
+                item
+                for item in candidates
+                if _detection_row_matches_embedding_space(item, expected_space)
+            ]
             clip_hits, candidate_map = _search_detection_clip_shards(candidates, clip_query_vec, limit)
     if not clip_hits:
         coverage = _build_detection_search_coverage(
@@ -17238,6 +17523,8 @@ if __name__ == '__main__':
     if warmup_warning:
         print(f"Embedder warm-up warning: {warmup_warning}")
     config.print_startup_info()
-    ensure_probe_daemon_thread()
+    initialize_runtime_services()
+    if _runtime_capture_bootstrap_allowed():
+        ensure_probe_daemon_thread()
     ensure_archive_retention_thread()
     app.run(host=config.HOST, port=config.PORT, debug=config.DEBUG)

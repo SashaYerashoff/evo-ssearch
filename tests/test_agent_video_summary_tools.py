@@ -233,6 +233,8 @@ class _DetectionStore:
         only_with_clip=True,
         include_vectors=False,
         include_thumbnail=True,
+        embedding_space=None,
+        allow_legacy_embedding_space=False,
     ):
         rows, _total = self.list_detections(
             probe_id=None,
@@ -264,6 +266,8 @@ class _DetectionStore:
         since_ms=None,
         until_ms=None,
         only_with_clip=True,
+        embedding_space=None,
+        allow_legacy_embedding_space=False,
     ):
         rows, total = self.list_detections(
             probe_id=None,
@@ -2025,6 +2029,8 @@ class AgentVideoSummaryToolTests(unittest.TestCase):
         siglip_space = {
             "backend": "siglip2",
             "model": "google/siglip2-base-patch16-224",
+            "revision": "pinned-rev-1",
+            "fingerprint": "space-a1b2",
             "dimension": 2,
         }
         rows = [
@@ -2058,6 +2064,19 @@ class AgentVideoSummaryToolTests(unittest.TestCase):
                     }
                 },
             },
+            {
+                "id": 4,
+                "channel_id": 7,
+                "source": "semantic_snapshot",
+                "event_timestamp_ms": 104_000,
+                "clip_vec": [1.0, 0.0],
+                "payload": {
+                    "embedding_space": {
+                        **siglip_space,
+                        "fingerprint": "different-space",
+                    }
+                },
+            },
         ]
 
         result = _tools(
@@ -2083,7 +2102,9 @@ class AgentVideoSummaryToolTests(unittest.TestCase):
 
         channel = result["channels"][0]
         self.assertEqual(channel["frame_count"], 1)
-        self.assertEqual(channel["embedding_space_rejected"], 2)
+        self.assertEqual(channel["embedding_space_rejected"], 3)
+        self.assertEqual(result["embedding_space"]["revision"], "pinned-rev-1")
+        self.assertEqual(result["embedding_space"]["fingerprint"], "space-a1b2")
         self.assertTrue(
             any("different embedding space" in item for item in channel["warnings"])
         )

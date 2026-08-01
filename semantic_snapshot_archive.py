@@ -17,6 +17,8 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import Any, Callable, Dict, Mapping, Optional, Protocol, Sequence, Tuple
 
+from embedding_space import identified_embedding_space
+
 
 class DetectionsStoreLike(Protocol):
     def add_detections(self, records: Sequence[Dict[str, Any]]) -> int: ...
@@ -93,7 +95,7 @@ class SemanticSnapshotArchiveWriter:
     """Bounded batch writer for one semantic snapshot per cadence slot/channel."""
 
     SOURCE = "semantic_snapshot"
-    FORMAT_VERSION = 1
+    FORMAT_VERSION = 2
     _COUNTER_KEYS = (
         "accepted_total",
         "duplicate_total",
@@ -260,10 +262,16 @@ class SemanticSnapshotArchiveWriter:
             raise ValueError("provenance is too large")
         return result
 
-    def _dedupe_key(self, channel_id: int, cadence_slot: int) -> str:
+    def _dedupe_key(
+        self,
+        channel_id: int,
+        cadence_slot: int,
+        embedding_fingerprint: str,
+    ) -> str:
         return (
             f"semantic_snapshot:v{self.FORMAT_VERSION}:"
-            f"ch{channel_id}:cadence{self.cadence_ms}:slot{cadence_slot}"
+            f"e{embedding_fingerprint}:ch{channel_id}:"
+            f"cadence{self.cadence_ms}:slot{cadence_slot}"
         )
 
     def _record_gap_locked(self, reason: str, count: int = 1) -> None:
@@ -308,6 +316,7 @@ class SemanticSnapshotArchiveWriter:
         timestamp_ms: int,
         embedding: Any,
         thumbnail: str,
+        embedding_space: Optional[Mapping[str, Any]] = None,
         provenance: Optional[Mapping[str, Any]] = None,
     ) -> SnapshotSubmitResult:
         """Queue an already-computed embedding without blocking on the database."""
@@ -328,32 +337,62 @@ class SemanticSnapshotArchiveWriter:
                 reason=f"validation:{exc}",
             )
 
-        cadence_slot = timestamp // self.cadence_ms
-        dedupe_key = self._dedupe_key(channel, cadence_slot)
-        recorded_at_ms = int(float(self._clock()) * 1000.0)
-        # Continuous embeddings use compact hourly shards.  At the eight-channel
-        # port profile this keeps an exact operator search bounded to roughly
-        # 3,600 vectors per channel/shard instead of loading a whole day at once.
-        shard_hour = time.strftime(
-            "%Y%m%d%H",
-            time.localtime(float(timestamp) / 1000.0),
-        )
-        embedding_space: Dict[str, Any] = {}
-        if callable(self.embedding_space_fn):
+        captured_embedding_space: Dict[str, Any] = {}
+        if isinstance(embedding_space, Mapping):
+            captured_embedding_space = {
+                str(key): _plain_json_value(value)
+                for key, value in embedding_space.items()
+                if str(key) in {
+                    "backend",
+                    "model",
+                    "revision",
+                    "dimension",
+                    "contract",
+                }
+                and value is not None
+            }
+        elif callable(self.embedding_space_fn):
             try:
                 raw_embedding_space = self.embedding_space_fn()
                 if isinstance(raw_embedding_space, Mapping):
-                    embedding_space = {
+                    captured_embedding_space = {
                         str(key): _plain_json_value(value)
                         for key, value in raw_embedding_space.items()
-                        if str(key) in {"backend", "model", "dimension"}
+                        if str(key) in {
+                            "backend",
+                            "model",
+                            "revision",
+                            "dimension",
+                            "contract",
+                        }
                         and value is not None
                     }
             except Exception:
                 # The vector remains searchable. Calibration treats missing
                 # identity conservatively for non-legacy embedding spaces.
-                embedding_space = {}
-        embedding_space.setdefault("dimension", int(len(vector)))
+                captured_embedding_space = {}
+        captured_embedding_space.setdefault("dimension", int(len(vector)))
+        captured_embedding_space = identified_embedding_space(
+            captured_embedding_space
+        )
+        embedding_fingerprint = str(
+            captured_embedding_space.get("fingerprint") or "unknown"
+        )
+        cadence_slot = timestamp // self.cadence_ms
+        dedupe_key = self._dedupe_key(
+            channel,
+            cadence_slot,
+            embedding_fingerprint,
+        )
+        recorded_at_ms = int(float(self._clock()) * 1000.0)
+        # Continuous embeddings use compact hourly shards, isolated by exact
+        # vector space. At the eight-channel port profile this keeps an exact
+        # operator search bounded to roughly 3,600 vectors/channel/shard and
+        # prevents CLIP/SigLIP2 vectors from entering the same FAISS index.
+        shard_hour = time.strftime(
+            "%Y%m%d%H",
+            time.localtime(float(timestamp) / 1000.0),
+        )
         record = {
             "dedupe_key": dedupe_key,
             "timestamp_ms": timestamp,
@@ -369,16 +408,19 @@ class SemanticSnapshotArchiveWriter:
             "margin": 0.0,
             "thumbnail_b64": thumbnail_value,
             "source": self.SOURCE,
-            "shard_key": f"semantic:ch{channel}:{shard_hour}",
+            "shard_key": (
+                f"semantic:e{embedding_fingerprint}:"
+                f"ch{channel}:{shard_hour}"
+            ),
             "clip_vec": vector,
             "payload": {
-                "kind": "semantic_snapshot_v1",
+                "kind": "semantic_snapshot_v2",
                 "version": self.FORMAT_VERSION,
                 "cadence_ms": self.cadence_ms,
                 "cadence_slot": cadence_slot,
                 "independent_of_alert_or_probe_hit": True,
                 "selection_policy": "one_embedding_per_channel_cadence_slot",
-                "embedding_space": embedding_space,
+                "embedding_space": captured_embedding_space,
                 "provenance": provenance_value,
             },
         }
@@ -476,6 +518,11 @@ class SemanticSnapshotArchiveWriter:
             timestamp_ms=frame_result.get("timestamp_ms"),
             embedding=frame_result.get("embedding"),
             thumbnail=frame_result.get("thumbnail"),
+            embedding_space=(
+                frame_result.get("embedding_space")
+                if isinstance(frame_result.get("embedding_space"), Mapping)
+                else None
+            ),
             provenance=merged_provenance,
         )
 

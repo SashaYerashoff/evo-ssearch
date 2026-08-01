@@ -274,6 +274,43 @@ class ArchiveChannelFilterTests(unittest.TestCase):
             [store.tenant_id, 7, "vlm_alert", "vlm-alert-exact"],
         )
 
+    def test_siglip_space_filter_is_applied_before_sql_limit(self):
+        store = object.__new__(PostgresDetectionsStore)
+        store.tenant_id = "f3c3533e-bf17-46a1-a543-696d95b8cf6f"
+        space = {
+            "backend": "siglip2",
+            "model": "google/siglip2-base-patch16-224",
+            "revision": "revision-a",
+            "dimension": 768,
+            "contract": "siglip2-torchvision-lower64-v1",
+        }
+
+        where_sql, params = store._build_where(embedding_space=space)
+
+        self.assertIn(
+            "payload_json#>>'{embedding_space,fingerprint}' = %s",
+            where_sql,
+        )
+        self.assertEqual(len(params[-1]), 16)
+
+    def test_openai_clip_space_filter_keeps_only_compatible_legacy_rows(self):
+        store = object.__new__(PostgresDetectionsStore)
+        store.tenant_id = "f3c3533e-bf17-46a1-a543-696d95b8cf6f"
+
+        where_sql, params = store._build_where(
+            embedding_space={
+                "backend": "openai_clip",
+                "model": "ViT-B/32",
+                "dimension": 512,
+            },
+            allow_legacy_embedding_space=True,
+        )
+
+        self.assertIn("fingerprint}' IS NULL", where_sql)
+        self.assertIn("backend}' = %s", where_sql)
+        self.assertIn("model}' = %s", where_sql)
+        self.assertEqual(params[-3:], ["openai_clip", "ViT-B/32", "512"])
+
 
 class MigrationContentTests(unittest.TestCase):
     @classmethod

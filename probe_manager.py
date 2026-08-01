@@ -9,6 +9,7 @@ import numpy as np
 from PIL import Image
 
 from config import config
+from embedding_space import embedding_space_fingerprint
 
 
 class _FaissTypingStub:
@@ -414,17 +415,50 @@ class ProbeManager:
         embed_image_fn: Callable[[Image.Image], np.ndarray],
         embed_text_fn: Callable[[str], np.ndarray],
         jpeg_encoder: Callable[..., str],
+        embed_image_with_metadata_fn: Optional[
+            Callable[[Image.Image], Tuple[np.ndarray, Mapping[str, Any]]]
+        ] = None,
+        embedding_space_fn: Optional[Callable[[], Mapping[str, Any]]] = None,
     ) -> None:
         self.buffers: Dict[int, ProbeBuffer] = {}
         self.lock = threading.Lock()
         self.max_frames = config.PROBE_MAX_FRAMES
         self.thumb_edge = config.PROBE_THUMB_MAX_EDGE
         self.embed_image_fn = embed_image_fn
+        self.embed_image_with_metadata_fn = embed_image_with_metadata_fn
+        self.embedding_space_fn = embedding_space_fn
+        self._buffer_embedding_fingerprints: Dict[int, str] = {}
         self.embed_text_fn = embed_text_fn
         self.jpeg_encoder = jpeg_encoder
         self._text_embedding_cache: Dict[str, np.ndarray] = {}
         self._text_embedding_cache_lock = threading.Lock()
         self._text_embedding_cache_limit = 512
+
+    @staticmethod
+    def _space_fingerprint(value: Any) -> str:
+        if not isinstance(value, Mapping) or not value:
+            return ""
+        return embedding_space_fingerprint(value)
+
+    def _current_space_fingerprint(self) -> str:
+        if self.embedding_space_fn is None:
+            return ""
+        try:
+            return self._space_fingerprint(self.embedding_space_fn())
+        except Exception:
+            return ""
+
+    def _buffer_matches_current_space(self, channel_id: int) -> bool:
+        current = self._current_space_fingerprint()
+        if not current:
+            return True
+        with self.lock:
+            buffered = self._buffer_embedding_fingerprints.get(int(channel_id))
+            if not buffered or buffered == current:
+                return True
+            self.buffers.pop(int(channel_id), None)
+            self._buffer_embedding_fingerprints.pop(int(channel_id), None)
+        return False
 
     def _buffer(self, channel_id: int) -> ProbeBuffer:
         if channel_id not in self.buffers:
@@ -439,10 +473,30 @@ class ProbeManager:
         provenance: Optional[Mapping[str, Any]] = None,
     ) -> Dict[str, Any]:
         ts_ms = timestamp_ms or int(time.time() * 1000)
-        emb = self.embed_image_fn(pil_image)
+        embedding_space: Dict[str, Any] = {}
+        if self.embed_image_with_metadata_fn is not None:
+            emb, raw_metadata = self.embed_image_with_metadata_fn(pil_image)
+            if isinstance(raw_metadata, Mapping):
+                embedding_space = dict(raw_metadata)
+        else:
+            emb = self.embed_image_fn(pil_image)
+        frame_fingerprint = self._space_fingerprint(embedding_space)
         thumb = self.jpeg_encoder(pil_image, max_edge=self.thumb_edge, quality=70)
         with self.lock:
+            previous_fingerprint = self._buffer_embedding_fingerprints.get(
+                int(channel_id)
+            )
+            if (
+                frame_fingerprint
+                and previous_fingerprint
+                and frame_fingerprint != previous_fingerprint
+            ):
+                self.buffers.pop(int(channel_id), None)
             buf = self._buffer(channel_id)
+            if frame_fingerprint:
+                self._buffer_embedding_fingerprints[int(channel_id)] = (
+                    frame_fingerprint
+                )
             frame_uid = buf.add(
                 emb,
                 ts_ms,
@@ -456,6 +510,7 @@ class ProbeManager:
             "timestamp_ms": int(ts_ms),
             "embedding_ref": f"probe-buffer:{int(channel_id)}:{int(frame_uid)}",
             "embedding": emb,
+            "embedding_space": embedding_space,
             "thumbnail": thumb,
         }
 
@@ -465,7 +520,9 @@ class ProbeManager:
             normalized = " ".join(str(t or "").split())
             if not normalized:
                 continue
-            cache_key = normalized.casefold()
+            cache_key = (
+                f"{self._current_space_fingerprint()}:{normalized.casefold()}"
+            )
             with self._text_embedding_cache_lock:
                 cached = self._text_embedding_cache.get(cache_key)
             if cached is None:
@@ -498,6 +555,11 @@ class ProbeManager:
     ) -> Dict[str, Any]:
         """Score all saved embedding snapshots without applying hit thresholds."""
 
+        if not self._buffer_matches_current_space(channel_id):
+            return {
+                "error": "Probe buffer belonged to a previous embedding space and was cleared.",
+                "frames_indexed": 0,
+            }
         pos_texts = [str(item).strip() for item in positives if str(item).strip()]
         neg_texts = [str(item).strip() for item in negatives if str(item).strip()]
         if not pos_texts:
@@ -546,6 +608,11 @@ class ProbeManager:
         roi_norm: Optional[Tuple[float, float, float, float]] = None,
         roi_padding: float = 0.05,
     ) -> Dict[str, Any]:
+        if not self._buffer_matches_current_space(channel_id):
+            return {
+                "error": "Probe buffer belonged to a previous embedding space and was cleared.",
+                "frames_indexed": 0,
+            }
         pos_texts = [p.strip() for p in positives if str(p).strip()]
         neg_texts = [n.strip() for n in negatives if str(n).strip()]
         image_enabled = False
@@ -619,9 +686,11 @@ class ProbeManager:
     def clear(self, channel_id: int) -> None:
         with self.lock:
             self.buffers.pop(channel_id, None)
+            self._buffer_embedding_fingerprints.pop(channel_id, None)
 
     def clear_all(self) -> None:
         with self.lock:
             self.buffers.clear()
+            self._buffer_embedding_fingerprints.clear()
         with self._text_embedding_cache_lock:
             self._text_embedding_cache.clear()

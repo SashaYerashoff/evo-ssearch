@@ -11,8 +11,9 @@ Invariants: [facts](../00_CANON/facts.md). Config: [config_reference](../00_CANO
   gateway. TLS is normally terminated before Gunicorn (Nginx/site proxy).
 - **PostgreSQL** — control plane: IAM, agent sessions, audit, archive
   (`archive.detections`, `archive.probes`, `archive.runtime_state`). RLS forced.
-- **CLIP embedder** — runs on the app host; embeds every captured frame and
-  search queries (`ViT-B/32`).
+- **SigLIP2/CLIP embedder** — runs in the app process; the default pinned
+  SigLIP2 base model embeds every cadence frame and search query into a tagged
+  vector epoch. OpenAI CLIP remains available for A/B and legacy archive access.
 - **VLM inference** (vLLM, `qwen3-vl-4b`) — produces video-descriptions; runs on
   dedicated host(s).
 - **Agent LM** — the conversational agent profile. The constrained eight-channel

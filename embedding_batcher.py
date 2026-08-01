@@ -12,7 +12,7 @@ import threading
 import time
 from collections import Counter, deque
 from dataclasses import dataclass, field
-from typing import Any, Callable, Deque, Optional, Sequence
+from typing import Any, Callable, Deque, Mapping, Optional, Sequence
 
 import numpy as np
 
@@ -29,12 +29,21 @@ class EmbeddingBatchTimeout(EmbeddingBatchError):
     """Raised when a caller cannot obtain its embedding before the deadline."""
 
 
+@dataclass(frozen=True)
+class EmbeddingBatchOutput:
+    """One batch plus immutable metadata from the same encoder generation."""
+
+    embeddings: np.ndarray
+    metadata: Mapping[str, Any] = field(default_factory=dict)
+
+
 @dataclass
 class _EmbeddingRequest:
     image: Any
     submitted_at: float
     done: threading.Event = field(default_factory=threading.Event)
     result: Optional[np.ndarray] = None
+    metadata: Mapping[str, Any] = field(default_factory=dict)
     error: Optional[BaseException] = None
     cancelled: bool = False
 
@@ -101,6 +110,20 @@ class ImageEmbeddingBatcher:
     ) -> np.ndarray:
         """Return exactly one embedding or raise an explicit bounded error."""
 
+        result, _metadata = self.embed_one_with_metadata(
+            image,
+            timeout_sec=timeout_sec,
+        )
+        return result
+
+    def embed_one_with_metadata(
+        self,
+        image: Any,
+        *,
+        timeout_sec: Optional[float] = None,
+    ) -> tuple[np.ndarray, dict[str, Any]]:
+        """Return one embedding and its batch encoder-generation metadata."""
+
         request = _EmbeddingRequest(image=image, submitted_at=time.monotonic())
         with self._condition:
             if self._stopping:
@@ -135,7 +158,7 @@ class ImageEmbeddingBatcher:
             raise EmbeddingBatchError(str(request.error)) from request.error
         if request.result is None:
             raise EmbeddingBatchError("embedding batch produced no result")
-        return request.result
+        return request.result, dict(request.metadata)
 
     def drain(self, timeout_sec: float = 15.0) -> bool:
         deadline = time.monotonic() + max(0.0, float(timeout_sec))
@@ -147,7 +170,7 @@ class ImageEmbeddingBatcher:
                 self._condition.wait(timeout=min(0.1, remaining))
             return True
 
-    def stop(self, timeout_sec: float = 5.0) -> None:
+    def stop(self, timeout_sec: float = 5.0) -> bool:
         with self._condition:
             self._stopping = True
             pending = list(self._queue)
@@ -161,6 +184,7 @@ class ImageEmbeddingBatcher:
             thread = self._thread
         if thread is not None and thread.is_alive():
             thread.join(timeout=max(0.0, float(timeout_sec)))
+        return bool(thread is None or not thread.is_alive())
 
     def status(self) -> dict[str, Any]:
         with self._condition:
@@ -211,6 +235,10 @@ class ImageEmbeddingBatcher:
 
             try:
                 raw = self.embed_many([request.image for request in batch])
+                metadata: Mapping[str, Any] = {}
+                if isinstance(raw, EmbeddingBatchOutput):
+                    metadata = dict(raw.metadata)
+                    raw = raw.embeddings
                 matrix = np.asarray(raw, dtype=np.float32)
                 if matrix.ndim == 1 and len(batch) == 1:
                     matrix = matrix.reshape(1, -1)
@@ -224,6 +252,7 @@ class ImageEmbeddingBatcher:
                         matrix[index],
                         dtype=np.float32,
                     ).reshape(-1)
+                    request.metadata = dict(metadata)
                 with self._condition:
                     self._counters["completed_total"] += len(batch)
                     self._counters["batches_total"] += 1

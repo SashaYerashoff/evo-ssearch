@@ -15,6 +15,11 @@ from typing import Any, Dict, List, Optional, Tuple, cast
 import numpy as np
 
 from eva_db import PsycopgPool, TransactionContext
+from embedding_space import (
+    embedding_space_fingerprint,
+    embedding_space_requires_identity,
+    normalize_embedding_space,
+)
 
 
 NIL_UUID = uuid.UUID(int=0)
@@ -878,6 +883,8 @@ class PostgresDetectionsStore(_TenantRepository):
         include_thumbnail: bool = True,
         source: Optional[str] = None,
         channel_ids: Optional[Sequence[int]] = None,
+        embedding_space: Optional[Mapping[str, Any]] = None,
+        allow_legacy_embedding_space: bool = False,
     ) -> List[Dict[str, Any]]:
         limit = max(1, min(100000, int(limit or 20000)))
         where_sql, params = self._build_where(
@@ -888,6 +895,8 @@ class PostgresDetectionsStore(_TenantRepository):
             since_ms=since_ms,
             until_ms=until_ms,
             only_with_clip=only_with_clip,
+            embedding_space=embedding_space,
+            allow_legacy_embedding_space=allow_legacy_embedding_space,
         )
         try:
             with self.lock:
@@ -917,6 +926,8 @@ class PostgresDetectionsStore(_TenantRepository):
         only_with_clip: bool = True,
         source: Optional[str] = None,
         channel_ids: Optional[Sequence[int]] = None,
+        embedding_space: Optional[Mapping[str, Any]] = None,
+        allow_legacy_embedding_space: bool = False,
     ) -> int:
         where_sql, params = self._build_where(
             probe_id=probe_id,
@@ -926,6 +937,8 @@ class PostgresDetectionsStore(_TenantRepository):
             since_ms=since_ms,
             until_ms=until_ms,
             only_with_clip=only_with_clip,
+            embedding_space=embedding_space,
+            allow_legacy_embedding_space=allow_legacy_embedding_space,
         )
         try:
             with self.lock:
@@ -1651,6 +1664,8 @@ class PostgresDetectionsStore(_TenantRepository):
         ids: Optional[Sequence[int]] = None,
         batch_id: Optional[str] = None,
         parent_alert_id: Optional[str] = None,
+        embedding_space: Optional[Mapping[str, Any]] = None,
+        allow_legacy_embedding_space: bool = False,
     ) -> Tuple[str, List[Any]]:
         where: List[str] = ["tenant_id = %s"]
         params: List[Any] = [self.tenant_id]
@@ -1703,6 +1718,40 @@ class PostgresDetectionsStore(_TenantRepository):
             where.append("clip_vec IS NOT NULL")
         if only_with_dino:
             where.append("dino_vec IS NOT NULL")
+        normalized_space = normalize_embedding_space(embedding_space)
+        if normalized_space:
+            fingerprint = embedding_space_fingerprint(normalized_space)
+            fingerprint_sql = (
+                "payload_json#>>'{embedding_space,fingerprint}' = %s"
+            )
+            if (
+                allow_legacy_embedding_space
+                and not embedding_space_requires_identity(normalized_space)
+            ):
+                legacy_clauses = [
+                    "payload_json#>>'{embedding_space,fingerprint}' IS NULL",
+                    "(payload_json#>>'{embedding_space,backend}' IS NULL "
+                    "OR payload_json#>>'{embedding_space,backend}' = %s)",
+                    "(payload_json#>>'{embedding_space,model}' IS NULL "
+                    "OR payload_json#>>'{embedding_space,model}' = %s)",
+                ]
+                legacy_params: List[Any] = [
+                    str(normalized_space.get("backend") or "openai_clip"),
+                    str(normalized_space.get("model") or ""),
+                ]
+                if normalized_space.get("dimension") is not None:
+                    legacy_clauses.append(
+                        "(payload_json#>>'{embedding_space,dimension}' IS NULL "
+                        "OR payload_json#>>'{embedding_space,dimension}' = %s)"
+                    )
+                    legacy_params.append(str(normalized_space["dimension"]))
+                where.append(
+                    f"({fingerprint_sql} OR ({' AND '.join(legacy_clauses)}))"
+                )
+                params.extend([fingerprint, *legacy_params])
+            else:
+                where.append(fingerprint_sql)
+                params.append(fingerprint)
         if ids is not None:
             ids_clean = [int(item) for item in ids]
             if ids_clean:
