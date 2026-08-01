@@ -19,6 +19,10 @@ import xml.etree.ElementTree as ET
 INCIDENT_MAX_WINDOW_MS = 6 * 60 * 60 * 1000
 INCIDENT_DEFAULT_RADIUS_MS = 15 * 60 * 1000
 INCIDENT_CONTINUITY_GAP_MS = 2 * 60 * 1000
+INCIDENT_SEMANTIC_ROLE_WINDOW_MS = 30 * 1000
+INCIDENT_SEMANTIC_QUERY_LIMIT = 64
+INCIDENT_MAX_SEMANTIC_REFS = 5
+INCIDENT_MAX_SCORE_REFS = 256
 
 
 class DetectionMemory(Protocol):
@@ -143,6 +147,18 @@ def _summary_is_candidate(row: Mapping[str, Any]) -> bool:
             "state_transition_events",
             "events",
         )
+    )
+
+
+def _summary_row_key(row: Mapping[str, Any]) -> str:
+    payload = _payload(row)
+    batch_id = _text(row.get("batch_id") or payload.get("batch_id"), 160)
+    if batch_id:
+        return f"batch:{batch_id}"
+    return (
+        f"window:{_summary_timestamp_ms(row, 'batch_start_ms')}:"
+        f"{_summary_timestamp_ms(row, 'batch_end_ms')}:"
+        f"{_int(row.get('archive_id') or row.get('id'))}"
     )
 
 
@@ -290,21 +306,42 @@ class IncidentDraftAssembler:
             limit=500,
             offset=0,
         )
+        raw_window_summaries, raw_summary_total = self.detections.list_detections(
+            channel_id=channel_id,
+            source="vlm_summary",
+            since_ms=since_ms,
+            until_ms=until_ms,
+            limit=500,
+            offset=0,
+            include_thumbnail=False,
+        )
+        structured_window = self._dedupe_summary_detections(
+            raw_window_summaries,
+            (),
+        )
+        summaries = self._augment_summary_batches(
+            summaries,
+            structured_window,
+        )
         connected = _connected_candidate_rows(
             summaries,
             anchor_ms=anchor_ms,
             max_gap_ms=INCIDENT_CONTINUITY_GAP_MS,
         )
+        context_summaries, context_roles = self._summary_context(
+            summaries,
+            connected,
+        )
         observed_start = min(
             (_int(row.get("batch_start_ms"), anchor_ms) for row in connected),
             default=anchor_ms,
         )
-        observed_end = max(
+        candidate_end = max(
             (_int(row.get("batch_end_ms"), anchor_ms) for row in connected),
             default=anchor_ms,
         )
         drill_since = max(since_ms, observed_start - INCIDENT_CONTINUITY_GAP_MS)
-        drill_until = min(until_ms, observed_end + INCIDENT_CONTINUITY_GAP_MS)
+        drill_until = min(until_ms, candidate_end + INCIDENT_CONTINUITY_GAP_MS)
 
         alerts, alert_total = self.detections.list_detections(
             channel_id=channel_id,
@@ -315,18 +352,9 @@ class IncidentDraftAssembler:
             offset=0,
             include_thumbnail=False,
         )
-        raw_summaries, _raw_summary_total = self.detections.list_detections(
-            channel_id=channel_id,
-            source="vlm_summary",
-            since_ms=drill_since,
-            until_ms=drill_until,
-            limit=500,
-            offset=0,
-            include_thumbnail=False,
-        )
         structured_summaries = self._dedupe_summary_detections(
-            raw_summaries,
-            connected,
+            structured_window,
+            context_summaries,
         )
         telemetry = self._attention_rows(channel_id, drill_since, drill_until)
         timeline = self._timeline(
@@ -334,13 +362,50 @@ class IncidentDraftAssembler:
             alerts,
             telemetry["intervals"],
         )
-        evidence = self._evidence(connected, alerts, telemetry["links"])
-        qualia = self._qualia_digest(telemetry["scores"], telemetry["intervals"])
+        apex_ms = self._apex_timestamp(timeline, anchor_ms)
+        resolution_ms = self._resolution_timestamp(timeline)
+        has_post_control = any(
+            role == "context_after"
+            and not _summary_is_candidate(row)
+            for row in context_summaries
+            for role in (context_roles.get(_summary_row_key(row)),)
+        )
+        observed_end: Optional[int] = (
+            int(resolution_ms)
+            if resolution_ms is not None
+            else int(candidate_end)
+            if has_post_control
+            else None
+        )
+        semantic_refs, semantic_status = self._semantic_snapshot_refs(
+            channel_id=channel_id,
+            drill_since=drill_since,
+            drill_until=drill_until,
+            observed_start=observed_start,
+            apex_ms=apex_ms,
+            candidate_end=candidate_end,
+            context_summaries=context_summaries,
+            context_roles=context_roles,
+        )
+        evidence = self._evidence(
+            context_summaries,
+            alerts,
+            telemetry["links"],
+            summary_roles=context_roles,
+            semantic_refs=semantic_refs,
+        )
+        qualia = self._qualia_digest(
+            telemetry["scores"],
+            telemetry["intervals"],
+            attention_status=telemetry["status"],
+        )
         coverage = self._coverage(
             summaries,
             since_ms=drill_since,
             until_ms=drill_until,
             summary_total=summary_total,
+            attention_status=telemetry["status"],
+            semantic_status=semantic_status,
         )
         severity = self._severity(timeline)
         title = self._title(timeline, anchor_row)
@@ -370,10 +435,22 @@ class IncidentDraftAssembler:
             "time_bounds": {
                 "possible_start_ms": drill_since,
                 "observed_start_ms": observed_start,
-                "apex_ms": self._apex_timestamp(timeline, anchor_ms),
+                "apex_ms": apex_ms,
                 "observed_end_ms": observed_end,
                 "possible_end_ms": drill_until,
+                "start_status": "observed" if connected else "possible",
+                "end_status": (
+                    "resolved"
+                    if resolution_ms is not None
+                    else "post_control"
+                    if has_post_control
+                    else "open"
+                ),
             },
+            "summary_context": self._summary_context_digest(
+                context_summaries,
+                context_roles,
+            ),
             "timeline": timeline,
             "evidence": evidence,
             "qualia_digest": qualia,
@@ -383,12 +460,161 @@ class IncidentDraftAssembler:
             "provenance": {
                 "summary_rows_considered": len(summaries),
                 "connected_summary_rows": len(connected),
+                "context_summary_rows": len(context_summaries),
                 "structured_summary_rows": len(structured_summaries),
+                "structured_summary_rows_available": int(raw_summary_total),
                 "alert_rows": len(alerts),
                 "alert_rows_available": int(alert_total),
                 "attention_store": bool(self.attention is not None),
             },
         }
+
+    def refresh(
+        self,
+        incident: Mapping[str, Any],
+        *,
+        until_ms: int,
+    ) -> dict[str, Any]:
+        """Rebuild an existing envelope through a later point in time.
+
+        The method is side-effect free. Callers decide whether and how to
+        persist the refreshed record, which keeps follow scheduling and
+        authorization outside this reconstruction module.
+        """
+
+        channel_ids = [
+            _int(value)
+            for value in _sequence(incident.get("channel_ids"))
+            if _int(value) > 0
+        ]
+        channel_id = _int(incident.get("primary_channel_id")) or (
+            channel_ids[0] if channel_ids else 0
+        )
+        if channel_id <= 0:
+            raise ValueError("incident has no positive channel id")
+        bounds = _mapping(incident.get("time_bounds"))
+        since_ms = _int(
+            bounds.get("possible_start_ms")
+            or incident.get("possible_start_ms")
+        )
+        if since_ms <= 0:
+            raise ValueError("incident has no possible start")
+        anchor = _mapping(incident.get("anchor") or incident.get("anchor_ref"))
+        anchor_detection_id = _int(anchor.get("detection_id")) or None
+        anchor_ms = _int(anchor.get("timestamp_ms")) or since_ms
+        refreshed = self.assemble(
+            IncidentDraftRequest(
+                channel_id=channel_id,
+                anchor_detection_id=anchor_detection_id,
+                since_ms=since_ms,
+                until_ms=int(until_ms),
+                now_ms=anchor_ms,
+            )
+        )
+        for key in ("id", "revision", "state", "focus_lease"):
+            if key in incident:
+                refreshed[key] = incident[key]
+        return refreshed
+
+    @staticmethod
+    def _augment_summary_batches(
+        summaries: Sequence[Mapping[str, Any]],
+        structured: Sequence[Mapping[str, Any]],
+    ) -> list[Mapping[str, Any]]:
+        structured_by_batch: dict[str, Mapping[str, Any]] = {}
+        for row in structured:
+            payload = _payload(row)
+            batch_id = _text(payload.get("batch_id"), 160)
+            if batch_id:
+                structured_by_batch[batch_id] = row
+        augmented: list[Mapping[str, Any]] = []
+        for raw in summaries:
+            row = dict(raw)
+            batch_id = _text(row.get("batch_id"), 160)
+            structured_row = structured_by_batch.get(batch_id)
+            if structured_row is not None:
+                structured_payload = dict(_payload(structured_row))
+                existing_payload = dict(_payload(row))
+                existing_payload.update(structured_payload)
+                row["payload"] = existing_payload
+                transitions = _sequence(
+                    structured_payload.get("state_transition_events")
+                )
+                if transitions:
+                    row["state_transition_total"] = len(transitions)
+            augmented.append(row)
+        return augmented
+
+    @staticmethod
+    def _summary_context(
+        summaries: Sequence[Mapping[str, Any]],
+        connected: Sequence[Mapping[str, Any]],
+    ) -> tuple[list[Mapping[str, Any]], dict[str, str]]:
+        ordered = sorted(
+            summaries,
+            key=lambda row: (
+                _summary_timestamp_ms(row, "batch_start_ms"),
+                _summary_timestamp_ms(row, "batch_end_ms"),
+                _summary_row_key(row),
+            ),
+        )
+        connected_keys = {_summary_row_key(row) for row in connected}
+        roles = {key: "candidate" for key in connected_keys}
+        indexes = [
+            index
+            for index, row in enumerate(ordered)
+            if _summary_row_key(row) in connected_keys
+        ]
+        if not indexes:
+            return list(connected), roles
+        first_index = min(indexes)
+        last_index = max(indexes)
+        before = next(
+            (
+                ordered[index]
+                for index in range(first_index - 1, -1, -1)
+                if not _summary_is_candidate(ordered[index])
+            ),
+            None,
+        )
+        after = next(
+            (
+                ordered[index]
+                for index in range(last_index + 1, len(ordered))
+                if not _summary_is_candidate(ordered[index])
+            ),
+            None,
+        )
+        selected = list(connected)
+        if before is not None:
+            selected.append(before)
+            roles[_summary_row_key(before)] = "context_before"
+        if after is not None:
+            selected.append(after)
+            roles[_summary_row_key(after)] = "context_after"
+        selected.sort(
+            key=lambda row: (
+                _summary_timestamp_ms(row, "batch_start_ms"),
+                _summary_row_key(row),
+            )
+        )
+        return selected, roles
+
+    @staticmethod
+    def _summary_context_digest(
+        rows: Sequence[Mapping[str, Any]],
+        roles: Mapping[str, str],
+    ) -> list[dict[str, Any]]:
+        return [
+            {
+                "batch_id": _text(row.get("batch_id"), 160),
+                "batch_start_ms": _summary_timestamp_ms(row, "batch_start_ms"),
+                "batch_end_ms": _summary_timestamp_ms(row, "batch_end_ms"),
+                "role": roles.get(_summary_row_key(row), "candidate"),
+                "candidate": _summary_is_candidate(row),
+            }
+            for row in rows[:502]
+        ]
 
     @staticmethod
     def _dedupe_summary_detections(
@@ -430,32 +656,227 @@ class IncidentDraftAssembler:
             key=lambda item: _int(item.get("timestamp_ms")),
         )
 
-    def _attention_rows(self, channel_id: int, since_ms: int, until_ms: int) -> dict[str, list[dict[str, Any]]]:
+    def _attention_rows(
+        self,
+        channel_id: int,
+        since_ms: int,
+        until_ms: int,
+    ) -> dict[str, Any]:
+        specs = {
+            "intervals": ("query_intervals", 2000),
+            "scores": ("query_probe_scores", 5000),
+            "links": ("query_evidence_links", 2000),
+        }
+        rows: dict[str, Any] = {key: [] for key in specs}
+        query_status: dict[str, dict[str, Any]] = {}
         if self.attention is None:
-            return {"intervals": [], "scores": [], "links": []}
-        try:
-            return {
-                "intervals": self.attention.query_intervals(
-                    channel_id=channel_id,
-                    start_ms=since_ms,
-                    end_ms=until_ms,
-                    limit=2000,
-                ),
-                "scores": self.attention.query_probe_scores(
-                    channel_id=channel_id,
-                    start_ms=since_ms,
-                    end_ms=until_ms,
-                    limit=5000,
-                ),
-                "links": self.attention.query_evidence_links(
-                    channel_id=channel_id,
-                    start_ms=since_ms,
-                    end_ms=until_ms,
-                    limit=2000,
-                ),
+            for key in specs:
+                query_status[key] = {
+                    "status": "unavailable",
+                    "row_count": 0,
+                    "reason": "attention_store_unavailable",
+                }
+            rows["status"] = {
+                "overall": "unavailable",
+                "queries": query_status,
             }
-        except Exception:
-            return {"intervals": [], "scores": [], "links": []}
+            return rows
+        successful = 0
+        for key, (method_name, limit) in specs.items():
+            method = getattr(self.attention, method_name, None)
+            if not callable(method):
+                query_status[key] = {
+                    "status": "unavailable",
+                    "row_count": 0,
+                    "reason": "query_not_supported",
+                }
+                continue
+            try:
+                values = method(
+                    channel_id=channel_id,
+                    start_ms=since_ms,
+                    end_ms=until_ms,
+                    limit=limit,
+                )
+                rows[key] = [
+                    dict(value)
+                    for value in values
+                    if isinstance(value, Mapping)
+                ]
+                successful += 1
+                query_status[key] = {
+                    "status": "ok",
+                    "row_count": len(rows[key]),
+                }
+            except Exception as exc:
+                query_status[key] = {
+                    "status": "unavailable",
+                    "row_count": 0,
+                    "reason": type(exc).__name__,
+                }
+        rows["status"] = {
+            "overall": (
+                "ok"
+                if successful == len(specs)
+                else "partial"
+                if successful > 0
+                else "unavailable"
+            ),
+            "queries": query_status,
+        }
+        return rows
+
+    def _semantic_snapshot_refs(
+        self,
+        *,
+        channel_id: int,
+        drill_since: int,
+        drill_until: int,
+        observed_start: int,
+        apex_ms: int,
+        candidate_end: int,
+        context_summaries: Sequence[Mapping[str, Any]],
+        context_roles: Mapping[str, str],
+    ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+        before_row = next(
+            (
+                row
+                for row in context_summaries
+                if context_roles.get(_summary_row_key(row)) == "context_before"
+            ),
+            None,
+        )
+        after_row = next(
+            (
+                row
+                for row in context_summaries
+                if context_roles.get(_summary_row_key(row)) == "context_after"
+            ),
+            None,
+        )
+        targets: list[tuple[str, int, str]] = [
+            (
+                "control_before",
+                (
+                    _summary_timestamp_ms(before_row, "batch_start_ms")
+                    + _summary_timestamp_ms(before_row, "batch_end_ms")
+                )
+                // 2
+                if before_row is not None
+                else observed_start,
+                "before",
+            ),
+            ("onset", observed_start, "near"),
+            ("apex", apex_ms, "near"),
+            ("post", candidate_end, "near"),
+        ]
+        if after_row is not None:
+            targets.append(
+                (
+                    "control_after",
+                    (
+                        _summary_timestamp_ms(after_row, "batch_start_ms")
+                        + _summary_timestamp_ms(after_row, "batch_end_ms")
+                    )
+                    // 2,
+                    "after",
+                )
+            )
+        refs: list[dict[str, Any]] = []
+        query_status: dict[str, dict[str, Any]] = {}
+        for role, target_ms, direction in targets[:INCIDENT_MAX_SEMANTIC_REFS]:
+            if direction == "before":
+                query_since = max(
+                    drill_since,
+                    target_ms - INCIDENT_SEMANTIC_ROLE_WINDOW_MS,
+                )
+                query_until = min(drill_until, target_ms)
+            elif direction == "after":
+                query_since = max(drill_since, target_ms)
+                query_until = min(
+                    drill_until,
+                    target_ms + INCIDENT_SEMANTIC_ROLE_WINDOW_MS,
+                )
+            else:
+                query_since = max(
+                    drill_since,
+                    target_ms - INCIDENT_SEMANTIC_ROLE_WINDOW_MS,
+                )
+                query_until = min(
+                    drill_until,
+                    target_ms + INCIDENT_SEMANTIC_ROLE_WINDOW_MS,
+                )
+            if query_until < query_since:
+                query_status[role] = {
+                    "status": "empty",
+                    "row_count": 0,
+                }
+                continue
+            try:
+                values, total = self.detections.list_detections(
+                    channel_id=channel_id,
+                    source="semantic_snapshot",
+                    since_ms=query_since,
+                    until_ms=query_until,
+                    limit=INCIDENT_SEMANTIC_QUERY_LIMIT,
+                    offset=0,
+                    include_thumbnail=False,
+                )
+            except Exception as exc:
+                query_status[role] = {
+                    "status": "unavailable",
+                    "row_count": 0,
+                    "reason": type(exc).__name__,
+                }
+                continue
+            candidates = [
+                value
+                for value in values
+                if isinstance(value, Mapping)
+                and _text(value.get("source"), 40) == "semantic_snapshot"
+            ]
+            query_status[role] = {
+                "status": "ok" if candidates else "empty",
+                "row_count": len(candidates),
+                "rows_available": int(total),
+            }
+            if not candidates:
+                continue
+            selected = min(
+                candidates,
+                key=lambda value: (
+                    abs(_int(value.get("timestamp_ms")) - target_ms),
+                    _int(value.get("timestamp_ms")),
+                    _int(value.get("id")),
+                ),
+            )
+            payload = _payload(selected)
+            refs.append(
+                {
+                    "kind": "semantic_snapshot",
+                    "role": role,
+                    "detection_id": _int(selected.get("id")) or None,
+                    "timestamp_ms": _int(selected.get("timestamp_ms")),
+                    "cadence_ms": _int(payload.get("cadence_ms")) or None,
+                    "shard_key": _text(selected.get("shard_key"), 160) or None,
+                }
+            )
+        statuses = {
+            str(value.get("status") or "unavailable")
+            for value in query_status.values()
+        }
+        overall = (
+            "unavailable"
+            if query_status and statuses == {"unavailable"}
+            else "partial"
+            if "unavailable" in statuses or "empty" in statuses
+            else "ok"
+        )
+        return refs, {
+            "overall": overall,
+            "references": len(refs),
+            "queries": query_status,
+        }
 
     @staticmethod
     def _timeline(
@@ -477,33 +898,50 @@ class IncidentDraftAssembler:
                 for raw in _sequence(payload.get(field)):
                     if not isinstance(raw, Mapping):
                         continue
-                    items.append(
-                        {
-                            "timestamp_ms": _event_timestamp(raw, fallback_ts),
-                            "semantic_key": _event_key(raw, fallback_key),
-                            "label": _event_label(raw, fallback_key.replace("_", " ").title()),
-                            "severity": _event_severity(raw),
-                            "confidence": _text(raw.get("confidence"), 24) or "unknown",
-                            "source": source,
-                            "summary_detection_id": _int(row.get("id")) or None,
-                        }
-                    )
+                    item = {
+                        "timestamp_ms": _event_timestamp(raw, fallback_ts),
+                        "semantic_key": _event_key(raw, fallback_key),
+                        "label": _event_label(raw, fallback_key.replace("_", " ").title()),
+                        "severity": _event_severity(raw),
+                        "confidence": _text(raw.get("confidence"), 24) or "unknown",
+                        "source": source,
+                        "summary_detection_id": _int(row.get("id")) or None,
+                    }
+                    for key in (
+                        "state",
+                        "event_type",
+                        "from_state",
+                        "to_state",
+                    ):
+                        value = _text(raw.get(key), 40).lower()
+                        if value:
+                            item[key] = value
+                    snapshot_indices = [
+                        _int(value)
+                        for value in _sequence(raw.get("snapshot_indices"))
+                        if _int(value) > 0
+                    ][:16]
+                    if snapshot_indices:
+                        item["snapshot_indices"] = snapshot_indices
+                    items.append(item)
         for row in alerts:
             payload = _payload(row)
-            items.append(
-                {
-                    "timestamp_ms": _int(row.get("timestamp_ms")),
-                    "semantic_key": _event_key(payload, "vlm_alert"),
-                    "label": _event_label(
-                        payload,
-                        _text(row.get("probe_name"), 600) or "VLM alert",
-                    ),
-                    "severity": _event_severity(payload, _text(row.get("severity"), 24) or "normal"),
-                    "confidence": _text(payload.get("confidence"), 24) or "unknown",
-                    "source": "vlm_alert",
-                    "detection_id": _int(row.get("id")) or None,
-                }
-            )
+            item = {
+                "timestamp_ms": _int(row.get("timestamp_ms")),
+                "semantic_key": _event_key(payload, "vlm_alert"),
+                "label": _event_label(
+                    payload,
+                    _text(row.get("probe_name"), 600) or "VLM alert",
+                ),
+                "severity": _event_severity(payload, _text(row.get("severity"), 24) or "normal"),
+                "confidence": _text(payload.get("confidence"), 24) or "unknown",
+                "source": "vlm_alert",
+                "detection_id": _int(row.get("id")) or None,
+            }
+            state = _text(payload.get("state"), 40).lower()
+            if state:
+                item["state"] = state
+            items.append(item)
         for interval in intervals:
             if _text(interval.get("state"), 24) not in {"motion", "mixed"}:
                 continue
@@ -539,10 +977,37 @@ class IncidentDraftAssembler:
         return deduped[:500]
 
     @staticmethod
+    def _resolution_timestamp(
+        timeline: Sequence[Mapping[str, Any]],
+    ) -> Optional[int]:
+        resolved_states = {
+            "resolved",
+            "finished",
+            "ended",
+            "closed",
+            "absent",
+        }
+        timestamps: list[int] = []
+        for item in timeline:
+            state = _text(item.get("state"), 40).lower()
+            to_state = _text(item.get("to_state"), 40).lower()
+            if (
+                state in resolved_states
+                or to_state == "absent"
+            ):
+                timestamp_ms = _int(item.get("timestamp_ms"))
+                if timestamp_ms > 0:
+                    timestamps.append(timestamp_ms)
+        return max(timestamps) if timestamps else None
+
+    @staticmethod
     def _evidence(
         summaries: Sequence[Mapping[str, Any]],
         alerts: Sequence[Mapping[str, Any]],
         links: Sequence[Mapping[str, Any]],
+        *,
+        summary_roles: Optional[Mapping[str, str]] = None,
+        semantic_refs: Sequence[Mapping[str, Any]] = (),
     ) -> list[dict[str, Any]]:
         evidence: list[dict[str, Any]] = []
         seen: set[tuple[str, str]] = set()
@@ -557,7 +1022,12 @@ class IncidentDraftAssembler:
             evidence.append(
                 {
                     "kind": "detection",
-                    "role": "summary_anchor",
+                    "role": (
+                        (summary_roles or {}).get(
+                            _summary_row_key(row),
+                            "summary_anchor",
+                        )
+                    ),
                     "detection_id": detection_id,
                     "timestamp_ms": _int(row.get("batch_end_ms")),
                     "batch_id": _text(row.get("batch_id"), 160),
@@ -599,6 +1069,21 @@ class IncidentDraftAssembler:
                     "timestamp_ms": _int(row.get("occurred_at_ms")),
                 }
             )
+        for row in semantic_refs:
+            detection_id = _int(row.get("detection_id"))
+            role = _text(row.get("role"), 32)
+            if detection_id <= 0 or not role:
+                continue
+            evidence.append(
+                {
+                    "kind": "semantic_snapshot",
+                    "role": role,
+                    "detection_id": detection_id,
+                    "timestamp_ms": _int(row.get("timestamp_ms")),
+                    "cadence_ms": _int(row.get("cadence_ms")) or None,
+                    "shard_key": _text(row.get("shard_key"), 160) or None,
+                }
+            )
         evidence.sort(key=lambda item: _int(item.get("timestamp_ms")))
         return evidence[:500]
 
@@ -606,8 +1091,11 @@ class IncidentDraftAssembler:
     def _qualia_digest(
         scores: Sequence[Mapping[str, Any]],
         intervals: Sequence[Mapping[str, Any]],
+        *,
+        attention_status: Optional[Mapping[str, Any]] = None,
     ) -> dict[str, Any]:
         by_probe: dict[str, dict[str, Any]] = {}
+        score_refs: list[dict[str, Any]] = []
         for row in scores:
             probe_id = _text(row.get("probe_id"), 160)
             if not probe_id:
@@ -629,6 +1117,27 @@ class IncidentDraftAssembler:
             current["max_positive"] = max(current["max_positive"], _float(row.get("pos_score"), -1.0))
             current["max_negative"] = max(current["max_negative"], _float(row.get("neg_score"), -1.0))
             current["max_margin"] = max(current["max_margin"], _float(row.get("margin"), -2.0))
+            if len(score_refs) < INCIDENT_MAX_SCORE_REFS:
+                score_refs.append(
+                    {
+                        "probe_id": probe_id,
+                        "probe_version": _text(row.get("probe_version"), 120),
+                        "embedding_snapshot_id": _text(
+                            row.get("embedding_snapshot_id"),
+                            160,
+                        )
+                        or None,
+                        "captured_at_ms": _int(row.get("captured_at_ms")) or None,
+                        "scored_at_ms": _int(row.get("scored_at_ms")) or None,
+                        "positive": _float(row.get("pos_score")),
+                        "negative": _float(row.get("neg_score")),
+                        "margin": _float(row.get("margin")),
+                        "threshold_state": _text(
+                            row.get("threshold_state"),
+                            32,
+                        ),
+                    }
+                )
         motion_values = [
             _float(row.get("motion_p95"))
             for row in intervals
@@ -639,9 +1148,11 @@ class IncidentDraftAssembler:
             "interpretation": "attention signals only",
             "probe_count": len(by_probe),
             "probes": sorted(by_probe.values(), key=lambda item: (-item["hits"], item["probe_id"]))[:64],
+            "score_refs": score_refs,
             "motion_interval_count": len(motion_values),
             "motion_p95_max": max(motion_values, default=0.0),
             "motion_p95_mean": statistics.fmean(motion_values) if motion_values else 0.0,
+            "attention_status": dict(attention_status or {}),
         }
 
     @staticmethod
@@ -651,6 +1162,8 @@ class IncidentDraftAssembler:
         since_ms: int,
         until_ms: int,
         summary_total: int,
+        attention_status: Optional[Mapping[str, Any]] = None,
+        semantic_status: Optional[Mapping[str, Any]] = None,
     ) -> dict[str, Any]:
         spans = sorted(
             (
@@ -660,7 +1173,15 @@ class IncidentDraftAssembler:
             for row in summaries
             if _int(row.get("batch_end_ms")) >= _int(row.get("batch_start_ms")) > 0
         )
-        gaps: list[dict[str, int]] = []
+        durations = [end - start for start, end in spans if end > start]
+        gap_threshold_ms = max(
+            5_000,
+            min(
+                60_000,
+                int(statistics.median(durations) / 2) if durations else 30_000,
+            ),
+        )
+        gaps: list[dict[str, Any]] = []
         cursor = int(since_ms)
         covered_ms = 0
         for start, end in spans:
@@ -668,23 +1189,54 @@ class IncidentDraftAssembler:
             clipped_end = min(until_ms, end)
             if clipped_end < clipped_start:
                 continue
-            if clipped_start - cursor > INCIDENT_CONTINUITY_GAP_MS:
-                gaps.append({"start_ms": cursor, "end_ms": clipped_start})
+            if clipped_start - cursor > gap_threshold_ms:
+                gaps.append(
+                    {
+                        "kind": "inferred_l0_gap",
+                        "start_ms": cursor,
+                        "end_ms": clipped_start,
+                        "duration_ms": clipped_start - cursor,
+                    }
+                )
             if clipped_end > cursor:
                 covered_ms += max(0, clipped_end - max(cursor, clipped_start))
                 cursor = clipped_end
-        if until_ms - cursor > INCIDENT_CONTINUITY_GAP_MS:
-            gaps.append({"start_ms": cursor, "end_ms": until_ms})
+        if until_ms - cursor > gap_threshold_ms:
+            gaps.append(
+                {
+                    "kind": "inferred_l0_gap",
+                    "start_ms": cursor,
+                    "end_ms": until_ms,
+                    "duration_ms": until_ms - cursor,
+                }
+            )
         window_ms = max(1, until_ms - since_ms)
+        coverage_status = "no_data" if not spans else "partial" if gaps else "covered"
+        covered_fraction = round(min(1.0, covered_ms / window_ms), 4)
+        l0_ledger = {
+            "status": coverage_status,
+            "gap_threshold_ms": gap_threshold_ms,
+            "span_count": len(spans),
+            "inferred_gap_count": len(gaps),
+            "covered_fraction_estimate": covered_fraction,
+            "gaps": gaps[:100],
+        }
         return {
-            "status": "no_data" if not spans else "partial" if gaps else "covered",
+            "status": coverage_status,
             "window_start_ms": since_ms,
             "window_end_ms": until_ms,
             "summary_rows": len(spans),
             "summary_rows_available": int(summary_total),
-            "covered_fraction_estimate": round(min(1.0, covered_ms / window_ms), 4),
+            "covered_fraction_estimate": covered_fraction,
             "gaps": gaps[:100],
             "must_state_coverage": True,
+            "ledger": {
+                "l0": l0_ledger,
+                "attention": dict(attention_status or {"overall": "unavailable"}),
+                "semantic_snapshots": dict(
+                    semantic_status or {"overall": "unavailable"}
+                ),
+            },
         }
 
     @staticmethod

@@ -26,6 +26,14 @@ class _Detections:
         return (
             [
                 {
+                    "archive_id": 9,
+                    "batch_id": "b-0",
+                    "batch_start_ms": 1_700_000_000_000,
+                    "batch_end_ms": 1_700_000_060_000,
+                    "alert_total": 0,
+                    "payload": {},
+                },
+                {
                     "archive_id": 10,
                     "batch_id": "b-1",
                     "batch_start_ms": 1_700_000_060_000,
@@ -60,14 +68,32 @@ class _Detections:
                         ]
                     },
                 },
+                {
+                    "archive_id": 12,
+                    "batch_id": "b-3",
+                    "batch_start_ms": 1_700_000_160_000,
+                    "batch_end_ms": 1_700_000_220_000,
+                    "alert_total": 0,
+                    "payload": {},
+                },
             ],
-            2,
+            4,
         )
 
     def list_detections(self, **kwargs):
         if kwargs.get("source") == "vlm_summary":
             return (
                 [
+                    {
+                        "id": 9,
+                        "channel_id": 112,
+                        "timestamp_ms": 1_700_000_060_000,
+                        "payload": {
+                            "batch_id": "b-0",
+                            "batch_start_ms": 1_700_000_000_000,
+                            "batch_end_ms": 1_700_000_060_000,
+                        },
+                    },
                     {
                         "id": 10,
                         "channel_id": 112,
@@ -105,9 +131,40 @@ class _Detections:
                             ],
                         },
                     },
+                    {
+                        "id": 12,
+                        "channel_id": 112,
+                        "timestamp_ms": 1_700_000_220_000,
+                        "payload": {
+                            "batch_id": "b-3",
+                            "batch_start_ms": 1_700_000_160_000,
+                            "batch_end_ms": 1_700_000_220_000,
+                        },
+                    },
                 ],
-                2,
+                4,
             )
+        if kwargs.get("source") == "semantic_snapshot":
+            timestamps = (
+                1_700_000_030_000,
+                1_700_000_060_000,
+                1_700_000_120_000,
+                1_700_000_160_000,
+                1_700_000_190_000,
+            )
+            rows = [
+                {
+                    "id": 100 + index,
+                    "channel_id": 112,
+                    "timestamp_ms": timestamp_ms,
+                    "source": "semantic_snapshot",
+                    "shard_key": f"snapshot-{index}",
+                    "payload": {"cadence_ms": 1000},
+                }
+                for index, timestamp_ms in enumerate(timestamps)
+                if kwargs.get("since_ms", 0) <= timestamp_ms <= kwargs.get("until_ms", timestamp_ms)
+            ]
+            return rows, len(rows)
         return (
             [
                 {
@@ -145,6 +202,10 @@ class _Attention:
         return [
             {
                 "probe_id": "small-craft",
+                "probe_version": "v1",
+                "embedding_snapshot_id": "snapshot-1",
+                "captured_at_ms": 1_700_000_100_000,
+                "scored_at_ms": 1_700_000_100_100,
                 "threshold_state": "hit",
                 "pos_score": 0.81,
                 "neg_score": 0.22,
@@ -162,6 +223,29 @@ class _Attention:
                 "occurred_at_ms": 1_700_000_100_000,
             }
         ]
+
+
+class _OpenDetections(_Detections):
+    def list_vlm_summary_batches(self, **kwargs):
+        rows, _total = super().list_vlm_summary_batches(**kwargs)
+        selected = [row for row in rows if row.get("batch_id") != "b-3"]
+        return selected, len(selected)
+
+    def list_detections(self, **kwargs):
+        rows, total = super().list_detections(**kwargs)
+        if kwargs.get("source") != "vlm_summary":
+            return rows, total
+        selected = [
+            row
+            for row in rows
+            if (row.get("payload") or {}).get("batch_id") != "b-3"
+        ]
+        return selected, len(selected)
+
+
+class _PartialAttention(_Attention):
+    def query_probe_scores(self, **_kwargs):
+        raise RuntimeError("probe score store unavailable")
 
 
 def test_incident_draft_is_bounded_grounded_and_coverage_aware():
@@ -182,8 +266,73 @@ def test_incident_draft_is_bounded_grounded_and_coverage_aware():
     }
     assert draft["qualia_digest"]["ground_truth"] is False
     assert draft["qualia_digest"]["probes"][0]["hits"] == 1
+    assert draft["qualia_digest"]["score_refs"][0]["embedding_snapshot_id"] == "snapshot-1"
+    assert draft["qualia_digest"]["score_refs"][0]["captured_at_ms"] == 1_700_000_100_000
     assert any(item.get("reference") == "snapshot-1" for item in draft["evidence"])
     assert draft["coverage"]["must_state_coverage"] is True
+
+
+def test_incident_envelope_keeps_context_and_semantic_control_roles():
+    draft = IncidentDraftAssembler(_Detections(), _Attention()).assemble(
+        IncidentDraftRequest(channel_id=112, anchor_detection_id=41)
+    )
+
+    context_roles = [item["role"] for item in draft["summary_context"]]
+    assert context_roles.count("context_before") == 1
+    assert context_roles.count("candidate") == 2
+    assert context_roles.count("context_after") == 1
+    semantic_roles = {
+        item["role"]
+        for item in draft["evidence"]
+        if item.get("kind") == "semantic_snapshot"
+    }
+    assert semantic_roles == {
+        "control_before",
+        "onset",
+        "apex",
+        "post",
+        "control_after",
+    }
+    assert draft["time_bounds"]["end_status"] == "post_control"
+    assert draft["coverage"]["ledger"]["semantic_snapshots"]["overall"] == "ok"
+    assert draft["coverage"]["ledger"]["attention"]["overall"] == "ok"
+
+
+def test_ongoing_incident_keeps_observed_end_open_without_post_control():
+    draft = IncidentDraftAssembler(_OpenDetections(), _Attention()).assemble(
+        IncidentDraftRequest(channel_id=112, anchor_detection_id=41)
+    )
+
+    assert draft["time_bounds"]["observed_end_ms"] is None
+    assert draft["time_bounds"]["end_status"] == "open"
+
+
+def test_attention_query_failure_is_partial_not_silently_empty():
+    draft = IncidentDraftAssembler(_Detections(), _PartialAttention()).assemble(
+        IncidentDraftRequest(channel_id=112, anchor_detection_id=41)
+    )
+
+    attention = draft["coverage"]["ledger"]["attention"]
+    assert attention["overall"] == "partial"
+    assert attention["queries"]["scores"]["status"] == "unavailable"
+    assert attention["queries"]["intervals"]["status"] == "ok"
+    assert any(item["semantic_key"] == "motion_peak" for item in draft["timeline"])
+
+
+def test_one_minute_missing_l0_window_is_reported_as_a_gap():
+    coverage = IncidentDraftAssembler._coverage(
+        [
+            {"batch_start_ms": 1_000, "batch_end_ms": 61_000},
+            {"batch_start_ms": 121_000, "batch_end_ms": 181_000},
+        ],
+        since_ms=1_000,
+        until_ms=181_000,
+        summary_total=2,
+    )
+
+    assert coverage["status"] == "partial"
+    assert coverage["ledger"]["l0"]["inferred_gap_count"] == 1
+    assert coverage["gaps"][0]["duration_ms"] == 60_000
 
 
 def test_incident_draft_rejects_cross_channel_anchor():
