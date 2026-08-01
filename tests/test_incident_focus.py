@@ -18,6 +18,7 @@ class IncidentFocusLeaseManagerTests(unittest.TestCase):
             [7, 8, 7],
             level="follow",
             ttl_seconds=5,
+            context='{"summary":"person left the desk"}',
         )
         manager.start(
             "incident-critical",
@@ -27,6 +28,7 @@ class IncidentFocusLeaseManagerTests(unittest.TestCase):
         )
 
         self.assertEqual(first.channel_ids, (7, 8))
+        self.assertIn("person left the desk", first.context)
         self.assertEqual(
             manager.directive_for_channel(8).level,
             FocusLevel.CRITICAL,
@@ -44,6 +46,7 @@ class IncidentFocusLeaseManagerTests(unittest.TestCase):
             ttl_seconds=4,
         )
         self.assertEqual(refreshed.created_at_ms, 1_000)
+        self.assertEqual(refreshed.context, first.context)
         self.assertIsNone(manager.directive_for_channel(7))
         self.assertTrue(manager.stop("incident-follow"))
         self.assertFalse(manager.stop("incident-follow"))

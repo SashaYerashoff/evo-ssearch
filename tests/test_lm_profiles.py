@@ -112,6 +112,7 @@ class LmProfileRuntimeTests(unittest.TestCase):
                 model_override="vlm-a",
                 profile_kind="vlm",
                 workload_class="rollup",
+                max_tokens_override=2048,
             )
 
         self.assertEqual(result, "ok")
@@ -120,6 +121,7 @@ class LmProfileRuntimeTests(unittest.TestCase):
         self.assertEqual(captured["headers"]["Authorization"], "Bearer vlm-secret")
         self.assertEqual(captured["timeout"], 321)
         self.assertEqual(captured["workload"], "rollup")
+        self.assertEqual(captured["json"]["max_tokens"], 2048)
         self.assertEqual(
             captured["json"]["chat_template_kwargs"],
             {"enable_thinking": False},

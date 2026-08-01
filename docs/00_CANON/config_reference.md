@@ -141,6 +141,7 @@ provide recorder archive playback or an Evo bookmark destination.
 | `EVOSSEARCH_LUXRIOT_ROLLUP_BACKFILL_ESTIMATE_SEC` (`45`) | Initial per-window ETA estimate until the durable worker measures the deployed LM |
 | `EVOSSEARCH_LUXRIOT_ROLLUP_LLM_LEVELS` (`L1,L2,L3`) | Which levels get LLM synthesis |
 | `EVOSSEARCH_LUXRIOT_ROLLUP_LLM_MODEL` (`agent` profile when configured) | Text-only L1–L3 model/profile selector; intentionally independent of each live channel's VLM selector |
+| `EVOSSEARCH_LUXRIOT_ROLLUP_L1_MAX_TOKENS` (`768`) / `_L2_` (`1024`) / `_L3_` (`2048`) | Independent text completion budgets for normal L1–L3 synthesis. They do not enlarge the live visual L0 completion budget |
 | `EVOSSEARCH_LUXRIOT_ROLLUP_L3_DEEP_ENABLED` (`false`) | Route L3 only to a separate OpenAI-compatible text endpoint. L1/L2 remain on `ROLLUP_LLM_MODEL`; there is no fallback/offload to the live model |
 | `EVOSSEARCH_LUXRIOT_ROLLUP_L3_DEEP_BASE_URL` / `_MODEL` / `_API_KEY` | Separate CPU/deep-review endpoint (for example a local llama.cpp 9B server); the key is optional for a local unauthenticated endpoint |
 | `EVOSSEARCH_LUXRIOT_ROLLUP_L3_DEEP_CONNECT_TIMEOUT_SEC` (`5`) / `_READ_TIMEOUT_SEC` (`600`) | Bounded connect/read timeouts for deep L3 |

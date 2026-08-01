@@ -4176,6 +4176,7 @@ def _call_lm_chat(
     profile_kind: str = "vlm",
     preflight: Optional[Callable[[], None]] = None,
     workload_class: Optional[str] = None,
+    max_tokens_override: Optional[int] = None,
 ) -> str:
     profile = _resolve_lm_profile(
         profile_id=profile_id,
@@ -4196,7 +4197,11 @@ def _call_lm_chat(
         "model": str(profile.get("model") or "").strip(),
         "messages": messages,
         "temperature": float(config.LM_VIDEO_TEMPERATURE),
-        "max_tokens": int(config.LM_VIDEO_MAX_TOKENS),
+        "max_tokens": int(
+            max_tokens_override
+            if max_tokens_override is not None
+            else config.LM_VIDEO_MAX_TOKENS
+        ),
     }
     response: Optional[requests.Response] = None
     resource = normalize_lm_resource(base_url, str(profile.get("model") or ""))
@@ -4306,6 +4311,7 @@ def _call_video_understanding(
     profile_id: Optional[str] = None,
     preflight: Optional[Callable[[], None]] = None,
     workload_class: Optional[str] = None,
+    max_tokens_override: Optional[int] = None,
 ) -> str:
     return _call_lm_chat(
         messages,
@@ -4314,6 +4320,7 @@ def _call_video_understanding(
         profile_kind="vlm",
         preflight=preflight,
         workload_class=workload_class,
+        max_tokens_override=max_tokens_override,
     )
 
 
@@ -4329,6 +4336,7 @@ def _video_understanding_resource_key(model_override: Optional[str] = None) -> s
 
 _call_video_understanding.eva_generation_preflight = True  # type: ignore[attr-defined]
 _call_video_understanding.eva_workload_class = True  # type: ignore[attr-defined]
+_call_video_understanding.eva_max_tokens_override = True  # type: ignore[attr-defined]
 _call_video_understanding.eva_resource_key = _video_understanding_resource_key  # type: ignore[attr-defined]
 
 

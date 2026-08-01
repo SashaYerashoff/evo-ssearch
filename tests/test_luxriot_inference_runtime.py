@@ -1031,6 +1031,7 @@ class LuxriotIncidentFocusRuntimeTests(unittest.TestCase):
                 [7],
                 level="follow",
                 ttl_seconds=30,
+                context='{"title":"Desk departure","timeline":[{"label":"Person left the desk"}]}',
             )
             mode, priority, digest = manager.apply_incident_focus(
                 7,
@@ -1040,6 +1041,14 @@ class LuxriotIncidentFocusRuntimeTests(unittest.TestCase):
             self.assertEqual(mode.value, "active")
             self.assertGreaterEqual(priority, 0.65)
             self.assertEqual(digest["incident_ids"], ["incident-7"])
+            self.assertTrue(digest["context_attached"])
+            live_prompt = manager.compose_live_system_prompt(
+                7,
+                "Describe the current snapshots.",
+            )
+            self.assertIn("INCIDENT_FOCUS_JSON", live_prompt)
+            self.assertIn("Person left the desk", live_prompt)
+            self.assertIn("not current visual evidence", live_prompt)
 
             session = LuxriotCaptureSession(
                 manager,
@@ -6224,6 +6233,93 @@ class LuxriotCaptureDispatchTests(unittest.TestCase):
             self.assertIn("### Routine and Behavior", row["summary"])
             self.assertIn("### Coverage and Interruptions", row["summary"])
 
+    def test_rollup_restores_channel_metadata_promoted_to_first_heading(self):
+        with tempfile.TemporaryDirectory() as temp:
+            calls = []
+
+            def lm_callback(_messages, _model, **kwargs):
+                calls.append(dict(kwargs))
+                return (
+                    "### Channel 7 — 10:00-10:15, 12 frames, 1 items.\n"
+                    "Routine room observations.\n\n"
+                    "### Routine and Behavior\nDesk work continued.\n\n"
+                    "### Notable Observations and Exceptions\nA brief departure was sampled.\n\n"
+                    "### Alerts and Meaning\nNo structured alerts were recorded.\n\n"
+                    "### Coverage and Interruptions\nNo interruption was recorded in metadata.\n\n"
+                    "### Operator Takeaway\nReview the sampled departure if relevant.\n\n"
+                    "MEMORY_UPDATE_JSON:\n{}"
+                )
+
+            lm_callback.eva_workload_class = True
+            lm_callback.eva_max_tokens_override = True
+            manager = build_manager(
+                Path(temp),
+                lm_callback=lm_callback,
+                config_overrides={"LUXRIOT_ROLLUP_L1_MAX_TOKENS": 777},
+            )
+            manager.rollup_llm_levels = {"L1"}
+            manager.record_summary_log(
+                7,
+                {
+                    "channel_id": 7,
+                    "run_id": "run-7",
+                    "summary": "Desk work with a brief departure.",
+                    "frame_count": 12,
+                    "created_at": 1_781_700_000.0,
+                },
+            )
+
+            row = manager.summary_rollups(7, run_selector="all")["levels"]["L1"][0]
+
+            self.assertEqual(len(calls), 1)
+            self.assertEqual(calls[0]["workload_class"], "rollup")
+            self.assertEqual(calls[0]["max_tokens_override"], 777)
+            self.assertEqual(row["summary_kind"], "llm")
+            self.assertTrue(row["summary"].startswith("### Period Overview\nChannel 7"))
+
+    def test_rollup_normalizes_inline_small_model_sections(self):
+        flattened = (
+            "### Period Overview Channel 7 — 10:00-10:15, 12 frames, 1 items.  "
+            "### Routine and Behavior Desk work continued.  "
+            "### Notable Observations and Exceptions A brief departure.  "
+            "### Alerts and Meaning One alert remains unreviewed.  "
+            "### Coverage and Interruptions No interruption recorded in metadata.  "
+            "### Operator Takeaway Review the sampled departure."
+        )
+
+        normalized = LuxriotManager._normalize_rollup_operator_headings(flattened)
+
+        self.assertTrue(LuxriotManager._rollup_operator_contract_valid(normalized))
+        self.assertIn("### Period Overview\nChannel 7", normalized)
+        self.assertIn("### Alerts and Meaning\nOne alert", normalized)
+
+    def test_unreviewed_alert_dismissal_is_guarded_and_sanitized(self):
+        summary = operator_rollup_response(
+            "A person remained in the foreground.",
+            alerts="The repeated alerts are benign and non-actionable.",
+        )
+        node = {"alert_total": 3, "operator_feedback": {}}
+
+        issues = LuxriotManager._rollup_grounding_guard_issues(summary, node)
+        sanitized = LuxriotManager._sanitize_rollup_operator_overclaims(summary, node)
+
+        self.assertIn("unreviewed_alert_dismissal", issues)
+        self.assertNotIn("unreviewed_alert_dismissal", LuxriotManager._rollup_grounding_guard_issues(sanitized, node))
+        self.assertIn("remain unreviewed and unclassified", sanitized)
+
+        memory = LuxriotManager._sanitize_rollup_memory_update(
+            {
+                "routine_baseline": "domestic activity",
+                "ignore_as_routine": [
+                    "repeated benign foreground alert",
+                    "cat sleeping on the shelf",
+                ],
+            },
+            node,
+        )
+        self.assertEqual(memory["routine_baseline"], "domestic activity")
+        self.assertEqual(memory["ignore_as_routine"], ["cat sleeping on the shelf"])
+
     def test_rollup_contract_gets_one_corrective_retry(self):
         with tempfile.TemporaryDirectory() as temp:
             calls = []
@@ -6606,6 +6702,113 @@ class LuxriotCaptureDispatchTests(unittest.TestCase):
                     l3[0],
                 ),
             )
+
+    def test_rollup_event_ledger_drops_static_pass_up_noise(self):
+        ledger = LuxriotManager._l0_event_ledger(
+            rollup_id="l0-ch7-static",
+            batch_state={
+                "events": [
+                    {
+                        "event_id": "static_scene",
+                        "label": "Person resting on couch",
+                        "state": "continuing",
+                        "summary": "Person remains stationary on couch across all snapshots.",
+                        "novelty": "routine",
+                        # A small VLM may set this incorrectly. The chronology
+                        # must not treat it as authority.
+                        "pass_up": True,
+                    },
+                    {
+                        "event_id": "cat_chase",
+                        "label": "Two cats chase each other across the room",
+                        "state": "new",
+                        "summary": "The cats run from the shelf toward the door.",
+                        "novelty": "novel",
+                        "pass_up": True,
+                    },
+                    {
+                        "event_id": "no_events",
+                        "label": "No observable events",
+                        "state": "new",
+                        "summary": "No new or resolved events are visible.",
+                        "novelty": "novel",
+                        "pass_up": True,
+                    },
+                ]
+            },
+            alert_events=[],
+            transition_events=[],
+            default_timestamp_ms=1_781_683_200_000,
+        )
+
+        self.assertEqual(
+            [item["label"] for item in ledger],
+            ["Two cats chase each other across the room"],
+        )
+
+    def test_rollup_event_ledger_groups_repeated_observations_without_claiming_occurrences(self):
+        children = []
+        base_ms = 1_781_683_200_000
+        for index, state in enumerate(("new", "continuing", "continuing")):
+            timestamp_ms = base_ms + index * 60_000
+            children.append(
+                {
+                    "event_ledger": [
+                        {
+                            "id": f"l0-{index}:event:0",
+                            "event_key": "person_leaves_desk",
+                            "kind": "event",
+                            "timestamp_ms": timestamp_ms,
+                            "first_observed_ms": timestamp_ms,
+                            "last_observed_ms": timestamp_ms,
+                            "observation_count": 1,
+                            "new_observation_count": 1 if state == "new" else 0,
+                            "label": "Person leaves the desk",
+                            "state": state,
+                            "novelty": "deviation",
+                            "pass_up": True,
+                            "source_id": f"l0-{index}",
+                        }
+                    ]
+                }
+            )
+
+        ledger = LuxriotManager._aggregate_event_ledger(children)
+
+        self.assertEqual(len(ledger), 1)
+        episode = ledger[0]
+        self.assertEqual(episode["observation_count"], 3)
+        self.assertEqual(episode["new_observation_count"], 1)
+        self.assertEqual(episode["first_observed_ms"], base_ms)
+        self.assertEqual(episode["last_observed_ms"], base_ms + 120_000)
+        self.assertNotIn("occurrence_count", episode)
+        self.assertEqual(episode["source_ids"], ["l0-0", "l0-1", "l0-2"])
+
+    def test_rollup_event_ledger_groups_repeated_alert_emissions_as_one_episode(self):
+        children = [
+            {
+                "event_ledger": [
+                    {
+                        "id": f"l0-{index}:alert:0",
+                        "kind": "alert",
+                        "timestamp_ms": 1_781_683_200_000 + index * 10_000,
+                        "label": "Person in white shirt seated in front of camera",
+                        "severity": "low",
+                        "pass_up": True,
+                        "source_id": f"l0-{index}",
+                    }
+                ]
+            }
+            for index in range(8)
+        ]
+
+        ledger = LuxriotManager._aggregate_event_ledger(children)
+
+        self.assertEqual(len(ledger), 1)
+        self.assertEqual(ledger[0]["kind"], "alert")
+        self.assertEqual(ledger[0]["observation_count"], 8)
+        self.assertEqual(ledger[0]["first_observed_ms"], 1_781_683_200_000)
+        self.assertEqual(ledger[0]["last_observed_ms"], 1_781_683_270_000)
 
     def test_older_memory_update_preserves_deviation_without_resurrecting_watchlist(self):
         with tempfile.TemporaryDirectory() as temp:

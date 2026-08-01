@@ -32,6 +32,7 @@ class FocusLease:
     created_at_ms: int
     updated_at_ms: int
     expires_at_ms: int
+    context: str = ""
 
     def remaining_ms(self, now_ms: int) -> int:
         return max(0, int(self.expires_at_ms) - int(now_ms))
@@ -42,6 +43,7 @@ class FocusDirective:
     level: FocusLevel
     incident_ids: tuple[str, ...]
     expires_at_ms: int
+    contexts: tuple[str, ...] = ()
 
 
 class IncidentFocusLeaseManager:
@@ -75,6 +77,7 @@ class IncidentFocusLeaseManager:
         *,
         level: FocusLevel | str = FocusLevel.FOLLOW,
         ttl_seconds: float = 5 * 60,
+        context: str | None = None,
     ) -> FocusLease:
         normalized_id = self._incident_id(incident_id)
         normalized_channels = self._channel_ids(channel_ids)
@@ -97,6 +100,9 @@ class IncidentFocusLeaseManager:
                 ),
                 updated_at_ms=now_ms,
                 expires_at_ms=now_ms + ttl_ms,
+                context=self._context(
+                    previous.context if context is None and previous is not None else context
+                ),
             )
             self._leases[normalized_id] = lease
             return lease
@@ -141,6 +147,11 @@ class IncidentFocusLeaseManager:
                 level=strongest,
                 incident_ids=tuple(lease.incident_id for lease in relevant),
                 expires_at_ms=max(lease.expires_at_ms for lease in relevant),
+                contexts=tuple(
+                    lease.context
+                    for lease in relevant
+                    if lease.context
+                )[:4],
             )
 
     def compact_digest(self, *, incident_limit: int = 16) -> dict[str, object]:
@@ -171,6 +182,7 @@ class IncidentFocusLeaseManager:
                         "level": lease.level.value,
                         "channels": list(lease.channel_ids),
                         "expires_in_ms": lease.remaining_ms(now_ms),
+                        "context_attached": bool(lease.context),
                     }
                     for lease in visible
                 ],
@@ -242,6 +254,12 @@ class IncidentFocusLeaseManager:
                 f"ttl_seconds exceeds maximum ({self.max_ttl_ms / 1000.0:g})"
             )
         return ttl_ms
+
+    @staticmethod
+    def _context(value: str | None) -> str:
+        # Context is inert, bounded prior evidence carried to the live VLM.
+        # It never changes lease routing or attention authority.
+        return " ".join(str(value or "").split())[:2400]
 
 
 __all__ = [

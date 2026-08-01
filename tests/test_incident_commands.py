@@ -49,10 +49,12 @@ class _Runtime:
     def __init__(self):
         self.active = {INCIDENT_ID: object()}
         self.stop_calls = []
+        self.start_context = None
 
-    def start_incident_focus(self, incident_id, channel_ids, *, level, ttl_seconds):
+    def start_incident_focus(self, incident_id, channel_ids, *, level, ttl_seconds, context=None):
         lease = SimpleNamespace(level=SimpleNamespace(value=level), channel_ids=tuple(channel_ids))
         self.active[incident_id] = lease
+        self.start_context = context
         return lease
 
     def stop_incident_focus(self, incident_id):
@@ -115,6 +117,7 @@ def test_follow_uses_explicit_optimistic_revision():
     assert updated["follow_policy"]["mode"] == "critical"
     assert updated["follow_policy"]["expires_at_ms"] == 130_000
     assert lease.level.value == "critical"
+    assert "Craft crossing the port gate" in runtime.start_context
 
 
 def test_draft_digest_is_stable_and_content_bound():

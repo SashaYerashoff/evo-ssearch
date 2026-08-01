@@ -462,12 +462,15 @@ _TOOL_SCHEMAS: List[Dict[str, Any]] = [
         "function": {
             "name": "calibrate_probe_from_archive",
             "description": (
-                "Read-only CLIP P/N/M calibration for a proposed probe over archived frames. "
+                "Read-only CLIP P/N/M calibration (including the default SigLIP2 embedding space) "
+                "for a proposed probe over archived frames. "
                 "Use before creating/updating probes from VLM alerts, archive searches, or "
                 "cross-channel sweeps. It scans real archived frames, compares a positive "
                 "event query against a visible contrast query, suggests initial pos_floor/margin "
-                "thresholds, and returns representative frames. Processes only a bounded channel "
-                "batch per call and returns deferred_channel_ids for continuation."
+                "thresholds, and returns representative frames. For noisy scenes use the explicit "
+                "discovery -> refine -> shadow stages; only a reviewed independent shadow pass may "
+                "become safe_to_apply. Processes only a bounded channel batch per call and returns "
+                "deferred_channel_ids for continuation."
             ),
             "parameters": {
                 "type": "object",
@@ -500,8 +503,11 @@ _TOOL_SCHEMAS: List[Dict[str, Any]] = [
                     },
                     "sources": {
                         "type": "array",
-                        "items": {"type": "string", "enum": ["vlm_summary", "vlm_alert", "probe"]},
-                        "description": "Archive frame sources to scan. Default: ['vlm_alert','vlm_summary'].",
+                        "items": {"type": "string", "enum": ["semantic_snapshot", "vlm_summary", "vlm_alert", "probe"]},
+                        "description": (
+                            "Archive frame sources to scan. Use semantic_snapshot for the independent ~1 Hz index; "
+                            "default: ['vlm_alert','vlm_summary']."
+                        ),
                     },
                     "since_hours": {
                         "type": "number",
@@ -530,6 +536,36 @@ _TOOL_SCHEMAS: List[Dict[str, Any]] = [
                     "min_frames": {
                         "type": "integer",
                         "description": "Minimum archived frames before suggestions are considered reliable. Default: 8.",
+                    },
+                    "calibration_stage": {
+                        "type": "string",
+                        "enum": ["single", "discovery", "refine", "shadow"],
+                        "description": (
+                            "Use discovery for an initial noisy-scene scan, refine after reviewing representative "
+                            "frames, and shadow on later held-out frames. single preserves the legacy one-pass preview."
+                        ),
+                    },
+                    "reviewed_positive_detection_ids": {
+                        "type": "array",
+                        "items": {"type": ["integer", "string"]},
+                        "description": "Frame IDs visually confirmed by the operator as positive examples.",
+                    },
+                    "reviewed_negative_detection_ids": {
+                        "type": "array",
+                        "items": {"type": ["integer", "string"]},
+                        "description": "Hard-negative frame IDs visually confirmed by the operator.",
+                    },
+                    "candidate_pos_floor": {
+                        "type": "number",
+                        "description": "Candidate positive floor produced by refine and evaluated by shadow.",
+                    },
+                    "candidate_margin_thr": {
+                        "type": "number",
+                        "description": "Candidate P-N margin threshold produced by refine and evaluated by shadow.",
+                    },
+                    "shadow_from_ms": {
+                        "type": "integer",
+                        "description": "Only frames at/after this Unix-ms boundary are used for independent shadow validation.",
                     },
                 },
                 "required": [],
@@ -3388,6 +3424,12 @@ class AgentTools:
                     "needs_manual_frame_review": True,
                     "warnings": list(dict.fromkeys(str(item) for item in threshold_warnings)),
                 }
+            suggested_thresholds, calibration_stages = _staged_probe_calibration(
+                samples,
+                base_thresholds=suggested_thresholds,
+                args=args,
+                min_frames=min_frames,
+            )
             channel_results.append({
                 "channel_id": channel_id,
                 "sources": sources,
@@ -3398,6 +3440,7 @@ class AgentTools:
                 "coverage": coverage,
                 "distributions": distributions,
                 "suggested_thresholds": suggested_thresholds,
+                "calibration_stages": calibration_stages,
                 "representative_frames": _calibration_representative_frames(samples, evidence_limit=evidence_limit),
                 "warnings": warnings[:12],
             })
@@ -3424,11 +3467,12 @@ class AgentTools:
                 if deferred_channel_ids else None
             ),
             "score_semantics": "clip_pnm_archive_calibration_not_ground_truth",
+            "calibration_stage": str(args.get("calibration_stage") or "single").strip().lower(),
             "embedding_space": embedding_space,
             "operator_note": (
-                "Calibration estimates initial probe thresholds from archived CLIP vectors. "
-                "It is a secondary attention signal, not proof; inspect representative frames "
-                "before applying probe changes."
+                "Calibration estimates probe thresholds from archived semantic vectors. It is a secondary "
+                "attention signal, not proof. On noisy scenes use discovery, operator-reviewed hard-negative "
+                "refinement, and a later held-out shadow pass before applying probe changes."
             ),
             "channels": channel_results,
         }
@@ -3604,6 +3648,7 @@ class AgentTools:
             "source_totals": channel_result.get("source_totals"),
             "source_returned": channel_result.get("source_returned"),
             "suggested_thresholds": channel_result.get("suggested_thresholds"),
+            "calibration_stages": channel_result.get("calibration_stages"),
             "warnings": warnings,
             "representative_frames": compact_frames,
             "recommended_probe_args": recommended,
@@ -10548,6 +10593,7 @@ def _record_turn_signal_ledger(
             {
                 "tool": tool_name,
                 "score_semantics": result.get("score_semantics"),
+                "calibration_stage": result.get("calibration_stage"),
                 "event_query": result.get("event_query"),
                 "contrast_query_effective": result.get("contrast_query_effective"),
                 "processed_channel_ids": result.get("processed_channel_ids"),
@@ -10559,6 +10605,7 @@ def _record_turn_signal_ledger(
                         "frame_count": row.get("frame_count"),
                         "coverage_status": (row.get("coverage") or {}).get("status") if isinstance(row.get("coverage"), Mapping) else None,
                         "suggested_thresholds": row.get("suggested_thresholds"),
+                        "calibration_stages": row.get("calibration_stages"),
                     }
                     for row in channels[:8]
                     if isinstance(row, Mapping)
@@ -13719,6 +13766,359 @@ def _suggest_probe_thresholds_from_samples(
     }
 
 
+def _calibration_review_ids(value: Any) -> set[str]:
+    if not isinstance(value, Sequence) or isinstance(value, (str, bytes, bytearray)):
+        return set()
+    return {
+        str(item).strip()
+        for item in value
+        if str(item).strip()
+    }
+
+
+def _calibration_sample_id(sample: Mapping[str, Any]) -> str:
+    return str(sample.get("detection_id") or "").strip()
+
+
+def _probe_threshold_metrics(
+    samples: Sequence[Mapping[str, Any]],
+    *,
+    pos_floor: float,
+    margin_thr: float,
+    positive_ids: Optional[set[str]] = None,
+    negative_ids: Optional[set[str]] = None,
+) -> Dict[str, Any]:
+    """Evaluate a threshold without treating unlabeled archive frames as truth."""
+
+    positive_ids = positive_ids or set()
+    negative_ids = negative_ids or set()
+    fired = 0
+    bucket_totals: Dict[int, int] = {}
+    bucket_fired: Dict[int, int] = {}
+    tp = fp = tn = fn = 0
+    for sample in samples:
+        pos_score = _opt_float(sample.get("positive_score"))
+        margin = _opt_float(sample.get("margin"))
+        predicted = bool(
+            pos_score is not None
+            and float(pos_score) >= float(pos_floor)
+            and margin is not None
+            and float(margin) >= float(margin_thr)
+        )
+        fired += int(predicted)
+        timestamp_ms = int(_opt_int(sample.get("timestamp_ms")) or 0)
+        bucket = timestamp_ms // 60_000 if timestamp_ms > 0 else 0
+        bucket_totals[bucket] = bucket_totals.get(bucket, 0) + 1
+        if predicted:
+            bucket_fired[bucket] = bucket_fired.get(bucket, 0) + 1
+        sample_id = _calibration_sample_id(sample)
+        if sample_id in positive_ids:
+            tp += int(predicted)
+            fn += int(not predicted)
+        elif sample_id in negative_ids:
+            fp += int(predicted)
+            tn += int(not predicted)
+    labeled_positive = tp + fn
+    labeled_negative = fp + tn
+    recall = float(tp) / labeled_positive if labeled_positive else None
+    false_positive_rate = float(fp) / labeled_negative if labeled_negative else None
+    precision = float(tp) / (tp + fp) if (tp + fp) else None
+    bucket_ratios = [
+        float(bucket_fired.get(bucket, 0)) / max(1, total)
+        for bucket, total in bucket_totals.items()
+    ]
+    return {
+        "frame_count": len(samples),
+        "fired_count": fired,
+        "firing_ratio": round(float(fired) / max(1, len(samples)), 4),
+        "max_minute_firing_ratio": round(max(bucket_ratios), 4) if bucket_ratios else 0.0,
+        "labeled_positive_count": labeled_positive,
+        "labeled_negative_count": labeled_negative,
+        "true_positive_count": tp,
+        "false_positive_count": fp,
+        "true_negative_count": tn,
+        "false_negative_count": fn,
+        "recall": round(recall, 4) if recall is not None else None,
+        "precision": round(precision, 4) if precision is not None else None,
+        "false_positive_rate": (
+            round(false_positive_rate, 4)
+            if false_positive_rate is not None
+            else None
+        ),
+    }
+
+
+def _reviewed_probe_threshold_candidate(
+    samples: Sequence[Mapping[str, Any]],
+    *,
+    positive_ids: set[str],
+    negative_ids: set[str],
+    fallback: Mapping[str, Any],
+) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+    labeled = [
+        sample
+        for sample in samples
+        if _calibration_sample_id(sample) in positive_ids | negative_ids
+        and _opt_float(sample.get("positive_score")) is not None
+        and _opt_float(sample.get("margin")) is not None
+    ]
+    positive_count = sum(
+        1 for sample in labeled if _calibration_sample_id(sample) in positive_ids
+    )
+    negative_count = sum(
+        1 for sample in labeled if _calibration_sample_id(sample) in negative_ids
+    )
+    if positive_count < 2 or negative_count < 4:
+        return dict(fallback), {
+            "status": "needs_more_reviewed_frames",
+            "labeled_positive_count": positive_count,
+            "labeled_negative_count": negative_count,
+            "minimum_positive": 2,
+            "minimum_negative": 4,
+        }
+
+    pos_values = np.asarray(
+        [float(sample.get("positive_score") or 0.0) for sample in labeled],
+        dtype=np.float32,
+    )
+    margin_values = np.asarray(
+        [float(sample.get("margin") or 0.0) for sample in labeled],
+        dtype=np.float32,
+    )
+    quantiles = np.linspace(0.05, 0.95, 13)
+    pos_candidates = sorted(
+        {
+            round(float(np.quantile(pos_values, q)), 6)
+            for q in quantiles
+        }
+        | {round(float(fallback.get("pos_floor") or 0.05), 6)}
+    )
+    margin_candidates = sorted(
+        {
+            round(float(np.quantile(margin_values, q)), 6)
+            for q in quantiles
+        }
+        | {round(float(fallback.get("margin_thr") or 0.0), 6)}
+    )
+    best: Optional[Tuple[Tuple[float, float, float, float], float, float, Dict[str, Any]]] = None
+    for pos_floor in pos_candidates:
+        for margin_thr in margin_candidates:
+            metrics = _probe_threshold_metrics(
+                labeled,
+                pos_floor=pos_floor,
+                margin_thr=margin_thr,
+                positive_ids=positive_ids,
+                negative_ids=negative_ids,
+            )
+            recall = float(metrics.get("recall") or 0.0)
+            false_positive_rate = float(metrics.get("false_positive_rate") or 0.0)
+            precision = float(metrics.get("precision") or 0.0)
+            # Precision is primary in a noisy room; recall remains bounded so
+            # a probe cannot become "accurate" by never firing.
+            acceptable = recall >= 0.50 and false_positive_rate <= 0.10
+            rank = (
+                1.0 if acceptable else 0.0,
+                precision - 1.5 * false_positive_rate,
+                recall,
+                pos_floor + margin_thr,
+            )
+            if best is None or rank > best[0]:
+                best = (rank, pos_floor, margin_thr, metrics)
+    assert best is not None
+    _rank, pos_floor, margin_thr, metrics = best
+    reviewed_recall = _opt_float(metrics.get("recall"))
+    reviewed_fpr = _opt_float(metrics.get("false_positive_rate"))
+    acceptable = bool(
+        reviewed_recall is not None
+        and reviewed_recall >= 0.50
+        and reviewed_fpr is not None
+        and reviewed_fpr <= 0.10
+    )
+    candidate = {
+        **dict(fallback),
+        "pos_floor": round(float(pos_floor), 4),
+        "margin_thr": round(float(margin_thr), 4),
+        "confidence": "medium" if acceptable else "low",
+        "calibration_status": (
+            "reviewed_candidate" if acceptable else "reviewed_separation_failed"
+        ),
+        "separation_quality": "reviewed" if acceptable else "poor",
+        "recommended_action": (
+            "collect_independent_shadow_frames"
+            if acceptable
+            else "rephrase_queries_and_repeat_discovery"
+        ),
+        # Refinement uses the same frames that selected the thresholds. It is
+        # a candidate, never promotion evidence.
+        "safe_to_apply": False,
+        "needs_manual_frame_review": not acceptable,
+    }
+    return candidate, {"status": candidate["calibration_status"], **metrics}
+
+
+def _staged_probe_calibration(
+    samples: Sequence[Mapping[str, Any]],
+    *,
+    base_thresholds: Mapping[str, Any],
+    args: Mapping[str, Any],
+    min_frames: int,
+) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+    """Apply discovery/refine/shadow semantics to noisy-scene calibration."""
+
+    stage = str(args.get("calibration_stage") or "single").strip().lower()
+    if stage not in {"single", "discovery", "refine", "shadow"}:
+        stage = "single"
+    thresholds = dict(base_thresholds)
+    positive_ids = _calibration_review_ids(
+        args.get("reviewed_positive_detection_ids")
+    )
+    negative_ids = _calibration_review_ids(
+        args.get("reviewed_negative_detection_ids")
+    )
+    if positive_ids & negative_ids:
+        negative_ids -= positive_ids
+
+    candidate_pos_floor = _opt_float(args.get("candidate_pos_floor"))
+    candidate_margin_thr = _opt_float(args.get("candidate_margin_thr"))
+    if stage == "single":
+        return thresholds, {
+            "stage": "single",
+            "status": "legacy_preview",
+            "promotion_ready": bool(thresholds.get("safe_to_apply")),
+            "next_stage": "discovery",
+            "note": "Use explicit staged calibration for a noisy or changing scene.",
+        }
+
+    if stage == "discovery":
+        thresholds.update(
+            {
+                "safe_to_apply": False,
+                "calibration_status": "discovery_complete",
+                "recommended_action": "review_hard_negatives_then_refine",
+                "needs_manual_frame_review": True,
+            }
+        )
+        metrics = _probe_threshold_metrics(
+            samples,
+            pos_floor=float(thresholds.get("pos_floor") or 0.05),
+            margin_thr=float(thresholds.get("margin_thr") or 0.0),
+        )
+        return thresholds, {
+            "stage": stage,
+            "status": "review_required",
+            "promotion_ready": False,
+            "metrics": metrics,
+            "next_stage": "refine",
+            "review_instructions": (
+                "Confirm at least 2 true-positive and 4 hard-negative representative frame IDs. "
+                "Include ordinary motion, lighting changes, occlusion, and visually similar objects."
+            ),
+        }
+
+    if stage == "refine":
+        thresholds, reviewed_metrics = _reviewed_probe_threshold_candidate(
+            samples,
+            positive_ids=positive_ids,
+            negative_ids=negative_ids,
+            fallback=thresholds,
+        )
+        ready_for_shadow = reviewed_metrics.get("status") == "reviewed_candidate"
+        return thresholds, {
+            "stage": stage,
+            "status": reviewed_metrics.get("status"),
+            "promotion_ready": False,
+            "reviewed_metrics": reviewed_metrics,
+            "candidate": {
+                "pos_floor": thresholds.get("pos_floor"),
+                "margin_thr": thresholds.get("margin_thr"),
+            },
+            "next_stage": "shadow" if ready_for_shadow else "refine",
+            "shadow_requirement": (
+                "Collect later frames not used for threshold selection; set shadow_from_ms and pass the candidate thresholds."
+            ),
+        }
+
+    if candidate_pos_floor is None or candidate_margin_thr is None:
+        thresholds.update(
+            {
+                "safe_to_apply": False,
+                "calibration_status": "shadow_candidate_missing",
+                "recommended_action": "provide_refined_candidate_thresholds",
+                "needs_manual_frame_review": True,
+            }
+        )
+        return thresholds, {
+            "stage": stage,
+            "status": "candidate_missing",
+            "promotion_ready": False,
+            "next_stage": "refine",
+        }
+
+    shadow_from_ms = int(_opt_int(args.get("shadow_from_ms")) or 0)
+    shadow_samples = [
+        sample
+        for sample in samples
+        if int(_opt_int(sample.get("timestamp_ms")) or 0) >= shadow_from_ms
+    ] if shadow_from_ms > 0 else []
+    metrics = _probe_threshold_metrics(
+        shadow_samples,
+        pos_floor=float(candidate_pos_floor),
+        margin_thr=float(candidate_margin_thr),
+        positive_ids=positive_ids,
+        negative_ids=negative_ids,
+    )
+    enough_frames = len(shadow_samples) >= max(8, min_frames)
+    enough_labels = bool(
+        int(metrics.get("labeled_positive_count") or 0) >= 2
+        and int(metrics.get("labeled_negative_count") or 0) >= 4
+    )
+    shadow_recall = _opt_float(metrics.get("recall"))
+    shadow_fpr = _opt_float(metrics.get("false_positive_rate"))
+    shadow_peak_ratio = _opt_float(metrics.get("max_minute_firing_ratio"))
+    promotion_ready = bool(
+        enough_frames
+        and enough_labels
+        and shadow_recall is not None
+        and shadow_recall >= 0.60
+        and shadow_fpr is not None
+        and shadow_fpr <= 0.10
+        and shadow_peak_ratio is not None
+        and shadow_peak_ratio <= 0.60
+    )
+    thresholds.update(
+        {
+            "pos_floor": round(float(candidate_pos_floor), 4),
+            "margin_thr": round(float(candidate_margin_thr), 4),
+            "safe_to_apply": promotion_ready,
+            "calibration_status": (
+                "shadow_validated" if promotion_ready else "shadow_review_required"
+            ),
+            "separation_quality": "validated" if promotion_ready else "unverified",
+            "recommended_action": (
+                "preview_threshold_update"
+                if promotion_ready
+                else "collect_or_review_more_shadow_frames"
+            ),
+            "needs_manual_frame_review": not promotion_ready,
+        }
+    )
+    return thresholds, {
+        "stage": stage,
+        "status": thresholds["calibration_status"],
+        "promotion_ready": promotion_ready,
+        "shadow_from_ms": shadow_from_ms or None,
+        "metrics": metrics,
+        "requirements": {
+            "enough_frames": enough_frames,
+            "enough_reviewed_labels": enough_labels,
+            "max_false_positive_rate": 0.10,
+            "min_recall": 0.60,
+            "max_minute_firing_ratio": 0.60,
+        },
+        "next_stage": "preview" if promotion_ready else "shadow",
+    }
+
+
 def _agent_normalized_vec(value: Any) -> Optional[np.ndarray]:
     if value is None:
         return None
@@ -15513,6 +15913,7 @@ def _compact_tool_result_for_model(tool_name: str, result: Any) -> Any:
             "sources": result.get("sources"),
             "time_window": result.get("time_window"),
             "score_semantics": result.get("score_semantics"),
+            "calibration_stage": result.get("calibration_stage"),
             "processed_channel_ids": result.get("processed_channel_ids"),
             "deferred_channel_ids": result.get("deferred_channel_ids"),
             "deferred_count": result.get("deferred_count"),
@@ -15528,6 +15929,7 @@ def _compact_tool_result_for_model(tool_name: str, result: Any) -> Any:
                     "coverage": row.get("coverage"),
                     "distributions": row.get("distributions"),
                     "suggested_thresholds": row.get("suggested_thresholds"),
+                    "calibration_stages": row.get("calibration_stages"),
                     "warnings": row.get("warnings"),
                     "representative_frames": compact_reps(row.get("representative_frames")),
                 }
@@ -15563,6 +15965,7 @@ def _compact_tool_result_for_model(tool_name: str, result: Any) -> Any:
                     "frame_count": row.get("frame_count"),
                     "coverage": row.get("coverage"),
                     "suggested_thresholds": row.get("suggested_thresholds"),
+                    "calibration_stages": row.get("calibration_stages"),
                     "warnings": row.get("warnings"),
                     "next_action": row.get("next_action"),
                     "recommended_probe_args": row.get("recommended_probe_args"),

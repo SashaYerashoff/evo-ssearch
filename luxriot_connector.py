@@ -165,6 +165,10 @@ DEFAULT_BATCH_STATE_JSON_PROMPT = (
     "- Use events to update episode continuity: new|continuing|resolved|uncertain. Novelty controls preservation "
     "priority, not alert severity. Scene status must be exactly one of matched, mismatch, uncertain, or unavailable. "
     "Use observed_states for watched entities/triggers in the current snapshots.\n"
+    "- events is a chronology of observable actions, transitions, and unresolved episodes, not a second scene "
+    "description. Never create an event for a static/unchanged scene, stationary people, or 'no activity'; put "
+    "grounded recurring context in routines and use events: [] when no episode changed. Set pass_up=true only for "
+    "a real deviation, meaningful transition, alert-linked episode, or unresolved item needed by the next window.\n"
     "- For observed_states, present means directly visible in every listed snapshot. Absent is allowed only when "
     "the relevant scene area is clearly observable in the listed snapshots; otherwise use unknown. A name, breed, "
     "ownership, or identity supplied by memory/policy is only a watch label and must remain unknown unless current "
@@ -281,6 +285,15 @@ VECTOR_SIGNAL_PROMPT_PREFIX = (
     "- If a vector cue and the current snapshots support an Alert review policy trigger, emit the normal "
     "BATCH_STATE_JSON alert.\n"
     "- If the cue is not visually supported, mention uncertainty briefly and do not create an alert from the vector cue alone.\n"
+)
+
+INCIDENT_FOCUS_PROMPT_PREFIX = (
+    "Active incident follow contract:\n"
+    "- This is bounded history from an operator-started incident follow, not current visual evidence.\n"
+    "- Use it only to inspect current snapshots for continuity, change, resolution, or contradiction.\n"
+    "- Current snapshots override incident history. Never assert a carried entity/action is still present without "
+    "visible current support, and never create an alert from history alone.\n"
+    "- Incident focus raises sampling density; it does not raise evidentiary confidence or severity by itself."
 )
 
 _OUTDATED_ALERT_PROMPT_MARKERS = (
@@ -5405,6 +5418,22 @@ class LuxriotManager:
         except Exception:
             self.rollup_llm_max_new_per_call = 2
         self.rollup_llm_max_new_per_call = max(1, self.rollup_llm_max_new_per_call)
+        self.rollup_completion_token_budgets: Dict[str, int] = {}
+        for level, default_tokens in (("L1", 768), ("L2", 1024), ("L3", 2048)):
+            try:
+                configured_tokens = int(
+                    getattr(
+                        config,
+                        f"LUXRIOT_ROLLUP_{level}_MAX_TOKENS",
+                        default_tokens,
+                    )
+                )
+            except (TypeError, ValueError):
+                configured_tokens = default_tokens
+            self.rollup_completion_token_budgets[level] = min(
+                32768,
+                max(256, configured_tokens),
+            )
         try:
             self.rollup_summary_cache_limit = int(getattr(config, "LUXRIOT_ROLLUP_SUMMARY_CACHE_LIMIT", 800))
         except Exception:
@@ -6724,6 +6753,7 @@ class LuxriotManager:
         *,
         level: FocusLevel | str = FocusLevel.FOLLOW,
         ttl_seconds: float = 5 * 60,
+        context: Optional[str] = None,
     ) -> FocusLease:
         """Start or refresh a process-local focus lease.
 
@@ -6736,6 +6766,7 @@ class LuxriotManager:
             channel_ids,
             level=level,
             ttl_seconds=ttl_seconds,
+            context=context,
         )
 
     def stop_incident_focus(self, incident_id: str) -> bool:
@@ -6800,6 +6831,7 @@ class LuxriotManager:
         return effective_mode, max(effective_priority, priority_floor), {
             "level": directive.level.value,
             "incident_ids": list(directive.incident_ids[:4]),
+            "context_attached": bool(directive.contexts),
         }
 
     def emit_attention_event(
@@ -8327,6 +8359,9 @@ class LuxriotManager:
             "- Preserve rare but important events even if they appear once.",
             "- The deterministic event ledger is extracted from lower-level BATCH_STATE_JSON, transitions, and structured alerts. "
             "Do not erase a ledger entry merely because lower-level prose calls the period routine.",
+            "- Repeated event-ledger rows are already grouped into episodes. observation_count means the number of sampled "
+            "lower-level windows that observed the episode, not a count of distinct real-world occurrences. Use first_observed_ms "
+            "and last_observed_ms as the bounded observed span; never rewrite observation_count as 'times happened'.",
             "- The watched-state ledger counts sampled present/absent/unknown observations once per batch. "
             "Zero present observations means no confirmed occurrence in available samples, not proof that an entity never appeared.",
             "- Keep numeric facts aligned with metadata above (item_count/frame_count/window).",
@@ -9252,6 +9287,104 @@ class LuxriotManager:
         return out
 
     @classmethod
+    def _routine_placeholder_event(cls, value: Mapping[str, Any]) -> bool:
+        """Return true for model-generated non-events that must not enter memory.
+
+        Small VLMs occasionally set ``pass_up=true`` on a continuing static
+        description.  ``pass_up`` is a useful hint, but it is not authority to
+        turn "nothing changed" into an event repeated through L1-L3.  Routine
+        observations still remain available in source prose and the state
+        ledger; this filter only protects the event chronology.
+        """
+
+        if str(value.get("kind") or "event").strip().lower() != "event":
+            return False
+        if str(value.get("severity") or "").strip():
+            return False
+        text = " ".join(
+            str(value.get(key) or "").strip()
+            for key in ("label", "summary", "evidence")
+        ).casefold()
+        if not text:
+            return False
+        # These phrases are self-declared non-events. A contradictory
+        # state=new/novel/pass_up combination from the VLM does not promote
+        # them into episodic memory.
+        if re.search(
+            r"\b(?:"
+            r"no\s+(?:(?:new|observable|notable|significant|resolved)\s+)*(?:activity|actions?|events?|changes?|movement|motion)|"
+            r"nothing\s+(?:changed|happened)|"
+            r"no\s+new\s+or\s+resolved\s+events?"
+            r")\b",
+            text,
+            flags=re.IGNORECASE,
+        ):
+            return True
+        novelty = str(value.get("novelty") or "").strip().lower()
+        state = str(value.get("state") or "").strip().lower()
+        label_text = str(value.get("label") or "").strip().casefold()
+        if re.search(r"\b(?:candidate|visually\s+unconfirmed|motion\s+blur|visual\s+artifact)\b", label_text):
+            return True
+        meaningful_episode = bool(
+            re.search(
+                r"\b(?:enter(?:s|ed|ing)?|exit(?:s|ed|ing)?|leave(?:s|ing)?|left|"
+                r"walk(?:s|ed|ing)?|mov(?:e|es|ed|ing)|stand(?:s|ing)?\s+up|"
+                r"sit(?:s|ting)?\s+down|fall(?:s|en|ing)?|fell|collaps(?:e|es|ed|ing)|"
+                r"reach(?:es|ed|ing)?|handl(?:e|es|ed|ing)|interact(?:s|ed|ing)?|"
+                r"drink(?:s|ing)?|pick(?:s|ed|ing)?|put(?:s|ting)?|open(?:s|ed|ing)?|"
+                r"clos(?:e|es|ed|ing)|gestur(?:e|es|ed|ing)|chas(?:e|es|ed|ing)|"
+                r"crawl(?:s|ed|ing)?|run(?:s|ning)?|jump(?:s|ed|ing)?|"
+                r"approach(?:es|ed|ing)?|bend(?:s|ing)?|bent|shift(?:s|ed|ing)?"
+                r"|appear(?:s|ed|ing)?|disappear(?:s|ed|ing)?|hold(?:s|ing)?|held|"
+                r"carry(?:ies|ing|ied)?|drift(?:s|ed|ing)?|turn(?:s|ed|ing)?|"
+                r"cross(?:es|ed|ing)?|climb(?:s|ed|ing)?|rest(?:s|ed)?\s+down|"
+                r"motion|movement|displacement|intrusion|collision|fire|smoke|"
+                r"weapon|obstruction|damage|flood|leak|collapse"
+                r")\b",
+                label_text,
+                flags=re.IGNORECASE,
+            )
+        )
+        if re.search(r"\bminor\s+(?:motion|movement|object\s+displacement)\b", label_text):
+            return True
+        if not meaningful_episode:
+            return True
+        if novelty in {"novel", "deviation", "unexpected"}:
+            return False
+        if state in {"new", "finished", "resolved"}:
+            return False
+        return bool(
+            re.search(
+                r"\b(?:"
+                r"static\s+(?:scene|room|environment|positions?)|"
+                r"scene\s+(?:remains?\s+)?(?:static|unchanged)|"
+                r"(?:room|environment|background)\s+(?:remains?\s+)?unchanged|"
+                r"no\s+(?:new\s+)?(?:activity|action|event|change|movement)|"
+                r"nothing\s+(?:changed|happened)|"
+                r"(?:person|people|individuals?|occupants?)\s+(?:remains?\s+)?(?:stationary|static)|"
+                r"ordinary\s+(?:static\s+)?routine"
+                r")\b",
+                text,
+                flags=re.IGNORECASE,
+            )
+        )
+
+    @classmethod
+    def _event_semantic_key(cls, value: Mapping[str, Any]) -> str:
+        """Build a stable grouping key without claiming identity resolution."""
+
+        explicit = cls._truncate_text(
+            value.get("event_key") or value.get("event_id"),
+            120,
+        )
+        seed = explicit or cls._truncate_text(
+            value.get("label") or value.get("title"),
+            160,
+        )
+        normalized = re.sub(r"[\W_]+", " ", seed.casefold(), flags=re.UNICODE)
+        return " ".join(normalized.split())[:160]
+
+    @classmethod
     def _compact_event_ledger(
         cls,
         value: object,
@@ -9273,6 +9406,8 @@ class LuxriotManager:
             kind = str(raw.get("kind") or "event").strip().lower()[:32]
             if kind not in {"event", "state_transition", "alert"}:
                 kind = "event"
+            if cls._routine_placeholder_event({**dict(raw), "kind": kind}):
+                continue
             label = cls._truncate_text(
                 raw.get("label") or raw.get("title") or raw.get("event_id"),
                 160,
@@ -9310,9 +9445,20 @@ class LuxriotManager:
                 "timestamp_ms": int(timestamp_ms),
                 "label": label,
             }
+            event_key = cls._event_semantic_key(raw)
+            if event_key:
+                item["event_key"] = event_key
             end_timestamp_ms = _parse_optional_int(raw.get("end_timestamp_ms"))
             if end_timestamp_ms is not None:
                 item["end_timestamp_ms"] = int(end_timestamp_ms)
+            for timestamp_key in ("first_observed_ms", "last_observed_ms"):
+                parsed = _parse_optional_int(raw.get(timestamp_key))
+                if parsed is not None and parsed > 0:
+                    item[timestamp_key] = int(parsed)
+            for count_key in ("observation_count", "new_observation_count"):
+                parsed = _parse_optional_int(raw.get(count_key))
+                if parsed is not None and parsed > 0:
+                    item[count_key] = int(parsed)
             for key, limit in (
                 ("state", 32),
                 ("novelty", 32),
@@ -9326,6 +9472,16 @@ class LuxriotManager:
                 text = cls._truncate_text(raw.get(key), limit)
                 if text:
                     item[key] = text
+            evidence_samples = cls._coerce_memory_items(
+                raw.get("evidence_samples"),
+                max_items=3,
+                max_len=220,
+            )
+            if evidence_samples:
+                item["evidence_samples"] = evidence_samples
+            source_ids = cls._coerce_str_list(raw.get("source_ids"))[:24]
+            if source_ids:
+                item["source_ids"] = source_ids
             if raw.get("pass_up") is not None:
                 item["pass_up"] = bool(raw.get("pass_up"))
             out.append(item)
@@ -9478,6 +9634,10 @@ class LuxriotManager:
                             raw.get("event_id"),
                             80,
                         ),
+                        "event_key": cls._truncate_text(
+                            raw.get("event_id") or label,
+                            120,
+                        ),
                         "kind": "event",
                         "timestamp_ms": int(default_timestamp_ms),
                         "label": label,
@@ -9489,6 +9649,10 @@ class LuxriotManager:
                         "novelty": novelty,
                         "pass_up": pass_up,
                         "source_id": rollup_id,
+                        "observation_count": 1,
+                        "new_observation_count": 1 if state == "new" else 0,
+                        "first_observed_ms": int(default_timestamp_ms),
+                        "last_observed_ms": int(default_timestamp_ms),
                     }
                 )
         for ordinal, raw in enumerate(transition_events[:32]):
@@ -9606,7 +9770,182 @@ class LuxriotManager:
                 rows.extend(
                     item for item in raw if isinstance(item, Mapping)
                 )
-        return cls._compact_event_ledger(rows, max_items=max_items)
+        compacted = cls._compact_event_ledger(
+            rows,
+            max_items=max(512, max(1, int(max_items)) * 8),
+        )
+        episodes: Dict[str, Dict[str, Any]] = {}
+        passthrough: List[Dict[str, Any]] = []
+        alias_parent: Dict[str, str] = {}
+
+        def alias_find(alias: str) -> str:
+            parent = alias_parent.setdefault(alias, alias)
+            while parent != alias_parent[parent]:
+                alias_parent[parent] = alias_parent[alias_parent[parent]]
+                parent = alias_parent[parent]
+            alias_parent[alias] = parent
+            return parent
+
+        def alias_union(left: str, right: str) -> None:
+            left_root = alias_find(left)
+            right_root = alias_find(right)
+            if left_root != right_root:
+                alias_parent[right_root] = left_root
+
+        for item in compacted:
+            kind = str(item.get("kind") or "")
+            if kind not in {"event", "alert"}:
+                continue
+            label_key = cls._event_semantic_key({"label": item.get("label")})
+            explicit_key = str(item.get("event_key") or "").strip()
+            aliases = [
+                f"{kind}:label:{label_key}" if label_key else "",
+                f"{kind}:id:{explicit_key}" if explicit_key else "",
+            ]
+            aliases = [alias for alias in aliases if alias]
+            for alias in aliases:
+                alias_find(alias)
+            for alias in aliases[1:]:
+                alias_union(aliases[0], alias)
+        novelty_rank = {
+            "": 0,
+            "routine": 1,
+            "known": 1,
+            "unchanged": 1,
+            "uncertain": 2,
+            "novel": 4,
+            "deviation": 5,
+            "unexpected": 6,
+        }
+        severity_rank = {
+            "": 0,
+            "info": 1,
+            "low": 2,
+            "normal": 3,
+            "high": 4,
+            "critical": 5,
+        }
+        for item in compacted:
+            kind = str(item.get("kind") or "")
+            if kind not in {"event", "alert"}:
+                passthrough.append(dict(item))
+                continue
+            label_key = cls._event_semantic_key({"label": item.get("label")})
+            explicit_key = str(item.get("event_key") or "").strip()
+            aliases = [
+                f"{kind}:label:{label_key}" if label_key else "",
+                f"{kind}:id:{explicit_key}" if explicit_key else "",
+            ]
+            aliases = [alias for alias in aliases if alias]
+            key = alias_find(aliases[0]) if aliases else ""
+            if not key:
+                passthrough.append(dict(item))
+                continue
+            timestamp_ms = int(
+                _parse_optional_int(item.get("first_observed_ms"))
+                or _parse_optional_int(item.get("timestamp_ms"))
+                or 0
+            )
+            last_timestamp_ms = int(
+                _parse_optional_int(item.get("last_observed_ms"))
+                or _parse_optional_int(item.get("end_timestamp_ms"))
+                or _parse_optional_int(item.get("timestamp_ms"))
+                or timestamp_ms
+            )
+            observation_count = max(
+                1,
+                int(_parse_optional_int(item.get("observation_count")) or 1),
+            )
+            new_observation_count = max(
+                0,
+                int(
+                    _parse_optional_int(item.get("new_observation_count"))
+                    or (1 if str(item.get("state") or "").lower() == "new" else 0)
+                ),
+            ) if kind == "event" else 0
+            target = episodes.get(key)
+            if target is None:
+                target = dict(item)
+                target["event_key"] = explicit_key or label_key
+                target["timestamp_ms"] = timestamp_ms
+                target["first_observed_ms"] = timestamp_ms
+                target["last_observed_ms"] = last_timestamp_ms
+                target["observation_count"] = observation_count
+                if new_observation_count:
+                    target["new_observation_count"] = new_observation_count
+                target["source_ids"] = list(
+                    dict.fromkeys(
+                        [
+                            *cls._coerce_str_list(item.get("source_ids")),
+                            str(item.get("source_id") or "").strip(),
+                        ]
+                    )
+                )[:24]
+                target["source_ids"] = [
+                    source_id for source_id in target["source_ids"] if source_id
+                ]
+                samples = cls._coerce_memory_items(
+                    [item.get("evidence"), *(item.get("evidence_samples") or [])],
+                    max_items=3,
+                    max_len=220,
+                )
+                if samples:
+                    target["evidence_samples"] = samples
+                episodes[key] = target
+                continue
+
+            target["first_observed_ms"] = min(
+                int(target.get("first_observed_ms") or timestamp_ms),
+                timestamp_ms,
+            )
+            target["last_observed_ms"] = max(
+                int(target.get("last_observed_ms") or last_timestamp_ms),
+                last_timestamp_ms,
+            )
+            target["timestamp_ms"] = int(target["first_observed_ms"])
+            target["end_timestamp_ms"] = int(target["last_observed_ms"])
+            target["observation_count"] = int(target.get("observation_count") or 0) + observation_count
+            combined_new_count = int(target.get("new_observation_count") or 0) + new_observation_count
+            if combined_new_count:
+                target["new_observation_count"] = combined_new_count
+            target["pass_up"] = bool(target.get("pass_up") or item.get("pass_up"))
+            current_novelty = str(target.get("novelty") or "").lower()
+            incoming_novelty = str(item.get("novelty") or "").lower()
+            if novelty_rank.get(incoming_novelty, 2) > novelty_rank.get(current_novelty, 2):
+                target["novelty"] = incoming_novelty
+            current_severity = str(target.get("severity") or "").lower()
+            incoming_severity = str(item.get("severity") or "").lower()
+            if severity_rank.get(incoming_severity, 0) > severity_rank.get(current_severity, 0):
+                target["severity"] = incoming_severity
+            target["source_ids"] = list(
+                dict.fromkeys(
+                    [
+                        *cls._coerce_str_list(target.get("source_ids")),
+                        *cls._coerce_str_list(item.get("source_ids")),
+                        str(item.get("source_id") or "").strip(),
+                    ]
+                )
+            )[:24]
+            target["source_ids"] = [
+                source_id for source_id in target["source_ids"] if source_id
+            ]
+            samples = cls._coerce_memory_items(
+                [
+                    *(target.get("evidence_samples") or []),
+                    target.get("evidence"),
+                    item.get("evidence"),
+                    *(item.get("evidence_samples") or []),
+                ],
+                max_items=3,
+                max_len=220,
+            )
+            if samples:
+                target["evidence_samples"] = samples
+
+        return cls._compact_event_ledger(
+            [*passthrough, *episodes.values()],
+            max_items=max_items,
+        )
 
     @classmethod
     def _aggregate_state_ledger(
@@ -14317,8 +14656,27 @@ class LuxriotManager:
             ),
             ("Operator Takeaway", r"operator\s+takeaway"),
         )
+        normalized_text = str(value or "")
+        # A common 4B correction-pass failure is to keep all mandatory
+        # headings but flatten each heading and its body onto one long line.
+        # Split only exact canonical Markdown headings; arbitrary prose and
+        # user headings are untouched.
+        for canonical, _body_pattern in heading_specs:
+            exact_heading = re.escape(f"### {canonical}")
+            normalized_text = re.sub(
+                rf"(?<!^)\s+(?={exact_heading}\b)",
+                "\n\n",
+                normalized_text,
+                flags=re.IGNORECASE,
+            )
+            normalized_text = re.sub(
+                rf"(^|\n)(\s*{exact_heading})[ \t]+(?=\S)",
+                lambda match: f"{match.group(1)}{match.group(2)}\n",
+                normalized_text,
+                flags=re.IGNORECASE,
+            )
         normalized_lines: List[str] = []
-        for line in str(value or "").splitlines():
+        for line in normalized_text.splitlines():
             replacement: Optional[str] = None
             for canonical, body_pattern in heading_specs:
                 if re.match(
@@ -14328,7 +14686,25 @@ class LuxriotManager:
                 ):
                     replacement = f"### {canonical}"
                     break
-            normalized_lines.append(replacement or line)
+            if replacement:
+                normalized_lines.append(replacement)
+                continue
+            # Small VLMs occasionally promote the required first body line
+            # ("Channel N — HH:MM-HH:MM, ...") to a Markdown heading.  This is
+            # harmless formatting drift: retain the metadata as evidence and
+            # restore the exact section heading.  Keep the match deliberately
+            # narrow so arbitrary headings are never relabelled.
+            channel_metadata = re.match(
+                r"^\s*#{2,3}\s*(Channel\s+#?\d+\s*[—-]\s*\d{1,2}:\d{2}\s*[—-]\s*\d{1,2}:\d{2}\s*,.+)$",
+                line,
+                flags=re.IGNORECASE,
+            )
+            if channel_metadata and "### Period Overview" not in normalized_lines:
+                normalized_lines.extend(
+                    ["### Period Overview", channel_metadata.group(1).strip()]
+                )
+                continue
+            normalized_lines.append(line)
         return "\n".join(normalized_lines).strip()
 
     @classmethod
@@ -14410,18 +14786,62 @@ class LuxriotManager:
             flags=re.IGNORECASE,
         ):
             issues.append("event_ledger_erased")
+        alert_total = int(
+            _parse_optional_int(node.get("alert_total")) or 0
+        ) if isinstance(node, Mapping) else 0
+        feedback = node.get("operator_feedback") if isinstance(node, Mapping) else None
+        feedback_summary = (
+            feedback.get("summary")
+            if isinstance(feedback, Mapping)
+            else None
+        )
+        reviewed_count = int(
+            _parse_optional_int(feedback_summary.get("annotation_count")) or 0
+        ) if isinstance(feedback_summary, Mapping) else 0
+        if alert_total > 0 and reviewed_count <= 0:
+            text = " ".join(str(value or "").split())
+            dismissal_patterns = (
+                r"\b(?:alerts?|criteria|criterion|triggers?)\b[^.]{0,180}\b(?:benign|non[- ]actionable|false[- ]positive|irrelevant)\b",
+                r"\b(?:benign|non[- ]actionable|false[- ]positive|irrelevant)\b[^.]{0,180}\b(?:alerts?|criteria|criterion|triggers?)\b",
+            )
+            if any(
+                re.search(pattern, text, flags=re.IGNORECASE)
+                for pattern in dismissal_patterns
+            ):
+                issues.append("unreviewed_alert_dismissal")
         return list(dict.fromkeys(issues))
 
     @classmethod
-    def _sanitize_rollup_operator_overclaims(cls, value: object) -> str:
+    def _sanitize_rollup_operator_overclaims(
+        cls,
+        value: object,
+        node: Optional[Mapping[str, Any]] = None,
+    ) -> str:
         """Replace a narrow set of unsafe sampled-evidence overclaims."""
 
+        node_issues = set(cls._rollup_grounding_guard_issues(value, node))
         output: List[str] = []
         for raw_line in str(value or "").splitlines():
             line = raw_line
             issues = set(cls._rollup_operator_semantic_guard_issues(line))
             prefix_match = re.match(r"^(\s*(?:[-*•]\s+|\d+[.)]\s+)?)", line)
             prefix = prefix_match.group(1) if prefix_match else ""
+            unreviewed_dismissal = (
+                "unreviewed_alert_dismissal" in node_issues
+                and re.search(r"\b(?:alerts?|criteria|criterion|triggers?)\b", line, flags=re.IGNORECASE)
+                and re.search(
+                    r"\b(?:benign|non[- ]actionable|false[- ]positive|irrelevant)\b",
+                    line,
+                    flags=re.IGNORECASE,
+                )
+            )
+            if unreviewed_dismissal:
+                line = (
+                    prefix
+                    + "No operator feedback was supplied for these alerts; they remain unreviewed and unclassified."
+                )
+                output.append(line)
+                continue
             if "complete_coverage_claim" in issues:
                 line = (
                     prefix
@@ -14443,6 +14863,42 @@ class LuxriotManager:
                 )
             output.append(line)
         return "\n".join(output).strip()
+
+    @classmethod
+    def _sanitize_rollup_memory_update(
+        cls,
+        memory_update: Mapping[str, Any],
+        node: Optional[Mapping[str, Any]],
+    ) -> Dict[str, Any]:
+        """Prevent unreviewed alert dismissal from entering routine memory."""
+
+        sanitized = dict(memory_update)
+        alert_total = int(
+            _parse_optional_int(node.get("alert_total")) or 0
+        ) if isinstance(node, Mapping) else 0
+        feedback = node.get("operator_feedback") if isinstance(node, Mapping) else None
+        feedback_summary = feedback.get("summary") if isinstance(feedback, Mapping) else None
+        reviewed_count = int(
+            _parse_optional_int(feedback_summary.get("annotation_count")) or 0
+        ) if isinstance(feedback_summary, Mapping) else 0
+        if alert_total <= 0 or reviewed_count > 0:
+            return sanitized
+        raw_items = sanitized.get("ignore_as_routine")
+        if not isinstance(raw_items, Sequence) or isinstance(
+            raw_items,
+            (str, bytes, bytearray),
+        ):
+            return sanitized
+        dismissal_pattern = re.compile(
+            r"\b(?:alerts?|criteria|criterion|triggers?|benign|non[- ]actionable|false[- ]positive|non[- ]hazardous)\b",
+            flags=re.IGNORECASE,
+        )
+        sanitized["ignore_as_routine"] = [
+            item
+            for item in raw_items
+            if not dismissal_pattern.search(str(item or ""))
+        ]
+        return sanitized
 
     @staticmethod
     def _is_legacy_fallback_rollup(value: object) -> bool:
@@ -14733,6 +15189,34 @@ class LuxriotManager:
             return ""
         return f"{VECTOR_SIGNAL_PROMPT_PREFIX}\nVECTOR_SIGNALS_JSON:\n{payload}"
 
+    def _render_incident_focus_prompt(self, channel_id: int) -> str:
+        directive = self.incident_focus_for_channel(channel_id)
+        if directive is None:
+            return ""
+        contexts: List[object] = []
+        for raw_context in directive.contexts[:2]:
+            try:
+                parsed = json.loads(raw_context)
+            except Exception:
+                parsed = str(raw_context)[:1200]
+            contexts.append(parsed)
+        payload = {
+            "level": directive.level.value,
+            "incident_ids": list(directive.incident_ids[:4]),
+            "prior_context": contexts,
+        }
+        try:
+            rendered = json.dumps(
+                payload,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+                allow_nan=False,
+            )
+        except Exception:
+            return ""
+        return f"{INCIDENT_FOCUS_PROMPT_PREFIX}\nINCIDENT_FOCUS_JSON:\n{rendered}"
+
     def compose_live_system_prompt(
         self,
         channel_id: int,
@@ -14749,6 +15233,7 @@ class LuxriotManager:
             raw_alert_policy
         )
         routine = self._get_channel_routine_prompt(channel_id)
+        incident_focus = self._render_incident_focus_prompt(channel_id)
         homeostasis = self._render_capture_homeostasis_prompt(channel_id)
         vector_prompt = self._render_vector_signal_prompt(
             vector_signal,
@@ -14760,6 +15245,7 @@ class LuxriotManager:
                 base,
                 alert_policy,
                 routine,
+                incident_focus,
                 homeostasis,
                 vector_prompt,
                 LIVE_OBSERVATION_STATE_PROMPT,
@@ -15850,7 +16336,7 @@ class LuxriotManager:
         semantic_issues = self._rollup_grounding_guard_issues(summary, entry)
         legacy_sanitized = False
         if semantic_issues and summary_kind == "legacy_cached":
-            sanitized = self._sanitize_rollup_operator_overclaims(summary)
+            sanitized = self._sanitize_rollup_operator_overclaims(summary, entry)
             if sanitized and not self._rollup_grounding_guard_issues(
                 sanitized,
                 entry,
@@ -16733,14 +17219,15 @@ class LuxriotManager:
                 "Window signal digest (compact continuity map):",
                 window_signal_digest or "none",
                 "",
-                "Deterministic event ledger (chronological lower-level pass-up):",
+                "Deterministic event ledger (chronological non-routine episodes; repeated observations are grouped):",
                 event_ledger_text or "none",
                 "",
                 "Watched-state sample ledger (counts are batches, not continuous proof):",
                 state_ledger_text or "none",
                 "",
-                "Period Overview must begin with:",
-                f"`Channel {channel_id} — {time.strftime('%H:%M', time.localtime(window_start))}-{time.strftime('%H:%M', time.localtime(window_end))}, {int(frame_count)} frames, {int(item_count)} items.`",
+                "Under the exact heading `### Period Overview`, its first body line must be:",
+                f"Channel {channel_id} — {time.strftime('%H:%M', time.localtime(window_start))}-{time.strftime('%H:%M', time.localtime(window_end))}, {int(frame_count)} frames, {int(item_count)} items.",
+                "This metadata line is body text. Do not turn it into a Markdown heading.",
                 "",
                 "Known long-window routine context (if available):",
                 routine_context or "n/a",
@@ -16808,12 +17295,19 @@ class LuxriotManager:
                     level,
                 )
             callback = self._rollup_callback_for_level(level)
+            callback_kwargs: Dict[str, Any] = {}
             if bool(getattr(callback, "eva_workload_class", False)):
+                callback_kwargs["workload_class"] = workload_class
+            if bool(getattr(callback, "eva_max_tokens_override", False)):
+                callback_kwargs["max_tokens_override"] = int(
+                    self.rollup_completion_token_budgets.get(level, 1024)
+                )
+            if callback_kwargs:
                 raw_summary = str(
                     callback(
                         messages,
                         model_hint,
-                        workload_class=workload_class,
+                        **callback_kwargs,
                     )
                 ).strip()
             else:
@@ -16829,7 +17323,11 @@ class LuxriotManager:
                 node,
             )
             if contract_valid and not semantic_issues:
-                return operator_summary, memory_update, None
+                return (
+                    operator_summary,
+                    self._sanitize_rollup_memory_update(memory_update, node),
+                    None,
+                )
 
             if not contract_valid:
                 self._increment_rollup_status_counter("invalid_operator_contract")
@@ -16862,6 +17360,7 @@ class LuxriotManager:
                                 "### Alerts and Meaning; ### Coverage and Interruptions; ### Operator Takeaway. "
                                 "Keep grounded factual content, but resolve internal presence/absence contradictions. "
                                 "Never claim complete coverage, no blind spots, or categorical absence of safety/security concerns from sampled frames. "
+                                "When operator feedback is absent, keep every alert unreviewed; do not dismiss it as harmless, false, or irrelevant. "
                                 "Never ask anyone to confirm intent; describe only the observable sequence or uncertainty. "
                                 "Append MEMORY_UPDATE_JSON only after all six sections."
                             ),
@@ -16869,12 +17368,12 @@ class LuxriotManager:
                     ],
                 }
             )
-            if bool(getattr(callback, "eva_workload_class", False)):
+            if callback_kwargs:
                 retry_raw = str(
                     callback(
                         corrective_messages,
                         model_hint,
-                        workload_class=workload_class,
+                        **callback_kwargs,
                     )
                 ).strip()
             else:
@@ -16893,10 +17392,15 @@ class LuxriotManager:
                 self._increment_rollup_status_counter("corrective_retry_successes")
                 if semantic_issues:
                     self._increment_rollup_status_counter("semantic_guard_retry_successes")
-                return retry_summary, retry_memory, None
+                return (
+                    retry_summary,
+                    self._sanitize_rollup_memory_update(retry_memory, node),
+                    None,
+                )
             if retry_contract_valid and retry_semantic_issues:
                 sanitized_summary = self._sanitize_rollup_operator_overclaims(
-                    retry_summary
+                    retry_summary,
+                    node,
                 )
                 if not self._rollup_grounding_guard_issues(
                     sanitized_summary,
@@ -16904,7 +17408,11 @@ class LuxriotManager:
                 ):
                     self._increment_rollup_status_counter("corrective_retry_successes")
                     self._increment_rollup_status_counter("semantic_guard_sanitized")
-                    return sanitized_summary, retry_memory, None
+                    return (
+                        sanitized_summary,
+                        self._sanitize_rollup_memory_update(retry_memory, node),
+                        None,
+                    )
                 self._increment_rollup_status_counter("semantic_guard_failures")
                 return fallback_summary, {}, "unsafe_operator_claims"
             if raw_summary or retry_raw:

@@ -182,6 +182,56 @@ class IncidentCommandService:
             raise LookupError("incident not found")
         return dict(incident)
 
+    @staticmethod
+    def _focus_context(incident: Mapping[str, Any]) -> str:
+        """Bound prior incident evidence carried into live VLM batches."""
+
+        report = (
+            incident.get("report")
+            if isinstance(incident.get("report"), Mapping)
+            else {}
+        )
+        raw_timeline = incident.get("timeline_refs")
+        timeline_items = raw_timeline if isinstance(raw_timeline, list) else []
+        timeline = [
+            {
+                key: item.get(key)
+                for key in (
+                    "timestamp_ms",
+                    "start_ms",
+                    "end_ms",
+                    "semantic_key",
+                    "label",
+                    "description",
+                    "confidence",
+                )
+                if item.get(key) is not None
+            }
+            for item in timeline_items[-8:]
+            if isinstance(item, Mapping)
+        ]
+        raw_uncertainties = incident.get("uncertainties_json") or incident.get("uncertainties")
+        uncertainty_items = raw_uncertainties if isinstance(raw_uncertainties, list) else []
+        payload = {
+            "title": str(incident.get("title") or "")[:180],
+            "summary": str(report.get("summary") or "")[:600],
+            "possible_start_ms": incident.get("possible_start_ms"),
+            "observed_start_ms": incident.get("observed_start_ms"),
+            "observed_end_ms": incident.get("observed_end_ms"),
+            "timeline": timeline,
+            "uncertainties": [
+                str(item)[:180]
+                for item in uncertainty_items[:6]
+            ],
+        }
+        return json.dumps(
+            payload,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            default=str,
+        )[:2400]
+
     def follow(
         self,
         incident_id: str,
@@ -210,12 +260,27 @@ class IncidentCommandService:
             except Exception:
                 previous_lease = None
 
-        lease = self.focus_runtime.start_incident_focus(
-            incident_id,
-            channel_ids,
-            level=normalized_mode,
-            ttl_seconds=ttl,
-        )
+        focus_args = {
+            "level": normalized_mode,
+            "ttl_seconds": ttl,
+        }
+        try:
+            lease = self.focus_runtime.start_incident_focus(
+                incident_id,
+                channel_ids,
+                context=self._focus_context(incident),
+                **focus_args,
+            )
+        except TypeError as exc:
+            # Compatibility seam for external/custom runtimes implementing
+            # the pre-context signature. EVA's runtime always accepts it.
+            if "context" not in str(exc):
+                raise
+            lease = self.focus_runtime.start_incident_focus(
+                incident_id,
+                channel_ids,
+                **focus_args,
+            )
         try:
             updated = self.incident_store.update_incident(
                 incident_id,

@@ -1275,6 +1275,31 @@ class Config:
         ),
     ).strip()
     LUXRIOT_ROLLUP_LLM_LEVELS = os.getenv('EVOSSEARCH_LUXRIOT_ROLLUP_LLM_LEVELS', 'L1,L2,L3').strip() or 'L1,L2,L3'
+    # Rollups are text-only and need a different completion budget from live
+    # visual L0.  In particular, a complete eight-hour L3 report plus its
+    # machine-memory block does not reliably fit in the small L0 budget used on
+    # edge GPUs.  Keep the levels independently configurable so increasing L3
+    # quality does not increase every live VLM request.
+    _ROLLUP_MAX_TOKEN_DEFAULTS = {
+        'L1': 768,
+        'L2': 1024,
+        'L3': 2048,
+    }
+    for _rollup_level, _rollup_default in _ROLLUP_MAX_TOKEN_DEFAULTS.items():
+        try:
+            _rollup_value = int(
+                os.getenv(
+                    f'EVOSSEARCH_LUXRIOT_ROLLUP_{_rollup_level}_MAX_TOKENS',
+                    str(_rollup_default),
+                )
+            )
+        except (TypeError, ValueError):
+            _rollup_value = _rollup_default
+        locals()[f'LUXRIOT_ROLLUP_{_rollup_level}_MAX_TOKENS'] = min(
+            32768,
+            max(256, _rollup_value),
+        )
+    del _rollup_level, _rollup_default, _rollup_value, _ROLLUP_MAX_TOKEN_DEFAULTS
     try:
         LUXRIOT_ROLLUP_MIN_SOURCE_TOKENS = int(os.getenv('EVOSSEARCH_LUXRIOT_ROLLUP_MIN_SOURCE_TOKENS', '8000'))
     except (TypeError, ValueError):

@@ -2215,6 +2215,78 @@ class AgentVideoSummaryToolTests(unittest.TestCase):
         self.assertEqual(thresholds["recommended_action"], "rephrase_positive_or_contrast")
         self.assertFalse(thresholds["safe_to_apply"])
 
+    def test_noisy_scene_calibration_requires_reviewed_refine_and_held_out_shadow(self):
+        rows = []
+        positive_ids = {1, 2, 9, 10}
+        for idx in range(1, 17):
+            rows.append(
+                {
+                    "id": idx,
+                    "channel_id": 7,
+                    "source": "semantic_snapshot",
+                    "event_timestamp_ms": 100_000 + idx * 1_000,
+                    "clip_vec": [1.0, 0.0] if idx in positive_ids else [0.0, 1.0],
+                }
+            )
+
+        tools = _tools(
+            detections_store=_DetectionStore(rows),
+            embed_text_fn=lambda text: (
+                [0.0, 1.0]
+                if "ordinary room" in str(text).lower()
+                else [1.0, 0.0]
+            ),
+        )
+        common = {
+            "event_query": "person leaves the desk",
+            "contrast_query": "ordinary room activity at the occupied desk",
+            "channel_id": 7,
+            "sources": ["semantic_snapshot"],
+            "from_ts": 100.0,
+            "to_ts": 120.0,
+            "min_frames": 4,
+        }
+
+        discovery = tools.execute(
+            "calibrate_probe_from_archive",
+            {**common, "calibration_stage": "discovery"},
+        )["channels"][0]
+        self.assertFalse(discovery["suggested_thresholds"]["safe_to_apply"])
+        self.assertEqual(discovery["calibration_stages"]["next_stage"], "refine")
+
+        refined = tools.execute(
+            "calibrate_probe_from_archive",
+            {
+                **common,
+                "calibration_stage": "refine",
+                "reviewed_positive_detection_ids": [1, 2],
+                "reviewed_negative_detection_ids": [3, 4, 5, 6],
+            },
+        )["channels"][0]
+        candidate = refined["suggested_thresholds"]
+        self.assertEqual(candidate["calibration_status"], "reviewed_candidate")
+        self.assertFalse(candidate["safe_to_apply"])
+        self.assertEqual(refined["calibration_stages"]["next_stage"], "shadow")
+
+        shadow = tools.execute(
+            "calibrate_probe_from_archive",
+            {
+                **common,
+                "calibration_stage": "shadow",
+                "candidate_pos_floor": candidate["pos_floor"],
+                "candidate_margin_thr": candidate["margin_thr"],
+                "shadow_from_ms": 109_000,
+                "reviewed_positive_detection_ids": [9, 10],
+                "reviewed_negative_detection_ids": [11, 12, 13, 14],
+            },
+        )["channels"][0]
+        self.assertEqual(
+            shadow["suggested_thresholds"]["calibration_status"],
+            "shadow_validated",
+        )
+        self.assertTrue(shadow["suggested_thresholds"]["safe_to_apply"])
+        self.assertTrue(shadow["calibration_stages"]["promotion_ready"])
+
     def test_prepare_probe_calibration_batch_keeps_server_side_job_state(self):
         rows = [
             {
