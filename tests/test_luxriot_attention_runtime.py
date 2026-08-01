@@ -7,6 +7,7 @@ from unittest.mock import patch
 
 from PIL import Image
 
+from attention_policy import AttentionMode, CostBudgetState
 from luxriot_connector import LuxriotCaptureSession, LuxriotManager
 
 
@@ -77,6 +78,60 @@ class CompactAttentionSignalTests(unittest.TestCase):
         self.assertAlmostEqual(score["p"], 0.18)
         self.assertAlmostEqual(score["n"], 0.12)
         self.assertAlmostEqual(score["m"], 0.06)
+
+    def test_live_vlm_gets_bounded_snapshot_signal_digest(self):
+        frame_scores = []
+        for source_frame_index in range(1, 17):
+            for probe_index in range(4):
+                frame_scores.append(
+                    {
+                        "source_frame_index": source_frame_index,
+                        "timestamp_ms": 1_000 + source_frame_index,
+                        "probe_id": f"probe-{probe_index}",
+                        "probe_name": f"probe {probe_index}",
+                        "p": 0.2 + source_frame_index / 100,
+                        "n": 0.2,
+                        "m": source_frame_index / 100,
+                        "pos_floor": 0.2,
+                        "margin_threshold": 0.01,
+                        "threshold_state": "hit",
+                    }
+                )
+        compact = LuxriotManager._compact_vector_signal(
+            {
+                "channel_id": 7,
+                "clip_frame_scores": frame_scores,
+                "motion_intervals": [
+                    {
+                        "started_at_ms": 1_000 + index * 1_000,
+                        "ended_at_ms": 1_900 + index * 1_000,
+                        "state": "motion" if index % 2 else "quiet",
+                        "sample_count": 4,
+                        "motion_max": index / 100,
+                        "moving_fraction": float(index % 2),
+                        "activity_x_max": float(index),
+                    }
+                    for index in range(16)
+                ],
+            }
+        )
+        frames = [
+            {"batch_source_frame_index": 1},
+            {"batch_source_frame_index": 8},
+            {"batch_source_frame_index": 16},
+        ]
+
+        prompt_view = LuxriotManager._vector_signal_prompt_view(compact, frames)
+
+        self.assertEqual(len(compact["clip_frame_scores"]), 64)
+        self.assertEqual(len(prompt_view["clip_snapshot_scores"]), 12)
+        self.assertEqual(
+            {item["snapshot_index"] for item in prompt_view["clip_snapshot_scores"]},
+            {1, 2, 3},
+        )
+        self.assertNotIn("clip_frame_scores", prompt_view)
+        self.assertLess(len(str(prompt_view)), 8_000)
+        self.assertEqual(prompt_view["motion_digest"]["interval_count"], 16)
 
     def test_embedding_dispatch_obeys_configured_cadence(self):
         calls = []
@@ -201,7 +256,7 @@ class L0BatchDeliveryContractTests(unittest.TestCase):
             self.assertEqual([len(batch) for batch in batches], [16])
             self.assertEqual(session.status()["pending_frames"], 0)
 
-    def test_quiet_frames_are_sampled_every_ten_seconds_and_flush_at_target(self):
+    def test_quiet_frames_are_sampled_every_ten_seconds_and_flush_by_l0_deadline(self):
         with tempfile.TemporaryDirectory() as temp:
             manager = self._manager(Path(temp))
             session = LuxriotCaptureSession(
@@ -223,10 +278,10 @@ class L0BatchDeliveryContractTests(unittest.TestCase):
                     )
                 session._summarize_if_ready()
 
-            self.assertEqual([len(batch) for batch in batches], [8])
+            self.assertEqual([len(batch) for batch in batches], [7])
             self.assertEqual(
                 [frame["captured_at"] for frame in batches[0]],
-                [100.0 + offset for offset in range(0, 71, 10)],
+                [100.0 + offset for offset in range(0, 61, 10)],
             )
 
     def test_attention_telemetry_does_not_start_sparse_vlm_dispatch_by_default(self):
@@ -247,7 +302,7 @@ class L0BatchDeliveryContractTests(unittest.TestCase):
             self.assertFalse(status["dispatch_enabled"])
             self.assertFalse(status["scheduler_alive"])
 
-    def test_quiet_deadline_excludes_a_frame_beyond_the_120_second_window(self):
+    def test_quiet_deadline_respects_the_60_second_l0_window(self):
         with tempfile.TemporaryDirectory() as temp:
             manager = self._manager(Path(temp))
             session = LuxriotCaptureSession(
@@ -264,8 +319,8 @@ class L0BatchDeliveryContractTests(unittest.TestCase):
             with session.lock:
                 session.frames = [
                     self._frame(100.0, "quiet"),
-                    self._frame(215.0, "quiet"),
-                    self._frame(221.0, "quiet"),
+                    self._frame(155.0, "quiet"),
+                    self._frame(161.0, "quiet"),
                 ]
                 session._summary_batch_opened_monotonic = 0.0
 
@@ -273,11 +328,128 @@ class L0BatchDeliveryContractTests(unittest.TestCase):
 
             self.assertEqual(
                 [[frame["captured_at"] for frame in batch] for batch in batches],
-                [[100.0, 215.0]],
+                [[100.0, 155.0]],
             )
             self.assertEqual(
                 [frame["captured_at"] for frame in session.frames],
-                [221.0],
+                [161.0],
+            )
+
+    def test_budget_deferral_compacts_pending_frames_without_a_coverage_gap(self):
+        with tempfile.TemporaryDirectory() as temp:
+            manager = self._manager(Path(temp))
+            manager.reserve_l0_cost_budget = lambda **_kwargs: False
+            session = LuxriotCaptureSession(
+                manager,
+                channel_id=7,
+                batch_size=16,
+                prompt="Describe.",
+                run_id="run-7",
+            )
+            dispatched = []
+            session._dispatch_summary_frames = (
+                lambda frames, **kwargs: dispatched.append(
+                    (list(frames), dict(kwargs.get("metadata") or {}))
+                )
+                is None
+                or True
+            )
+
+            for offset in range(40):
+                session._admit_embedding_completed_frame(
+                    self._frame(100.0 + offset, "burst"),
+                    None,
+                    trigger_summary=True,
+                )
+
+            status = session.status()
+            self.assertEqual(status["pending_frames"], 16)
+            self.assertEqual(status["dropped_frames"], 0)
+            self.assertEqual(status["summary_coverage_gap_frames"], 0)
+            self.assertEqual(status["summary_compaction_events"], 24)
+            self.assertEqual(status["summary_compacted_frames"], 24)
+
+            manager.reserve_l0_cost_budget = lambda **_kwargs: True
+            session._summarize_if_ready()
+
+            self.assertEqual(len(dispatched), 1)
+            frames, metadata = dispatched[0]
+            self.assertEqual(len(frames), 16)
+            self.assertFalse(
+                any("_eva_summary_source_weight" in frame for frame in frames)
+            )
+            self.assertEqual(metadata["source_frame_count"], 40)
+            self.assertEqual(metadata["coalesced"]["omitted_frames"], 24)
+
+    def test_l0_budget_waiters_are_served_before_new_channels(self):
+        with tempfile.TemporaryDirectory() as temp:
+            manager = self._manager(Path(temp))
+            with manager._l0_cost_budget_lock:
+                now_ms = manager._l0_cost_budget_state.timestamp_ms
+                manager._l0_cost_budget_state = CostBudgetState(
+                    timestamp_ms=now_ms,
+                    available_tokens=0.0,
+                    available_slot_seconds=0.0,
+                )
+
+            self.assertFalse(
+                manager.reserve_l0_cost_budget(
+                    channel_id=7,
+                    mode=AttentionMode.QUIET,
+                    frame_count=8,
+                )
+            )
+            with manager._l0_cost_budget_lock:
+                now_ms = manager._l0_cost_budget_state.timestamp_ms
+                manager._l0_cost_budget_state = CostBudgetState(
+                    timestamp_ms=now_ms,
+                    available_tokens=manager._l0_cost_budget_config.token_capacity,
+                    available_slot_seconds=(
+                        manager._l0_cost_budget_config.slot_seconds_capacity
+                    ),
+                )
+
+            self.assertFalse(
+                manager.reserve_l0_cost_budget(
+                    channel_id=8,
+                    mode=AttentionMode.QUIET,
+                    frame_count=8,
+                )
+            )
+            self.assertTrue(
+                manager.reserve_l0_cost_budget(
+                    channel_id=7,
+                    mode=AttentionMode.QUIET,
+                    frame_count=8,
+                )
+            )
+            status = manager.l0_cost_budget_status()
+            self.assertEqual(status["admitted_by_channel"], {"7": 1})
+            self.assertEqual(status["waiting_channel_ids"], [8])
+            self.assertEqual(status["fairness_deferred_total"], 1)
+
+    def test_overdue_coverage_can_use_the_bounded_global_loan(self):
+        with tempfile.TemporaryDirectory() as temp:
+            manager = self._manager(Path(temp))
+            with manager._l0_cost_budget_lock:
+                now_ms = manager._l0_cost_budget_state.timestamp_ms
+                manager._l0_cost_budget_state = CostBudgetState(
+                    timestamp_ms=now_ms,
+                    available_tokens=0.0,
+                    available_slot_seconds=0.0,
+                )
+
+            self.assertTrue(
+                manager.reserve_l0_cost_budget(
+                    channel_id=7,
+                    mode=AttentionMode.QUIET,
+                    frame_count=8,
+                    coverage_overdue=True,
+                )
+            )
+            self.assertEqual(
+                manager.l0_cost_budget_status()["coverage_loans_total"],
+                1,
             )
 
     def test_attention_mode_retains_frozen_frames_for_quiet_heartbeat(self):

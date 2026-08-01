@@ -1,7 +1,22 @@
-import { IconSettings, IconPlayerPlay, IconPlayerStop, IconTrash, IconPhoto } from '@tabler/icons-react'
+import {
+  IconExternalLink,
+  IconPhoto,
+  IconPlayerPlay,
+  IconPlayerStop,
+  IconSettings,
+  IconTrash,
+} from '@tabler/icons-react'
 import type { Probe } from '../../api/probes'
 import { hitImageSrc } from '../../api/probes'
-import { gateText, lastHit, type ProbeStatus } from './ProbeCard'
+import {
+  gateText,
+  lastHit,
+  ProbeOriginBadge,
+  ProbeSparkline,
+  PROBE_ORIGIN_LABELS,
+  type ProbeStatus,
+} from './ProbeCard'
+import { probeOrigin, probeTemporaryTtl } from './probeBoard'
 
 const n3 = (v?: number | null) => (v == null ? '—' : Number(v).toFixed(3))
 function fmtDateTime(ms?: number | null): string {
@@ -9,7 +24,7 @@ function fmtDateTime(ms?: number | null): string {
   return new Date(Number(ms)).toLocaleString([], { month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit', second: '2-digit' })
 }
 
-export function ProbeInspector({ probe, status, busy, settingsBlockedReason, onSettings, onRun, onDelete }: {
+export function ProbeInspector({ probe, status, busy, settingsBlockedReason, onSettings, onRun, onDelete, onOpenParentAlert }: {
   probe: Probe
   status: ProbeStatus
   busy: boolean
@@ -17,9 +32,13 @@ export function ProbeInspector({ probe, status, busy, settingsBlockedReason, onS
   onSettings?: () => void
   onRun?: () => void
   onDelete?: () => void
+  onOpenParentAlert?: (probe: Probe) => void
 }) {
   const hit = lastHit(probe)
   const src = hitImageSrc(hit)
+  const origin = probeOrigin(probe)
+  const originView = PROBE_ORIGIN_LABELS[origin]
+  const ttl = probeTemporaryTtl(probe)
   return (
     <div className="mon-panel">
       <div className="mon-panel-title">Selected CLIP probe</div>
@@ -31,11 +50,16 @@ export function ProbeInspector({ probe, status, busy, settingsBlockedReason, onS
           <div className="pi-name">{probe.name || 'Untitled probe'}</div>
           <div className="pi-line">Ch {probe.channel_id ?? '—'} · Last event {fmtDateTime(hit?.timestamp_ms ?? hit?.recorded_at_ms)}</div>
         </div>
-        <span className={`pc-badge ${status}`}>{status.toUpperCase()}</span>
+        <div className="pi-head-tags">
+          <span className={`pc-badge ${status}`}>{status.toUpperCase()}</span>
+          <ProbeOriginBadge probe={probe} />
+          {ttl && <span className={`probe-ttl ${ttl.expired ? 'expired' : ''}`} title={ttl.title}>{ttl.text}</span>}
+        </div>
       </div>
 
       {/* what matters: the last signal, front and centre */}
       <div className="pi-sec">Last signal</div>
+      <ProbeSparkline probe={probe} />
       <div className="pi-scores">
         <div><span>Positive</span><b className="pos">{n3(hit?.pos_score)}</b></div>
         <div><span>Negative</span><b>{n3(hit?.neg_score)}</b></div>
@@ -45,6 +69,21 @@ export function ProbeInspector({ probe, status, busy, settingsBlockedReason, onS
       {/* how it's set up: one quiet scannable list */}
       <div className="pi-sec">Configuration</div>
       <div className="pi-config">
+        <div className="pi-row"><span>Created by</span><b>{originView.label}</b></div>
+        {origin === 'agent' && probe.origin_meta?.plan_id && (
+          <div className="pi-row"><span>Approval plan</span><b>{probe.origin_meta.plan_id}</b></div>
+        )}
+        {origin === 'auto' && (
+          <>
+            <div className="pi-row">
+              <span>Parent alert</span>
+              <b title={probe.parent_alert_description}>{probe.parent_alert_title || probe.parent_alert_id || 'unknown'}</b>
+            </div>
+            {probe.parent_alert_timestamp_ms && (
+              <div className="pi-row"><span>Alert time</span><b>{fmtDateTime(probe.parent_alert_timestamp_ms)}</b></div>
+            )}
+          </>
+        )}
         <div className="pi-row"><span>Text pairs</span><b>{(probe.positives?.length ?? 0)} positive · {(probe.negatives?.length ?? 0)} negative</b></div>
         <div className="pi-row"><span>Image probe</span><b>{probe.image_probe?.enabled ? 'on' : 'off'}</b></div>
         <div className="pi-row"><span>Floor · margin</span><b>{n3(probe.pos_floor)} · {n3(probe.margin)}</b></div>
@@ -53,6 +92,11 @@ export function ProbeInspector({ probe, status, busy, settingsBlockedReason, onS
       </div>
 
       <div className="pi-actions">
+        {origin === 'auto' && probe.parent_alert_id && probe.parent_alert_timestamp_ms && onOpenParentAlert && (
+          <button className="mon-btn" onClick={() => onOpenParentAlert(probe)}>
+            <IconExternalLink size={15} /> Open parent alert in archive
+          </button>
+        )}
         {(onSettings || settingsBlockedReason) && (
           <button className="mon-btn" disabled={!!settingsBlockedReason} title={settingsBlockedReason} onClick={onSettings}>
             <IconSettings size={15} /> CLIP probe settings

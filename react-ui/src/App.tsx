@@ -8,7 +8,8 @@ import {
   hasPermission,
   PERMISSION,
 } from './api/access'
-import { getChannels } from './api/detections'
+import { findParentAlert, getChannels } from './api/detections'
+import type { Probe } from './api/probes'
 import { api, API_FORBIDDEN_EVENT, AUTH_EXPIRED_EVENT } from './api/client'
 import { TopBar } from './components/shell/TopBar'
 import { LeftRail, SECTION_LABELS, type SectionId } from './components/shell/LeftRail'
@@ -17,11 +18,20 @@ import { AgentPanel, type AgentAction } from './components/shell/AgentPanel'
 import { ArchiveScreen } from './components/archive/ArchiveScreen'
 import { MonitoringScreen } from './components/monitoring/MonitoringScreen'
 import { VideoScreen } from './components/video/VideoScreen'
+import type { SummaryEntry } from './api/video'
 import { SettingsModal } from './components/settings/SettingsModal'
 import { HomeScreen } from './components/home/HomeScreen'
 import { NeuralBackground } from './components/shell/NeuralBackground'
+import { AppearanceModal } from './components/appearance/AppearanceModal'
+import { useAppearance } from './appearance/AppearanceProvider'
+import type { ConsoleUiEffect } from './ui-effects/consoleEffects'
 
 export type AgentDrive = AgentAction & { seq: number }
+export interface ConsoleDrive {
+  effect: ConsoleUiEffect
+  result: unknown
+  seq: number
+}
 
 export interface StatusData {
   luxriot: boolean
@@ -60,6 +70,11 @@ function LoginGate({ onDone }: { onDone: (u: AuthUser) => void }) {
 }
 
 export default function App() {
+  const {
+    savedPreferences,
+    isMotionReduced,
+    commitPreferences,
+  } = useAppearance()
   const [user, setUser] = useState<AuthUser | null>(null)
   const [ready, setReady] = useState(false)
   const [channels, setChannels] = useState<Channel[]>([])
@@ -69,27 +84,137 @@ export default function App() {
   const [agentFull, setAgentFull] = useState(false)
   const [agentArchiveColumns, setAgentArchiveColumns] = useState(4)
   const [agentCommittedArchiveColumns, setAgentCommittedArchiveColumns] = useState(4)
-  const [noAnim, setNoAnim] = useState(false)
   const [settingsOpen, setSettingsOpen] = useState(false)
+  const [appearanceOpen, setAppearanceOpen] = useState(false)
   const [drive, setDrive] = useState<AgentDrive | null>(null)
+  const [probeDrive, setProbeDrive] = useState<ConsoleDrive | null>(null)
+  const [videoDrive, setVideoDrive] = useState<ConsoleDrive | null>(null)
   const [archiveFilters, setArchiveFilters] = useState<ArchiveFilters | null>(null)
   const [forbiddenNotice, setForbiddenNotice] = useState('')
   const [appVersion, setAppVersion] = useState('')
   const [serverStartedAtMs, setServerStartedAtMs] = useState<number | null>(null)
   const seqRef = useRef(0)
+  const appliedEffectIds = useRef(new Set<string>())
   const visibleSections = (['home', 'archive', 'video', 'monitoring'] as SectionId[])
     .filter((candidate) => canViewSection(user, candidate))
   const settingsAllowed = canOpenSettings(user)
 
-  // agent → console mirroring: route each agent action to the working area
-  const handleAgentAction = useCallback((a: AgentAction) => {
-    if (!canViewSection(user, 'archive')) return
-    setSection('archive')
-    setDrive({ ...a, seq: ++seqRef.current })
+  // Trusted backend effects route completed domain reads/receipts into the console.
+  const handleAgentUiEffects = useCallback((effects: ConsoleUiEffect[], result: unknown) => {
+    for (const effect of effects) {
+      if (appliedEffectIds.current.has(effect.effectId)) continue
+      if (appliedEffectIds.current.size >= 512) appliedEffectIds.current.clear()
+      appliedEffectIds.current.add(effect.effectId)
+      const seq = ++seqRef.current
+      if (effect.target === 'archive' && canViewSection(user, 'archive')) {
+        setSection('archive')
+        setDrive({
+          name: effect.source.tool,
+          args: effect.payload,
+          done: true,
+          result,
+          seq,
+        })
+      } else if (effect.target === 'probes' && canViewSection(user, 'monitoring')) {
+        setSection('monitoring')
+        setProbeDrive({ effect, result, seq })
+      } else if (effect.target === 'video' && canViewSection(user, 'video')) {
+        setSection('video')
+        setVideoDrive({ effect, result, seq })
+      }
+    }
   }, [user])
   const handleAgentBusy = useCallback((busy: boolean) => {
     const agent = busy ? 'working' : 'idle'
     setStatus((current) => current.agent === agent ? current : { ...current, agent })
+  }, [])
+  const handleOpenParentAlert = useCallback(async (probe: Probe) => {
+    const parentAlertId = String(probe.parent_alert_id || '').trim()
+    const channelId = Number(probe.channel_id)
+    if (!parentAlertId || !Number.isInteger(channelId)) return
+    try {
+      const detection = await findParentAlert(
+        parentAlertId,
+        channelId,
+        channels,
+        probe.parent_alert_timestamp_ms,
+      )
+      if (!detection) {
+        setForbiddenNotice('The parent VLM alert is no longer available in the archive.')
+        window.setTimeout(() => setForbiddenNotice(''), 5_000)
+        return
+      }
+      const timestamp = Number(probe.parent_alert_timestamp_ms || detection.tsMs || Date.now())
+      setSection('archive')
+      setDrive({
+        name: 'get_detections',
+        args: {
+          channel_id: channelId,
+          source: 'vlm_alert',
+          since_ms: timestamp - 15 * 60_000,
+          until_ms: timestamp + 15 * 60_000,
+          open_detection_id: detection.id,
+        },
+        done: true,
+        result: { detections: [detection.raw] },
+        seq: ++seqRef.current,
+      })
+    } catch (exception: any) {
+      setForbiddenNotice(exception?.message || 'Could not open the parent VLM alert.')
+      window.setTimeout(() => setForbiddenNotice(''), 5_000)
+    }
+  }, [channels])
+  const handleReviewVideoSummary = useCallback((entry: SummaryEntry) => {
+    const detectionId = Number(entry.thumbnail_detection_id)
+    const channelId = Number(entry.channel_id)
+    if (!Number.isInteger(detectionId) || detectionId <= 0 || !Number.isInteger(channelId) || channelId <= 0) return
+    const toMs = (value: unknown): number => {
+      const number = Number(value)
+      if (!Number.isFinite(number) || number <= 0) return 0
+      return number > 1e12 ? number : number * 1000
+    }
+    const batchStartMs = toMs(entry.batch_start_ms ?? entry.window_start)
+    const batchEndMs = toMs(entry.batch_end_ms ?? entry.window_end ?? entry.created_at)
+    const timestampMs = batchEndMs || batchStartMs || Date.now()
+    const raw = {
+      id: detectionId,
+      detection_id: detectionId,
+      source: 'vlm_summary',
+      source_label: 'Video description',
+      channel_id: channelId,
+      timestamp_ms: timestampMs,
+      summary: String(entry.summary || ''),
+      image_url: `/detections/thumbnail/${detectionId}`,
+      payload: {
+        source: 'vlm_summary',
+        batch_id: String(entry.batch_id || ''),
+        run_id: String(entry.run_id || ''),
+        batch_start_ms: batchStartMs || undefined,
+        batch_end_ms: batchEndMs || undefined,
+        summary: String(entry.summary || ''),
+        anchor_role: String(entry.thumbnail_role || 'sample'),
+        snapshot_index: entry.thumbnail_snapshot_index,
+        is_cover: entry.thumbnail_is_cover === true,
+        cover_kind: String(entry.cover_kind || ''),
+        cover_reason: String(entry.cover_reason || ''),
+        cover_confidence: String(entry.cover_confidence || ''),
+        selection_source: String(entry.thumbnail_selection_source || ''),
+      },
+    }
+    setSection('archive')
+    setDrive({
+      name: 'get_detections',
+      args: {
+        channel_id: channelId,
+        source: 'vlm_summary',
+        since_ms: Math.max(0, (batchStartMs || timestampMs) - 60_000),
+        until_ms: Math.max(batchEndMs || timestampMs, timestampMs) + 60_000,
+        open_detection_id: detectionId,
+      },
+      done: true,
+      result: { detections: [raw] },
+      seq: ++seqRef.current,
+    })
   }, [])
 
   const refreshChannels = useCallback(async () => {
@@ -148,12 +273,6 @@ export default function App() {
     }
   }, [])
   useEffect(() => { apiMe().then((u) => { setUser(u); setReady(true) }) }, [])
-  // the "Animations" switch also turns off the ambient backdrop entirely — neural field,
-  // aurora and the starfield (#root::after) — for a clean, motionless background.
-  useEffect(() => {
-    document.documentElement.classList.toggle('anim-off', noAnim)
-    return () => document.documentElement.classList.remove('anim-off')
-  }, [noAnim])
   useEffect(() => {
     refreshHealth()
     const timer = window.setInterval(refreshHealth, 30_000)
@@ -189,6 +308,7 @@ export default function App() {
 
   async function handleLogout() { await apiLogout(); setUser(null) }
   const agentPresetGrid = agentOpen && !agentFull
+  const noAnim = isMotionReduced
 
   return (
     <div className={`shell ${noAnim ? 'no-anim' : ''}`}>
@@ -200,7 +320,11 @@ export default function App() {
         section={SECTION_LABELS[section]}
         noAnim={noAnim}
         canBenchmark={hasPermission(user, PERMISSION.diagnosticsView)}
-        onToggleNoAnim={() => setNoAnim((v) => !v)}
+        onToggleNoAnim={() => commitPreferences({
+          ...savedPreferences,
+          motion: noAnim ? 'full' : 'reduced',
+        })}
+        onAppearance={() => setAppearanceOpen(true)}
         onBrand={() => setSection('home')}
       />
       {forbiddenNotice && <div className="global-notice" role="alert">{forbiddenNotice}</div>}
@@ -228,6 +352,9 @@ export default function App() {
               channels={channels}
               drive={drive}
               noAnim={noAnim}
+              canReportFeedback={hasPermission(user, PERMISSION.bookmarksCreate)}
+              canReportIncidents={hasPermission(user, PERMISSION.incidentsManage)}
+              canExport={hasPermission(user, PERMISSION.dataExport)}
               onFilters={setArchiveFilters}
               onRefreshChannels={refreshChannels}
             />
@@ -235,18 +362,24 @@ export default function App() {
           {section === 'monitoring' && (
             <MonitoringScreen
               channels={channels}
+              drive={probeDrive}
               canOperate={hasPermission(user, PERMISSION.probesRun) && hasPermission(user, PERMISSION.captureManage)}
               canManage={hasPermission(user, PERMISSION.probesManage)}
               canCreateBookmarks={hasPermission(user, PERMISSION.bookmarksCreate)}
+              onOpenParentAlert={handleOpenParentAlert}
             />
           )}
           {section === 'video' && (
             <VideoScreen
               channels={channels}
+              drive={videoDrive}
               onReloadChannels={refreshChannels}
               canCapture={hasPermission(user, PERMISSION.captureManage)}
               canManagePrompts={hasPermission(user, PERMISSION.promptsManage)}
               canCreateBookmarks={hasPermission(user, PERMISSION.bookmarksCreate)}
+              canReportIncidents={hasPermission(user, PERMISSION.incidentsManage)}
+              canExport={hasPermission(user, PERMISSION.dataExport)}
+              onReviewSummary={handleReviewVideoSummary}
             />
           )}
           {section !== 'home' && section !== 'archive' && section !== 'monitoring' && section !== 'video' && (
@@ -264,6 +397,7 @@ export default function App() {
             onClose={() => setSettingsOpen(false)}
           />
         )}
+        {appearanceOpen && <AppearanceModal onClose={() => setAppearanceOpen(false)} />}
         {hasPermission(user, PERMISSION.agentUse) && (
           <>
             <AgentEar open={agentOpen} onToggle={() => setAgentOpen((v) => !v)} />
@@ -272,9 +406,10 @@ export default function App() {
               full={agentFull}
               onClose={() => setAgentOpen(false)}
               onToggleFull={() => setAgentFull((v) => !v)}
+              section={section}
               channels={channels}
               archiveFilters={archiveFilters}
-              onAction={handleAgentAction}
+              onUiEffects={handleAgentUiEffects}
               onBusyChange={handleAgentBusy}
               onLayoutPresetChange={setAgentArchiveColumns}
               onLayoutPresetCommit={setAgentCommittedArchiveColumns}

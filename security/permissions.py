@@ -21,6 +21,7 @@ class Permission(StrEnum):
     AGENT_USE = "agent:use"
     PROBES_RUN = "probes:run"
     BOOKMARKS_CREATE = "bookmarks:create"
+    INCIDENTS_MANAGE = "incidents:manage"
     PROBES_MANAGE = "probes:manage"
     PROMPTS_MANAGE = "prompts:manage"
     MODELS_MANAGE = "models:manage"
@@ -45,12 +46,14 @@ _OPERATOR_PERMISSIONS = _VIEWER_PERMISSIONS | frozenset(
         Permission.AGENT_USE,
         Permission.PROBES_RUN,
         Permission.BOOKMARKS_CREATE,
+        Permission.INCIDENTS_MANAGE,
     }
 )
 _ENGINEER_PERMISSIONS = _VIEWER_PERMISSIONS | frozenset(
     {
         Permission.AGENT_USE,
         Permission.PROBES_RUN,
+        Permission.INCIDENTS_MANAGE,
         Permission.PROBES_MANAGE,
         Permission.PROMPTS_MANAGE,
         Permission.MODELS_MANAGE,

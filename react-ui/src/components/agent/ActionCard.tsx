@@ -13,11 +13,13 @@ export interface ToolAction {
 const LABELS: Record<string, string> = {
   search_archive: 'Search archive', search_detections: 'Search archive', search_folder: 'Search frames',
   get_detections: 'Detections', get_detection_summary: 'Detection summary', list_channels: 'Channels',
+  list_video_summary_channels: 'Video channel coverage',
   list_probes: 'Probes', survey_channels: 'Channel survey', create_probe: 'Create probe', update_probe: 'Update probe',
   delete_probes: 'Delete probes', deploy_summary: 'Deploy summary', describe_frame: 'Describe frame',
   get_video_summaries: 'Video summaries', count_video_summary_events: 'Summary events',
   track_visual_state_transitions: 'State transitions', create_bookmark: 'Bookmark', generate_report: 'Report',
   normalize_time_window: 'Time window', build_research_batch: 'Research batch',
+  get_prompt_settings: 'VLM prompt layers', update_prompt_settings: 'Update VLM prompts',
 }
 
 function label(name: string) { return (LABELS[name] || name.replace(/_/g, ' ')).toUpperCase() }
@@ -57,6 +59,151 @@ function entriesOf(obj: any): [string, string][] {
   return out
 }
 
+export interface ActionTable {
+  title: string
+  columns: string[]
+  rows: string[][]
+}
+
+function textValue(value: unknown, fallback = '—'): string {
+  if (value == null || value === '') return fallback
+  if (typeof value === 'boolean') return value ? 'yes' : 'no'
+  if (Array.isArray(value)) return value.map((item) => textValue(item, '')).filter(Boolean).join(', ') || fallback
+  if (typeof value === 'object') {
+    const record = value as Record<string, unknown>
+    return Object.entries(record)
+      .slice(0, 4)
+      .map(([key, item]) => `${key.replace(/_/g, ' ')} ${textValue(item, '')}`)
+      .join(' · ') || fallback
+  }
+  return String(value)
+}
+
+function row(values: unknown[]): string[] {
+  return values.map((value) => textValue(value))
+}
+
+/** Closed, bounded renderers for the high-volume EVA tools used in ordinary operator flows. */
+export function actionTables(name: string, result: any): ActionTable[] {
+  if (!result || typeof result !== 'object') return []
+
+  if (name === 'list_channels') {
+    const rows = Array.isArray(result.channels) ? result.channels : []
+    return [{
+      title: `${result.count ?? rows.length} visible channels`,
+      columns: ['Channel', 'Title', 'State'],
+      rows: rows.slice(0, 12).map((item: any) => row([
+        `#${item.id ?? item.channel_id ?? '?'}`,
+        item.title,
+        item.status ?? (item.enabled === false ? 'disabled' : 'enabled'),
+      ])),
+    }]
+  }
+
+  if (name === 'list_video_summary_channels') {
+    const rows = Array.isArray(result.candidate_channels) ? result.candidate_channels : []
+    return [{
+      title: `${result.active_count ?? rows.length} active · ${result.error_count ?? 0} problems`,
+      columns: ['Channel', 'VLM / coverage', 'Signals'],
+      rows: rows.slice(0, 12).map((item: any) => row([
+        `#${item.channel_id ?? '?'} ${item.title || ''}`.trim(),
+        `${item.running || item.runtime_running ? 'running' : 'idle'} · ${item.coverage_status || 'coverage unknown'}`,
+        `${item.summary_count ?? 0} summaries · ${item.alert_total ?? 0} alerts${item.dropped_frames ? ` · ${item.dropped_frames} dropped` : ''}`,
+      ])),
+    }]
+  }
+
+  if (name === 'survey_channels') {
+    const rows = Array.isArray(result.channels) ? result.channels : []
+    return [{
+      title: `${rows.length} channel scene surveys`,
+      columns: ['Channel', 'Samples', 'Observed scene'],
+      rows: rows.slice(0, 8).map((item: any) => row([
+        `#${item.channel_id ?? '?'} ${item.title || ''}`.trim(),
+        item.sample_count,
+        item.error || item.survey,
+      ])),
+    }]
+  }
+
+  if (name === 'list_probes') {
+    const rows = Array.isArray(result.probes) ? result.probes : []
+    return [{
+      title: `${result.count ?? rows.length} probes`,
+      columns: ['Probe', 'Channel / state', 'Thresholds / hits'],
+      rows: rows.slice(0, 12).map((item: any) => row([
+        item.name || item.id,
+        `#${item.channel_id ?? '?'} · ${item.enabled === false ? 'disabled' : 'enabled'} · ${item.severity || 'info'}`,
+        `P ≥ ${item.pos_floor ?? '—'} · M ≥ ${item.margin ?? '—'} · ${item.hit_count_24h ?? 0} hits/24h`,
+      ])),
+    }]
+  }
+
+  if (name === 'get_video_summaries') {
+    const rows = Array.isArray(result.entries) ? result.entries : []
+    return [{
+      title: `${result.count ?? rows.length} ${result.depth || 'video'} summaries · ${result.coverage?.status || 'coverage unknown'}`,
+      columns: ['Window', 'Material', 'Summary'],
+      rows: rows.slice(0, 5).map((item: any) => row([
+        item.time || item.window_start || item.window_end_time,
+        `${item.level || result.depth || 'L0'} · ${item.frame_count ?? 0} frames · ${item.alert_total ?? 0} alerts`,
+        item.summary,
+      ])),
+    }]
+  }
+
+  if (name === 'count_video_summary_events') {
+    const events = Array.isArray(result.transition_events) ? result.transition_events : []
+    const timeline = Array.isArray(result.timeline_samples) ? result.timeline_samples : []
+    const tables: ActionTable[] = [{
+      title: `${result.event_total ?? events.length} counted events · ${textValue(result.coverage?.status || result.coverage)}`,
+      columns: ['Transition', 'Time', 'Evidence'],
+      rows: events.slice(0, 12).map((item: any) => row([
+        item.type || item.basis,
+        item.time || item.window_start,
+        item.summary || `${item.previous_state || 'unknown'} → event`,
+      ])),
+    }]
+    if (timeline.length) {
+      tables.push({
+        title: 'State timeline sample',
+        columns: ['Time', 'State', 'Evidence'],
+        rows: timeline.slice(0, 8).map((item: any) => row([
+          item.time || item.window_start,
+          item.state,
+          item.summary,
+        ])),
+      })
+    }
+    return tables
+  }
+
+  if (name === 'get_prompt_settings' || name === 'update_prompt_settings') {
+    const current = result.current && typeof result.current === 'object' ? result.current : result
+    const health = current.prompt_health || {}
+    return [{
+      title: `VLM prompt scope · ${current.scope || (current.channel_id ? `channel ${current.channel_id}` : 'global')}`,
+      columns: ['Layer', 'State', 'Preview'],
+      rows: [
+        row(['L0 live role', 'editable', current.stream_system_prompt || current.L0_live_prompt]),
+        row(['Alert criteria', health.needs_migration ? 'migration suggested' : 'separate', current.alert_policy_prompt]),
+        row(['BATCH_STATE_JSON', 'system contract', current.json_alert_prompt]),
+      ],
+    }]
+  }
+
+  if (name === 'generate_report' && result.report_type === 'false_positives') {
+    const rows = Array.isArray(result.reason_counts) ? result.reason_counts : []
+    return [{
+      title: `${textValue(result.period, 'Selected period')} false-positive feedback`,
+      columns: ['Reason', 'Count'],
+      rows: rows.slice(0, 8).map((item: any) => row([item.reason_label || item.reason_code, item.count])),
+    }]
+  }
+
+  return []
+}
+
 export function ActionCard({ action, onThumb, onApply }: {
   action: ToolAction
   onThumb: (url: string, title: string) => void
@@ -64,9 +211,10 @@ export function ActionCard({ action, onThumb, onApply }: {
 }) {
   const { name, result, error } = action
   const items = itemsOf(result)
-  const isApproval = !!action.planId || result?.status === 'preview'
+  const isApproval = !!action.applied || !!action.planId || result?.status === 'preview'
   const describeImg = name === 'describe_frame' ? agentImageUrl(result) : ''
   const text = result?.description || result?.summary || result?.note || result?.text || result?.message
+  const tables = actionTables(name, result)
 
   if (isApproval) {
     const fields = entriesOf(result?.approval || result?.preview || result)
@@ -122,7 +270,20 @@ export function ActionCard({ action, onThumb, onApply }: {
           </div>
         )}
         {text && <div className="ag-card-text">{String(text)}</div>}
-        {!items.length && !describeImg && !text && (
+        {tables.map((table, tableIndex) => (
+          <section className="ag-tool-table" key={`${table.title}-${tableIndex}`}>
+            <div className="ag-tool-table-title">{table.title}</div>
+            <div className="ag-tool-table-scroll">
+              <div className="ag-tool-table-grid" style={{ '--ag-columns': table.columns.length } as React.CSSProperties}>
+                {table.columns.map((column) => <b key={column}>{column}</b>)}
+                {table.rows.flatMap((values, rowIndex) => values.map((value, columnIndex) => (
+                  <span key={`${rowIndex}-${columnIndex}`} title={value}>{value}</span>
+                )))}
+              </div>
+            </div>
+          </section>
+        ))}
+        {!items.length && !describeImg && !text && !tables.length && (
           <div className="ag-fields">
             {entriesOf(result).map(([k, v]) => <div key={k} className="ag-field"><span className="ag-field-k">{k}</span><span className="ag-field-v">{v}</span></div>)}
           </div>

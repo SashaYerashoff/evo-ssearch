@@ -64,11 +64,14 @@ function agentHoursFromArgs(args: any): string | null {
 const DEFAULT_FILTERS: ArchiveFilters = { source: '', hours: '24', sortBy: 'similarity', rows: '24' }
 
 export function ArchiveScreen({
-  channels, drive, noAnim, onFilters, onRefreshChannels,
+  channels, drive, noAnim, canReportFeedback, canReportIncidents, canExport, onFilters, onRefreshChannels,
 }: {
   channels: Channel[]
   drive?: AgentDrive | null
   noAnim?: boolean
+  canReportFeedback?: boolean
+  canReportIncidents?: boolean
+  canExport?: boolean
   onFilters?: (f: ArchiveFilters) => void
   onRefreshChannels?: () => Promise<void> | void
 }) {
@@ -233,7 +236,15 @@ export function ArchiveScreen({
       .finally(() => {
         if (probeRequestSeq.current === seq) setProbesLoading(false)
       })
-  }, [filters.source, filters.channelId, filters.hours, filters.sinceMs, filters.untilMs, filterRefresh])
+  }, [
+    filters.source,
+    filters.channelId,
+    filters.channelIds?.join(','),
+    filters.hours,
+    filters.sinceMs,
+    filters.untilMs,
+    filterRefresh,
+  ])
 
   const refreshFilters = useCallback(async () => {
     await onRefreshChannels?.()
@@ -244,26 +255,40 @@ export function ArchiveScreen({
   useEffect(() => {
     if (!drive) return
     const { name, args, done, error, result } = drive
+    if (VIEW_TOOLS.has(name)) {
+      if (Array.isArray(args?.channel_ids)) {
+        const selected = channels
+          .filter((channel) => args.channel_ids.some((id: unknown) => String(id) === String(channel.id)))
+          .map((channel) => String(channel.id))
+        patch({
+          channelIds: selected,
+          channelId: selected.length === 1 ? selected[0] : undefined,
+        })
+      }
+      if (args?.channel_id != null) {
+        const ch = channels.find((c) => String(c.id) === String(args.channel_id))
+        if (ch) patch({ channelIds: [String(ch.id)], channelId: String(ch.id) })
+      }
+      if (args?.source) patch({ source: String(args.source) })
+      if (args?.probe_id) patch({ source: 'probe', probeId: String(args.probe_id) })
+      const h = agentHoursFromArgs(args)
+      if (h != null) patch({ hours: h, sinceMs: undefined, untilMs: undefined })
+      if (args?.sort_by) patch({ sortBy: String(args.sort_by) === 'time' ? 'time' : 'similarity' })
+      if (args?.limit != null && isFinite(Number(args.limit))) {
+        const ps = [12, 24, 36, 48]; const n = Number(args.limit)
+        patch({ rows: String(ps.reduce((b, p) => (Math.abs(p - n) < Math.abs(b - n) ? p : b), ps[0])) })
+      }
+      if (done && (args?.channel_id != null || Array.isArray(args?.channel_ids) || args?.source || h != null || args?.sort_by || args?.limit != null)) {
+        setOpenTool('filters')
+      }
+    }
     if (!done) {
       setAgentStep(prettyTool(name))
       if (VIEW_TOOLS.has(name)) {
         // agent drives the console controls: channel / source / time / sort / rows visibly change
-        if (args?.channel_id != null) {
-          const ch = channels.find((c) => String(c.id) === String(args.channel_id))
-          if (ch) patch({ channelId: String(ch.id) })
-        }
-        if (args?.source) patch({ source: String(args.source) })
-        if (args?.probe_id) patch({ source: 'probe', probeId: String(args.probe_id) })
-        const h = agentHoursFromArgs(args)
-        if (h != null) patch({ hours: h, sinceMs: undefined, untilMs: undefined })
-        if (args?.sort_by) patch({ sortBy: String(args.sort_by) === 'time' ? 'time' : 'similarity' })
-        if (args?.limit != null && isFinite(Number(args.limit))) {
-          const ps = [12, 24, 36, 48]; const n = Number(args.limit)
-          patch({ rows: String(ps.reduce((b, p) => (Math.abs(p - n) < Math.abs(b - n) ? p : b), ps[0])) })
-        }
         const q = String(args?.query || args?.event_query || args?.positive_query || args?.text || '').trim()
         if (TYPING_TOOLS.has(name) && q) { setOpenTool('text'); animateTyping(q) }
-        else if (args?.channel_id != null || args?.source || h != null || args?.sort_by || args?.limit != null) setOpenTool('filters')
+        else if (args?.channel_id != null || Array.isArray(args?.channel_ids) || args?.source || args?.sort_by || args?.limit != null) setOpenTool('filters')
       }
       return
     }
@@ -281,6 +306,11 @@ export function ArchiveScreen({
         setAppliedFilters({ ...filters })
         setNote(`Agent · ${found.length} frame${found.length === 1 ? '' : 's'} · ${prettyTool(name)}`)
         setError(found.length ? null : 'Agent returned no frames for this query.')
+        if (args?.open_detection_id != null) {
+          const requestedId = String(args.open_detection_id)
+          const requested = found.find((item) => String(item.id) === requestedId)
+          if (requested) setSelected(requested)
+        }
       }
     }
     setAgentStep(error ? `${prettyTool(name)} — failed` : prettyTool(name))
@@ -310,7 +340,13 @@ export function ArchiveScreen({
 
   // live summaries shown on collapsed chips
   const filtersSummary = [
-    filters.channelId ? (channels.find((c) => String(c.id) === filters.channelId)?.title || `ch ${filters.channelId}`) : 'All streams',
+    filters.channelIds?.length
+      ? (filters.channelIds.length === 1
+          ? (channels.find((c) => String(c.id) === filters.channelIds?.[0])?.title || `ch ${filters.channelIds[0]}`)
+          : `${filters.channelIds.length} streams`)
+      : filters.channelId
+        ? (channels.find((c) => String(c.id) === filters.channelId)?.title || `ch ${filters.channelId}`)
+        : 'All streams',
     filters.source === 'probe' && filters.probeId
       ? (probeOptions.find((p) => p.id === filters.probeId)?.name || filters.probeId)
       : null,
@@ -420,7 +456,17 @@ export function ArchiveScreen({
         </div>
       )}
 
-      {selected && <InspectorModal d={selected} onClose={() => setSelected(null)} onFindSimilar={runSimilar} />}
+      {selected && (
+        <InspectorModal
+          d={selected}
+          channels={channels}
+          canReportFeedback={!!canReportFeedback}
+          canReportIncidents={!!canReportIncidents}
+          canExport={!!canExport}
+          onClose={() => setSelected(null)}
+          onFindSimilar={runSimilar}
+        />
+      )}
     </div>
   )
 }

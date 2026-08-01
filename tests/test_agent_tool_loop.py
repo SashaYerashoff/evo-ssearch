@@ -412,6 +412,54 @@ class AgentToolLoopTests(unittest.TestCase):
         ][-1]
         self.assertTrue(duplicate_result["result"]["duplicate_suppressed"])
 
+    def test_completed_archive_tool_emits_closed_console_effect(self):
+        runner = AgentRunner.__new__(AgentRunner)
+        runner.store = _FakeStore()
+        runner._lm_client = _FakeLMClient(
+            tool_rounds=1,
+            tool_name="search_archive",
+        )
+        runner._tools = _FakeTools(
+            result={
+                "results": [
+                    {
+                        "id": 77,
+                        "channel_id": 7,
+                        "timestamp_ms": 2_000,
+                    }
+                ]
+            }
+        )
+        runner._ps = object()
+        runner._ds = object()
+        runner._lxm = object()
+
+        events = [
+            json.loads(item.removeprefix("data: ").strip())
+            for item in runner.stream_chat(
+                "session-1",
+                "Search the archive for a person at the gate",
+                console_context={
+                    "version": 1,
+                    "section": "archive",
+                    "archive": {
+                        "channel_id": 7,
+                        "since_ms": 1_000,
+                        "until_ms": 2_000,
+                    },
+                },
+            )
+            if item.startswith("data: ")
+        ]
+
+        call = next(item for item in events if item.get("type") == "tool_call")
+        result = next(item for item in events if item.get("type") == "tool_result")
+        self.assertEqual(call["call_id"], result["call_id"])
+        self.assertEqual(runner._tools.call_args[0][1]["channel_id"], 7)
+        self.assertEqual(runner._tools.call_args[0][1]["since_ms"], 1_000)
+        self.assertEqual(result["ui_effects"][0]["target"], "archive")
+        self.assertEqual(result["ui_effects"][0]["action"], "show_results")
+
     def test_activated_runbook_tools_pass_the_intent_gate(self):
         query = "проверь канал 115, был ли почтальон вчера вечером?"
         context = _seed_turn_tool_context(query)

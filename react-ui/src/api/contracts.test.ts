@@ -15,9 +15,17 @@ import {
 import { mapUser } from './auth'
 import { apiErrorMessage, shouldAttachCsrf } from './client'
 import {
+  incidentExportUrl,
+  incidentPath,
+  normalizeIncidentDraftInput,
+  normalizeIncidentFollowInput,
+} from './incidents'
+import {
   buildArchiveFilterPayload,
   buildArchiveListQuery,
   buildArchiveSearchPayload,
+  batchFrameNumber,
+  falsePositiveExportUrl,
   fullDetectionImageSrc,
   normalizeDetection,
 } from './detections'
@@ -27,8 +35,19 @@ import {
   normalizeAuditEvent,
   normalizeRevokedSessions,
   buildAuditQuery,
+  buildArchiveCapacityQuery,
 } from './settings'
-import { buildCaptureInput, buildPromptSettingsPayload, buildSessionQuery } from './video'
+import {
+  attentionStreamUrl,
+  buildIncidentDraftFromSummary,
+  buildSummaryBookmarkInput,
+  buildCaptureInput,
+  buildPromptSettingsPayload,
+  buildSessionQuery,
+  buildSummaryFeedQuery,
+  fullLiveMediaUrl,
+  recentFrameUrl,
+} from './video'
 import { API_PREFIXES } from '../../proxy-config'
 
 describe('React/backend contract normalizers', () => {
@@ -94,6 +113,11 @@ describe('React/backend contract normalizers', () => {
     })
   })
 
+  it('keeps expensive current archive statistics opt-in', () => {
+    expect(buildArchiveCapacityQuery()).toEqual({ include_current: 'false' })
+    expect(buildArchiveCapacityQuery(true)).toEqual({ include_current: 'true' })
+  })
+
   it('maps revokedSessions to the UI count', () => {
     expect(normalizeRevokedSessions({ success: true, revokedSessions: 3 })).toEqual({
       success: true,
@@ -111,23 +135,101 @@ describe('React/backend contract normalizers', () => {
     expect(buildSessionQuery(7, { limit: 60, from_ts: 1234 })).toEqual({
       channel_id: '7',
       limit: '60',
+      run: undefined,
       from_ts: 1234,
       to_ts: undefined,
     })
   })
 
-  it('includes the operator live prompt when starting video capture', () => {
+  it('requests the bounded video-summary feed instead of internal diagnostics', () => {
+    expect(buildSummaryFeedQuery(7, { limit: 240, from_ts: 1234 })).toEqual({
+      channel_id: '7',
+      limit: '240',
+      run: undefined,
+      from_ts: 1234,
+      to_ts: undefined,
+      view: 'feed',
+    })
+  })
+
+  it('keeps model-view preview fresh across dense capture windows', () => {
+    expect(recentFrameUrl(112, 7)).toBe(
+      '/luxriot/recent_frame/112?stream=mainStream&fallback=snapshot&mode=latest&max_age_sec=60&_=7',
+    )
+  })
+
+  it('uses the credential-safe bounded broker for opt-in full live', () => {
+    expect(fullLiveMediaUrl(112, 9)).toBe(
+      '/luxriot/media/live/112?stream=mainStream&request=9',
+    )
+  })
+
+  it('uses the shared EVA attention ring for the model-view stream', () => {
+    expect(attentionStreamUrl(112, 8)).toBe(
+      '/luxriot/attention_stream/112?max_age_sec=60&request=8',
+    )
+  })
+
+  it('builds an incident draft from a grounded VLM summary anchor', () => {
+    expect(buildIncidentDraftFromSummary({
+      channel_id: 112,
+      thumbnail_detection_id: 401,
+      batch_start_ms: 1_785_000_000_000,
+      batch_end_ms: 1_785_000_060_000,
+    })).toEqual({
+      channel_id: 112,
+      anchor_detection_id: 401,
+    })
+    expect(buildIncidentDraftFromSummary({ channel_id: 112 })).toBeNull()
+  })
+
+  it('normalizes incident draft and export contracts', () => {
+    expect(normalizeIncidentDraftInput({
+      channel_id: 112,
+      anchor_detection_id: 401,
+      from_ts: 10,
+      to_ts: 20,
+    })).toEqual({
+      channel_id: 112,
+      anchor_detection_id: 401,
+      from_ts: 10,
+      to_ts: 20,
+    })
+    expect(() => normalizeIncidentDraftInput({ channel_id: 0 })).toThrow('valid incident channel')
+    expect(() => normalizeIncidentDraftInput({ channel_id: 112, from_ts: 20, to_ts: 10 })).toThrow('cannot precede')
+    expect(incidentExportUrl('case/7', 'xml')).toBe('/incidents/case%2F7/export?format=xml')
+    expect(incidentPath('case/7')).toBe('/incidents/case%2F7')
+    expect(incidentPath('case/7', '/follow')).toBe('/incidents/case%2F7/follow')
+    expect(incidentPath('case/7', '/stop-follow')).toBe('/incidents/case%2F7/stop-follow')
+    expect(normalizeIncidentFollowInput('critical', 30)).toEqual({ mode: 'critical', ttl_seconds: 60 })
+    expect(API_PREFIXES).toContain('/incidents')
+  })
+
+  it('builds the same bounded L0 bookmark payload as the legacy console', () => {
+    expect(buildSummaryBookmarkInput({
+      channel_id: 112,
+      created_at: 1_785_000_000,
+      summary: 'Person entered\nMore evidence',
+    })).toEqual({
+      channel_id: 112,
+      title: 'Live summary: Person entered',
+      description: 'Person entered\nMore evidence',
+      severity: 'normal',
+      state: 'new',
+      timestamp_ms: 1_785_000_000_000,
+    })
+  })
+
+  it('starts video capture from persistent channel prompt settings', () => {
     expect(buildCaptureInput(7, {
       batch: '12',
       every: '5',
       model: '  auto ',
-      prompt: '  Watch the loading bay  ',
     })).toEqual({
       channel_id: 7,
       batch_size: 12,
       interval_sec: 5,
       model: 'auto',
-      prompt: 'Watch the loading bay',
     })
   })
 
@@ -164,6 +266,7 @@ describe('React/backend contract normalizers', () => {
     }
     const common = {
       channel_id: '7',
+      channel_ids: undefined,
       source: 'probe',
       probe_id: 'probe-1',
       hours: 72,
@@ -192,11 +295,28 @@ describe('React/backend contract normalizers', () => {
       untilMs: '9000',
     })).toEqual({
       channel_id: undefined,
+      channel_ids: undefined,
       source: 'vlm_summary',
       probe_id: undefined,
       hours: undefined,
       since_ms: '1000',
       until_ms: '9000',
+    })
+  })
+
+  it('keeps multi-stream archive scope across list and semantic search', () => {
+    expect(buildArchiveFilterPayload({
+      channelIds: ['9', '7', '9'],
+      source: 'semantic_snapshot',
+      hours: '6',
+    })).toEqual({
+      channel_id: undefined,
+      channel_ids: ['9', '7'],
+      source: 'semantic_snapshot',
+      probe_id: undefined,
+      hours: 6,
+      since_ms: undefined,
+      until_ms: undefined,
     })
   })
 
@@ -219,6 +339,16 @@ describe('React/backend contract normalizers', () => {
     })
     expect(fullDetectionImageSrc(detection)).toBe(
       '/detections/image?image_path=D%3A%5Carchive%5Ccamera%207%5Cframe.jpg',
+    )
+  })
+
+  it('orders batch frames by stored snapshot index and scopes feedback exports', () => {
+    expect(batchFrameNumber(normalizeDetection({
+      source: 'vlm_summary',
+      payload: { snapshot_index: 6 },
+    }))).toBe(6)
+    expect(falsePositiveExportUrl('xml', 112)).toBe(
+      '/reports/false-positives/export?format=xml&hours=24&channel_id=112',
     )
   })
 

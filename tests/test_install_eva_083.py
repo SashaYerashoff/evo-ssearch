@@ -129,7 +129,7 @@ class OfflineInstallerUnitTests(unittest.TestCase):
             installer.EXPECTED_VERSION,
             (ROOT / "VERSION").read_text(encoding="utf-8").strip(),
         )
-        self.assertEqual(installer.EXPECTED_SCHEMA, "20260727_0010")
+        self.assertEqual(installer.EXPECTED_SCHEMA, "20260801_0011")
 
     def test_discovers_existing_app_dotenv_before_source_and_preserves_target(self):
         with tempfile.TemporaryDirectory() as tmp:

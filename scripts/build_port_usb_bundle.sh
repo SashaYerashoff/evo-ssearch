@@ -8,6 +8,7 @@ MODEL_VLM="${EVA_PORT_VLM_MODEL_DIR:-${REPO_ROOT}/.local/inference/models/qwen3-
 MODEL_9B="${EVA_PORT_9B_MODEL_DIR:-/mnt/eva-llamacpp-lab/models/unsloth/Qwen3.5-9B-MTP-GGUF}"
 CLIP_WEIGHT="${EVA_PORT_CLIP_WEIGHT:-/home/sasha/.cache/clip/ViT-B-32.pt}"
 LLAMA_SOURCE="${EVA_PORT_LLAMA_SOURCE:-/mnt/eva-llamacpp-lab/src/llama.cpp}"
+REACT_UI_ROOT="${REPO_ROOT}/react-ui"
 
 for required in \
     "${MODEL_VLM}/model.safetensors" \
@@ -19,6 +20,16 @@ for required in \
         exit 1
     fi
 done
+
+if [[ ! -x "${REACT_UI_ROOT}/node_modules/.bin/vite" ]]; then
+    echo "ERROR: React build dependencies are missing. Run: npm --prefix ${REACT_UI_ROOT} ci" >&2
+    exit 1
+fi
+npm --prefix "${REACT_UI_ROOT}" run build
+if [[ ! -f "${REACT_UI_ROOT}/dist/index.html" ]]; then
+    echo "ERROR: React production build did not produce dist/index.html" >&2
+    exit 1
+fi
 
 mkdir -p "${STAGING_ROOT}"
 mkdir -p "${STAGING_ROOT}/repo"
@@ -42,9 +53,9 @@ rsync -a --delete --delete-excluded \
     --exclude=.clip_index \
     --exclude=.pytest_cache \
     --exclude=__pycache__ \
-    --exclude=react-ui/ \
+    --exclude=react-ui/node_modules/ \
     --exclude=node_modules/ \
-    --exclude=dist/ \
+    --exclude=/dist/ \
     --exclude=detections_archive/ \
     --exclude=inference_spool/ \
     --exclude=video/ \

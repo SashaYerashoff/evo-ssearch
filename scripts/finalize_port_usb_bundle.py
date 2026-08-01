@@ -31,7 +31,7 @@ def main() -> int:
     debian_version = version_match.group(0)
     critical_files = (
         "repo/VERSION",
-        "repo/migrations/versions/20260727_0010_audit_hash_chain.py",
+        "repo/migrations/versions/20260801_0011_incidents.py",
         "models/qwen3-vl-4b-awq/model.safetensors",
         "models/qwen3.5-9b-mtp/Qwen3.5-9B-Q4_K_M.gguf",
         "models/clip/ViT-B-32.pt",
@@ -53,7 +53,7 @@ def main() -> int:
     manifest = {
         "format": 1,
         "version": version,
-        "schema_head": "20260727_0010",
+        "schema_head": "20260801_0011",
         "created_at": datetime.now(timezone.utc).isoformat(),
         "target": {
             "os": "Ubuntu Server 24.04 amd64",

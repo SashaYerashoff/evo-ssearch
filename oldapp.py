@@ -48,11 +48,13 @@ import torch
 import cv2
 from PIL import Image, ImageDraw
 from transformers import AutoModel, AutoProcessor
-from flask import Flask, g, request, jsonify, send_file, make_response, render_template, Response, stream_with_context
+from flask import Flask, g, request, jsonify, send_file, send_from_directory, make_response, render_template, Response, stream_with_context
 from flask_cors import CORS
 from werkzeug.middleware.proxy_fix import ProxyFix
 
 from config import config
+from agent_console_context import normalize_agent_console_context
+from agent_ui_effects import derive_agent_ui_effects
 from agent_postgres_store import PostgresAgentStore, record_agent_tool_run_audit
 from archive_store import (
     ALERT_FEEDBACK_REASON_LABELS,
@@ -92,6 +94,17 @@ from inference_queue import (
     LuxriotInferenceQueueRuntime,
     PostgresInferenceQueueRepository,
 )
+from incident_service import (
+    IncidentDraftAssembler,
+    IncidentDraftRequest,
+    incident_report_markdown,
+    incident_report_xml,
+)
+from incident_store import (
+    IncidentRevisionConflict,
+    IncidentStoreNotReady,
+    PostgresIncidentStore,
+)
 from embedding_batcher import ImageEmbeddingBatcher
 from lm_admission import (
     configured_lm_capacity,
@@ -127,6 +140,7 @@ except Exception:  # pragma: no cover - optional dependency
 
 app = Flask(__name__, static_folder='static', template_folder='templates')
 app.config["MAX_CONTENT_LENGTH"] = max(1, int(config.MAX_FILE_SIZE_MB)) * 1024 * 1024
+_REACT_UI_DIST = Path(__file__).resolve().parent / "react-ui" / "dist"
 if int(getattr(config, "TRUSTED_PROXY_HOPS", 0) or 0) > 0:
     trusted_hops = int(config.TRUSTED_PROXY_HOPS)
     app.wsgi_app = ProxyFix(
@@ -314,6 +328,9 @@ _MUTATION_ENDPOINT_PERMISSIONS: Dict[str, Optional[Permission]] = {
     "agent_skills_create": Permission.SETTINGS_MANAGE,
     "agent_skill_detail": Permission.SETTINGS_MANAGE,
     "agent_session": Permission.AGENT_USE,
+    "incident_draft": Permission.INCIDENTS_MANAGE,
+    "incident_follow": Permission.INCIDENTS_MANAGE,
+    "incident_stop_follow": Permission.INCIDENTS_MANAGE,
     "save_settings": Permission.SETTINGS_MANAGE,
     "save_settings_env": Permission.SETTINGS_MANAGE,
 }
@@ -342,6 +359,8 @@ _SENSITIVE_ENDPOINT_PERMISSIONS: Dict[str, Permission] = {
     "alert_feedback": Permission.DETECTIONS_VIEW,
     "false_positive_report": Permission.REPORTS_VIEW,
     "false_positive_report_export": Permission.DATA_EXPORT,
+    "incident_detail": Permission.REPORTS_VIEW,
+    "incident_export": Permission.DATA_EXPORT,
     "luxriot_channels": Permission.STREAMS_VIEW,
     "luxriot_prompt_settings": Permission.STREAMS_VIEW,
     "luxriot_recent_frame": Permission.STREAMS_VIEW,
@@ -374,6 +393,7 @@ _CHANNEL_REQUIRED_FOR_SCOPED_ENDPOINTS = frozenset(
         "detections_search_text",
         "detections_summary",
         "describe_image",
+        "incident_draft",
         "search",
         "serve_image",
         "luxriot_prompt_settings",
@@ -808,6 +828,38 @@ def _detection_channel_ids_for_request_value(value: Any) -> Set[int]:
     return channel_ids
 
 
+def _incident_channel_ids_for_request_value(value: Any) -> Set[int]:
+    incident_id = str(value or "").strip()
+    if not incident_id:
+        return set()
+    try:
+        getter = getattr(incident_store, "get_incident", None)
+        if not callable(getter):
+            getter = getattr(incident_store, "get", None)
+        incident = getter(incident_id) if callable(getter) else None
+    except Exception:
+        g.channel_resolution_error = "incident_owner_lookup_failed"
+        return set()
+    if not isinstance(incident, Mapping):
+        g.channel_resolution_error = "incident_owner_missing"
+        return set()
+    channel_ids = {
+        int(channel_id)
+        for channel_id in (
+            _to_optional_int(item)
+            for item in incident.get("channel_ids") or []
+        )
+        if channel_id is not None and channel_id > 0
+    }
+    if not channel_ids:
+        primary = _to_optional_int(incident.get("primary_channel_id"))
+        if primary is not None and primary > 0:
+            channel_ids.add(primary)
+    if not channel_ids:
+        g.channel_resolution_error = "incident_owner_missing"
+    return channel_ids
+
+
 def _request_image_channel_ids(
     endpoint: str,
     view_args: Mapping[str, Any],
@@ -889,6 +941,15 @@ def _request_channel_ids() -> Set[int]:
     channel_ids.update(
         _request_image_channel_ids(endpoint, view_args, payload, form)
     )
+    if endpoint in {
+        "incident_detail",
+        "incident_export",
+        "incident_follow",
+        "incident_stop_follow",
+    }:
+        channel_ids.update(
+            _incident_channel_ids_for_request_value(view_args.get("incident_id"))
+        )
     if endpoint in {
         "probes_channel_groups_save",
         "probes_channel_groups_delete",
@@ -2131,6 +2192,23 @@ def create_index(folder_path):
 @app.route('/')
 def home():
     """Serve the frontend."""
+    requested_ui = str(request.args.get("ui") or getattr(config, "UI_MODE", "legacy")).strip().lower()
+    if requested_ui not in {"legacy", "react"}:
+        requested_ui = str(getattr(config, "UI_MODE", "legacy")).strip().lower()
+    if requested_ui == "react":
+        react_index = _REACT_UI_DIST / "index.html"
+        if react_index.is_file():
+            response = make_response(send_file(react_index, mimetype="text/html", conditional=True))
+            response.headers["Cache-Control"] = "no-cache, no-store, must-revalidate"
+            response.headers["Pragma"] = "no-cache"
+            response.headers["Expires"] = "0"
+            response.headers["X-EVA-UI"] = "react"
+            return response
+        app.logger.warning(
+            "React UI requested but production build is missing: %s; serving legacy UI",
+            react_index,
+        )
+
     min_val, max_val, default_val = config.MIN_RESULTS, config.MAX_RESULTS, config.DEFAULT_RESULTS
     options: Set[int] = {min_val, default_val, max_val}
     if max_val <= 20:
@@ -2192,6 +2270,22 @@ def home():
     response.headers['Cache-Control'] = 'no-cache, no-store, must-revalidate'
     response.headers['Pragma'] = 'no-cache'
     response.headers['Expires'] = '0'
+    response.headers['X-EVA-UI'] = 'legacy'
+    if requested_ui == "react":
+        response.headers['X-EVA-UI-Fallback'] = 'react-dist-missing'
+    return response
+
+
+@app.route('/ui-assets/<path:filename>')
+def react_ui_asset(filename: str):
+    """Serve immutable hashed React build assets without requiring Node in production."""
+    if not _REACT_UI_DIST.is_dir():
+        return ("React UI build not found", 404)
+    response = make_response(send_from_directory(_REACT_UI_DIST, filename, conditional=True))
+    if filename.startswith("assets/"):
+        response.headers["Cache-Control"] = "public, max-age=31536000, immutable"
+    else:
+        response.headers["Cache-Control"] = "no-cache"
     return response
 
 
@@ -2662,6 +2756,390 @@ def false_positive_report_export():
         )
     response.headers["Content-Disposition"] = (
         f'attachment; filename="eva-false-positive-report-{date_label}.{export_format}"'
+    )
+    return response
+
+
+def _incident_store_not_ready_response(exc: Exception):
+    app.logger.warning(
+        "Incident store not ready request_id=%s error=%s",
+        getattr(g, "request_id", ""),
+        exc,
+    )
+    return jsonify(
+        {
+            "error": (
+                "Incident storage is not ready. Apply the required database "
+                "migration before reporting incidents."
+            ),
+            "not_ready": "incident_store",
+            "required_revision": "20260801_0011",
+        }
+    ), 503
+
+
+def _incident_timestamp_ms(value: Any, field_name: str) -> Optional[int]:
+    if value is None or str(value).strip() == "":
+        return None
+    try:
+        timestamp = float(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{field_name} must be a Unix timestamp") from exc
+    if not math.isfinite(timestamp) or timestamp <= 0:
+        raise ValueError(f"{field_name} must be a positive Unix timestamp")
+    # The React API and legacy callers historically use seconds; storage uses ms.
+    return int(round(timestamp if timestamp >= 1_000_000_000_000 else timestamp * 1000.0))
+
+
+def _incident_narrative(incident: Mapping[str, Any]) -> str:
+    timeline = [
+        item
+        for item in incident.get("timeline_refs") or incident.get("timeline") or []
+        if isinstance(item, Mapping) and str(item.get("label") or "").strip()
+    ]
+    coverage = incident.get("coverage") if isinstance(incident.get("coverage"), Mapping) else {}
+    if not timeline:
+        return (
+            "No grounded event transition was recovered around the selected anchor. "
+            f"Archive coverage is {str(coverage.get('status') or 'unknown')}; operator review is required."
+        )
+    labels = [str(item.get("label") or "").strip() for item in timeline[:4]]
+    narrative = " → ".join(labels)
+    if len(timeline) > len(labels):
+        narrative += f" → {len(timeline) - len(labels)} more grounded timeline item(s)"
+    return (
+        f"EVA connected {len(timeline)} evidence-linked timeline item(s): {narrative}. "
+        f"Archive coverage is {str(coverage.get('status') or 'unknown')}; "
+        "P/N/M and motion values remain attention signals, not visual proof."
+    )
+
+
+def _incident_public_record(record: Mapping[str, Any]) -> Dict[str, Any]:
+    channel_ids = [
+        int(value)
+        for value in record.get("channel_ids") or []
+        if _to_optional_int(value) is not None and int(value) > 0
+    ]
+    timeline = [dict(item) for item in record.get("timeline_refs") or [] if isinstance(item, Mapping)]
+    evidence = [dict(item) for item in record.get("evidence_refs") or [] if isinstance(item, Mapping)]
+    report = dict(record.get("report") or {}) if isinstance(record.get("report"), Mapping) else {}
+    qualia_refs = [dict(item) for item in record.get("qualia_refs") or [] if isinstance(item, Mapping)]
+    follow = dict(record.get("follow_policy") or {}) if isinstance(record.get("follow_policy"), Mapping) else {}
+    if follow.get("active") is True:
+        expires_at_ms = _to_optional_int(follow.get("expires_at_ms"))
+        inactive_reason: Optional[str] = None
+        if expires_at_ms is not None and expires_at_ms <= int(time.time() * 1000.0):
+            inactive_reason = "ttl_expired"
+        lease_manager = getattr(luxriot_manager, "incident_focus_leases", None)
+        lease_getter = getattr(lease_manager, "get", None)
+        if inactive_reason is None and callable(lease_getter):
+            try:
+                if lease_getter(str(record.get("id") or "")) is None:
+                    inactive_reason = "runtime_lease_absent"
+            except Exception:
+                pass
+        if inactive_reason is not None:
+            follow["active"] = False
+            follow["inactive_reason"] = inactive_reason
+    bounds = {
+        "possible_start": record.get("possible_start_ms"),
+        "possible_start_ms": record.get("possible_start_ms"),
+        "observed_start": record.get("observed_start_ms"),
+        "observed_start_ms": record.get("observed_start_ms"),
+        "apex": report.get("apex_ms"),
+        "apex_ms": report.get("apex_ms"),
+        "observed_end": record.get("observed_end_ms"),
+        "observed_end_ms": record.get("observed_end_ms"),
+        "possible_end": record.get("possible_end_ms"),
+        "possible_end_ms": record.get("possible_end_ms"),
+    }
+    semantic_keys = list(
+        dict.fromkeys(
+            str(item.get("semantic_key") or "").strip()
+            for item in timeline
+            if str(item.get("semantic_key") or "").strip()
+        )
+    )
+    public = {
+        **dict(record),
+        "incident_id": str(record.get("id") or ""),
+        "channel_id": channel_ids[0] if channel_ids else None,
+        "channels": channel_ids,
+        "channel_ids": channel_ids,
+        "severity": str(report.get("severity") or "info"),
+        "summary": str(report.get("summary") or "").strip(),
+        "time_bounds": bounds,
+        "timeline": timeline,
+        "events": timeline,
+        "evidence": evidence,
+        "qualia_digest": qualia_refs[0] if qualia_refs else {},
+        "semantic_keys": semantic_keys,
+        "follow": follow,
+        "follow_policy": follow,
+    }
+    if public.get("state") == "following" and follow.get("active") is False:
+        public["state"] = "draft"
+    if not public["summary"]:
+        public["summary"] = _incident_narrative(public)
+    return public
+
+
+def _incident_storage_record(draft: Mapping[str, Any]) -> Dict[str, Any]:
+    bounds = draft.get("time_bounds") if isinstance(draft.get("time_bounds"), Mapping) else {}
+    report = {
+        "severity": str(draft.get("severity") or "info"),
+        "apex_ms": bounds.get("apex_ms"),
+        "provenance": dict(draft.get("provenance") or {}),
+        "qualia_digest": dict(draft.get("qualia_digest") or {}),
+    }
+    provisional = {
+        "timeline_refs": list(draft.get("timeline") or []),
+        "coverage": dict(draft.get("coverage") or {}),
+    }
+    report["summary"] = _incident_narrative(provisional)
+    return {
+        "state": "draft",
+        "title": str(draft.get("title") or "Incident draft")[:200],
+        "channel_ids": list(draft.get("channel_ids") or []),
+        "possible_start_ms": bounds.get("possible_start_ms"),
+        "observed_start_ms": bounds.get("observed_start_ms"),
+        "observed_end_ms": bounds.get("observed_end_ms"),
+        "possible_end_ms": bounds.get("possible_end_ms"),
+        "anchor_ref": dict(draft.get("anchor") or {}),
+        "timeline_refs": list(draft.get("timeline") or []),
+        "evidence_refs": list(draft.get("evidence") or []),
+        "qualia_refs": [dict(draft.get("qualia_digest") or {})],
+        "coverage": dict(draft.get("coverage") or {}),
+        "uncertainties": list(draft.get("uncertainties") or []),
+        "report": report,
+        "follow_policy": {},
+    }
+
+
+def _incident_focus_payload(lease: Any, ttl_seconds: int) -> Dict[str, Any]:
+    # The runtime lease clock is monotonic by design; persistence and UI need a
+    # wall-clock deadline that survives serialization and renders correctly.
+    now_ms = int(time.time() * 1000.0)
+    return {
+        "active": True,
+        "mode": str(getattr(getattr(lease, "level", None), "value", None) or "follow"),
+        "channel_ids": [int(value) for value in getattr(lease, "channel_ids", ())],
+        "started_at_ms": now_ms,
+        "updated_at_ms": now_ms,
+        "expires_at_ms": now_ms + int(ttl_seconds) * 1000,
+        "ttl_seconds": int(ttl_seconds),
+    }
+
+
+def _incident_load_or_404(incident_id: str) -> Optional[Dict[str, Any]]:
+    incident = incident_store.get_incident(incident_id)
+    return dict(incident) if isinstance(incident, Mapping) else None
+
+
+@app.route('/incidents/draft', methods=['POST'])
+def incident_draft():
+    guard = _mutation_guard_error()
+    if guard is not None:
+        return guard
+    data = _json_body()
+    try:
+        channel_id = int(data.get("channel_id") or 0)
+        if channel_id <= 0:
+            raise ValueError("channel_id must be positive")
+        anchor_id = _to_optional_int(data.get("anchor_detection_id"))
+        if anchor_id is not None and anchor_id <= 0:
+            raise ValueError("anchor_detection_id must be positive")
+        since_ms = _incident_timestamp_ms(data.get("from_ts"), "from_ts")
+        until_ms = _incident_timestamp_ms(data.get("to_ts"), "to_ts")
+        draft = IncidentDraftAssembler(detections_store, _attention_store).assemble(
+            IncidentDraftRequest(
+                channel_id=channel_id,
+                anchor_detection_id=anchor_id,
+                since_ms=since_ms,
+                until_ms=until_ms,
+            )
+        )
+        stored = incident_store.create_incident(
+            _incident_storage_record(draft),
+            actor_id=_feedback_actor_id(),
+        )
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
+    except LookupError as exc:
+        return jsonify({"error": str(exc)}), 404
+    except (IncidentStoreNotReady, ArchiveStoreNotReady) as exc:
+        return _incident_store_not_ready_response(exc)
+    except Exception:
+        app.logger.exception(
+            "Incident draft failed request_id=%s channel_id=%s",
+            getattr(g, "request_id", ""),
+            data.get("channel_id"),
+        )
+        return jsonify({"error": "incident_draft_failed"}), 500
+    audit_error = _write_completion_audit_or_error(
+        action="incident.draft.created",
+        target_type="incident",
+        target_id=str(stored.get("id") or ""),
+        channel_id=channel_id,
+        details={
+            "timeline_items": len(stored.get("timeline_refs") or []),
+            "evidence_items": len(stored.get("evidence_refs") or []),
+            "coverage": (stored.get("coverage") or {}).get("status"),
+        },
+    )
+    if audit_error is not None:
+        return audit_error
+    return jsonify({"success": True, "incident": _incident_public_record(stored)}), 201
+
+
+@app.route('/incidents/<incident_id>', methods=['GET'])
+def incident_detail(incident_id: str):
+    try:
+        incident = _incident_load_or_404(incident_id)
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
+    except (IncidentStoreNotReady, ArchiveStoreNotReady) as exc:
+        return _incident_store_not_ready_response(exc)
+    except Exception:
+        app.logger.exception("Incident load failed request_id=%s", getattr(g, "request_id", ""))
+        return jsonify({"error": "incident_load_failed"}), 500
+    if incident is None:
+        return jsonify({"error": "incident_not_found"}), 404
+    return jsonify({"success": True, "incident": _incident_public_record(incident)})
+
+
+@app.route('/incidents/<incident_id>/follow', methods=['POST'])
+def incident_follow(incident_id: str):
+    guard = _mutation_guard_error()
+    if guard is not None:
+        return guard
+    data = _json_body()
+    try:
+        mode = str(data.get("mode") or "follow").strip().lower()
+        if mode not in {"follow", "critical"}:
+            raise ValueError("mode must be follow or critical")
+        ttl_seconds = int(data.get("ttl_seconds") or 300)
+        if ttl_seconds < 60 or ttl_seconds > 8 * 60 * 60:
+            raise ValueError("ttl_seconds must be between 60 and 28800")
+        incident = _incident_load_or_404(incident_id)
+        if incident is None:
+            return jsonify({"error": "incident_not_found"}), 404
+        channel_ids = [int(value) for value in incident.get("channel_ids") or []]
+        lease = luxriot_manager.start_incident_focus(
+            incident_id,
+            channel_ids,
+            level=mode,
+            ttl_seconds=ttl_seconds,
+        )
+        try:
+            updated = incident_store.update_incident(
+                incident_id,
+                expected_revision=int(incident.get("revision") or 0),
+                changes={
+                    "state": "following",
+                    "follow_policy": _incident_focus_payload(lease, ttl_seconds),
+                },
+                actor_id=_feedback_actor_id(),
+            )
+        except Exception:
+            luxriot_manager.stop_incident_focus(incident_id)
+            raise
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
+    except IncidentRevisionConflict as exc:
+        return jsonify({"error": "incident_revision_conflict", "revision": exc.actual_revision}), 409
+    except (IncidentStoreNotReady, ArchiveStoreNotReady) as exc:
+        return _incident_store_not_ready_response(exc)
+    except Exception:
+        app.logger.exception("Incident follow failed request_id=%s", getattr(g, "request_id", ""))
+        return jsonify({"error": "incident_follow_failed"}), 500
+    audit_error = _write_completion_audit_or_error(
+        action="incident.follow.started",
+        target_type="incident",
+        target_id=incident_id,
+        channel_id=channel_ids[0] if len(channel_ids) == 1 else None,
+        details={"mode": mode, "ttl_seconds": ttl_seconds, **_audit_key_details("channel_ids", channel_ids)},
+    )
+    if audit_error is not None:
+        return audit_error
+    return jsonify({"success": True, "incident": _incident_public_record(updated)})
+
+
+@app.route('/incidents/<incident_id>/stop-follow', methods=['POST'])
+def incident_stop_follow(incident_id: str):
+    guard = _mutation_guard_error()
+    if guard is not None:
+        return guard
+    try:
+        incident = _incident_load_or_404(incident_id)
+        if incident is None:
+            return jsonify({"error": "incident_not_found"}), 404
+        channel_ids = [int(value) for value in incident.get("channel_ids") or []]
+        stopped = luxriot_manager.stop_incident_focus(incident_id)
+        previous_follow = dict(incident.get("follow_policy") or {})
+        previous_follow.update(
+            {
+                "active": False,
+                "stopped_at_ms": int(time.time() * 1000.0),
+                "stop_reason": "operator",
+            }
+        )
+        updated = incident_store.update_incident(
+            incident_id,
+            expected_revision=int(incident.get("revision") or 0),
+            changes={"state": "draft", "follow_policy": previous_follow},
+            actor_id=_feedback_actor_id(),
+        )
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
+    except IncidentRevisionConflict as exc:
+        return jsonify({"error": "incident_revision_conflict", "revision": exc.actual_revision}), 409
+    except (IncidentStoreNotReady, ArchiveStoreNotReady) as exc:
+        return _incident_store_not_ready_response(exc)
+    except Exception:
+        app.logger.exception("Incident stop-follow failed request_id=%s", getattr(g, "request_id", ""))
+        return jsonify({"error": "incident_stop_follow_failed"}), 500
+    audit_error = _write_completion_audit_or_error(
+        action="incident.follow.stopped",
+        target_type="incident",
+        target_id=incident_id,
+        channel_id=channel_ids[0] if len(channel_ids) == 1 else None,
+        details={"runtime_lease_removed": bool(stopped), **_audit_key_details("channel_ids", channel_ids)},
+    )
+    if audit_error is not None:
+        return audit_error
+    return jsonify({"success": True, "incident": _incident_public_record(updated)})
+
+
+@app.route('/incidents/<incident_id>/export', methods=['GET'])
+def incident_export(incident_id: str):
+    export_format = str(request.args.get("format") or "md").strip().lower()
+    if export_format not in {"md", "xml"}:
+        return jsonify({"error": "format must be md or xml"}), 400
+    try:
+        incident = _incident_load_or_404(incident_id)
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
+    except (IncidentStoreNotReady, ArchiveStoreNotReady) as exc:
+        return _incident_store_not_ready_response(exc)
+    except Exception:
+        app.logger.exception("Incident export failed request_id=%s", getattr(g, "request_id", ""))
+        return jsonify({"error": "incident_export_failed"}), 500
+    if incident is None:
+        return jsonify({"error": "incident_not_found"}), 404
+    public = _incident_public_record(incident)
+    date_label = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    content = incident_report_xml(public) if export_format == "xml" else incident_report_markdown(public)
+    response = Response(
+        content,
+        content_type=(
+            "application/xml; charset=utf-8"
+            if export_format == "xml"
+            else "text/markdown; charset=utf-8"
+        ),
+    )
+    response.headers["Content-Disposition"] = (
+        f'attachment; filename="eva-incident-{date_label}.{export_format}"'
     )
     return response
 
@@ -3633,6 +4111,79 @@ def _lm_admission_profiles() -> List[Dict[str, Any]]:
 _lm_admission_controller = get_lm_admission_controller()
 
 
+def _lm_response_text(data: Mapping[str, Any]) -> Tuple[str, str]:
+    choice = (data.get("choices") or [{}])[0]
+    message = choice.get("message", {}) or {}
+    content = message.get("content", "")
+    if isinstance(content, list):
+        parts = []
+        for part in content:
+            if isinstance(part, dict) and part.get("type") == "text":
+                parts.append(str(part.get("text", "")))
+        content_text = "\n".join(parts).strip()
+    else:
+        content_text = str(content).strip()
+    return content_text, str(choice.get("finish_reason") or "").strip().lower()
+
+
+def _lm_repetition_issue(content: str) -> Optional[str]:
+    """Identify a runaway prose loop without penalizing structured JSON arrays."""
+
+    text = str(content or "").strip()
+    if len(text) < 400:
+        return None
+    prose = re.split(
+        r"\b(?:BATCH_STATE_JSON|ALERTS_JSON|MEMORY_UPDATE_JSON)\s*:",
+        text,
+        maxsplit=1,
+        flags=re.IGNORECASE,
+    )[0]
+    normalized_units: Dict[str, int] = {}
+    for raw in re.split(r"(?<=[.!?])\s+|[\r\n]+", prose):
+        unit = re.sub(r"\s+", " ", raw).strip().lower()
+        if len(unit) < 48:
+            continue
+        normalized_units[unit] = normalized_units.get(unit, 0) + 1
+        if normalized_units[unit] >= 3:
+            return "repeated sentence"
+
+    words = re.findall(r"[a-z0-9][a-z0-9'_-]*", prose.lower())
+    if len(words) >= 80:
+        ngram_counts: Dict[Tuple[str, ...], int] = {}
+        for index in range(0, len(words) - 9):
+            ngram = tuple(words[index : index + 10])
+            count = ngram_counts.get(ngram, 0) + 1
+            ngram_counts[ngram] = count
+            if count >= 4:
+                return "repeated 10-token phrase"
+    return None
+
+
+def _with_concise_retry_instruction(
+    messages: Sequence[Mapping[str, Any]],
+) -> List[Dict[str, Any]]:
+    retry_messages = copy.deepcopy(list(messages))
+    instruction = (
+        "Generation quality guard: inspect every current image again, especially for visible people and actions. "
+        "Write each fact once, keep the prose concise, and finish the required machine-readable block. "
+        "Do not repeat a sentence or background detail."
+    )
+    if retry_messages and str(retry_messages[0].get("role") or "") == "system":
+        content = retry_messages[0].get("content")
+        if isinstance(content, list):
+            content.append({"type": "text", "text": instruction})
+        elif isinstance(content, str):
+            retry_messages[0]["content"] = f"{content}\n\n{instruction}".strip()
+        else:
+            retry_messages[0]["content"] = [{"type": "text", "text": instruction}]
+    else:
+        retry_messages.insert(
+            0,
+            {"role": "system", "content": [{"type": "text", "text": instruction}]},
+        )
+    return retry_messages
+
+
 def _call_lm_chat(
     messages: List[Dict[str, Any]],
     model_override: Optional[str] = None,
@@ -3669,15 +4220,19 @@ def _call_lm_chat(
     default_workload = "agent" if str(profile_kind or "").strip().lower() == "agent" else "vlm"
     requested_workload = str(workload_class or "").strip().lower()
     workload = requested_workload if requested_workload in {"agent", "interactive", "alert", "describe", "video", "vlm", "heartbeat", "rollup", "background"} else default_workload
-    if (
+    bounded_generation = (
         str(profile_kind or "").strip().lower() != "agent"
         or workload in {"rollup", "background"}
-    ):
+    )
+    if bounded_generation:
         # MTP/reasoning models can spend most or all of the completion budget
         # on an internal chain of thought.  Vision descriptions and scheduled
         # rollups need a bounded operator-facing answer; the interactive agent
         # keeps its own reasoning/tool-loop policy.
         payload["chat_template_kwargs"] = {"enable_thinking": False}
+        payload["repetition_penalty"] = float(
+            getattr(config, "LM_VIDEO_REPETITION_PENALTY", 1.08)
+        )
 
     def _response_error_detail(resp: Any) -> str:
         try:
@@ -3701,51 +4256,62 @@ def _call_lm_chat(
             return text[:500]
         return "empty error response"
 
-    try:
-        with _lm_admission_controller.admission(
-            resource,
-            workload=workload,
-            capacity=capacity,
-            timeout=float(profile.get("timeout") or config.LM_TIMEOUT),
-        ):
-            if preflight is not None:
-                preflight()
-            response = requests.post(
-                endpoint,
-                headers=headers,
-                json=payload,
-                timeout=int(profile.get("timeout") or config.LM_TIMEOUT),
-            )
-            response.raise_for_status()
-    except requests.HTTPError as exc:
-        resp = getattr(exc, "response", None) or response
-        detail = _response_error_detail(resp) if resp is not None else str(exc)
-        status = getattr(resp, "status_code", None)
-        status_text = f"HTTP {status}" if status else "HTTP error"
-        raise RuntimeError(
-            f"LM request failed for profile {profile['id']} "
-            f"(model {payload['model']}): {status_text}; {detail}"
-        ) from exc
-    except Exception as exc:
-        if bool(getattr(exc, "superseded", False)):
-            raise
-        raise RuntimeError(
-            f"LM request failed for profile {profile['id']} "
-            f"(model {payload['model']}): {exc}"
-        ) from exc
+    def _perform(request_payload: Mapping[str, Any]) -> Mapping[str, Any]:
+        response: Optional[requests.Response] = None
+        try:
+            with _lm_admission_controller.admission(
+                resource,
+                workload=workload,
+                capacity=capacity,
+                timeout=float(profile.get("timeout") or config.LM_TIMEOUT),
+            ):
+                if preflight is not None:
+                    preflight()
+                response = requests.post(
+                    endpoint,
+                    headers=headers,
+                    json=dict(request_payload),
+                    timeout=int(profile.get("timeout") or config.LM_TIMEOUT),
+                )
+                response.raise_for_status()
+        except requests.HTTPError as exc:
+            resp = getattr(exc, "response", None) or response
+            detail = _response_error_detail(resp) if resp is not None else str(exc)
+            status = getattr(resp, "status_code", None)
+            status_text = f"HTTP {status}" if status else "HTTP error"
+            raise RuntimeError(
+                f"LM request failed for profile {profile['id']} "
+                f"(model {request_payload['model']}): {status_text}; {detail}"
+            ) from exc
+        except Exception as exc:
+            if bool(getattr(exc, "superseded", False)):
+                raise
+            raise RuntimeError(
+                f"LM request failed for profile {profile['id']} "
+                f"(model {request_payload['model']}): {exc}"
+            ) from exc
+        data = response.json()
+        return data if isinstance(data, Mapping) else {}
 
-    data = response.json()
-    choice = (data.get("choices") or [{}])[0]
-    message = choice.get("message", {}) or {}
-    content = message.get("content", "")
-    if isinstance(content, list):
-        parts = []
-        for part in content:
-            if isinstance(part, dict) and part.get("type") == "text":
-                parts.append(str(part.get("text", "")))
-        content_text = "\n".join(parts).strip()
-    else:
-        content_text = str(content).strip()
+    data = _perform(payload)
+    content_text, finish_reason = _lm_response_text(data)
+    issue = _lm_repetition_issue(content_text) if bounded_generation else None
+    if issue:
+        retry_payload = copy.deepcopy(payload)
+        retry_payload["messages"] = _with_concise_retry_instruction(messages)
+        retry_payload["temperature"] = 0.0
+        retry_payload["repetition_penalty"] = max(
+            1.12,
+            float(retry_payload.get("repetition_penalty") or 1.0),
+        )
+        data = _perform(retry_payload)
+        content_text, finish_reason = _lm_response_text(data)
+        retry_issue = _lm_repetition_issue(content_text)
+        if retry_issue:
+            raise RuntimeError(
+                "LM response rejected after one guarded retry: "
+                f"{retry_issue} (finish_reason={finish_reason or 'unknown'})"
+            )
     return content_text or "(empty response from model)"
 
 
@@ -4569,6 +5135,21 @@ def _build_archive_stores() -> Tuple[Any, Any]:
 
 probes_store, detections_store = _build_archive_stores()
 luxriot_manager.probes_store = probes_store
+
+
+def _build_incident_store() -> Any:
+    if not _postgres_archive_enabled():
+        return _UnavailablePostgresStore("incidents")
+    try:
+        return PostgresIncidentStore(
+            _get_control_plane_db_pool(),
+            _archive_tenant_id(),
+        )
+    except Exception as exc:
+        return _UnavailablePostgresStore("incidents", exc)
+
+
+incident_store = _build_incident_store()
 semantic_snapshot_writer: Optional[SemanticSnapshotArchiveWriter] = None
 if bool(getattr(config, "SEMANTIC_SNAPSHOT_ARCHIVE_ENABLED", True)):
     semantic_snapshot_writer = SemanticSnapshotArchiveWriter(
@@ -15431,6 +16012,11 @@ def settings_archive_capacity():
     if guard is not None:
         return guard
     try:
+        include_current = _coerce_bool(
+            request.args.get("include_current", True),
+            True,
+        )
+
         def _optional_float(name: str) -> Optional[float]:
             raw = request.args.get(name)
             if raw is None or str(raw).strip() == "":
@@ -15460,7 +16046,15 @@ def settings_archive_capacity():
             {
                 "success": True,
                 "estimate": estimate,
-                "current": _archive_storage_summary(),
+                "current": (
+                    _archive_storage_summary()
+                    if include_current
+                    else {
+                        "available": False,
+                        "deferred": True,
+                        "backend": getattr(detections_store, "backend", "unknown"),
+                    }
+                ),
                 "retention": dict(_archive_retention_last_result),
             }
         )
@@ -15654,7 +16248,14 @@ def get_settings():
                 250.0,
             ),
             'archiveCapacityEstimate': _archive_capacity_estimate(),
-            'archiveStorageSummary': _archive_storage_summary(),
+            # Current archive row/storage statistics can require a full aggregate
+            # on large PostgreSQL stores. Keep the base settings read fast and
+            # let /settings/archive_capacity request that diagnostic explicitly.
+            'archiveStorageSummary': {
+                'available': False,
+                'deferred': True,
+                'backend': getattr(detections_store, "backend", "unknown"),
+            },
             'envCount': len(_effective_env_map()),
         }
         return jsonify({'success': True, 'settings': settings})
@@ -16275,6 +16876,14 @@ def agent_chat():
     operator_mode = bool(data.get('operator_mode'))
     tool_context = None
     auth_context = _current_auth_context()
+    console_context = normalize_agent_console_context(
+        data.get('console_context'),
+        allowed_channel_ids=(
+            auth_context.allowed_channel_ids
+            if auth_context is not None
+            else None
+        ),
+    )
     if _auth_enabled() and auth_context is not None:
         tool_context = ToolExecutionContext(
             actor_id=auth_context.user_id,
@@ -16302,6 +16911,7 @@ def agent_chat():
             image_b64=image_b64,
             tool_context=tool_context,
             force_tools=operator_mode,
+            console_context=console_context,
         )
 
     response = Response(
@@ -16342,7 +16952,28 @@ def agent_action_plan_execute(plan_id: str):
     try:
         runner = _get_agent_runner()
         result = runner.approve_action_plan(plan_id, tool_context)
-        return jsonify({'success': True, 'result': result})
+        receipt = result.get('action_receipt') if isinstance(result, Mapping) else None
+        tool_name = (
+            str(receipt.get('tool') or '').strip()
+            if isinstance(receipt, Mapping)
+            else ''
+        )
+        ui_effects = (
+            derive_agent_ui_effects(
+                tool_name,
+                {},
+                result,
+                committed=True,
+                seed=plan_id,
+            )
+            if tool_name
+            else []
+        )
+        return jsonify({
+            'success': True,
+            'result': result,
+            'ui_effects': ui_effects,
+        })
     except ToolGatewayError as exc:
         status = 403 if getattr(exc, 'code', '') in {'permission_denied', 'channel_access_denied'} else 409
         return jsonify({'success': False, 'error': str(exc), 'code': getattr(exc, 'code', 'tool_error')}), status

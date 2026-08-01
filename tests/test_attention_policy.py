@@ -358,6 +358,40 @@ class EpisodeSelectionTests(unittest.TestCase):
 
 
 class CoordinatorApiTests(unittest.TestCase):
+    def test_late_probe_scores_regulate_next_observation_then_expire(self):
+        coordinator = AttentionCoordinator(
+            CoordinatorConfig(probe_score_ttl_ms=1_000)
+        )
+        coordinator.link_snapshot(
+            "7",
+            1_000,
+            "embedding://7/1000",
+            snapshot_id="snapshot-1",
+        )
+        coordinator.observe_cv("7", 1_000, 0.0, 0.0, "quiet")
+        updated = coordinator.attach_probe_scores(
+            "7",
+            "snapshot-1",
+            [
+                {
+                    "probe_id": "operator-person",
+                    "positive": 0.82,
+                    "negative": 0.20,
+                    "margin": 0.62,
+                    "probe_version": "v1",
+                }
+            ],
+        )
+        self.assertEqual(updated.probe_scores[0].probe_id, "operator-person")
+
+        regulated = coordinator.observe_cv("7", 1_500, 0.0, 0.0, "quiet")
+        self.assertEqual(regulated.state.vector.probe_positive, 0.82)
+        self.assertEqual(regulated.state.vector.probe_margin, 0.62)
+
+        expired = coordinator.observe_cv("7", 2_001, 0.0, 0.0, "quiet")
+        self.assertEqual(expired.state.vector.probe_positive, 0.0)
+        self.assertEqual(expired.state.vector.probe_margin, 0.0)
+
     def test_high_level_observe_plan_dispatch_complete_and_status_flow(self):
         coordinator = AttentionCoordinator(
             CoordinatorConfig(

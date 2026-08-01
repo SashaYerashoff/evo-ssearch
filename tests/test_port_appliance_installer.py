@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib.util
+import io
 import json
 import shutil
 import subprocess
@@ -21,19 +22,25 @@ sys.modules[SPEC.name] = installer
 SPEC.loader.exec_module(installer)
 
 
-def test_usb_builder_excludes_the_unused_react_workspace():
+def test_usb_builder_builds_react_for_node_free_runtime():
     builder = (ROOT / "scripts" / "build_port_usb_bundle.sh").read_text(
         encoding="utf-8"
     )
 
-    assert "--exclude=react-ui/" in builder
+    assert 'npm --prefix "${REACT_UI_ROOT}" run build' in builder
+    assert 'dist/index.html' in builder
+    assert not any(
+        line.strip() == "--exclude=react-ui/ \\"
+        for line in builder.splitlines()
+    )
+    assert "--exclude=react-ui/node_modules/" in builder
     assert "--delete-excluded" in builder
     for local_only_pattern in (
         "--exclude='.env*'",
         "--exclude='.venv*'",
         "--exclude=.eva-runtime",
         "--exclude=node_modules/",
-        "--exclude=dist/",
+        "--exclude=/dist/",
         "--exclude=probes_store.json",
         "--exclude='*.sqlite3'",
     ):
@@ -47,6 +54,7 @@ def test_port_profile_keeps_gpu_for_vllm_and_clip_on_cpu():
     assert installer.PORT_ENV["EVOSSEARCH_LUXRIOT_ATTENTION_EMBEDDING_CADENCE_MS"] == "1000"
     assert installer.PORT_ENV["EVOSSEARCH_LUXRIOT_SUMMARY_MAX_BATCH_FRAMES"] == "16"
     assert installer.PORT_ENV["EVOSSEARCH_EMBEDDER_EAGER_LOAD"] == "true"
+    assert installer.PORT_ENV["EVOSSEARCH_UI_MODE"] == "legacy"
 
 
 def test_port_profile_has_bounded_queue_and_context():
@@ -54,6 +62,72 @@ def test_port_profile_has_bounded_queue_and_context():
     assert installer.PORT_ENV["EVOSSEARCH_INFERENCE_WORKER_COUNT"] == "1"
     assert installer.PORT_ENV["EVOSSEARCH_AGENT_CONTEXT_LIMIT_TOKENS"] == "32768"
     assert installer.PORT_ENV["EVOSSEARCH_AGENT_CONTEXT_HARD_TOKENS"] == "30000"
+    assert installer.PORT_ENV["EVOSSEARCH_LM_VIDEO_REPETITION_PENALTY"] == "1.08"
+
+
+def test_vision_smoke_png_and_response_contract():
+    png = installer._vision_smoke_png()
+    assert png.startswith(b"\x89PNG\r\n\x1a\n")
+
+    response = {
+        "choices": [
+            {
+                "message": {
+                    "content": "VISION_OK 7391 RED GREEN BLUE",
+                }
+            }
+        ]
+    }
+
+    class FakeResponse(io.BytesIO):
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+    def fake_urlopen(request, timeout):
+        assert request.full_url == "http://vlm.local/v1/chat/completions"
+        assert timeout == 12
+        payload = json.loads(request.data)
+        assert payload["model"] == "vlm-test"
+        image_url = payload["messages"][0]["content"][0]["image_url"]["url"]
+        assert image_url.startswith("data:image/png;base64,")
+        return FakeResponse(json.dumps(response).encode())
+
+    with patch.object(installer.urllib.request, "urlopen", fake_urlopen):
+        installer._verify_vlm_vision(
+            "http://vlm.local/v1",
+            "vlm-test",
+            timeout_sec=12,
+        )
+
+
+def test_vision_smoke_rejects_text_only_hallucination():
+    response = {
+        "choices": [
+            {
+                "message": {
+                    "content": "VISION_OK 1234 RED BLUE",
+                }
+            }
+        ]
+    }
+
+    class FakeResponse(io.BytesIO):
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+    with patch.object(
+        installer.urllib.request,
+        "urlopen",
+        return_value=FakeResponse(json.dumps(response).encode()),
+    ):
+        with pytest.raises(installer.InstallError, match="did not perceive"):
+            installer._verify_vlm_vision("http://vlm.local/v1", "vlm-test")
 
 
 def test_rendered_env_is_sorted_and_shell_quoted():

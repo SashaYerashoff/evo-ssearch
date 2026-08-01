@@ -4,4 +4,5 @@ export const API_PREFIXES = [
   '/auth', '/detections', '/luxriot', '/probes', '/agent',
   '/describe_image', '/lm', '/settings', '/health', '/ready',
   '/branding', '/image', '/comments', '/commented_images', '/audit',
+  '/incidents',
 ]

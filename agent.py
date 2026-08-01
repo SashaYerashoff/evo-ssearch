@@ -41,6 +41,11 @@ from agent_research import (
     trusted_research_message,
     usable_research_state,
 )
+from agent_console_context import (
+    apply_console_context_defaults,
+    trusted_console_context_message,
+)
+from agent_ui_effects import derive_agent_ui_effects
 from agent_security import ToolExecutionContext, ToolGatewayError
 from agent_security.audit import ToolAuditEvent
 from agent_security.eva_adapter import EvaAgentToolAdapter
@@ -9724,6 +9729,20 @@ def _apply_turn_tool_context(tool_name: str, args: Dict[str, Any], context: Dict
     ):
         prepared["source"] = "vlm_summary"
 
+    if tool_name in {"get_detections", "get_detection_summary", "search_archive"}:
+        if not prepared.get("source") and context.get("console_archive_source"):
+            prepared["source"] = context["console_archive_source"]
+        if (
+            not prepared.get("probe_id")
+            and prepared.get("source") == "probe"
+            and context.get("console_archive_probe_id")
+        ):
+            prepared["probe_id"] = context["console_archive_probe_id"]
+        if not prepared.get("sort_by") and context.get("console_archive_sort_by"):
+            prepared["sort_by"] = context["console_archive_sort_by"]
+        if not prepared.get("limit") and context.get("console_archive_rows"):
+            prepared["limit"] = context["console_archive_rows"]
+
     return prepared
 
 
@@ -10722,6 +10741,7 @@ class AgentRunner:
         image_b64: Optional[str] = None,
         tool_context: Optional[ToolExecutionContext] = None,
         force_tools: bool = False,
+        console_context: Optional[Mapping[str, Any]] = None,
     ) -> Generator[str, None, None]:
         """
         Main entry point. Yields SSE-formatted strings.
@@ -10892,11 +10912,17 @@ class AgentRunner:
             user_text,
             history_prefix,
         )
+        apply_console_context_defaults(turn_tool_context, console_context)
         turn_tool_context["active_skill_slugs"] = list(requested_skill_slugs)
         requested_skill_tool_names = _skill_tool_names(requested_skill_slugs)
         if requested_skill_tool_names:
             turn_tool_context["skill_tool_names"] = sorted(requested_skill_tool_names)
         trusted_research_messages: List[Dict[str, Any]] = []
+        console_context_message = trusted_console_context_message(console_context)
+        if console_context_message:
+            trusted_research_messages.append(
+                {"role": "system", "content": console_context_message}
+            )
         if active_research_state is not None:
             trusted_research_messages.append(
                 {
@@ -11183,7 +11209,14 @@ class AgentRunner:
             # Execute each tool call
             stop_tool_loop_after_batch = False
             for tc in lm_response.tool_calls:
-                yield _sse({"type": "tool_call", "name": tc.name, "args": tc.args})
+                yield _sse(
+                    {
+                        "type": "tool_call",
+                        "call_id": tc.id,
+                        "name": tc.name,
+                        "args": tc.args,
+                    }
+                )
                 progress_queue: "queue.Queue[Dict[str, Any]]" = queue.Queue()
                 if tool_calls_used >= turn_tool_call_limit:
                     error_payload = {
@@ -11200,8 +11233,15 @@ class AgentRunner:
                         error_payload,
                         error=error_payload["error"],
                     )
-                    yield _sse({"type": "tool_result", "name": tc.name,
-                                "result": error_payload, "error": error_payload["error"]})
+                    yield _sse(
+                        {
+                            "type": "tool_result",
+                            "call_id": tc.id,
+                            "name": tc.name,
+                            "result": error_payload,
+                            "error": error_payload["error"],
+                        }
+                    )
                     in_flight.append(result_msg)
                     new_assistant_messages.append(result_msg)
                     continue
@@ -11242,6 +11282,7 @@ class AgentRunner:
                     yield _sse(
                         {
                             "type": "tool_result",
+                            "call_id": tc.id,
                             "name": tc.name,
                             "result": {
                                 "duplicate_suppressed": True,
@@ -11331,10 +11372,18 @@ class AgentRunner:
                                   "content": json.dumps(result_for_model, default=str)}
                     _remember_turn_tool_result(tc.name, result, turn_tool_context)
                     _record_turn_signal_ledger(turn_signal_ledger, tc.name, result_for_model)
+                    ui_result = _tool_result_for_ui(tc.name, result)
                     yield _sse({
                         "type": "tool_result",
+                        "call_id": tc.id,
                         "name": tc.name,
-                        "result": _tool_result_for_ui(tc.name, result),
+                        "result": ui_result,
+                        "ui_effects": derive_agent_ui_effects(
+                            tc.name,
+                            tc.args,
+                            ui_result,
+                            seed=tc.id,
+                        ),
                     })
                     if research_event is not None:
                         yield _sse({"type": "research_state", **research_event})
@@ -11356,8 +11405,15 @@ class AgentRunner:
                         error_payload,
                         error=str(exc),
                     )
-                    yield _sse({"type": "tool_result", "name": tc.name,
-                                "result": error_payload, "error": str(exc)})
+                    yield _sse(
+                        {
+                            "type": "tool_result",
+                            "call_id": tc.id,
+                            "name": tc.name,
+                            "result": error_payload,
+                            "error": str(exc),
+                        }
+                    )
                 except Exception as exc:
                     error_payload = {"error": f"Internal tool error: {exc}"}
                     result_msg = {"role": "tool", "tool_call_id": tc.id, "name": tc.name,
@@ -11368,8 +11424,15 @@ class AgentRunner:
                         error_payload,
                         error=str(exc),
                     )
-                    yield _sse({"type": "tool_result", "name": tc.name,
-                                "result": error_payload, "error": str(exc)})
+                    yield _sse(
+                        {
+                            "type": "tool_result",
+                            "call_id": tc.id,
+                            "name": tc.name,
+                            "result": error_payload,
+                            "error": str(exc),
+                        }
+                    )
 
                 in_flight.append(result_msg)
                 new_assistant_messages.append(result_msg)

@@ -76,6 +76,28 @@ class EmbeddingPolicyTests(unittest.TestCase):
         self.assertFalse(settings["fusionEnabled"])
         self.assertFalse(settings["segmentsEnabled"])
 
+    def test_settings_read_defers_expensive_archive_storage_scan(self) -> None:
+        with patch("oldapp._archive_storage_summary") as storage_summary:
+            resp = self.client.get("/settings")
+
+        self.assertEqual(resp.status_code, 200)
+        storage_summary.assert_not_called()
+        archive_summary = resp.get_json()["settings"]["archiveStorageSummary"]
+        self.assertFalse(archive_summary["available"])
+        self.assertTrue(archive_summary["deferred"])
+
+    def test_archive_capacity_can_skip_or_request_current_storage_scan(self) -> None:
+        current = {"available": True, "row_count": 73}
+        with patch("oldapp._archive_storage_summary", return_value=current) as storage_summary:
+            deferred = self.client.get("/settings/archive_capacity?include_current=false")
+            scanned = self.client.get("/settings/archive_capacity?include_current=true")
+
+        self.assertEqual(deferred.status_code, 200)
+        self.assertTrue(deferred.get_json()["current"]["deferred"])
+        self.assertEqual(scanned.status_code, 200)
+        self.assertEqual(scanned.get_json()["current"]["row_count"], 73)
+        storage_summary.assert_called_once_with()
+
     def test_policy_normalizers_allow_experimental_models_only_when_enabled(self) -> None:
         config.EXPERIMENTAL_EMBEDDERS_ENABLED = False
         config.PRODUCTION_CLIP_MODEL = "ViT-B/32"

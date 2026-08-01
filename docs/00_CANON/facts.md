@@ -24,8 +24,8 @@ Last reviewed: 2026-07-27 (β 0.8.5)
 | Fact | Value |
 |---|---|
 | Control plane | PostgreSQL (required in secure deployment) |
-| Alembic schema head | `20260727_0010` |
-| Code-expected revision | `CURRENT_SCHEMA_REVISION` in `eva_db/settings.py` = `20260727_0010` |
+| Alembic schema head | `20260801_0011` |
+| Code-expected revision | `CURRENT_SCHEMA_REVISION` in `eva_db/settings.py` = `20260801_0011` |
 | Migration needed for this working tree | **Yes**: run `alembic upgrade head` |
 | Archive store | PostgreSQL, forced in secure mode (`EVOSSEARCH_ARCHIVE_STORE=postgres`) |
 | Row-level security | Enabled and forced on `iam`, `agent`, `audit`, `archive` schemas |
@@ -48,6 +48,7 @@ Last reviewed: 2026-07-27 (β 0.8.5)
 | Worker count | **1** (required; in-process capture/probe/summary schedulers are not multi-worker safe) |
 | App bind | Gunicorn serves plain HTTP on `EVOSSEARCH_HOST:EVOSSEARCH_PORT` (`5000` default) |
 | Browser entrypoint | HTTPS/TLS reverse proxy or site TLS boundary `[FIELD]`; office/demo may use HTTP-only internally |
+| Browser UI rollout | Legacy is the appliance default during React parity soak. `EVOSSEARCH_UI_MODE=react` changes the default; `/?ui=legacy` remains an emergency per-request fallback |
 | Liveness / readiness | `GET /health`, `GET /ready` |
 | Inference queue | Code default is off for unconfigured development; the clean appliance installer enables the PostgreSQL queue, one worker, and `/var/lib/eva-ai/inference-spool` |
 | Rollup durability | Closed semantic L1–L3 windows are stored as queryable `archive.runtime_state` rows; a bounded hot cache is also flushed by Gunicorn worker hooks (`gunicorn_conf.py`) |

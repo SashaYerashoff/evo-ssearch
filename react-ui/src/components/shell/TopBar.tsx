@@ -1,10 +1,18 @@
-import { IconVideo, IconRadar2, IconPlug, IconPlugConnectedX, IconActivity, IconPlayerPause } from '@tabler/icons-react'
+import {
+  IconActivity,
+  IconColorSwatch,
+  IconPlayerPause,
+  IconPlug,
+  IconPlugConnectedX,
+  IconRadar2,
+  IconVideo,
+} from '@tabler/icons-react'
 import type { AuthUser } from '../../api/types'
 import type { StatusData } from '../../App'
 import { BenchmarkButton } from '../monitoring/BenchmarkButton'
 
 export function TopBar({
-  user, status, section, noAnim, canBenchmark, appVersion, onToggleNoAnim, onBrand,
+  user, status, section, noAnim, canBenchmark, appVersion, onToggleNoAnim, onAppearance, onBrand,
 }: {
   user: AuthUser
   status: StatusData
@@ -13,6 +21,7 @@ export function TopBar({
   canBenchmark: boolean
   appVersion: string
   onToggleNoAnim: () => void
+  onAppearance: () => void
   onBrand: () => void
 }) {
   return (
@@ -53,6 +62,15 @@ export function TopBar({
         <span className="status-chip" title={user.username}>{user.displayName || user.username}</span>
       </div>
         {canBenchmark && <BenchmarkButton />}
+        <button
+          className="motion-toggle appearance-toggle"
+          onClick={onAppearance}
+          title="Theme and appearance"
+          aria-label="Open theme and appearance settings"
+        >
+          <IconColorSwatch size={14} />
+          Appearance
+        </button>
         <button
           className={`motion-toggle ${noAnim ? 'off' : ''}`}
           onClick={onToggleNoAnim}

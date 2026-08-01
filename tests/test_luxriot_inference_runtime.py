@@ -24,6 +24,7 @@ from inference_queue import (
     LuxriotInferenceQueueRuntime,
 )
 from archive_store import PostgresRuntimeStateStore
+from attention_policy import AttentionMode, CostBudgetState
 from luxriot_connector import LuxriotCaptureSession, LuxriotManager
 
 
@@ -542,6 +543,13 @@ class LuxriotCaptureApexDeciderTests(unittest.TestCase):
                     "thumbnail_role": "burst_apex",
                     "thumbnail_frame_index": 2,
                     "thumbnail_selection_source": "capture_cv_frame_delta",
+                    "thumbnail_is_cover": True,
+                    "thumbnail_snapshot_index": 3,
+                    "cover_kind": "event",
+                    "cover_reason": "Burst apex represents the episode.",
+                    "cover_confidence": "high",
+                    "batch_id": "batch-7",
+                    "state_transition_total": 2,
                     "prompt": "large internal prompt",
                     "frame_selection": {
                         "groups": [
@@ -573,6 +581,13 @@ class LuxriotCaptureApexDeciderTests(unittest.TestCase):
             self.assertEqual(feed_log["thumbnail_detection_id"], 44)
             self.assertEqual(feed_log["thumbnail_role"], "burst_apex")
             self.assertEqual(feed_log["thumbnail_frame_index"], 2)
+            self.assertTrue(feed_log["thumbnail_is_cover"])
+            self.assertEqual(feed_log["thumbnail_snapshot_index"], 3)
+            self.assertEqual(feed_log["cover_kind"], "event")
+            self.assertEqual(feed_log["cover_reason"], "Burst apex represents the episode.")
+            self.assertEqual(feed_log["cover_confidence"], "high")
+            self.assertEqual(feed_log["batch_id"], "batch-7")
+            self.assertEqual(feed_log["state_transition_total"], 2)
             self.assertEqual(
                 feed_log["thumbnail_selection_source"],
                 "capture_cv_frame_delta",
@@ -1005,6 +1020,135 @@ def _capture_max_coalesce() -> int:
     from luxriot_connector import _SUMMARY_COALESCE_MAX_BATCHES
 
     return _SUMMARY_COALESCE_MAX_BATCHES
+
+
+class LuxriotIncidentFocusRuntimeTests(unittest.TestCase):
+    def test_focus_raises_l0_profile_and_degraded_source_stays_degraded(self):
+        with tempfile.TemporaryDirectory() as temp:
+            manager = build_manager(Path(temp))
+            manager.start_incident_focus(
+                "incident-7",
+                [7],
+                level="follow",
+                ttl_seconds=30,
+            )
+            mode, priority, digest = manager.apply_incident_focus(
+                7,
+                "quiet",
+                0.1,
+            )
+            self.assertEqual(mode.value, "active")
+            self.assertGreaterEqual(priority, 0.65)
+            self.assertEqual(digest["incident_ids"], ["incident-7"])
+
+            session = LuxriotCaptureSession(
+                manager,
+                channel_id=7,
+                batch_size=12,
+                prompt="Describe.",
+            )
+            focused_frame = {
+                "captured_at": 1.0,
+                "attention_mode": mode.value,
+                "incident_focus": digest,
+            }
+            self.assertEqual(
+                session._summary_cadence_for_frame(focused_frame),
+                2.5,
+            )
+            session.frames = [
+                {
+                    **focused_frame,
+                    "captured_at": float(index),
+                }
+                for index in range(1, 13)
+            ]
+            self.assertEqual(session._summary_profile_locked().mode.value, "active")
+            enqueued = []
+
+            def enqueue(**kwargs):
+                enqueued.append(kwargs)
+                session.frames.clear()
+                return True
+
+            with patch.object(session, "_enqueue_summary_batch", side_effect=enqueue):
+                session._summarize_if_ready()
+            self.assertEqual(enqueued[0]["workload_class"], "event")
+            self.assertEqual(enqueued[0]["frame_limit"], 12)
+
+            degraded, degraded_priority, degraded_digest = (
+                manager.apply_incident_focus(7, "degraded", 0.0)
+            )
+            self.assertEqual(degraded.value, "degraded")
+            self.assertEqual(degraded_priority, 0.0)
+            self.assertEqual(
+                degraded_digest["suppressed"],
+                "degraded_source",
+            )
+
+    def test_critical_focus_uses_burst_floor_and_stop_restores_mode(self):
+        with tempfile.TemporaryDirectory() as temp:
+            manager = build_manager(Path(temp))
+            manager.start_incident_focus(
+                "incident-critical",
+                [7],
+                level="critical",
+                ttl_seconds=30,
+            )
+            mode, priority, _digest = manager.apply_incident_focus(7, "watch", 0.2)
+            self.assertEqual(mode.value, "burst")
+            self.assertGreaterEqual(priority, 1.1)
+            self.assertTrue(manager.stop_incident_focus("incident-critical"))
+            mode, priority, digest = manager.apply_incident_focus(7, "watch", 0.2)
+            self.assertEqual(mode.value, "watch")
+            self.assertEqual(priority, 0.2)
+            self.assertIsNone(digest)
+
+    def test_critical_focus_does_not_jump_an_older_coverage_waiter(self):
+        with tempfile.TemporaryDirectory() as temp:
+            manager = build_manager(
+                Path(temp),
+                config_overrides={
+                    "LUXRIOT_ATTENTION_SCHEDULER_ENABLED": True,
+                },
+            )
+            now_ms = int(time.time() * 1000.0)
+            config = manager._l0_cost_budget_config
+            manager._l0_cost_budget_state = CostBudgetState(
+                timestamp_ms=now_ms,
+                available_tokens=-config.token_borrow_limit,
+                available_slot_seconds=-config.slot_seconds_borrow_limit,
+            )
+            self.assertFalse(
+                manager.reserve_l0_cost_budget(
+                    channel_id=8,
+                    mode=AttentionMode.QUIET,
+                    frame_count=8,
+                    coverage_overdue=True,
+                )
+            )
+            manager.start_incident_focus(
+                "incident-critical",
+                [7],
+                level="critical",
+                ttl_seconds=30,
+            )
+            focused_mode, _priority, _digest = manager.apply_incident_focus(
+                7,
+                AttentionMode.QUIET,
+                0.0,
+            )
+            self.assertFalse(
+                manager.reserve_l0_cost_budget(
+                    channel_id=7,
+                    mode=focused_mode,
+                    frame_count=8,
+                )
+            )
+            self.assertEqual(
+                manager.l0_cost_budget_status()["waiting_channel_ids"],
+                [7, 8],
+            )
 
 
 class LuxriotCaptureAttentionSignalTests(unittest.TestCase):
@@ -4018,7 +4162,7 @@ class LuxriotCaptureDispatchTests(unittest.TestCase):
 
     def test_bookmark_delivery_deduplicates_normalized_title_and_severity(self):
         with tempfile.TemporaryDirectory() as temp:
-            current = {"title": "Vehicle   burnout", "severity": "HIGH"}
+            current = {"title": "Vehicle   burnout", "severity": "WARNING"}
 
             def parse_alerts(_text, _channel_id, _default_ts_ms=None):
                 return [{"title": current["title"], "description": "Looped clip", "severity": current["severity"]}]
@@ -4027,7 +4171,7 @@ class LuxriotCaptureDispatchTests(unittest.TestCase):
                 Path(temp),
                 alert_parser=parse_alerts,
                 config_overrides={
-                    "LUXRIOT_BOOKMARK_COOLDOWN_SEC": 0.0,
+                    "LUXRIOT_BOOKMARK_COOLDOWN_SEC": 60.0,
                     "LUXRIOT_ALERT_DEDUPE_WINDOW_SEC": 600.0,
                 },
             )
@@ -4036,7 +4180,7 @@ class LuxriotCaptureDispatchTests(unittest.TestCase):
             with patch.object(manager, "send_bookmark_event", side_effect=lambda **kwargs: sent.append(kwargs) or {"success": True}):
                 first = manager.process_summary_alerts(120, "ALERTS_JSON: {}")
                 current["title"] = "  vehicle burnout  "
-                current["severity"] = "high"
+                current["severity"] = "low"
                 second = manager.process_summary_alerts(120, "ALERTS_JSON: {}")
 
             self.assertEqual(first, 1)
@@ -4044,6 +4188,52 @@ class LuxriotCaptureDispatchTests(unittest.TestCase):
             self.assertEqual(len(sent), 1)
             self.assertEqual(second.parsed, 1)
             self.assertEqual(second.alert_events[0]["delivery_status"], "deduplicated")
+            self.assertEqual(second.skipped_duplicate, 1)
+
+    def test_operator_cooldown_caps_content_dedupe_window(self):
+        with tempfile.TemporaryDirectory() as temp:
+            manager = build_manager(
+                Path(temp),
+                alert_parser=lambda *_args, **_kwargs: [
+                    {
+                        "title": "British flag mug",
+                        "description": "Person drinks from the mug",
+                        "severity": "warning",
+                    }
+                ],
+                config_overrides={
+                    "LUXRIOT_BOOKMARK_COOLDOWN_SEC": 10.0,
+                    "LUXRIOT_ALERT_DEDUPE_WINDOW_SEC": 600.0,
+                },
+            )
+            manager.default_bookmark_enabled = True
+            sent = []
+            now = {"value": 1_785_480_000.0}
+
+            with (
+                patch(
+                    "luxriot_connector.time.time",
+                    side_effect=lambda: now["value"],
+                ),
+                patch.object(
+                    manager,
+                    "send_bookmark_event",
+                    side_effect=lambda **kwargs: sent.append(kwargs)
+                    or {"success": True},
+                ),
+            ):
+                first = manager.process_summary_alerts(112, "ALERTS_JSON: {}")
+                now["value"] += 5.0
+                second = manager.process_summary_alerts(112, "ALERTS_JSON: {}")
+                now["value"] += 6.0
+                third = manager.process_summary_alerts(112, "ALERTS_JSON: {}")
+
+            self.assertEqual((first, second, third), (1, 0, 1))
+            self.assertEqual(len(sent), 2)
+            self.assertEqual(
+                second.alert_events[0]["delivery_status"],
+                "deduplicated",
+            )
 
     def test_bookmark_content_dedupe_keeps_title_and_severity_distinct(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -4109,7 +4299,6 @@ class LuxriotCaptureDispatchTests(unittest.TestCase):
             manager = build_manager(Path(temp), alert_parser=parse_alerts)
             manager.default_bookmark_enabled = True
             manager.default_bookmark_cooldown_sec = 60.0
-            manager.alert_dedupe_window_sec = 0.0
             sent = []
 
             with patch.object(manager, "send_bookmark_event", side_effect=lambda **kwargs: sent.append(kwargs) or {"success": True}):
@@ -4422,8 +4611,20 @@ class LuxriotCaptureDispatchTests(unittest.TestCase):
                 }
 
         with tempfile.TemporaryDirectory() as temp:
-            manager = build_manager(Path(temp))
+            manager = build_manager(
+                Path(temp),
+                config_overrides={
+                    "LUXRIOT_ATTENTION_SCHEDULER_ENABLED": True,
+                },
+            )
             manager.probe_manager = ProbeManager()
+            manager.link_attention_snapshot(
+                channel_id=7,
+                timestamp_ms=1_000,
+                snapshot_id="snapshot-1",
+                embedding_ref="embedding://7/snapshot-1",
+                frame_hash="hash-1",
+            )
             emitted = []
             manager.set_attention_event_callback(
                 lambda event_type, payload: emitted.append(
@@ -4451,6 +4652,17 @@ class LuxriotCaptureDispatchTests(unittest.TestCase):
             self.assertFalse(
                 any(event_type == "probe_scores" for event_type, _ in emitted)
             )
+            shadow_decision = manager.observe_attention_cv(
+                channel_id=7,
+                timestamp_ms=1_100,
+                motion_score=0.0,
+                activity_x=0.0,
+                mode="quiet",
+            )
+            self.assertEqual(
+                shadow_decision.state.vector.probe_positive,
+                0.0,
+            )
 
             emitted.clear()
             frames[0].pop("attention_probe_scores", None)
@@ -4467,6 +4679,21 @@ class LuxriotCaptureDispatchTests(unittest.TestCase):
             )
             self.assertTrue(
                 any(event_type == "probe_scores" for event_type, _ in emitted)
+            )
+            regulatory_decision = manager.observe_attention_cv(
+                channel_id=7,
+                timestamp_ms=1_200,
+                motion_score=0.0,
+                activity_x=0.0,
+                mode="quiet",
+            )
+            self.assertEqual(
+                regulatory_decision.state.vector.probe_positive,
+                0.42,
+            )
+            self.assertEqual(
+                regulatory_decision.state.vector.probe_margin,
+                0.24,
             )
 
     def test_siglip2_probe_stays_shadow_until_embedding_space_is_stamped(self):

@@ -67,12 +67,16 @@ class RoleAndAuthorizationTests(unittest.TestCase):
 
         self.assertIn(Permission.STREAMS_VIEW, viewer)
         self.assertNotIn(Permission.AGENT_USE, viewer)
+        self.assertNotIn(Permission.INCIDENTS_MANAGE, viewer)
         self.assertIn(Permission.AGENT_USE, operator)
         self.assertIn(Permission.PROBES_RUN, operator)
+        self.assertIn(Permission.INCIDENTS_MANAGE, operator)
         self.assertNotIn(Permission.PROBES_MANAGE, operator)
         self.assertIn(Permission.PROBES_MANAGE, engineer)
+        self.assertIn(Permission.INCIDENTS_MANAGE, engineer)
         self.assertIn(Permission.PROMPTS_MANAGE, engineer)
         self.assertNotIn(Permission.USERS_MANAGE, engineer)
+        self.assertIn(Permission.INCIDENTS_MANAGE, role_permissions(Role.ADMIN))
         self.assertEqual(role_permissions(Role.ADMIN), ALL_PERMISSIONS)
         self.assertEqual(
             permissions_for_roles({Role.VIEWER, Role.OPERATOR}),

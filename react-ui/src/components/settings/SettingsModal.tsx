@@ -74,20 +74,59 @@ export function SettingsModal({
   const [loading, setLoading] = useState(true)
   const [saving, setSaving] = useState(false)
   const [status, setStatus] = useState<{ msg: string; ok: boolean } | null>(null)
+  const [settingsLoadError, setSettingsLoadError] = useState('')
   const [capacity, setCapacity] = useState<any>(null)
+  const [capacityLoading, setCapacityLoading] = useState(false)
+  const [capacityError, setCapacityError] = useState('')
   const [search, setSearch] = useState('')
   const canReadSettings = canViewSettingsTab(user, 'settings')
   const canManageSettings = hasPermission(user, PERMISSION.settingsManage)
   const canReadCapacity = hasPermission(user, PERMISSION.diagnosticsView)
 
+  const mergeSettings = useCallback((settings?: Settings) => ({
+    ...DEFAULTS,
+    ...(settings || {}),
+    luxriotSeverityMap: {
+      ...DEFAULTS.luxriotSeverityMap,
+      ...(settings?.luxriotSeverityMap || {}),
+    },
+  }), [])
+
+  const loadCapacity = useCallback(async (includeCurrent = false) => {
+    if (!canReadCapacity) return
+    setCapacityLoading(true)
+    setCapacityError('')
+    try {
+      const result = await settingsApi.archiveCapacity(includeCurrent)
+      if (!result?.success) throw new Error(result?.error || 'Capacity estimate failed')
+      setCapacity(result)
+    } catch (error: any) {
+      setCapacityError(error?.message || 'Capacity estimate unavailable')
+    } finally {
+      setCapacityLoading(false)
+    }
+  }, [canReadCapacity])
+
   useEffect(() => {
     if (canReadSettings) {
-      settingsApi.get().then((r) => setS(r.settings || {})).catch(() => setStatus({ msg: 'Failed to load settings', ok: false })).finally(() => setLoading(false))
+      settingsApi.get()
+        .then((r) => {
+          if (!r?.success || !r.settings) throw new Error('Settings response is incomplete')
+          setS(mergeSettings(r.settings))
+          setSettingsLoadError('')
+        })
+        .catch((error: any) => {
+          const message = error?.message || 'Failed to load settings'
+          setS(mergeSettings())
+          setSettingsLoadError(message)
+          setStatus({ msg: message, ok: false })
+        })
+        .finally(() => setLoading(false))
     } else {
       setLoading(false)
     }
-    if (canReadCapacity) settingsApi.archiveCapacity().then(setCapacity).catch(() => {})
-  }, [canReadCapacity, canReadSettings])
+    void loadCapacity(false)
+  }, [canReadSettings, loadCapacity, mergeSettings])
 
   const patch = useCallback((k: string, v: any) => setS((x) => ({ ...x, [k]: v })), [])
   const patchSev = (k: string, v: string) => setS((x) => ({ ...x, luxriotSeverityMap: { ...(x.luxriotSeverityMap || {}), [k]: v } }))
@@ -100,7 +139,7 @@ export function SettingsModal({
         if (k === 'luxriotPassword' && !s[k]) continue // blank = keep current
         if (s[k] !== undefined) payload[k] = s[k]
       }
-      if (Number(payload.minResults) >= Number(payload.maxResults)) throw new Error('Min results must be less than max results')
+      if (Number(payload.minResults) > Number(payload.maxResults)) throw new Error('Min results must not exceed max results')
       const r = await settingsApi.save(payload)
       if (!r.success) throw new Error(r.error || 'Save failed')
       setStatus({ msg: r.message || 'Settings saved. Some changes need a server restart.', ok: true })
@@ -153,7 +192,23 @@ export function SettingsModal({
           </aside>
 
           <div className="set-content">
-            {loading && <div className="loading-state"><div className="spinner" /></div>}
+            {loading && (
+              <div className="set-loading">
+                <div className="spinner" />
+                <div>
+                  <b>Loading runtime settings…</b>
+                  <span>Archive capacity is loaded separately and cannot block these controls.</span>
+                </div>
+              </div>
+            )}
+            {!loading && settingsLoadError && (
+              <div className="set-load-error">{settingsLoadError}. Showing safe defaults; saving is disabled until the live configuration can be read.</div>
+            )}
+            {!loading && !activeTab && (
+              <div className="set-load-error">
+                This account can open Settings but has no readable settings tab. Ask an administrator to grant settings:view, users:manage, or audit:view.
+              </div>
+            )}
             {!loading && activeTab?.custom === 'env' && <EnvTab />}
             {!loading && activeTab?.custom === 'audit' && <AuditTab />}
             {!loading && activeTab?.custom === 'users' && (
@@ -180,15 +235,29 @@ export function SettingsModal({
                         ))}
                       </div>
                     ) : (
-                      <div className="set-capacity">
-                        {capacity ? (
-                          <>
-                            <div><span>Daily frame rows</span><b>{fmt(capacitySummary.dailyFrameRows)}</b></div>
-                            <div><span>Retained frame rows</span><b>{fmt(capacitySummary.retainedFrameRows)}</b></div>
-                            <div><span>Estimated storage</span><b>{fmtBytes(capacitySummary.totalBytes)}</b></div>
-                            <div><span>Current archive rows</span><b>{fmt(capacitySummary.currentRows)}</b></div>
-                          </>
-                        ) : <div className="set-note">Capacity estimate unavailable.</div>}
+                      <div className="set-capacity-wrap">
+                        <div className="set-capacity">
+                          {capacity ? (
+                            <>
+                              <div><span>Daily frame rows</span><b>{fmt(capacitySummary.dailyFrameRows)}</b></div>
+                              <div><span>Retained frame rows</span><b>{fmt(capacitySummary.retainedFrameRows)}</b></div>
+                              <div><span>Estimated storage</span><b>{fmtBytes(capacitySummary.totalBytes)}</b></div>
+                              <div>
+                                <span>Current archive rows</span>
+                                <b>{capacitySummary.currentRows == null ? 'Not scanned' : fmt(capacitySummary.currentRows)}</b>
+                              </div>
+                            </>
+                          ) : <div className="set-note">Capacity estimate unavailable.</div>}
+                        </div>
+                        <div className="set-capacity-actions">
+                          <button className="mon-btn" disabled={capacityLoading || !canReadCapacity} onClick={() => void loadCapacity(true)}>
+                            <IconRotate size={14} /> {capacityLoading ? 'Reading archive…' : 'Scan current archive'}
+                          </button>
+                          <span>
+                            Estimates load immediately. The current-row scan is manual because a large PostgreSQL archive may take several seconds.
+                          </span>
+                        </div>
+                        {capacityError && <div className="set-load-error">{capacityError}</div>}
                       </div>
                     )}
                   </div>
@@ -218,7 +287,7 @@ export function SettingsModal({
 
         <div className="set-footer">
           <div className={`set-status ${status ? (status.ok ? 'ok' : 'err') : ''}`}>{status?.msg || ''}</div>
-          {activeTab && !activeTab.custom && canManageSettings && (
+          {activeTab && !activeTab.custom && canManageSettings && !loading && !settingsLoadError && (
             <div className="set-actions">
               <button className="mon-btn" onClick={reset}><IconRotate size={15} /> Reset to defaults</button>
               <button className="mon-btn accent" disabled={saving} onClick={save}><IconDeviceFloppy size={15} /> {saving ? 'Saving…' : 'Save settings'}</button>

@@ -9,6 +9,7 @@ before any Python packages have been installed.
 from __future__ import annotations
 
 import argparse
+import base64
 import getpass
 import hashlib
 import json
@@ -19,6 +20,7 @@ import secrets
 import shlex
 import shutil
 import socket
+import struct
 import subprocess
 import sys
 import tarfile
@@ -26,6 +28,7 @@ import time
 import urllib.error
 import urllib.request
 import uuid
+import zlib
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -34,7 +37,7 @@ from urllib.parse import urlsplit
 
 
 VERSION = "β 0.8.5"
-EXPECTED_SCHEMA = "20260727_0010"
+EXPECTED_SCHEMA = "20260801_0011"
 DEFAULT_ROOT = Path("/opt/eva-ai")
 DEFAULT_DATA = Path("/var/lib/eva-ai")
 DEFAULT_CONFIG = Path("/etc/eva-ai")
@@ -52,6 +55,9 @@ PORT_ENV = {
     "EVOSSEARCH_HOST": "127.0.0.1",
     "EVOSSEARCH_PORT": "5000",
     "EVOSSEARCH_DEBUG": "false",
+    # Keep the mature console as the appliance default until React parity is
+    # accepted. Operators can pilot React at /?ui=react without a restart.
+    "EVOSSEARCH_UI_MODE": "legacy",
     "EVOSSEARCH_GUNICORN_WORKERS": "1",
     "EVOSSEARCH_GUNICORN_THREADS": "8",
     "EVOSSEARCH_GUNICORN_TIMEOUT": "240",
@@ -81,6 +87,7 @@ PORT_ENV = {
     "EVOSSEARCH_INFERENCE_QUEUE_ENABLED": "true",
     "EVOSSEARCH_INFERENCE_QUEUE_CAPACITY": "200",
     "EVOSSEARCH_INFERENCE_WORKER_COUNT": "1",
+    "EVOSSEARCH_LM_VIDEO_REPETITION_PENALTY": "1.08",
     "EVOSSEARCH_LUXRIOT_CAPTURE_SOURCE": "live_segment",
     "EVOSSEARCH_LUXRIOT_LIVE_SEGMENT_SECONDS": "60",
     "EVOSSEARCH_LUXRIOT_LIVE_SEGMENT_FPS": "4",
@@ -505,7 +512,7 @@ def verify_critical_payload(bundle_root: Path, manifest: Mapping) -> None:
     required = (
         "repo/VERSION",
         "repo/alembic.ini",
-        "repo/migrations/versions/20260727_0010_audit_hash_chain.py",
+        "repo/migrations/versions/20260801_0011_incidents.py",
         "wheelhouse",
         "apt/Packages.gz",
         "models/qwen3-vl-4b-awq/model.safetensors",
@@ -1458,7 +1465,7 @@ Environment=HF_HUB_OFFLINE=1
 Environment=TRANSFORMERS_OFFLINE=1
 Environment=VLLM_USE_FLASHINFER_SAMPLER=0
 Environment=PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
-ExecStart={vllm} serve {model} --served-model-name {DEFAULT_VLM_MODEL} --host 127.0.0.1 --port 1234 --max-model-len 32768 --gpu-memory-utilization 0.82 --max-num-seqs 4 --max-num-batched-tokens 4096 --kv-cache-dtype fp8 --enforce-eager --attention-backend TRITON_ATTN --limit-mm-per-prompt.image 16 --limit-mm-per-prompt.video 0 --mm-processor-kwargs.max_pixels 100352 --enable-auto-tool-choice --tool-call-parser hermes
+ExecStart={vllm} serve {model} --served-model-name {DEFAULT_VLM_MODEL} --host 127.0.0.1 --port 1234 --max-model-len 32768 --gpu-memory-utilization 0.82 --max-num-seqs 4 --max-num-batched-tokens 4096 --kv-cache-dtype fp8 --enforce-eager --attention-backend TRITON_ATTN --mm-encoder-attn-backend TRITON_ATTN --limit-mm-per-prompt.image 16 --limit-mm-per-prompt.video 0 --mm-processor-kwargs.max_pixels 100352 --enable-auto-tool-choice --tool-call-parser hermes
 Restart=on-failure
 RestartSec=10
 TimeoutStartSec=300
@@ -1635,6 +1642,123 @@ def _wait_for_json_endpoint(
     raise InstallError(f"{label} did not become ready within {timeout_sec}s: {last_error}")
 
 
+def _vision_smoke_png() -> bytes:
+    """Build a deterministic PNG without depending on Pillow on a fresh host."""
+
+    width, height = 640, 360
+    pixels = bytearray([255, 255, 255] * width * height)
+
+    def rectangle(x0: int, y0: int, x1: int, y1: int, color: tuple[int, int, int]) -> None:
+        for y in range(max(0, y0), min(height, y1)):
+            row = y * width * 3
+            for x in range(max(0, x0), min(width, x1)):
+                offset = row + x * 3
+                pixels[offset : offset + 3] = bytes(color)
+
+    # A three-colour sequence catches an image encoder returning unrelated features.
+    rectangle(70, 35, 210, 145, (220, 35, 45))
+    rectangle(250, 35, 390, 145, (30, 170, 75))
+    rectangle(430, 35, 570, 145, (35, 90, 220))
+
+    glyphs = {
+        "1": ("00100", "01100", "00100", "00100", "00100", "00100", "01110"),
+        "3": ("11110", "00010", "00010", "01110", "00010", "00010", "11110"),
+        "7": ("11111", "00001", "00010", "00100", "01000", "01000", "01000"),
+        "9": ("01110", "10001", "10001", "01111", "00001", "00010", "11100"),
+    }
+    scale = 18
+    digit_width = 5 * scale
+    gap = 2 * scale
+    code = "7391"
+    total_width = len(code) * digit_width + (len(code) - 1) * gap
+    cursor_x = (width - total_width) // 2
+    for digit in code:
+        for row_index, row in enumerate(glyphs[digit]):
+            for column_index, enabled in enumerate(row):
+                if enabled == "1":
+                    rectangle(
+                        cursor_x + column_index * scale,
+                        190 + row_index * scale,
+                        cursor_x + (column_index + 1) * scale,
+                        190 + (row_index + 1) * scale,
+                        (10, 10, 10),
+                    )
+        cursor_x += digit_width + gap
+
+    raw = b"".join(
+        b"\x00" + bytes(pixels[y * width * 3 : (y + 1) * width * 3])
+        for y in range(height)
+    )
+
+    def chunk(kind: bytes, payload: bytes) -> bytes:
+        return (
+            struct.pack(">I", len(payload))
+            + kind
+            + payload
+            + struct.pack(">I", zlib.crc32(kind + payload) & 0xFFFFFFFF)
+        )
+
+    return (
+        b"\x89PNG\r\n\x1a\n"
+        + chunk(b"IHDR", struct.pack(">IIBBBBB", width, height, 8, 2, 0, 0, 0))
+        + chunk(b"IDAT", zlib.compress(raw, level=9))
+        + chunk(b"IEND", b"")
+    )
+
+
+def _verify_vlm_vision(base_url: str, model: str, *, timeout_sec: int = 90) -> None:
+    image = base64.b64encode(_vision_smoke_png()).decode("ascii")
+    payload = {
+        "model": model,
+        "messages": [
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "image_url",
+                        "image_url": {"url": f"data:image/png;base64,{image}"},
+                    },
+                    {
+                        "type": "text",
+                        "text": (
+                            "Read the four black digits and the three coloured blocks "
+                            "from left to right. Reply on one line exactly as: "
+                            "VISION_OK <digits> <COLOR> <COLOR> <COLOR>."
+                        ),
+                    },
+                ],
+            }
+        ],
+        "temperature": 0,
+        "max_tokens": 64,
+    }
+    request = urllib.request.Request(
+        base_url.rstrip("/") + "/chat/completions",
+        data=json.dumps(payload).encode("utf-8"),
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=timeout_sec) as response:
+            result = json.loads(response.read().decode("utf-8"))
+        content = str(result["choices"][0]["message"]["content"])
+    except Exception as exc:
+        raise InstallError(
+            "VLM text endpoint is ready, but the required vision smoke test failed: "
+            f"{type(exc).__name__}: {exc}"
+        ) from exc
+    normalized = " ".join(content.upper().replace(",", " ").split())
+    if "7391" not in normalized or not all(
+        color in normalized for color in ("RED", "GREEN", "BLUE")
+    ):
+        raise InstallError(
+            "VLM responded to an image but did not perceive the control frame. "
+            f"Expected code 7391 and RED/GREEN/BLUE; received {content!r}. "
+            "Check the multimodal encoder/attention backend before starting EVA."
+        )
+    print("VLM vision smoke passed: code 7391, RED/GREEN/BLUE.")
+
+
 def start_and_verify(answers: Answers, runner: Runner) -> None:
     if answers.local_vlm:
         runner.run(("systemctl", "restart", "eva-vllm"))
@@ -1645,6 +1769,7 @@ def start_and_verify(answers: Answers, runner: Runner) -> None:
             timeout_sec=600 if answers.local_vlm else 60,
             expected_model=answers.vlm_model,
         )
+        _verify_vlm_vision(answers.vlm_url, answers.vlm_model)
     if answers.local_deep:
         runner.run(("systemctl", "restart", "eva-deep-review"))
     if answers.deep_url and not runner.dry_run:

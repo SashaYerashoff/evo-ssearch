@@ -2309,6 +2309,7 @@ class CoordinatorConfig:
     cv_retention_ms: int = 120_000
     snapshot_retention_ms: int = 300_000
     expected_snapshot_interval_ms: int = 1_000
+    probe_score_ttl_ms: int = 60_000
     persistence_window_ms: int = 5_000
     minimum_dispatch_gap_ms: int = 3_000
     burst_postroll_wait_ms: int = 2_000
@@ -2323,6 +2324,7 @@ class CoordinatorConfig:
             "cv_retention_ms",
             "snapshot_retention_ms",
             "expected_snapshot_interval_ms",
+            "probe_score_ttl_ms",
             "persistence_window_ms",
             "minimum_dispatch_gap_ms",
             "burst_postroll_wait_ms",
@@ -2502,7 +2504,10 @@ class AttentionCoordinator:
                     / self.config.expected_snapshot_interval_ms,
                 )
             )
-            positive, margin = self._latest_probe_signal(latest_snapshot)
+            positive, margin = self._latest_probe_signal(
+                runtime.snapshots,
+                timestamp,
+            )
             vector = AttentionVector(
                 timestamp_ms=timestamp,
                 motion_intensity=max(sample.motion, activity_signal),
@@ -2606,6 +2611,57 @@ class AttentionCoordinator:
             runtime.apex_markers.append(marker)
             self._trim(runtime, marker.timestamp_ms)
         return marker
+
+    def attach_probe_scores(
+        self,
+        channel_id: str,
+        snapshot_id: str,
+        probe_scores: Iterable[ProbeScore | Mapping[str, object]],
+    ) -> EmbeddingSnapshot:
+        """Attach late-arriving scalar probe scores to a linked snapshot.
+
+        CLIP scoring may finish after the embedding snapshot was linked.  This
+        method updates only the bounded in-memory reference; durable score
+        storage remains the caller's responsibility.  Scores are merged by
+        probe/version so repeated callbacks are idempotent.
+        """
+
+        normalized_snapshot_id = str(snapshot_id or "").strip()
+        if not normalized_snapshot_id:
+            raise ValueError("snapshot_id must not be empty")
+        parsed_scores = tuple(
+            self._parse_probe_score(value) for value in probe_scores
+        )
+        if not parsed_scores:
+            raise ValueError("probe_scores must not be empty")
+        if len(parsed_scores) > 64:
+            raise ValueError("probe_scores must not contain more than 64 scores")
+        with self._lock:
+            runtime = self._channels.get(str(channel_id))
+            if runtime is None:
+                raise ValueError("channel has no attention state")
+            for index, snapshot in enumerate(runtime.snapshots):
+                if snapshot.snapshot_id != normalized_snapshot_id:
+                    continue
+                merged = {
+                    (score.probe_id, score.probe_version): score
+                    for score in snapshot.probe_scores
+                }
+                merged.update(
+                    {
+                        (score.probe_id, score.probe_version): score
+                        for score in parsed_scores
+                    }
+                )
+                updated = replace(
+                    snapshot,
+                    probe_scores=tuple(
+                        merged[key] for key in sorted(merged)
+                    ),
+                )
+                runtime.snapshots[index] = updated
+                return updated
+        raise ValueError("snapshot is not linked to this channel")
 
     def should_dispatch(
         self, channel_id: str, now_ms: int | None = None
@@ -2814,9 +2870,20 @@ class AttentionCoordinator:
         ]
 
     def _latest_probe_signal(
-        self, snapshot: EmbeddingSnapshot | None
+        self,
+        snapshots: Sequence[EmbeddingSnapshot],
+        now_ms: int,
     ) -> tuple[float, float]:
-        if snapshot is None or not snapshot.probe_scores:
+        cutoff_ms = int(now_ms) - int(self.config.probe_score_ttl_ms)
+        snapshot = next(
+            (
+                item
+                for item in reversed(snapshots)
+                if item.probe_scores and item.timestamp_ms >= cutoff_ms
+            ),
+            None,
+        )
+        if snapshot is None:
             return 0.0, 0.0
         return (
             min(1.0, max(0.0, max(score.positive for score in snapshot.probe_scores))),

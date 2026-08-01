@@ -7,8 +7,17 @@ import {
 } from '@tabler/icons-react'
 import type { Channel, ArchiveFilters } from '../../api/types'
 import { agentSubmissionText, streamAgent, agentApi, type AgentEvent, type AgentSession, type AgentSkill } from '../../api/agent'
+import {
+  buildAgentConsoleContext,
+  normalizeConsoleUiEffects,
+  type ConsoleUiEffect,
+} from '../../ui-effects/consoleEffects'
 import { renderMarkdown } from '../agent/markdown'
 import { ActionCard, type ToolAction } from '../agent/ActionCard'
+import {
+  maxTranscriptActionId,
+  restoreAgentTranscript,
+} from '../agent/agentTranscript'
 import { PromptAssist } from '../agent/PromptAssist'
 import {
   AGENT_WIDTH_PRESET_STORAGE_KEY,
@@ -46,6 +55,38 @@ interface Msg {
   error?: string
 }
 
+function ResearchTrace({
+  message,
+  onThumb,
+  onApply,
+}: {
+  message: Msg
+  onThumb: (url: string, title: string) => void
+  onApply: (action: ToolAction) => void
+}) {
+  // The operator owns this disclosure state. Streaming updates must not force
+  // a trace open or closed after the user has touched it.
+  const [traceOpen, setTraceOpen] = useState(true)
+  const stepCount = (message.actions?.length ?? 0) + (message.notes?.length ?? 0)
+  return (
+    <details
+      className="ag-trace"
+      open={traceOpen}
+      onToggle={(event) => setTraceOpen(event.currentTarget.open)}
+    >
+      <summary>Research trace · {stepCount} step{stepCount === 1 ? '' : 's'}</summary>
+      <div className="ag-trace-body">
+        {message.notes?.map((note) => (
+          <div key={note.id} className="ag-note"><span className="ag-note-badge">In progress</span>{note.message}</div>
+        ))}
+        {message.actions?.map((action) => (
+          <ActionCard key={action.id} action={action} onThumb={onThumb} onApply={onApply} />
+        ))}
+      </div>
+    </details>
+  )
+}
+
 const labelTool = (n: string) => (n || '').replace(/_/g, ' ')
 
 // format a session timestamp (backend may send seconds, ms, or ISO)
@@ -62,51 +103,18 @@ function sessionLabel(s: AgentSession): string {
   return fmtTs(s.updated_at) || 'Untitled session'
 }
 
-// Build an "operator console context" preamble from the current archive filters so the
-// server-side agent respects the operator's selected channel / time window / source.
-function buildAgentContext(f: ArchiveFilters | null | undefined, channels: Channel[], operator: boolean): string {
-  const lines: string[] = []
-  if (operator) {
-    lines.push(
-      'OPERATOR MODE — you are operating the operator\'s live console UI (currently the Archive screen). Rules:',
-      '- You MUST answer by calling tools that drive the console; NEVER answer archive/detection/channel questions from memory or from earlier messages.',
-      '- Your tool calls are mirrored onto the console in real time (filters change, frames load) — so always act via a tool first, then summarise briefly.',
-    )
-  }
-  if (f) {
-    const now = Date.now()
-    const hours = f.hours ?? '24'
-    const until = f.untilMs ? Number(f.untilMs) : now
-    const since = f.sinceMs ? Number(f.sinceMs) : (hours === '0' ? 0 : until - Number(hours) * 3600_000)
-    const chTitle = f.channelId ? (channels.find((c) => String(c.id) === String(f.channelId))?.title || `channel ${f.channelId}`) : null
-    const timeLabel = (f.sinceMs || f.untilMs) ? 'custom range' : hours === '0' ? 'all time' : `last ${hours}h`
-    lines.push(
-      'Console filter state (use these values for archive tool calls):',
-      `- channel: ${chTitle ? `${chTitle} (channel_id=${f.channelId})` : 'all channels'}`,
-      `- time window: ${timeLabel} → since_ms=${since}, until_ms=${until}`,
-      `- source: ${f.source || 'all'}`,
-      `- probe: ${f.source === 'probe' && f.probeId ? `${f.probeId} (probe_id)` : 'all'}`,
-      'Tool guidance:',
-      '- To show / list / browse archived frames or "the archive", call get_detections with the window above — it returns the stored detection frames. Do NOT use search_archive for this.',
-      '- Use search_archive ONLY when the operator gives a specific visual query to match (an object, action, or scene).',
-      '- Always pass since_ms/until_ms and channel_id (when set) explicitly; never fall back to a default 24h window.',
-      '- If the operator names a different time range in their request below (e.g. "all time", "last week"), that overrides the window above.',
-    )
-  }
-  return lines.join('\n')
-}
-
 export function AgentPanel({
-  open, full, onClose, onToggleFull, channels, archiveFilters, onAction, onBusyChange,
+  open, full, onClose, onToggleFull, section, channels, archiveFilters, onUiEffects, onBusyChange,
   onLayoutPresetChange, onLayoutPresetCommit, canManageModels, canManageSkills,
 }: {
   open: boolean
   full: boolean
   onClose: () => void
   onToggleFull: () => void
+  section: string
   channels: Channel[]
   archiveFilters?: ArchiveFilters | null
-  onAction: (a: AgentAction) => void
+  onUiEffects: (effects: ConsoleUiEffect[], result: unknown) => void
   onBusyChange?: (busy: boolean) => void
   onLayoutPresetChange?: (archiveColumns: number) => void
   onLayoutPresetCommit?: (archiveColumns: number) => void
@@ -216,7 +224,9 @@ export function AgentPanel({
     try {
       const data = await agentApi.session(id)
       setCurSession(id); sessionRef.current = id; localStorage.setItem(LS_SESSION, id)
-      setMsgs((data.messages || []).map((m) => ({ role: m.role, text: m.content, ts: undefined })))
+      const restored = restoreAgentTranscript(data.messages || [])
+      idRef.current = Math.max(idRef.current, maxTranscriptActionId(restored) + 1)
+      setMsgs(restored)
     } catch { /* ignore */ }
   }
   async function deleteSession(id: string) {
@@ -243,24 +253,28 @@ export function AgentPanel({
     setBusy(true)
     const ctrl = new AbortController(); abortRef.current = ctrl
 
-    // prepend live console context so the agent respects the operator's filters / drives the UI
-    const ctx = buildAgentContext(archiveFilters, channels, operatorMode)
-    const wire = ctx ? `${ctx}\n\nOperator request: ${q}` : q
+    const consoleContext = buildAgentConsoleContext(section, archiveFilters)
 
     try {
-      await streamAgent(wire, { sessionId: sessionRef.current, imageB64: img, operatorMode, signal: ctrl.signal }, (e: AgentEvent) => {
+      await streamAgent(q, {
+        sessionId: sessionRef.current,
+        imageB64: img,
+        operatorMode,
+        consoleContext,
+        signal: ctrl.signal,
+      }, (e: AgentEvent) => {
         if ((e.type === 'session' || e.type === 'done') && e.session_id) {
           sessionRef.current = e.session_id; setCurSession(e.session_id); localStorage.setItem(LS_SESSION, e.session_id)
         }
         if ((e.type === 'text' || e.type === 'token') && e.content) patchLast((m) => ({ ...m, text: m.text + e.content, status: '' }))
         else if (e.type === 'tool_call') {
           patchLast((m) => ({ ...m, status: `Running ${labelTool(e.name || '')}…` }))
-          onAction({ name: e.name || '', args: e.args || {}, done: false })
         } else if (e.type === 'tool_result') {
           const planId = e.result?.approval?.plan_id || (e.result?.status === 'preview' ? e.result?.plan_id : null) || null
           const act: ToolAction = { id: ++idRef.current, name: e.name || '', result: e.result, error: e.error, planId }
           patchLast((m) => ({ ...m, actions: [...(m.actions || []), act], status: '' }))
-          onAction({ name: e.name || '', args: {}, done: true, error: e.error, result: e.result })
+          const effects = normalizeConsoleUiEffects(e.ui_effects)
+          if (effects.length) onUiEffects(effects, e.result)
         } else if (e.type === 'tool_progress') {
           patchLast((m) => ({ ...m, notes: [...(m.notes || []), { id: ++idRef.current, message: e.message || 'Working…' }], status: e.message || 'Working…' }))
         } else if (e.type === 'heartbeat') patchLast((m) => ({ ...m, status: m.text ? '' : 'Still working…' }))
@@ -284,6 +298,8 @@ export function AgentPanel({
       patchAction(a.id, (x) => ({ ...x, applying: false, applied: true }))
       // append the receipt card
       if (res.result) patchLast((m) => ({ ...m, actions: [...(m.actions || []), { id: ++idRef.current, name: a.name, result: res.result, applied: true }] }))
+      const effects = normalizeConsoleUiEffects(res.ui_effects)
+      if (effects.length) onUiEffects(effects, res.result)
       refreshStreams()
     } catch (ex: any) {
       patchAction(a.id, (x) => ({ ...x, applying: false, error: ex?.message || 'Apply failed' }))
@@ -546,17 +562,11 @@ export function AgentPanel({
                   : m.streaming && <div className="chat-status"><span className="action-dots"><i /><i /><i /></span>{m.status || 'Thinking…'}</div>}
 
                 {((m.actions?.length ?? 0) > 0 || (m.notes?.length ?? 0) > 0) && (
-                  <details className="ag-trace" open>
-                    <summary>Research trace · {(m.actions?.length ?? 0) + (m.notes?.length ?? 0)} step{((m.actions?.length ?? 0) + (m.notes?.length ?? 0)) === 1 ? '' : 's'}</summary>
-                    <div className="ag-trace-body">
-                      {m.notes?.map((n) => (
-                        <div key={n.id} className="ag-note"><span className="ag-note-badge">In progress</span>{n.message}</div>
-                      ))}
-                      {m.actions?.map((a) => (
-                        <ActionCard key={a.id} action={a} onThumb={(url, title) => setLightbox({ url, title })} onApply={applyPlan} />
-                      ))}
-                    </div>
-                  </details>
+                  <ResearchTrace
+                    message={m}
+                    onThumb={(url, title) => setLightbox({ url, title })}
+                    onApply={applyPlan}
+                  />
                 )}
                 {m.error && <div className="chat-error"><IconAlertTriangle size={14} /> {m.error}</div>}
               </div>

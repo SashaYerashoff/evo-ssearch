@@ -287,6 +287,277 @@ class VlmAlertPromptContractTests(unittest.TestCase):
             final_prompt = manager.compose_live_system_prompt(7, manager.get_effective_stream_system_prompt(7))
             self.assertIn("Pay special attention to people falling near stairs.", final_prompt)
             self.assertIn("BATCH_STATE_JSON:", final_prompt)
+            self.assertIn("Mandatory current-batch alert reconciliation:", final_prompt)
+            self.assertLess(
+                final_prompt.index("Pay special attention to people falling near stairs."),
+                final_prompt.index("BATCH_STATE_JSON:"),
+            )
+            self.assertLess(
+                final_prompt.index("Mandatory current-batch alert reconciliation:"),
+                final_prompt.index("BATCH_STATE_JSON:"),
+            )
+
+    def test_channel_alert_criteria_follow_memory_and_remain_adjacent_to_batch_contract(self):
+        with tempfile.TemporaryDirectory() as temp:
+            manager = build_manager(Path(temp))
+            manager.update_prompt_settings(
+                channel_id=7,
+                stream_system_prompt="Describe visible activity.",
+                alert_policy_prompt="Alert when a person drinks from the British flag mug.",
+            )
+            manager._render_capture_homeostasis_prompt = lambda _channel_id: (
+                "CURRENT HOMEOSTASIS TEST LAYER"
+            )
+
+            final_prompt = manager.compose_live_system_prompt(
+                7,
+                manager.get_effective_stream_system_prompt(7),
+            )
+
+            homeostasis_at = final_prompt.index("CURRENT HOMEOSTASIS TEST LAYER")
+            criteria_at = final_prompt.rindex(
+                "Alert when a person drinks from the British flag mug."
+            )
+            contract_at = final_prompt.index("BATCH_STATE_JSON:")
+            self.assertLess(homeostasis_at, criteria_at)
+            self.assertLess(criteria_at, contract_at)
+            self.assertEqual(
+                final_prompt.count(
+                    "Alert when a person drinks from the British flag mug."
+                ),
+                2,
+            )
+            self.assertIn(
+                "alerts must contain the corresponding object",
+                final_prompt[criteria_at:contract_at],
+            )
+
+    def test_backend_reconciles_explicit_current_event_omitted_by_small_vlm(self):
+        frames = [
+            {"thumbnail": f"frame-{index}", "captured_at": 100.0 + index}
+            for index in range(4)
+        ]
+        summary = (
+            "The person lifts a mug with a Union Jack design and takes a sip. "
+            "The action is a minor, non-alertable routine.\n"
+            "BATCH_STATE_JSON:\n"
+            '{"version":1,"cover":{"snapshot_index":3,"kind":"event",'
+            '"reason":"Person drinking from mug with British flag art","confidence":"high"},'
+            '"scene":{"status":"matched","summary":"Person seated and drinking"},'
+            '"events":[{"event_id":"drink_from_mug","label":"drinking from mug",'
+            '"state":"new","snapshot_indices":[3],"summary":'
+            '"Person lifts mug with British flag design to mouth and sips.",'
+            '"novelty":"expected_variation","pass_up":true}],'
+            '"observed_states":[],"routines":[],"memory_pass":[],'
+            '"alerts":[]}'
+        )
+        with tempfile.TemporaryDirectory() as temp:
+            manager = build_manager(Path(temp))
+            manager.update_prompt_settings(
+                channel_id=7,
+                alert_policy_prompt=(
+                    "Create alert if person shows thumbs up, or drinks from the mug "
+                    "with the British flag art on it. Alert level for the thumbs up - "
+                    "info, for the mug - warning"
+                ),
+            )
+            state = manager._extract_batch_state(summary, frames)
+
+            patched_summary, reconciled = manager._reconcile_operator_alert_contract(
+                7,
+                summary,
+                state,
+            )
+
+            self.assertEqual(reconciled["contract_status"], "parsed_alert_reconciled")
+            self.assertEqual(reconciled["alert_reconciliation"]["source"], "current_structured_event")
+            self.assertEqual(len(reconciled["alerts"]), 1)
+            self.assertEqual(reconciled["alerts"][0]["severity"], "low")
+            self.assertEqual(reconciled["alerts"][0]["snapshot_indices"], [3])
+            self.assertEqual(
+                reconciled["alerts"][0]["source"],
+                "backend_policy_reconciliation",
+            )
+            self.assertEqual(
+                len(manager._structured_alert_payloads(patched_summary)),
+                1,
+            )
+            self.assertNotIn("```", patched_summary)
+
+    def test_backend_alert_reconciliation_rejects_weak_object_only_match(self):
+        frames = [
+            {"thumbnail": "frame-one", "captured_at": 100.0},
+            {"thumbnail": "frame-two", "captured_at": 101.0},
+        ]
+        summary = (
+            "A person drinks from a plain mug.\n"
+            "BATCH_STATE_JSON:\n"
+            '{"version":1,"cover":{"snapshot_index":2,"kind":"event"},'
+            '"events":[{"event_id":"drink","label":"drinking from mug","state":"new",'
+            '"snapshot_indices":[2],"summary":"Person drinks from a plain mug.",'
+            '"novelty":"routine","pass_up":false}],'
+            '"observed_states":[],"routines":[],"memory_pass":[],"alerts":[]}'
+        )
+        with tempfile.TemporaryDirectory() as temp:
+            manager = build_manager(Path(temp))
+            manager.update_prompt_settings(
+                channel_id=7,
+                alert_policy_prompt=(
+                    "Create alert if the person drinks from the mug with British flag art."
+                ),
+            )
+            state = manager._extract_batch_state(summary, frames)
+
+            patched_summary, reconciled = manager._reconcile_operator_alert_contract(
+                7,
+                summary,
+                state,
+            )
+
+            self.assertEqual(patched_summary, summary)
+            self.assertEqual(reconciled["contract_status"], "parsed")
+            self.assertEqual(reconciled["alerts"], [])
+
+    def test_backend_alert_reconciliation_never_promotes_memory_or_prose_without_event_evidence(self):
+        frames = [{"thumbnail": "frame-one", "captured_at": 100.0}]
+        summary = (
+            "Prior memory mentions a person drinking from a British flag mug.\n"
+            "BATCH_STATE_JSON:\n"
+            '{"version":1,"cover":{"snapshot_index":1,"kind":"routine"},'
+            '"events":[],"observed_states":[],"routines":[],'
+            '"memory_pass":["Person drinking from British flag mug"],"alerts":[]}'
+        )
+        with tempfile.TemporaryDirectory() as temp:
+            manager = build_manager(Path(temp))
+            manager.update_prompt_settings(
+                channel_id=7,
+                alert_policy_prompt=(
+                    "Create alert if the person drinks from the mug with British flag art."
+                ),
+            )
+            state = manager._extract_batch_state(summary, frames)
+
+            patched_summary, reconciled = manager._reconcile_operator_alert_contract(
+                7,
+                summary,
+                state,
+            )
+
+            self.assertEqual(patched_summary, summary)
+            self.assertEqual(reconciled["alerts"], [])
+
+    def test_backend_reconciles_grounded_drift_general_hazard(self):
+        frames = [
+            {"thumbnail": f"frame-{index}", "captured_at": 100.0 + index}
+            for index in range(3)
+        ]
+        summary = (
+            "An orange car drifts through the intersection with visible smoke.\n"
+            "BATCH_STATE_JSON:\n"
+            '{"version":1,"cover":{"snapshot_index":2,"kind":"event"},'
+            '"events":[{"event_id":"drift","label":"orange car drifting with smoke",'
+            '"state":"continuing","snapshot_indices":[2,3],'
+            '"summary":"Orange car performs repeated drifting with smoke.",'
+            '"novelty":"expected_variation","pass_up":true}],'
+            '"observed_states":[],"routines":[],"memory_pass":[],"alerts":[]}'
+        )
+        with tempfile.TemporaryDirectory() as temp:
+            manager = build_manager(Path(temp))
+            state = manager._extract_batch_state(summary, frames)
+
+            patched_summary, reconciled = (
+                manager._reconcile_general_hazard_alert_contract(
+                    118,
+                    summary,
+                    state,
+                )
+            )
+
+            self.assertEqual(reconciled["contract_status"], "parsed_alert_reconciled")
+            self.assertEqual(
+                reconciled["alert_reconciliation"]["rule"],
+                "dangerous_vehicle_behavior",
+            )
+            self.assertEqual(reconciled["alerts"][0]["title"], "Dangerous vehicle behavior")
+            self.assertEqual(reconciled["alerts"][0]["severity"], "normal")
+            self.assertEqual(reconciled["alerts"][0]["snapshot_indices"], [2, 3])
+            self.assertEqual(
+                reconciled["alerts"][0]["source"],
+                "backend_general_hazard_reconciliation",
+            )
+            self.assertEqual(len(manager._structured_alert_payloads(patched_summary)), 1)
+
+    def test_backend_general_hazard_reconciliation_ignores_routine_vehicle_crossing(self):
+        frames = [{"thumbnail": "frame-one", "captured_at": 100.0}]
+        summary = (
+            "A car crosses the intersection normally.\n"
+            "BATCH_STATE_JSON:\n"
+            '{"version":1,"cover":{"snapshot_index":1,"kind":"routine"},'
+            '"events":[{"event_id":"crossing","label":"car crossing intersection",'
+            '"state":"new","snapshot_indices":[1],'
+            '"summary":"Car crosses under traffic light control.",'
+            '"novelty":"routine","pass_up":false}],'
+            '"observed_states":[],"routines":[],"memory_pass":[],"alerts":[]}'
+        )
+        with tempfile.TemporaryDirectory() as temp:
+            manager = build_manager(Path(temp))
+            state = manager._extract_batch_state(summary, frames)
+
+            patched_summary, reconciled = (
+                manager._reconcile_general_hazard_alert_contract(
+                    118,
+                    summary,
+                    state,
+                )
+            )
+
+            self.assertEqual(patched_summary, summary)
+            self.assertEqual(reconciled["alerts"], [])
+
+    def test_backend_general_hazard_reconciliation_ignores_smoke_detector_object(self):
+        frames = [{"thumbnail": "frame-one", "captured_at": 100.0}]
+        summary = (
+            "A smoke detector remains mounted above the intersection office.\n"
+            "BATCH_STATE_JSON:\n"
+            '{"version":1,"cover":{"snapshot_index":1,"kind":"routine"},'
+            '"events":[{"event_id":"detector","label":"smoke detector present",'
+            '"state":"continuing","snapshot_indices":[1],'
+            '"summary":"Static smoke detector remains mounted on the wall.",'
+            '"novelty":"routine","pass_up":false}],'
+            '"observed_states":[],"routines":[],"memory_pass":[],"alerts":[]}'
+        )
+        with tempfile.TemporaryDirectory() as temp:
+            manager = build_manager(Path(temp))
+            state = manager._extract_batch_state(summary, frames)
+
+            patched_summary, reconciled = (
+                manager._reconcile_general_hazard_alert_contract(
+                    118,
+                    summary,
+                    state,
+                )
+            )
+
+            self.assertEqual(patched_summary, summary)
+            self.assertEqual(reconciled["alerts"], [])
+
+    def test_old_persisted_batch_contract_is_replaced_by_current_default(self):
+        with tempfile.TemporaryDirectory() as temp:
+            manager = build_manager(Path(temp))
+            old_contract = (
+                "BATCH_STATE_JSON:\n"
+                '{"cover":{"kind":"event|transition|routine|coverage_issue",'
+                '"confidence":"high|medium|low"},"alerts":[]}'
+            )
+
+            normalized = manager._normalize_json_alert_prompt(old_contract)
+
+            self.assertNotEqual(normalized, old_contract)
+            self.assertIn("Cover kind must be exactly one of", normalized)
+            self.assertIn(
+                "evaluate every operator-defined trigger independently",
+                normalized,
+            )
 
     def test_legacy_stream_alert_prompt_returns_migration_suggestion(self):
         with tempfile.TemporaryDirectory() as temp:

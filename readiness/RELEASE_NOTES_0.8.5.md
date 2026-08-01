@@ -2,7 +2,7 @@
 
 Release date: release candidate prepared 2026-07-27  
 Previous baseline: `β 0.8.4`  
-Schema head: `20260727_0010`
+Schema head: `20260801_0011`
 Database migration: **required**
 
 `β 0.8.5` is the adaptive-attention, bounded L0 memory, operator-feedback,
@@ -217,18 +217,20 @@ gates.
 
 ## Database Migration
 
-Upgrade from `β 0.8.4` requires all four revisions:
+Upgrade from `β 0.8.4` requires all five revisions:
 
 1. `20260725_0007` — `archive.alert_feedback`, indexes, RLS, and role grants.
 2. `20260726_0008` — embedding snapshots, probe scores, motion intervals,
    evidence links, attention episodes, scheduler decisions, and probe lineage.
 3. `20260726_0009` — stable VLM batch-identity index.
 4. `20260727_0010` — tenant-scoped security audit hash-chain support.
+5. `20260801_0011` — tenant-scoped durable incident records, evidence
+   references, optimistic revisions, and incident-management permission.
 
 Required final head:
 
 ```text
-20260727_0010
+20260801_0011
 ```
 
 Before migration:
@@ -254,9 +256,9 @@ set +a
 Do not use the historical `field_upgrade_084.sh` or the 0.8.4 Git guide as an
 0.8.5 recipe. The generic `update_bundle.sh` remains deliberately
 non-migrating and accepts the code overlay only after its read-only gate sees
-`20260727_0010`. The migration-capable offline installer is
+`20260801_0011`. The migration-capable offline installer is
 `scripts/install_eva_083.py`; despite its legacy filename, its version is read
-from `VERSION` and its expected schema is now `20260727_0010`.
+from `VERSION` and its expected schema is now `20260801_0011`.
 
 For a clean port appliance, use the generated USB kit instead:
 
@@ -275,7 +277,7 @@ CPU/iGPU. The installer also accepts external OpenAI-compatible endpoints.
 ## Operator Acceptance Focus
 
 - Confirm `/health.version` and `/ready.version` report `β 0.8.5`.
-- Confirm `/ready` reports database revision `20260727_0010`.
+- Confirm `/ready` reports database revision `20260801_0011`.
 - Run a live channel through quiet, normal, and burst motion:
   - no batch exceeds 16 snapshots;
   - a quiet non-empty batch arrives within 60 seconds;
@@ -298,6 +300,10 @@ CPU/iGPU. The installer also accepts external OpenAI-compatible endpoints.
   the controls and telemetry but does not claim that capacity in advance.
 - Dense CV and CLIP/P/N/M signals are attention candidates, not visual or legal
   proof.
+- Incident Report/Follow is an evidence-linked operator workflow, not an
+  autonomous dispatch or case-management system. Follow leases are process-local
+  and TTL-bounded; persisted incident records retain their audit trail, while a
+  restarted runtime correctly treats the old lease as inactive.
 - Attention storage, sparse episode dispatch, embedding-all-channels, and
   alert-derived probes are separately configurable. A disabled subsystem must
   be reported as disabled rather than silently assumed active.
@@ -310,7 +316,7 @@ CPU/iGPU. The installer also accepts external OpenAI-compatible endpoints.
 
 ## Verification
 
-- Full project suite: **926 passed, 23 skipped, 156 subtests passed**.
+- Full project suite: **997 passed, 23 skipped, 161 subtests passed**.
 - Archive modal regression contract: **45 passed** in the focused UI/CSS suite.
 - Visual archive-modal smoke: Chromium at `1040×896`, with a long L0 summary
   and hidden feedback panel, retained the large preview and independent summary

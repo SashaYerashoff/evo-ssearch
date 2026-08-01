@@ -1,4 +1,5 @@
 import { api } from './client'
+import type { IncidentDraftInput } from './incidents'
 
 // One capture stream (video or analytics/probe) as returned inside /luxriot/streams.
 export interface Stream {
@@ -46,7 +47,82 @@ export interface SummaryEntry {
   run_id?: string
   severity?: string
   alert_counts?: Record<string, number>
+  alert_total?: number
+  level?: string
+  rollup_id?: string
+  batch_id?: string
+  item_count?: number
+  source_tokens?: number
+  run_ids?: string[]
+  summary_kind?: string
+  generation_status?: string
+  generation_error?: string
+  semantic_refresh_pending?: boolean
+  state_transition_total?: number
+  coverage_gap?: boolean
+  gap_reason?: string
+  coalesced?: { batches?: number; omitted_frames?: number }
+  thumbnail_detection_id?: number
+  thumbnail_role?: string
+  thumbnail_snapshot_index?: number
+  thumbnail_selection_source?: string
+  thumbnail_is_cover?: boolean
+  cover_kind?: string
+  cover_reason?: string
+  cover_confidence?: string
+  vector_signal?: {
+    capture_attention?: {
+      seconds?: Array<{
+        snapshot?: number | string
+        mode?: string
+        activity_x?: number
+        [k: string]: any
+      }>
+      [k: string]: any
+    }
+    [k: string]: any
+  }
   [k: string]: any
+}
+
+export interface SummaryBookmarkInput {
+  channel_id: number
+  title: string
+  description: string
+  severity: 'normal'
+  state: 'new'
+  timestamp_ms?: number
+}
+
+export function buildIncidentDraftFromSummary(entry: SummaryEntry): IncidentDraftInput | null {
+  const channelId = Number(entry.channel_id)
+  const anchorId = Number(entry.thumbnail_detection_id)
+  if (!Number.isInteger(channelId) || channelId <= 0 || !Number.isInteger(anchorId) || anchorId <= 0) {
+    return null
+  }
+  return {
+    channel_id: channelId,
+    anchor_detection_id: anchorId,
+  }
+}
+
+export function buildSummaryBookmarkInput(entry: SummaryEntry): SummaryBookmarkInput | null {
+  const channelId = Number(entry.channel_id)
+  const summary = String(entry.summary || '').trim()
+  if (!Number.isInteger(channelId) || channelId <= 0 || !summary) return null
+  const firstLine = summary.split(/\r?\n/, 1)[0].trim() || `Channel ${channelId} summary`
+  const shortTitle = firstLine.length > 80 ? `${firstLine.slice(0, 77)}...` : firstLine
+  const createdAt = Number(entry.created_at)
+  return {
+    channel_id: channelId,
+    title: `Live summary: ${shortTitle}`,
+    description: summary.length > 2400 ? `${summary.slice(0, 2397)}...` : summary,
+    severity: 'normal',
+    state: 'new',
+    timestamp_ms: Number.isFinite(createdAt) && createdAt > 0
+      ? Math.round((createdAt > 1e12 ? createdAt : createdAt * 1000))
+      : undefined,
+  }
 }
 
 export interface RollupsResponse {
@@ -68,14 +144,13 @@ export interface CaptureInput {
 
 export function buildCaptureInput(
   channelId: number,
-  values: { batch: string; every: string; model: string; prompt: string },
+  values: { batch: string; every: string; model: string },
 ): CaptureInput {
   return {
     channel_id: channelId,
     batch_size: Number(values.batch),
     interval_sec: Number(values.every),
     model: values.model.trim() || undefined,
-    prompt: values.prompt.trim() || undefined,
   }
 }
 
@@ -116,29 +191,54 @@ export interface LmModelCatalog {
 export interface SessionQuery extends Record<string, unknown> {
   channel_id: string
   limit: string
+  run?: string
   from_ts?: number
   to_ts?: number
 }
 
 export function buildSessionQuery(
   channelId: number,
-  opts: { limit?: number; from_ts?: number; to_ts?: number } = {},
+  opts: { limit?: number; run?: string; from_ts?: number; to_ts?: number } = {},
 ): SessionQuery {
   return {
     channel_id: String(channelId),
     limit: String(opts.limit ?? 40),
+    run: opts.run,
     from_ts: opts.from_ts,
     to_ts: opts.to_ts,
   }
 }
 
+export function buildSummaryFeedQuery(
+  channelId: number,
+  opts: { limit?: number; run?: string; from_ts?: number; to_ts?: number } = {},
+): SessionQuery & { view: 'feed' } {
+  return { ...buildSessionQuery(channelId, opts), view: 'feed' }
+}
+
 export const videoApi = {
   streams: (): Promise<StreamsStatus> => api.get('/luxriot/streams'),
   lmModels: (): Promise<LmModelCatalog> => api.get('/lm/models'),
-  rollups: (channelId: number, opts: { level_limit?: number; from_ts?: number; to_ts?: number } = {}): Promise<RollupsResponse> =>
-    api.get('/luxriot/rollups', { channel_id: String(channelId), level_limit: String(opts.level_limit ?? 60), from_ts: opts.from_ts, to_ts: opts.to_ts }),
-  session: (channelId: number, opts: { limit?: number; from_ts?: number; to_ts?: number } = {}): Promise<{ logs?: SummaryEntry[]; running?: boolean; [k: string]: any }> =>
-    api.get('/luxriot/session', buildSessionQuery(channelId, opts)),
+  rollups: (
+    channelId: number,
+    opts: {
+      level_limit?: number
+      run?: string
+      from_ts?: number
+      to_ts?: number
+      target_level?: 'L1' | 'L2' | 'L3'
+    } = {},
+  ): Promise<RollupsResponse> =>
+    api.get('/luxriot/rollups', {
+      channel_id: String(channelId),
+      level_limit: String(opts.level_limit ?? 60),
+      run: opts.run,
+      from_ts: opts.from_ts,
+      to_ts: opts.to_ts,
+      target_level: opts.target_level,
+    }),
+  session: (channelId: number, opts: { limit?: number; run?: string; from_ts?: number; to_ts?: number } = {}): Promise<{ logs?: SummaryEntry[]; running?: boolean; [k: string]: any }> =>
+    api.get('/luxriot/session', buildSummaryFeedQuery(channelId, opts)),
   startCapture: (b: CaptureInput): Promise<{ success: boolean; session?: any; error?: string }> => api.postJson('/luxriot/start_capture', b),
   stopCapture: (channelId: number): Promise<any> => api.postJson('/luxriot/stop_capture', { channel_id: channelId }),
   flushCapture: (channelId: number): Promise<{ success: boolean; status?: { logs?: SummaryEntry[] }; items?: number }> =>
@@ -149,11 +249,28 @@ export const videoApi = {
     api.postJson('/luxriot/streams/stop_all', { stop_video: opts.stop_video ?? true, stop_analytics: opts.stop_analytics ?? true, pause_analytics: opts.pause_analytics ?? true }),
   getPromptSettings: (channelId: number): Promise<PromptSettings> => api.get('/luxriot/prompt_settings', { channel_id: String(channelId) }),
   savePromptSettings: (b: PromptSettings): Promise<PromptSettings> => api.postJson('/luxriot/prompt_settings', b),
+  createBookmark: (b: SummaryBookmarkInput): Promise<{ success?: boolean; [k: string]: any }> =>
+    api.postJson('/luxriot/bookmark', b),
 }
 
-// Live-preview image URL (EVA recent frame with snapshot fallback). Add a cache-buster on each poll.
+// Model-view preview from EVA's bounded attention-frame ring. Dense Luxriot
+// capture fills windows incrementally, so a five-second freshness limit can
+// reject a healthy channel between apex admissions. Match the legacy
+// operator preview contract: frames remain live evidence for at most 60 s.
 export function recentFrameUrl(channelId: number, bust: number): string {
-  return `/luxriot/recent_frame/${channelId}?stream=mainStream&fallback=snapshot&mode=latest&max_age_sec=5&_=${bust}`
+  return `/luxriot/recent_frame/${channelId}?stream=mainStream&fallback=snapshot&mode=latest&max_age_sec=60&_=${bust}`
+}
+
+// Exact bounded MJPEG sequence of per-second EVA apex frames. Unlike full
+// live, this reuses the attention ring and opens no additional Evo stream.
+export function attentionStreamUrl(channelId: number, bust: number): string {
+  return `/luxriot/attention_stream/${channelId}?max_age_sec=60&request=${bust}`
+}
+
+// Full live opens a separate bounded Luxriot media lease. It is intentionally
+// opt-in because the model-view preview reuses EVA's existing capture ring.
+export function fullLiveMediaUrl(channelId: number, bust: number): string {
+  return `/luxriot/media/live/${channelId}?stream=mainStream&request=${bust}`
 }
 
 // Merge video + analytics streams into one per-channel runtime record.

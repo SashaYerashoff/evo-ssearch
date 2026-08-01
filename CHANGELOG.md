@@ -66,6 +66,17 @@ Format loosely follows Keep a Changelog.
   calibrates P/N/M from continuous semantic snapshots, and emits
   proposal-only threshold/cadence changes. Counted transition/dwell queries
   remain independent of alert cooldown and delivery.
+- **Incident attention v0:** an operator can turn an archived alert or grounded
+  L0 summary into a durable incident draft. EVA reconstructs bounded start/end
+  candidates from neighboring summaries, structured transitions, alert anchors,
+  CV intervals, and stored evidence links; coverage gaps and uncertainty remain
+  explicit, while P/N/M stays labelled as attention rather than visual proof.
+  Markdown/XML export is available. A TTL-bounded Follow/Critical lease raises
+  only the affected channels to active/burst sampling, never masks a degraded
+  source, never bypasses coverage fairness, and leaves independent 1 Hz semantic
+  indexing running. Approved operator/agent probe scores can regulate subsequent
+  observations for 60 seconds; automatic, temporary, attention-only, or
+  embedding-space-mismatched probes remain shadow signals.
 - **Offline port appliance:** an English interactive Ubuntu Server 24.04
   installer and USB-bundle builder now cover a clean RTX 4070 Super / i9 /
   64-GB deployment without network access. The bundle carries a local APT
@@ -75,10 +86,11 @@ Format loosely follows Keep a Changelog.
   disk/GPU/schema state, preserves or backs up existing state, writes the
   runtime `.env`, provisions systemd and TLS, and hands off to Protocol Deploy.
 - **Upgrade:** database migration required from β 0.8.4. Apply revisions
-  `20260725_0007` through `20260727_0010`; resulting schema head is
-  `20260727_0010`. New audit writes form a concurrency-safe, tenant-scoped
-  SHA-256 chain.
-- **Verification:** 926 passed, 23 skipped, 156 subtests passed.
+  `20260725_0007` through `20260801_0011`; resulting schema head is
+  `20260801_0011`. New audit writes form a concurrency-safe, tenant-scoped
+  SHA-256 chain, and incident drafts persist as bounded evidence references
+  with optimistic revisions.
+- **Verification:** 997 passed, 23 skipped, 161 subtests passed.
   See `readiness/RELEASE_NOTES_0.8.5.md`.
 
 ## β 0.8.4 — 2026-07-15 (attention decider, media broker, stabilization)
