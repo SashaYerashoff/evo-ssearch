@@ -505,6 +505,22 @@ class MigrationContentTests(unittest.TestCase):
         self.assertIn("CREATE TABLE archive.incidents", incidents_source)
         self.assertIn("archive_incidents_tenant_isolation", incidents_source)
         self.assertIn("'incidents:manage'", incidents_source)
+        self.assertIn(
+            "ALTER TABLE iam.role_permissions NO FORCE ROW LEVEL SECURITY",
+            incidents_source,
+        )
+        self.assertIn(
+            "ALTER TABLE iam.role_permissions FORCE ROW LEVEL SECURITY",
+            incidents_source,
+        )
+        self.assertIn(
+            "ALTER TABLE iam.roles NO FORCE ROW LEVEL SECURITY",
+            incidents_source,
+        )
+        self.assertIn(
+            "ALTER TABLE iam.roles FORCE ROW LEVEL SECURITY",
+            incidents_source,
+        )
         self.assertNotIn("thumbnail_b64", incidents_source)
         self.assertIn(
             "CREATE TABLE archive.attention_probe_scores",

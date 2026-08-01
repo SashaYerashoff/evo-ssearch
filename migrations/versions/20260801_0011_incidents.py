@@ -140,6 +140,13 @@ def upgrade() -> None:
             risk = EXCLUDED.risk
         """
     )
+    # Both the source roles table and target role_permissions table are FORCE
+    # RLS.  Migrations run as the table-owning eva_owner role, so temporarily
+    # removing FORCE (inside this transaction) lets the owner backfill every
+    # tenant without granting BYPASSRLS to the long-lived migration login.  RLS
+    # remains enabled throughout and FORCE is restored before commit.
+    _execute("ALTER TABLE iam.roles NO FORCE ROW LEVEL SECURITY")
+    _execute("ALTER TABLE iam.role_permissions NO FORCE ROW LEVEL SECURITY")
     _execute(
         """
         INSERT INTO iam.role_permissions (
@@ -151,17 +158,21 @@ def upgrade() -> None:
         ON CONFLICT (tenant_id, role_id, permission_key) DO NOTHING
         """
     )
+    _execute("ALTER TABLE iam.role_permissions FORCE ROW LEVEL SECURITY")
+    _execute("ALTER TABLE iam.roles FORCE ROW LEVEL SECURITY")
     _execute("RESET ROLE")
 
 
 def downgrade() -> None:
     _execute("SET LOCAL ROLE eva_owner")
+    _execute("ALTER TABLE iam.role_permissions NO FORCE ROW LEVEL SECURITY")
     _execute(
         """
         DELETE FROM iam.role_permissions
         WHERE permission_key = 'incidents:manage'
         """
     )
+    _execute("ALTER TABLE iam.role_permissions FORCE ROW LEVEL SECURITY")
     _execute(
         "DELETE FROM iam.permissions WHERE key = 'incidents:manage'"
     )
