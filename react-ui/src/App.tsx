@@ -18,6 +18,7 @@ import { AgentPanel, type AgentAction } from './components/shell/AgentPanel'
 import { ArchiveScreen } from './components/archive/ArchiveScreen'
 import { MonitoringScreen } from './components/monitoring/MonitoringScreen'
 import { VideoScreen } from './components/video/VideoScreen'
+import type { SummaryEntry } from './api/video'
 import { SettingsModal } from './components/settings/SettingsModal'
 import { HomeScreen } from './components/home/HomeScreen'
 import { NeuralBackground } from './components/shell/NeuralBackground'
@@ -163,6 +164,58 @@ export default function App() {
       window.setTimeout(() => setForbiddenNotice(''), 5_000)
     }
   }, [channels])
+  const handleReviewVideoSummary = useCallback((entry: SummaryEntry) => {
+    const detectionId = Number(entry.thumbnail_detection_id)
+    const channelId = Number(entry.channel_id)
+    if (!Number.isInteger(detectionId) || detectionId <= 0 || !Number.isInteger(channelId) || channelId <= 0) return
+    const toMs = (value: unknown): number => {
+      const number = Number(value)
+      if (!Number.isFinite(number) || number <= 0) return 0
+      return number > 1e12 ? number : number * 1000
+    }
+    const batchStartMs = toMs(entry.batch_start_ms ?? entry.window_start)
+    const batchEndMs = toMs(entry.batch_end_ms ?? entry.window_end ?? entry.created_at)
+    const timestampMs = batchEndMs || batchStartMs || Date.now()
+    const raw = {
+      id: detectionId,
+      detection_id: detectionId,
+      source: 'vlm_summary',
+      source_label: 'Video description',
+      channel_id: channelId,
+      timestamp_ms: timestampMs,
+      summary: String(entry.summary || ''),
+      image_url: `/detections/thumbnail/${detectionId}`,
+      payload: {
+        source: 'vlm_summary',
+        batch_id: String(entry.batch_id || ''),
+        run_id: String(entry.run_id || ''),
+        batch_start_ms: batchStartMs || undefined,
+        batch_end_ms: batchEndMs || undefined,
+        summary: String(entry.summary || ''),
+        anchor_role: String(entry.thumbnail_role || 'sample'),
+        snapshot_index: entry.thumbnail_snapshot_index,
+        is_cover: entry.thumbnail_is_cover === true,
+        cover_kind: String(entry.cover_kind || ''),
+        cover_reason: String(entry.cover_reason || ''),
+        cover_confidence: String(entry.cover_confidence || ''),
+        selection_source: String(entry.thumbnail_selection_source || ''),
+      },
+    }
+    setSection('archive')
+    setDrive({
+      name: 'get_detections',
+      args: {
+        channel_id: channelId,
+        source: 'vlm_summary',
+        since_ms: Math.max(0, (batchStartMs || timestampMs) - 60_000),
+        until_ms: Math.max(batchEndMs || timestampMs, timestampMs) + 60_000,
+        open_detection_id: detectionId,
+      },
+      done: true,
+      result: { detections: [raw] },
+      seq: ++seqRef.current,
+    })
+  }, [])
 
   const refreshChannels = useCallback(async () => {
     if (!user || !hasPermission(user, PERMISSION.streamsView)) {
@@ -324,6 +377,7 @@ export default function App() {
               canManagePrompts={hasPermission(user, PERMISSION.promptsManage)}
               canCreateBookmarks={hasPermission(user, PERMISSION.bookmarksCreate)}
               canExport={hasPermission(user, PERMISSION.dataExport)}
+              onReviewSummary={handleReviewVideoSummary}
             />
           )}
           {section !== 'home' && section !== 'archive' && section !== 'monitoring' && section !== 'video' && (

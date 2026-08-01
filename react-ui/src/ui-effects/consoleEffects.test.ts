@@ -58,4 +58,21 @@ describe('console effects', () => {
       section: 'probes',
     })
   })
+
+  it('passes a multi-stream archive selection to the agent as structured context', () => {
+    expect(buildAgentConsoleContext('archive', {
+      channelIds: ['112', '118'],
+      source: 'semantic_snapshot',
+      hours: '0',
+    }, 7_200_000)).toEqual({
+      version: 1,
+      section: 'archive',
+      archive: {
+        channel_ids: [112, 118],
+        source: 'semantic_snapshot',
+        since_ms: 0,
+        until_ms: 7_200_000,
+      },
+    })
+  })
 })

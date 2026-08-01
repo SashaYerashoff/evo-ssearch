@@ -17,6 +17,21 @@ describe('video summary view metadata', () => {
     expect(summaryAlertCounts({ alert_total: 3, severity: 'high' })).toEqual({ high: 3 })
   })
 
+  it('restores alert badges from structured events when flat counts are absent', () => {
+    expect(summaryAlertCounts({
+      batch_state: {
+        alerts: [
+          { severity: 'high', title: 'Person entered' },
+          { severity: 'warning', title: 'Vehicle stopped' },
+        ],
+      },
+    })).toEqual({ high: 1, low: 1 })
+    expect(summaryAlertCounts({
+      summary: 'Episode update\nMovement detected.\n\nBATCH_STATE_JSON:\n'
+        + '{"alerts":[{"severity":"critical"},{"severity":"critical"}]}',
+    })).toEqual({ critical: 2 })
+  })
+
   it('extracts homeostatic burst intensity and snapshots', () => {
     expect(summaryBurst({
       vector_signal: {

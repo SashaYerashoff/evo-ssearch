@@ -195,6 +195,81 @@ class LmProfileRuntimeTests(unittest.TestCase):
             captured["json"]["chat_template_kwargs"],
             {"enable_thinking": False},
         )
+        self.assertGreater(captured["json"]["repetition_penalty"], 1.0)
+
+    def test_repetition_loop_is_retried_once_with_stronger_guard(self):
+        profile = {
+            "id": "vlm",
+            "kind": "vlm",
+            "base_url": "http://vlm.local/v1",
+            "model": "qwen3-vl-4b",
+            "api_key": "",
+            "timeout": 120,
+        }
+        repeated = (
+            "Scene description. "
+            + (
+                "The room contains a pink and white corner, a wooden cabinet, and a patterned chair. "
+                * 8
+            )
+        )
+        responses = [
+            _Response(
+                {
+                    "choices": [
+                        {
+                            "finish_reason": "length",
+                            "message": {"content": repeated},
+                        }
+                    ]
+                }
+            ),
+            _Response(
+                {
+                    "choices": [
+                        {
+                            "finish_reason": "stop",
+                            "message": {
+                                "content": (
+                                    "Two people are seated on a sofa; one stands and crosses the frame. "
+                                    'BATCH_STATE_JSON: {\"version\":1,\"alerts\":[]}'
+                                )
+                            },
+                        }
+                    ]
+                }
+            ),
+        ]
+        payloads = []
+
+        def fake_post(_url, **kwargs):
+            payloads.append(kwargs["json"])
+            return responses.pop(0)
+
+        class AdmissionCapture:
+            def admission(self, _resource, **_kwargs):
+                return nullcontext()
+
+        with (
+            patch.object(oldapp, "_resolve_lm_profile", return_value=profile),
+            patch.object(oldapp.requests, "post", fake_post),
+            patch.object(oldapp, "_lm_admission_controller", AdmissionCapture()),
+        ):
+            result = oldapp._call_lm_chat(
+                [{"role": "user", "content": "describe these frames"}],
+                profile_id="vlm",
+                profile_kind="vlm",
+                workload_class="vlm",
+            )
+
+        self.assertIn("Two people", result)
+        self.assertEqual(len(payloads), 2)
+        self.assertEqual(payloads[1]["temperature"], 0.0)
+        self.assertGreaterEqual(payloads[1]["repetition_penalty"], 1.12)
+        self.assertIn(
+            "Write each fact once",
+            str(payloads[1]["messages"]),
+        )
 
     def test_model_catalog_exposes_profiles_without_api_keys(self):
         profiles = {

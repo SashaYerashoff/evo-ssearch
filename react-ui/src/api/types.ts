@@ -38,6 +38,9 @@ export interface Detection {
 }
 
 export interface ArchiveFilters {
+  /** Multiple selected streams. Empty/undefined means the dynamic "all streams" scope. */
+  channelIds?: string[]
+  /** Backward-compatible single-stream value used by older console effects. */
   channelId?: string
   source?: string
   probeId?: string

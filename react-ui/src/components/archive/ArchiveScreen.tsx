@@ -235,7 +235,15 @@ export function ArchiveScreen({
       .finally(() => {
         if (probeRequestSeq.current === seq) setProbesLoading(false)
       })
-  }, [filters.source, filters.channelId, filters.hours, filters.sinceMs, filters.untilMs, filterRefresh])
+  }, [
+    filters.source,
+    filters.channelId,
+    filters.channelIds?.join(','),
+    filters.hours,
+    filters.sinceMs,
+    filters.untilMs,
+    filterRefresh,
+  ])
 
   const refreshFilters = useCallback(async () => {
     await onRefreshChannels?.()
@@ -247,9 +255,18 @@ export function ArchiveScreen({
     if (!drive) return
     const { name, args, done, error, result } = drive
     if (VIEW_TOOLS.has(name)) {
+      if (Array.isArray(args?.channel_ids)) {
+        const selected = channels
+          .filter((channel) => args.channel_ids.some((id: unknown) => String(id) === String(channel.id)))
+          .map((channel) => String(channel.id))
+        patch({
+          channelIds: selected,
+          channelId: selected.length === 1 ? selected[0] : undefined,
+        })
+      }
       if (args?.channel_id != null) {
         const ch = channels.find((c) => String(c.id) === String(args.channel_id))
-        if (ch) patch({ channelId: String(ch.id) })
+        if (ch) patch({ channelIds: [String(ch.id)], channelId: String(ch.id) })
       }
       if (args?.source) patch({ source: String(args.source) })
       if (args?.probe_id) patch({ source: 'probe', probeId: String(args.probe_id) })
@@ -260,7 +277,7 @@ export function ArchiveScreen({
         const ps = [12, 24, 36, 48]; const n = Number(args.limit)
         patch({ rows: String(ps.reduce((b, p) => (Math.abs(p - n) < Math.abs(b - n) ? p : b), ps[0])) })
       }
-      if (done && (args?.channel_id != null || args?.source || h != null || args?.sort_by || args?.limit != null)) {
+      if (done && (args?.channel_id != null || Array.isArray(args?.channel_ids) || args?.source || h != null || args?.sort_by || args?.limit != null)) {
         setOpenTool('filters')
       }
     }
@@ -270,7 +287,7 @@ export function ArchiveScreen({
         // agent drives the console controls: channel / source / time / sort / rows visibly change
         const q = String(args?.query || args?.event_query || args?.positive_query || args?.text || '').trim()
         if (TYPING_TOOLS.has(name) && q) { setOpenTool('text'); animateTyping(q) }
-        else if (args?.channel_id != null || args?.source || args?.sort_by || args?.limit != null) setOpenTool('filters')
+        else if (args?.channel_id != null || Array.isArray(args?.channel_ids) || args?.source || args?.sort_by || args?.limit != null) setOpenTool('filters')
       }
       return
     }
@@ -322,7 +339,13 @@ export function ArchiveScreen({
 
   // live summaries shown on collapsed chips
   const filtersSummary = [
-    filters.channelId ? (channels.find((c) => String(c.id) === filters.channelId)?.title || `ch ${filters.channelId}`) : 'All streams',
+    filters.channelIds?.length
+      ? (filters.channelIds.length === 1
+          ? (channels.find((c) => String(c.id) === filters.channelIds?.[0])?.title || `ch ${filters.channelIds[0]}`)
+          : `${filters.channelIds.length} streams`)
+      : filters.channelId
+        ? (channels.find((c) => String(c.id) === filters.channelId)?.title || `ch ${filters.channelId}`)
+        : 'All streams',
     filters.source === 'probe' && filters.probeId
       ? (probeOptions.find((p) => p.id === filters.probeId)?.name || filters.probeId)
       : null,

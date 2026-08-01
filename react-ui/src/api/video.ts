@@ -84,6 +84,34 @@ export interface SummaryEntry {
   [k: string]: any
 }
 
+export interface SummaryBookmarkInput {
+  channel_id: number
+  title: string
+  description: string
+  severity: 'normal'
+  state: 'new'
+  timestamp_ms?: number
+}
+
+export function buildSummaryBookmarkInput(entry: SummaryEntry): SummaryBookmarkInput | null {
+  const channelId = Number(entry.channel_id)
+  const summary = String(entry.summary || '').trim()
+  if (!Number.isInteger(channelId) || channelId <= 0 || !summary) return null
+  const firstLine = summary.split(/\r?\n/, 1)[0].trim() || `Channel ${channelId} summary`
+  const shortTitle = firstLine.length > 80 ? `${firstLine.slice(0, 77)}...` : firstLine
+  const createdAt = Number(entry.created_at)
+  return {
+    channel_id: channelId,
+    title: `Live summary: ${shortTitle}`,
+    description: summary.length > 2400 ? `${summary.slice(0, 2397)}...` : summary,
+    severity: 'normal',
+    state: 'new',
+    timestamp_ms: Number.isFinite(createdAt) && createdAt > 0
+      ? Math.round((createdAt > 1e12 ? createdAt : createdAt * 1000))
+      : undefined,
+  }
+}
+
 export interface RollupsResponse {
   channel_id?: number
   levels?: { L0?: SummaryEntry[]; L1?: SummaryEntry[]; L2?: SummaryEntry[]; L3?: SummaryEntry[] }
@@ -103,14 +131,13 @@ export interface CaptureInput {
 
 export function buildCaptureInput(
   channelId: number,
-  values: { batch: string; every: string; model: string; prompt: string },
+  values: { batch: string; every: string; model: string },
 ): CaptureInput {
   return {
     channel_id: channelId,
     batch_size: Number(values.batch),
     interval_sec: Number(values.every),
     model: values.model.trim() || undefined,
-    prompt: values.prompt.trim() || undefined,
   }
 }
 
@@ -209,11 +236,28 @@ export const videoApi = {
     api.postJson('/luxriot/streams/stop_all', { stop_video: opts.stop_video ?? true, stop_analytics: opts.stop_analytics ?? true, pause_analytics: opts.pause_analytics ?? true }),
   getPromptSettings: (channelId: number): Promise<PromptSettings> => api.get('/luxriot/prompt_settings', { channel_id: String(channelId) }),
   savePromptSettings: (b: PromptSettings): Promise<PromptSettings> => api.postJson('/luxriot/prompt_settings', b),
+  createBookmark: (b: SummaryBookmarkInput): Promise<{ success?: boolean; [k: string]: any }> =>
+    api.postJson('/luxriot/bookmark', b),
 }
 
-// Live-preview image URL (EVA recent frame with snapshot fallback). Add a cache-buster on each poll.
+// Model-view preview from EVA's bounded attention-frame ring. Dense Luxriot
+// capture fills windows incrementally, so a five-second freshness limit can
+// reject a healthy channel between apex admissions. Match the legacy
+// operator preview contract: frames remain live evidence for at most 60 s.
 export function recentFrameUrl(channelId: number, bust: number): string {
-  return `/luxriot/recent_frame/${channelId}?stream=mainStream&fallback=snapshot&mode=latest&max_age_sec=5&_=${bust}`
+  return `/luxriot/recent_frame/${channelId}?stream=mainStream&fallback=snapshot&mode=latest&max_age_sec=60&_=${bust}`
+}
+
+// Exact bounded MJPEG sequence of per-second EVA apex frames. Unlike full
+// live, this reuses the attention ring and opens no additional Evo stream.
+export function attentionStreamUrl(channelId: number, bust: number): string {
+  return `/luxriot/attention_stream/${channelId}?max_age_sec=60&request=${bust}`
+}
+
+// Full live opens a separate bounded Luxriot media lease. It is intentionally
+// opt-in because the model-view preview reuses EVA's existing capture ring.
+export function fullLiveMediaUrl(channelId: number, bust: number): string {
+  return `/luxriot/media/live/${channelId}?stream=mainStream&request=${bust}`
 }
 
 // Merge video + analytics streams into one per-channel runtime record.

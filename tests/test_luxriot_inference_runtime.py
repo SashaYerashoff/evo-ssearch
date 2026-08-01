@@ -4032,7 +4032,7 @@ class LuxriotCaptureDispatchTests(unittest.TestCase):
 
     def test_bookmark_delivery_deduplicates_normalized_title_and_severity(self):
         with tempfile.TemporaryDirectory() as temp:
-            current = {"title": "Vehicle   burnout", "severity": "HIGH"}
+            current = {"title": "Vehicle   burnout", "severity": "WARNING"}
 
             def parse_alerts(_text, _channel_id, _default_ts_ms=None):
                 return [{"title": current["title"], "description": "Looped clip", "severity": current["severity"]}]
@@ -4041,7 +4041,7 @@ class LuxriotCaptureDispatchTests(unittest.TestCase):
                 Path(temp),
                 alert_parser=parse_alerts,
                 config_overrides={
-                    "LUXRIOT_BOOKMARK_COOLDOWN_SEC": 0.0,
+                    "LUXRIOT_BOOKMARK_COOLDOWN_SEC": 60.0,
                     "LUXRIOT_ALERT_DEDUPE_WINDOW_SEC": 600.0,
                 },
             )
@@ -4050,7 +4050,7 @@ class LuxriotCaptureDispatchTests(unittest.TestCase):
             with patch.object(manager, "send_bookmark_event", side_effect=lambda **kwargs: sent.append(kwargs) or {"success": True}):
                 first = manager.process_summary_alerts(120, "ALERTS_JSON: {}")
                 current["title"] = "  vehicle burnout  "
-                current["severity"] = "high"
+                current["severity"] = "low"
                 second = manager.process_summary_alerts(120, "ALERTS_JSON: {}")
 
             self.assertEqual(first, 1)
@@ -4058,6 +4058,52 @@ class LuxriotCaptureDispatchTests(unittest.TestCase):
             self.assertEqual(len(sent), 1)
             self.assertEqual(second.parsed, 1)
             self.assertEqual(second.alert_events[0]["delivery_status"], "deduplicated")
+            self.assertEqual(second.skipped_duplicate, 1)
+
+    def test_operator_cooldown_caps_content_dedupe_window(self):
+        with tempfile.TemporaryDirectory() as temp:
+            manager = build_manager(
+                Path(temp),
+                alert_parser=lambda *_args, **_kwargs: [
+                    {
+                        "title": "British flag mug",
+                        "description": "Person drinks from the mug",
+                        "severity": "warning",
+                    }
+                ],
+                config_overrides={
+                    "LUXRIOT_BOOKMARK_COOLDOWN_SEC": 10.0,
+                    "LUXRIOT_ALERT_DEDUPE_WINDOW_SEC": 600.0,
+                },
+            )
+            manager.default_bookmark_enabled = True
+            sent = []
+            now = {"value": 1_785_480_000.0}
+
+            with (
+                patch(
+                    "luxriot_connector.time.time",
+                    side_effect=lambda: now["value"],
+                ),
+                patch.object(
+                    manager,
+                    "send_bookmark_event",
+                    side_effect=lambda **kwargs: sent.append(kwargs)
+                    or {"success": True},
+                ),
+            ):
+                first = manager.process_summary_alerts(112, "ALERTS_JSON: {}")
+                now["value"] += 5.0
+                second = manager.process_summary_alerts(112, "ALERTS_JSON: {}")
+                now["value"] += 6.0
+                third = manager.process_summary_alerts(112, "ALERTS_JSON: {}")
+
+            self.assertEqual((first, second, third), (1, 0, 1))
+            self.assertEqual(len(sent), 2)
+            self.assertEqual(
+                second.alert_events[0]["delivery_status"],
+                "deduplicated",
+            )
 
     def test_bookmark_content_dedupe_keeps_title_and_severity_distinct(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -4123,7 +4169,6 @@ class LuxriotCaptureDispatchTests(unittest.TestCase):
             manager = build_manager(Path(temp), alert_parser=parse_alerts)
             manager.default_bookmark_enabled = True
             manager.default_bookmark_cooldown_sec = 60.0
-            manager.alert_dedupe_window_sec = 0.0
             sent = []
 
             with patch.object(manager, "send_bookmark_event", side_effect=lambda **kwargs: sent.append(kwargs) or {"success": True}):

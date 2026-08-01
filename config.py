@@ -446,6 +446,16 @@ class Config:
     except (TypeError, ValueError):
         LM_VIDEO_TEMPERATURE = 0.2
     LM_VIDEO_TEMPERATURE = min(1.5, max(0.0, LM_VIDEO_TEMPERATURE))
+    try:
+        LM_VIDEO_REPETITION_PENALTY = float(
+            os.getenv('EVOSSEARCH_LM_VIDEO_REPETITION_PENALTY', '1.08')
+        )
+    except (TypeError, ValueError):
+        LM_VIDEO_REPETITION_PENALTY = 1.08
+    LM_VIDEO_REPETITION_PENALTY = min(
+        1.3,
+        max(1.0, LM_VIDEO_REPETITION_PENALTY),
+    )
 
     # Durable L0 video-summary queue. Keep disabled until PostgreSQL roles and
     # the shared spool directory are configured.
@@ -1677,6 +1687,7 @@ class Config:
             f"Video LM: {cls.LM_MODEL} @ {cls.LM_BASE_URL or 'unset'} "
             f"(frames: default {cls.LM_VIDEO_DEFAULT_FRAMES}, max {cls.LM_VIDEO_MAX_FRAMES}, "
             f"max_edge={cls.LM_VIDEO_MAX_EDGE}, max_tokens={cls.LM_VIDEO_MAX_TOKENS}, "
+            f"repetition_penalty={cls.LM_VIDEO_REPETITION_PENALTY}, "
             f"input_warn_chars={cls.LM_VIDEO_INPUT_WARNING_CHARS})"
         )
         print(

@@ -227,6 +227,18 @@ DEFAULT_ALERT_POLICY_PROMPT = (
     "{operator_alert_policy}"
 )
 
+LIVE_ALERT_RECONCILIATION_PROMPT = (
+    "Mandatory current-batch alert reconciliation:\n"
+    "Channel-specific criteria repeated at the final decision point:\n"
+    "{operator_alert_policy}\n"
+    "- Immediately before writing BATCH_STATE_JSON, compare every channel-specific criterion above with the visible "
+    "events, observed states, and operator-facing narrative you just produced.\n"
+    "- If any current-batch event or narrative explicitly says that a criterion happened, alerts must contain the "
+    "corresponding object. Routine status, low novelty, continuing/resolved episode state, or a previous alert never "
+    "turns a currently visible criterion match into alerts: [].\n"
+    "- This reconciliation uses current snapshots only; do not recover a match from memory or vector signals alone."
+)
+
 LIVE_OBSERVATION_STATE_PROMPT = (
     "Current-batch observation contract:\n"
     "- Treat prior channel memory as context only, never as visual evidence for the current batch.\n"
@@ -268,11 +280,107 @@ _OUTDATED_ALERT_PROMPT_MARKERS = (
     "if no trigger match: emit no json block",
     "rules: max 3 alerts",
     "\"timestamp_ms\": 1772202050000",
+    "\"kind\": \"event|transition|routine|coverage_issue\"",
+    "\"confidence\": \"high|medium|low\"",
     "also emit operator-defined low/normal test triggers when the stream prompt explicitly asks",
 )
 
 ALERT_SEVERITY_ORDER = ("critical", "high", "normal", "low", "info")
 ALERT_SEVERITY_SET = set(ALERT_SEVERITY_ORDER)
+_ALERT_POLICY_MATCH_STOPWORDS = {
+    "a",
+    "an",
+    "and",
+    "as",
+    "at",
+    "be",
+    "by",
+    "for",
+    "from",
+    "if",
+    "in",
+    "into",
+    "is",
+    "it",
+    "of",
+    "on",
+    "or",
+    "the",
+    "to",
+    "when",
+    "with",
+}
+_ALERT_POLICY_ACTION_STEMS = {
+    "appear",
+    "approach",
+    "collapse",
+    "depart",
+    "drink",
+    "enter",
+    "exit",
+    "fall",
+    "fight",
+    "gesture",
+    "leave",
+    "move",
+    "raise",
+    "run",
+    "show",
+    "smoke",
+    "steal",
+    "take",
+    "tamper",
+    "wave",
+}
+_GENERAL_HAZARD_EVENT_RULES: Tuple[
+    Tuple[str, str, str, Tuple[frozenset[str], ...]],
+    ...,
+] = (
+    (
+        "vehicle_collision",
+        "Vehicle collision",
+        "normal",
+        (
+            frozenset({"collision"}),
+            frozenset({"crash"}),
+            frozenset({"vehicle", "impact"}),
+            frozenset({"car", "impact"}),
+        ),
+    ),
+    (
+        "dangerous_vehicle_behavior",
+        "Dangerous vehicle behavior",
+        "normal",
+        (
+            frozenset({"drift"}),
+            frozenset({"burnout"}),
+            frozenset({"vehicle", "skid"}),
+            frozenset({"car", "skid"}),
+            frozenset({"vehicle", "spin"}),
+            frozenset({"car", "spin"}),
+            frozenset({"vehicle", "high", "speed"}),
+            frozenset({"car", "high", "speed"}),
+        ),
+    ),
+    (
+        "visible_smoke_or_fire",
+        "Visible smoke or fire",
+        "low",
+        (
+            frozenset({"smoke", "emit"}),
+            frozenset({"smoke", "tire"}),
+            frozenset({"smoke", "plume"}),
+            frozenset({"smoke", "cloud"}),
+            frozenset({"smoke", "rise"}),
+            frozenset({"smoke", "billow"}),
+            frozenset({"smoke", "trail"}),
+            frozenset({"fire", "active"}),
+            frozenset({"fire", "burn"}),
+            frozenset({"fire", "spread"}),
+            frozenset({"flame", "burn"}),
+        ),
+    ),
+)
 
 # Per-second CV apex decider (policy v2). Fast events produce only motion-blurred
 # frames, so sharpness may only steer the choice when it actually discriminates
@@ -1320,6 +1428,8 @@ class LuxriotCaptureSession:
         self.summary_condition = threading.Condition(self.lock)
         self.summary_queue: List[Tuple[List[Dict[str, Any]], str, Dict[str, Any]]] = []
         self.summary_coalesced_batches = 0
+        self.summary_compaction_events = 0
+        self.summary_compacted_frames = 0
         self.summary_coverage_gap_batches = 0
         self.summary_coverage_gap_frames = 0
         self.summary_coverage_gap_reasons: Dict[str, int] = {}
@@ -1477,6 +1587,13 @@ class LuxriotCaptureSession:
         self._flush_capture_apex_bucket()
         if self.summary_worker_thread.is_alive():
             self.summary_worker_thread.join(timeout=0.75)
+        release_budget = getattr(
+            self.manager,
+            "release_l0_cost_budget_channel",
+            None,
+        )
+        if callable(release_budget):
+            release_budget(self.channel_id)
 
     def _run(self) -> None:
         while not self.stop_event.is_set():
@@ -3340,6 +3457,13 @@ class LuxriotCaptureSession:
             return False
         if not self.frames:
             self._summary_batch_opened_monotonic = time.monotonic()
+        # Private accounting used only while the pending accumulator is
+        # compacted under inference pressure. It lets one retained keyframe
+        # represent omitted 1 Hz observations without claiming a coverage gap.
+        frame["_eva_summary_source_weight"] = max(
+            1,
+            int(_parse_optional_int(frame.get("_eva_summary_source_weight")) or 1),
+        )
         self.frames.append(frame)
         self._summary_last_admitted_source_ms = source_ms
         return True
@@ -3562,7 +3686,15 @@ class LuxriotCaptureSession:
                         int(self.summary_max_batch_frames),
                         int(profile.hard_accumulator_cap),
                     )
-                    deadline_sec = float(profile.deadline_ms) / 1000.0
+                    # Mode profiles express how slowly a quiet channel may be
+                    # sampled under the full eight-channel port budget.  They
+                    # must not weaken the operator-facing L0 window contract:
+                    # every non-empty accumulator is submitted by the configured
+                    # summary maximum (60 s by default), regardless of mode.
+                    deadline_sec = min(
+                        float(profile.deadline_ms) / 1000.0,
+                        float(self.summary_max_window_sec),
+                    )
                     ready_by_size = bool(size_trigger) and (
                         pending_count >= target_frames
                         or pending_count >= hard_cap
@@ -3606,12 +3738,14 @@ class LuxriotCaptureSession:
             if not ready_by_size and not ready_by_deadline:
                 return
             if adaptive and not self.manager.reserve_l0_cost_budget(
+                channel_id=self.channel_id,
                 mode=budget_mode,
                 frame_count=frame_limit,
+                coverage_overdue=bool(ready_by_deadline),
             ):
-                # Keep the complete embedding-backed accumulator. Refill repays
-                # burst debt first; the next 1 Hz observation retries without
-                # turning budget pressure into an archive or L0 coverage gap.
+                # Keep a bounded representative accumulator. The next 1 Hz
+                # observation compacts it to the 16-frame VLM ceiling while
+                # preserving source_frame_count, then retries after refill.
                 return
             if not self._enqueue_summary_batch(
                 workload_class=workload_class,
@@ -3679,6 +3813,13 @@ class LuxriotCaptureSession:
             ):
                 if key in job_meta:
                     batch[key] = copy.deepcopy(job_meta[key])
+            batch["source_frame_count"] = max(
+                len(frame_items),
+                int(
+                    _parse_optional_int(job_meta.get("source_frame_count"))
+                    or len(frame_items)
+                ),
+            )
             queue_workload = str(workload_class or "heartbeat").strip().lower()
             batch["lm_workload_class"] = {
                 "event": "alert",
@@ -3782,10 +3923,29 @@ class LuxriotCaptureSession:
             frames_copy = list(self.frames)
             self.frames.clear()
             self._summary_batch_opened_monotonic = None
+        frames_copy, source_frame_count, omitted_frames = self._prepare_summary_frames(
+            frames_copy
+        )
+        metadata = self._summary_job_metadata()
+        metadata["source_frame_count"] = int(source_frame_count)
+        if omitted_frames > 0:
+            metadata["coalesced"] = {
+                "batches": max(
+                    2,
+                    int(
+                        math.ceil(
+                            source_frame_count
+                            / float(max(1, int(self.batch_size)))
+                        )
+                    ),
+                ),
+                "omitted_frames": int(omitted_frames),
+            }
         return self._dispatch_summary_frames(
             frames_copy,
             workload_class=workload_class,
             restore_on_failure=True,
+            metadata=metadata,
         )
 
     def _summary_job_metadata(self) -> Dict[str, Any]:
@@ -3797,6 +3957,32 @@ class LuxriotCaptureSession:
             "interval_sec": float(self.interval),
             "session_generation": self.session_generation,
         }
+
+    @staticmethod
+    def _summary_source_weight(frame: Mapping[str, Any]) -> int:
+        return max(
+            1,
+            int(_parse_optional_int(frame.get("_eva_summary_source_weight")) or 1),
+        )
+
+    @classmethod
+    def _prepare_summary_frames(
+        cls,
+        frames: Sequence[Mapping[str, Any]],
+    ) -> Tuple[List[Dict[str, Any]], int, int]:
+        """Strip private accumulator fields and conserve represented frame count."""
+
+        clean: List[Dict[str, Any]] = []
+        source_frame_count = 0
+        for raw_frame in frames:
+            if not isinstance(raw_frame, Mapping):
+                continue
+            frame = dict(raw_frame)
+            source_frame_count += cls._summary_source_weight(frame)
+            frame.pop("_eva_summary_source_weight", None)
+            clean.append(frame)
+        source_frame_count = max(len(clean), source_frame_count)
+        return clean, source_frame_count, max(0, source_frame_count - len(clean))
 
     @staticmethod
     def _frame_capture_mode(frame: Mapping[str, Any]) -> str:
@@ -3902,6 +4088,22 @@ class LuxriotCaptureSession:
             "batches": total_batches,
             "omitted_frames": omitted_count(meta_a) + omitted_count(meta_b) + int(omitted),
         }
+        merged_meta["source_frame_count"] = (
+            max(
+                len(frames_a),
+                int(
+                    _parse_optional_int(meta_a.get("source_frame_count"))
+                    or len(frames_a)
+                ),
+            )
+            + max(
+                len(frames_b),
+                int(
+                    _parse_optional_int(meta_b.get("source_frame_count"))
+                    or len(frames_b)
+                ),
+            )
+        )
         self.summary_queue[0:2] = [(merged_frames, workload_a, merged_meta)]
         self.summary_coalesced_batches += 1
         return True
@@ -3961,6 +4163,25 @@ class LuxriotCaptureSession:
                 else None
             )
             metadata = self._summary_job_metadata()
+            (
+                frames_copy,
+                source_frame_count,
+                omitted_frames,
+            ) = self._prepare_summary_frames(frames_copy)
+            metadata["source_frame_count"] = int(source_frame_count)
+            if omitted_frames > 0:
+                metadata["coalesced"] = {
+                    "batches": max(
+                        2,
+                        int(
+                            math.ceil(
+                                source_frame_count
+                                / float(max(1, int(self.batch_size)))
+                            )
+                        ),
+                    ),
+                    "omitted_frames": int(omitted_frames),
+                }
             if not self.summary_worker_thread.is_alive():
                 # Unit tests and manual direct calls often exercise the loop without
                 # start(); preserve the previous synchronous semantics there.
@@ -4177,6 +4398,38 @@ class LuxriotCaptureSession:
         """Ensure frame buffers stay bounded and return lost L0 frames."""
 
         dropped_summary_frames: List[Dict[str, Any]] = []
+        if (
+            bool(getattr(self.manager, "attention_scheduler_enabled", False))
+            and len(self.frames) > int(self.summary_max_batch_frames)
+        ):
+            # Cost-budget deferral is not evidence loss. Keep a bounded,
+            # temporally representative set of model inputs and carry the
+            # represented 1 Hz frame count forward into source_frame_count.
+            # The independent CLIP archive still retains every configured
+            # embedding snapshot.
+            source_frame_count = sum(
+                self._summary_source_weight(frame)
+                for frame in self.frames
+                if isinstance(frame, Mapping)
+            )
+            compacted, omitted = self._subsample_coalesced_frames(
+                self.frames,
+                int(self.summary_max_batch_frames),
+            )
+            retained_weight = sum(
+                self._summary_source_weight(frame)
+                for frame in compacted
+            )
+            if compacted and source_frame_count > retained_weight:
+                compacted[0]["_eva_summary_source_weight"] = (
+                    self._summary_source_weight(compacted[0])
+                    + source_frame_count
+                    - retained_weight
+                )
+            self.frames = compacted
+            if omitted > 0:
+                self.summary_compaction_events += 1
+                self.summary_compacted_frames += int(omitted)
         if self.max_buffer and len(self.frames) > self.max_buffer:
             overflow = len(self.frames) - self.max_buffer
             # Drop oldest frames to cap size; keep last max_buffer frames
@@ -4202,6 +4455,8 @@ class LuxriotCaptureSession:
             summary_queue_frame_count = sum(len(item[0]) for item in self.summary_queue)
             summary_inflight = bool(self.summary_inflight)
             summary_worker_alive = self.summary_worker_thread.is_alive()
+            summary_compaction_events = self.summary_compaction_events
+            summary_compacted_frames = self.summary_compacted_frames
             recent_frame_count = len(self.recent_frames)
             last_snapshot_latency_sec = self.last_snapshot_latency_sec
             avg_snapshot_latency_sec = self.avg_snapshot_latency_sec
@@ -4310,6 +4565,8 @@ class LuxriotCaptureSession:
             "queue_submissions": self.queue_submissions,
             "queue_dropped_batches": self.queue_dropped_batches,
             "summary_coalesced_batches": self.summary_coalesced_batches,
+            "summary_compaction_events": summary_compaction_events,
+            "summary_compacted_frames": summary_compacted_frames,
             "summary_coverage_gap_batches": summary_coverage_gap_batches,
             "summary_coverage_gap_frames": summary_coverage_gap_frames,
             "summary_coverage_gap_reasons": summary_coverage_gap_reasons,
@@ -4419,6 +4676,12 @@ class LuxriotManager:
             return DEFAULT_ALERTS_JSON_PROMPT
         if any(marker in lowered for marker in _OUTDATED_ALERT_PROMPT_MARKERS):
             return DEFAULT_ALERTS_JSON_PROMPT
+        compacted = re.sub(r"\s+", "", lowered)
+        if (
+            '"kind":"event|transition|routine|coverage_issue"' in compacted
+            or '"confidence":"high|medium|low"' in compacted
+        ):
+            return DEFAULT_ALERTS_JSON_PROMPT
         if (
             "do not merge unrelated triggers into one alert" in lowered
             and "evaluate every operator-defined trigger independently" not in lowered
@@ -4457,6 +4720,16 @@ class LuxriotManager:
         criteria = str(prompt_text or "").strip()
         rendered_criteria = criteria if criteria else "None provided. Use only the general safety/security hazards above."
         return DEFAULT_ALERT_POLICY_PROMPT.replace("{operator_alert_policy}", rendered_criteria).strip()
+
+    @staticmethod
+    def _render_live_alert_reconciliation_prompt(prompt_text: object) -> str:
+        criteria = str(prompt_text or "").strip()
+        if not criteria:
+            return ""
+        return LIVE_ALERT_RECONCILIATION_PROMPT.replace(
+            "{operator_alert_policy}",
+            criteria,
+        ).strip()
 
     @staticmethod
     def _compact_prompt_text(text: object) -> str:
@@ -4925,6 +5198,11 @@ class LuxriotManager:
         self._l0_cost_budget_admitted = 0
         self._l0_cost_budget_deferred = 0
         self._l0_cost_budget_by_mode: Dict[str, int] = {}
+        self._l0_cost_budget_by_channel: Dict[int, int] = {}
+        self._l0_cost_budget_waiters: Dict[int, Dict[str, int]] = {}
+        self._l0_cost_budget_last_admitted_ms: Dict[int, int] = {}
+        self._l0_cost_budget_fairness_deferred = 0
+        self._l0_cost_budget_coverage_loans = 0
         self._l0_slot_seconds_ewma = (
             self._l0_cost_budget_config.reference_l0_slot_seconds
         )
@@ -6813,13 +7091,22 @@ class LuxriotManager:
     def reserve_l0_cost_budget(
         self,
         *,
+        channel_id: int = 0,
         mode: AttentionMode,
         frame_count: int,
+        coverage_overdue: bool = False,
     ) -> bool:
-        """Reserve global token and slot-seconds capacity for one L0 request."""
+        """Reserve global L0 capacity without letting one channel monopolize it.
+
+        Contending channels form a short-lived FIFO. An overdue coverage window
+        may use the same bounded two-L0 loan as a burst, but it cannot jump an
+        older waiter. This keeps an active stream from starving quiet or
+        degraded channels while preserving the global 4070-class budget.
+        """
 
         if not self.attention_scheduler_enabled:
             return True
+        normalized_channel_id = max(0, int(channel_id))
         frames = max(1, min(16, int(frame_count)))
         cost = InferenceCost(
             prompt_tokens=1800,
@@ -6841,14 +7128,60 @@ class LuxriotManager:
                 now_ms,
                 self._l0_cost_budget_config,
             )
+            if normalized_channel_id > 0:
+                stale_before_ms = now_ms - 30_000
+                self._l0_cost_budget_waiters = {
+                    waiter_channel: waiter
+                    for waiter_channel, waiter in self._l0_cost_budget_waiters.items()
+                    if int(waiter.get("last_attempt_ms") or 0) >= stale_before_ms
+                }
+                current_waiter = self._l0_cost_budget_waiters.get(
+                    normalized_channel_id
+                )
+                if current_waiter is not None:
+                    current_waiter["last_attempt_ms"] = now_ms
+                if self._l0_cost_budget_waiters:
+                    oldest_channel = min(
+                        self._l0_cost_budget_waiters,
+                        key=lambda waiter_channel: (
+                            int(
+                                self._l0_cost_budget_waiters[waiter_channel].get(
+                                    "first_deferred_ms"
+                                )
+                                or now_ms
+                            ),
+                            int(waiter_channel),
+                        ),
+                    )
+                    if oldest_channel != normalized_channel_id:
+                        self._l0_cost_budget_waiters.setdefault(
+                            normalized_channel_id,
+                            {
+                                "first_deferred_ms": now_ms,
+                                "last_attempt_ms": now_ms,
+                            },
+                        )
+                        self._l0_cost_budget_state = replenished
+                        self._l0_cost_budget_deferred += 1
+                        self._l0_cost_budget_fairness_deferred += 1
+                        return False
+            last_admitted_ms = self._l0_cost_budget_last_admitted_ms.get(
+                normalized_channel_id,
+                0,
+            )
+            coverage_loan = bool(coverage_overdue) and (
+                normalized_channel_id <= 0
+                or now_ms - last_admitted_ms
+                >= max(1_000, int(profile_for_mode(mode).cadence_ms))
+            )
             token_floor = (
                 -self._l0_cost_budget_config.token_borrow_limit
-                if mode is AttentionMode.BURST
+                if mode is AttentionMode.BURST or coverage_loan
                 else 0.0
             )
             slot_floor = (
                 -self._l0_cost_budget_config.slot_seconds_borrow_limit
-                if mode is AttentionMode.BURST
+                if mode is AttentionMode.BURST or coverage_loan
                 else 0.0
             )
             admitted = (
@@ -6872,10 +7205,51 @@ class LuxriotManager:
                 self._l0_cost_budget_by_mode[key] = (
                     self._l0_cost_budget_by_mode.get(key, 0) + 1
                 )
+                if normalized_channel_id > 0:
+                    self._l0_cost_budget_waiters.pop(
+                        normalized_channel_id,
+                        None,
+                    )
+                    self._l0_cost_budget_last_admitted_ms[
+                        normalized_channel_id
+                    ] = now_ms
+                    self._l0_cost_budget_by_channel[normalized_channel_id] = (
+                        self._l0_cost_budget_by_channel.get(
+                            normalized_channel_id,
+                            0,
+                        )
+                        + 1
+                    )
+                if (
+                    coverage_loan
+                    and (
+                        replenished.available_tokens - cost.total_tokens < 0.0
+                        or replenished.available_slot_seconds - cost.slot_seconds
+                        < 0.0
+                    )
+                ):
+                    self._l0_cost_budget_coverage_loans += 1
             else:
                 self._l0_cost_budget_state = replenished
                 self._l0_cost_budget_deferred += 1
+                if normalized_channel_id > 0:
+                    self._l0_cost_budget_waiters.setdefault(
+                        normalized_channel_id,
+                        {
+                            "first_deferred_ms": now_ms,
+                            "last_attempt_ms": now_ms,
+                        },
+                    )
             return admitted
+
+    def release_l0_cost_budget_channel(self, channel_id: int) -> None:
+        """Remove a stopped capture from the fairness queue."""
+
+        normalized_channel_id = max(0, int(channel_id))
+        if normalized_channel_id <= 0:
+            return
+        with self._l0_cost_budget_lock:
+            self._l0_cost_budget_waiters.pop(normalized_channel_id, None)
 
     def note_l0_duration(self, duration_seconds: float) -> None:
         duration = max(0.1, min(300.0, float(duration_seconds)))
@@ -6906,8 +7280,24 @@ class LuxriotManager:
                 ),
                 "admitted_total": int(self._l0_cost_budget_admitted),
                 "deferred_total": int(self._l0_cost_budget_deferred),
+                "fairness_deferred_total": int(
+                    self._l0_cost_budget_fairness_deferred
+                ),
+                "coverage_loans_total": int(
+                    self._l0_cost_budget_coverage_loans
+                ),
                 "admitted_by_mode": dict(
                     sorted(self._l0_cost_budget_by_mode.items())
+                ),
+                "admitted_by_channel": {
+                    str(channel_id): int(count)
+                    for channel_id, count in sorted(
+                        self._l0_cost_budget_by_channel.items()
+                    )
+                },
+                "waiting_channel_ids": sorted(
+                    int(channel_id)
+                    for channel_id in self._l0_cost_budget_waiters
                 ),
             }
 
@@ -9907,6 +10297,208 @@ class LuxriotManager:
         return out
 
     @classmethod
+    def _vector_signal_prompt_view(
+        cls,
+        value: object,
+        frames: Optional[Sequence[Mapping[str, Any]]] = None,
+    ) -> Dict[str, Any]:
+        """Build the bounded signal digest shown to the live VLM.
+
+        The complete compact signal remains attached to the L0 entry for
+        archive/replay.  A batch can contain dozens of per-candidate CLIP/CV
+        measurements, however, and serializing all of them into the system
+        prompt can bury the current images under tens of thousands of
+        characters.  The VLM needs a snapshot-aligned attention digest, not
+        the diagnostic trace used by the archive.
+        """
+
+        compact = cls._compact_vector_signal(value)
+        if not compact:
+            return {}
+        out: Dict[str, Any] = {
+            "version": int(_parse_optional_int(compact.get("version")) or 1),
+            "semantics": "vector_homeostasis_attention_signal_not_visual_proof",
+        }
+        for key in ("channel_id", "batch_start_ms", "batch_end_ms"):
+            parsed = _parse_optional_int(compact.get(key))
+            if parsed is not None:
+                out[key] = int(parsed)
+
+        raw_probe_signals = compact.get("clip_probe_signals")
+        if isinstance(raw_probe_signals, Sequence) and not isinstance(
+            raw_probe_signals,
+            (str, bytes, bytearray),
+        ):
+            prompt_probes: List[Dict[str, Any]] = []
+            for raw in raw_probe_signals[:8]:
+                if not isinstance(raw, Mapping):
+                    continue
+                item: Dict[str, Any] = {
+                    "name": str(raw.get("name") or "probe").strip()[:120],
+                    "state": str(raw.get("state") or "candidate").strip()[:40],
+                    "attention_authority": str(
+                        raw.get("attention_authority") or "shadow"
+                    ).strip()[:40],
+                }
+                for key in ("probe_id", "severity", "origin"):
+                    text = str(raw.get(key) or "").strip()
+                    if text:
+                        item[key] = text[:80]
+                for key in ("p", "n", "m"):
+                    score = cls._finite_float(raw.get(key))
+                    if score is not None:
+                        item[key] = round(float(score), 4)
+                for key in ("timestamp_ms", "apex_frame", "hit_count"):
+                    parsed = _parse_optional_int(raw.get(key))
+                    if parsed is not None:
+                        item[key] = int(parsed)
+                prompt_probes.append(item)
+            if prompt_probes:
+                out["clip_probe_signals"] = prompt_probes
+
+        selected_sources: Dict[int, int] = {}
+        if isinstance(frames, Sequence) and not isinstance(
+            frames,
+            (str, bytes, bytearray),
+        ):
+            for snapshot_index, frame in enumerate(frames, start=1):
+                if not isinstance(frame, Mapping):
+                    continue
+                source_index = _parse_optional_int(
+                    frame.get("batch_source_frame_index")
+                )
+                if source_index is not None and source_index > 0:
+                    selected_sources[int(source_index)] = int(snapshot_index)
+
+        raw_frame_scores = compact.get("clip_frame_scores")
+        grouped_scores: Dict[Tuple[int, str], Dict[str, Any]] = {}
+        if (
+            selected_sources
+            and isinstance(raw_frame_scores, Sequence)
+            and not isinstance(raw_frame_scores, (str, bytes, bytearray))
+        ):
+            for raw in raw_frame_scores:
+                if not isinstance(raw, Mapping):
+                    continue
+                source_index = _parse_optional_int(raw.get("source_frame_index"))
+                snapshot_index = selected_sources.get(int(source_index or 0))
+                probe_id = str(raw.get("probe_id") or "").strip()[:80]
+                if snapshot_index is None or not probe_id:
+                    continue
+                candidate: Dict[str, Any] = {
+                    "snapshot_index": int(snapshot_index),
+                    "probe_id": probe_id,
+                    "threshold_state": str(
+                        raw.get("threshold_state") or "not_evaluated"
+                    ).strip()[:32],
+                }
+                probe_name = str(raw.get("probe_name") or "").strip()
+                if probe_name:
+                    candidate["probe_name"] = probe_name[:120]
+                for key in ("p", "n", "m", "pos_floor", "margin_threshold"):
+                    score = cls._finite_float(raw.get(key))
+                    if score is not None:
+                        candidate[key] = round(float(score), 4)
+                group_key = (int(snapshot_index), probe_id)
+                existing = grouped_scores.get(group_key)
+                if existing is None or (
+                    float(candidate.get("m") or float("-inf")),
+                    float(candidate.get("p") or float("-inf")),
+                ) > (
+                    float(existing.get("m") or float("-inf")),
+                    float(existing.get("p") or float("-inf")),
+                ):
+                    grouped_scores[group_key] = candidate
+        if grouped_scores:
+            out["clip_snapshot_scores"] = [
+                grouped_scores[key]
+                for key in sorted(grouped_scores)
+            ][:32]
+
+        raw_intervals = compact.get("motion_intervals")
+        if isinstance(raw_intervals, Sequence) and not isinstance(
+            raw_intervals,
+            (str, bytes, bytearray),
+        ):
+            state_counts: Dict[str, int] = {}
+            strongest: List[Dict[str, Any]] = []
+            motion_max = 0.0
+            activity_x_max = 0.0
+            for raw in raw_intervals:
+                if not isinstance(raw, Mapping):
+                    continue
+                state = str(raw.get("state") or "unknown").strip().lower()[:20]
+                state_counts[state] = state_counts.get(state, 0) + 1
+                motion = cls._finite_float(raw.get("motion_max")) or 0.0
+                activity = cls._finite_float(raw.get("activity_x_max")) or 0.0
+                motion_max = max(motion_max, float(motion))
+                activity_x_max = max(activity_x_max, float(activity))
+                if state != "quiet" or activity >= 3.0:
+                    interval: Dict[str, Any] = {
+                        "state": state,
+                        "started_at_ms": int(
+                            _parse_optional_int(raw.get("started_at_ms")) or 0
+                        ),
+                        "ended_at_ms": int(
+                            _parse_optional_int(raw.get("ended_at_ms")) or 0
+                        ),
+                        "activity_x_max": round(float(activity), 2),
+                    }
+                    moving = cls._finite_float(raw.get("moving_fraction"))
+                    if moving is not None:
+                        interval["moving_fraction"] = round(float(moving), 3)
+                    strongest.append(interval)
+            motion_digest: Dict[str, Any] = {
+                "interval_count": len(raw_intervals),
+                "states": state_counts,
+                "motion_max": round(motion_max, 5),
+                "activity_x_max": round(activity_x_max, 2),
+            }
+            strongest.sort(
+                key=lambda item: -float(item.get("activity_x_max") or 0.0)
+            )
+            if strongest:
+                strongest = strongest[:6]
+                strongest.sort(key=lambda item: int(item.get("started_at_ms") or 0))
+                motion_digest["active_intervals"] = strongest
+            out["motion_digest"] = motion_digest
+
+        for key, limit in (("road_cv_cues", 4), ("road_episodes", 4)):
+            raw_items = compact.get(key)
+            if isinstance(raw_items, Sequence) and not isinstance(
+                raw_items,
+                (str, bytes, bytearray),
+            ):
+                items = [dict(item) for item in raw_items[:limit] if isinstance(item, Mapping)]
+                if items:
+                    out[key] = items
+        for key in ("road_cv_scene", "capture_attention"):
+            item = compact.get(key)
+            if isinstance(item, Mapping):
+                out[key] = dict(item)
+
+        health = compact.get("health")
+        if isinstance(health, Mapping):
+            health_keys = (
+                "clip_probe_configured",
+                "clip_probe_scanned",
+                "clip_probe_shadow",
+                "clip_probe_regulatory",
+                "clip_probe_embedding_space_mismatch",
+                "road_cv_scene_status",
+                "road_cv_sampled_frame_count",
+                "road_cv_low_fps_suppressed_frames",
+            )
+            health_digest = {
+                key: health.get(key)
+                for key in health_keys
+                if key in health
+            }
+            if health_digest:
+                out["health"] = health_digest
+        return out
+
+    @classmethod
     def _compact_summary_history_entry(cls, value: Mapping[str, Any]) -> Dict[str, Any]:
         """Keep operator/agent evidence while dropping per-candidate diagnostics.
 
@@ -12792,6 +13384,429 @@ class LuxriotManager:
         }
 
     @staticmethod
+    def _alert_policy_match_stem(token: str) -> str:
+        """Return a tiny deterministic English stem for alert-policy matching."""
+
+        value = str(token or "").strip().lower()
+        if len(value) > 5 and value.endswith("ing"):
+            value = value[:-3]
+            if len(value) > 3 and value[-1:] == value[-2:-1]:
+                value = value[:-1]
+        elif len(value) > 4 and value.endswith("ied"):
+            value = value[:-3] + "y"
+        elif len(value) > 4 and value.endswith("ed"):
+            value = value[:-2]
+        elif len(value) > 4 and value.endswith("ies"):
+            value = value[:-3] + "y"
+        elif len(value) > 3 and value.endswith("s"):
+            value = value[:-1]
+        return value
+
+    @classmethod
+    def _alert_policy_match_tokens(cls, value: object) -> Set[str]:
+        tokens: Set[str] = set()
+        for raw_token in re.findall(r"[a-z0-9]+", str(value or "").casefold()):
+            token = cls._alert_policy_match_stem(raw_token)
+            if (
+                len(token) < 2
+                or token in _ALERT_POLICY_MATCH_STOPWORDS
+                or token in {
+                    "alert",
+                    "bookmark",
+                    "criteria",
+                    "criterion",
+                    "detect",
+                    "event",
+                    "level",
+                    "monitor",
+                    "operator",
+                    "require",
+                    "severity",
+                    "significant",
+                    "trigger",
+                    "visible",
+                }
+            ):
+                continue
+            tokens.add(token)
+        return tokens
+
+    @classmethod
+    def _operator_alert_policy_criteria(cls, policy_text: object) -> List[str]:
+        """Extract explicit operator trigger clauses from free-form policy text.
+
+        This is deliberately conservative.  It recognizes only imperative
+        alert/watch forms and comma-separated alternatives, leaving general
+        scene prose and severity notes out of the matcher.
+        """
+
+        criteria: List[str] = []
+        seen: Set[str] = set()
+        marker = re.compile(
+            r"\b(?:"
+            r"create\s+(?:an?\s+)?alert\s+if|"
+            r"raise\s+(?:an?\s+)?alert\s+(?:if|when)|"
+            r"alert\s+(?:if|when)|"
+            r"bookmark\s+(?:if|when)|"
+            r"watch\s+for|"
+            r"detect"
+            r")\b",
+            flags=re.IGNORECASE,
+        )
+        for raw_line in str(policy_text or "").splitlines():
+            line = cls._strip_prompt_bullet(raw_line)
+            if not line:
+                continue
+            for sentence in re.split(r"(?<=[.!?])\s+", line):
+                match = marker.search(sentence)
+                if match is None:
+                    continue
+                tail = sentence[match.end() :].strip(" \t:;-")
+                tail = re.sub(
+                    r"\s+as\s+(?:a\s+)?significant\s+events?.*$",
+                    "",
+                    tail,
+                    flags=re.IGNORECASE,
+                ).strip()
+                alternatives = re.split(
+                    r"\s*,\s*or\s+|\s+or\s+when\s+|\s*;\s*or\s+",
+                    tail,
+                    flags=re.IGNORECASE,
+                )
+                for alternative in alternatives:
+                    criterion = cls._truncate_text(alternative.strip(" \t,;:-"), 220)
+                    tokens = cls._alert_policy_match_tokens(criterion)
+                    if len(tokens) < 2:
+                        continue
+                    key = " ".join(sorted(tokens))
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    criteria.append(criterion)
+                    if len(criteria) >= 24:
+                        return criteria
+        return criteria
+
+    @classmethod
+    def _operator_alert_policy_severity(
+        cls,
+        policy_text: object,
+        criterion: object,
+    ) -> str:
+        criterion_tokens = cls._alert_policy_match_tokens(criterion)
+        best_overlap = 0
+        best_severity = "low"
+        severity_pattern = re.compile(
+            r"\bfor\s+(?:the\s+)?(?P<label>[a-z0-9][a-z0-9 _/-]{0,60}?)"
+            r"\s*[-:]\s*(?P<severity>"
+            r"critical|emergency|high|danger|normal|moderate|medium|low|"
+            r"warning|warn|info|informational|information"
+            r")\b",
+            flags=re.IGNORECASE,
+        )
+        for match in severity_pattern.finditer(str(policy_text or "")):
+            label_tokens = cls._alert_policy_match_tokens(match.group("label"))
+            overlap = len(criterion_tokens & label_tokens)
+            if overlap <= best_overlap:
+                continue
+            best_overlap = overlap
+            best_severity = cls._normalize_alert_severity(match.group("severity"))
+        return best_severity
+
+    @classmethod
+    def _operator_policy_event_match(
+        cls,
+        criterion: object,
+        event: Mapping[str, Any],
+    ) -> Optional[float]:
+        snapshot_indices = event.get("snapshot_indices")
+        if (
+            not isinstance(snapshot_indices, Sequence)
+            or isinstance(snapshot_indices, (str, bytes, bytearray))
+            or not snapshot_indices
+        ):
+            return None
+        if str(event.get("state") or "").strip().lower() not in {
+            "new",
+            "continuing",
+            "resolved",
+        }:
+            return None
+        criterion_tokens = cls._alert_policy_match_tokens(criterion)
+        evidence_tokens = cls._alert_policy_match_tokens(
+            f"{event.get('label') or ''} {event.get('summary') or ''}"
+        )
+        if len(criterion_tokens) < 2 or not evidence_tokens:
+            return None
+        overlap = criterion_tokens & evidence_tokens
+        if len(overlap) < 2:
+            return None
+        criterion_actions = criterion_tokens & _ALERT_POLICY_ACTION_STEMS
+        if criterion_actions and not (criterion_actions & evidence_tokens):
+            return None
+        score = len(overlap) / max(1, len(criterion_tokens))
+        threshold = 2.0 / 3.0 if len(criterion_tokens) <= 3 else 0.6
+        return float(score) if score >= threshold else None
+
+    @staticmethod
+    def _render_reconciled_batch_state_summary(
+        summary_text: object,
+        batch_state: Mapping[str, Any],
+    ) -> str:
+        """Replace the model's trailing state with the reconciled state."""
+
+        text = str(summary_text or "").strip()
+        marker = re.search(
+            r"\bBATCH[\s_-]*STATE[\s_-]*JSON\s*:",
+            text,
+            flags=re.IGNORECASE,
+        )
+        if marker is None:
+            return text
+        narrative = text[: marker.start()].rstrip()
+        narrative = re.sub(
+            r"```(?:json)?\s*$",
+            "",
+            narrative,
+            flags=re.IGNORECASE,
+        ).rstrip()
+        rendered_state = {
+            key: copy.deepcopy(batch_state.get(key))
+            for key in (
+                "version",
+                "cover",
+                "scene",
+                "events",
+                "observed_states",
+                "routines",
+                "memory_pass",
+                "alerts",
+            )
+            if key in batch_state
+        }
+        block = (
+            "BATCH_STATE_JSON:\n"
+            + json.dumps(
+                rendered_state,
+                ensure_ascii=False,
+                indent=2,
+                allow_nan=False,
+            )
+        )
+        return f"{narrative}\n\n{block}".strip() if narrative else block
+
+    def _reconcile_operator_alert_contract(
+        self,
+        channel_id: int,
+        summary_text: object,
+        batch_state: Mapping[str, Any],
+    ) -> Tuple[str, Dict[str, Any]]:
+        """Recover an omitted explicit operator alert from grounded L0 events.
+
+        The fallback cannot infer from prose, memory, CLIP, or homeostasis.  It
+        requires a model-produced current event with snapshot references and a
+        strong lexical match to an imperative operator criterion.
+        """
+
+        state = copy.deepcopy(dict(batch_state))
+        existing_alerts = state.get("alerts")
+        if isinstance(existing_alerts, Sequence) and not isinstance(
+            existing_alerts,
+            (str, bytes, bytearray),
+        ) and existing_alerts:
+            return str(summary_text or ""), state
+        if str(state.get("contract_status") or "") != "parsed":
+            return str(summary_text or ""), state
+        events = state.get("events")
+        if not isinstance(events, Sequence) or isinstance(
+            events,
+            (str, bytes, bytearray),
+        ):
+            return str(summary_text or ""), state
+        with self.cache_lock:
+            policy_text = self._get_alert_policy_prompt_locked(channel_id)
+        criteria = self._operator_alert_policy_criteria(policy_text)
+        if not criteria:
+            return str(summary_text or ""), state
+
+        best: Optional[Tuple[float, str, Mapping[str, Any]]] = None
+        for criterion in criteria:
+            for raw_event in events:
+                if not isinstance(raw_event, Mapping):
+                    continue
+                score = self._operator_policy_event_match(criterion, raw_event)
+                if score is None:
+                    continue
+                candidate = (score, criterion, raw_event)
+                if best is None or candidate[0] > best[0]:
+                    best = candidate
+        if best is None:
+            return str(summary_text or ""), state
+
+        score, criterion, event = best
+        snapshot_indices = [
+            int(index)
+            for index in (
+                _parse_optional_int(value)
+                for value in cast(Sequence[Any], event.get("snapshot_indices") or [])
+            )
+            if index is not None and index > 0
+        ][:16]
+        if not snapshot_indices:
+            return str(summary_text or ""), state
+        label = self._truncate_text(
+            event.get("label") or criterion,
+            90,
+        )
+        event_summary = self._truncate_text(
+            event.get("summary") or event.get("label"),
+            180,
+        )
+        alert = {
+            "title": self._truncate_text(
+                f"{label} — operator criterion",
+                120,
+            ),
+            "description": self._truncate_text(
+                f"Current structured VLM event matched operator criterion: {event_summary}",
+                240,
+            ),
+            "severity": self._operator_alert_policy_severity(
+                policy_text,
+                criterion,
+            ),
+            "state": str(event.get("state") or "new").strip().lower(),
+            "channel_id": int(channel_id),
+            "timestamp_ms": 0,
+            "snapshot_indices": snapshot_indices,
+            "source": "backend_policy_reconciliation",
+            "policy_criterion": self._truncate_text(criterion, 220),
+            "policy_match_score": round(float(score), 3),
+        }
+        state["alerts"] = [alert]
+        state["contract_status"] = "parsed_alert_reconciled"
+        state["alert_reconciliation"] = {
+            "source": "current_structured_event",
+            "count": 1,
+        }
+        return self._render_reconciled_batch_state_summary(
+            summary_text,
+            state,
+        ), state
+
+    @classmethod
+    def _general_hazard_event_candidate(
+        cls,
+        events: object,
+    ) -> Optional[Tuple[str, str, str, Mapping[str, Any]]]:
+        if not isinstance(events, Sequence) or isinstance(
+            events,
+            (str, bytes, bytearray),
+        ):
+            return None
+        for rule_key, title, severity, patterns in _GENERAL_HAZARD_EVENT_RULES:
+            for raw_event in events:
+                if not isinstance(raw_event, Mapping):
+                    continue
+                snapshot_indices = raw_event.get("snapshot_indices")
+                if (
+                    not isinstance(snapshot_indices, Sequence)
+                    or isinstance(snapshot_indices, (str, bytes, bytearray))
+                    or not snapshot_indices
+                ):
+                    continue
+                if str(raw_event.get("state") or "").strip().lower() not in {
+                    "new",
+                    "continuing",
+                    "resolved",
+                }:
+                    continue
+                evidence = (
+                    f"{raw_event.get('label') or ''} "
+                    f"{raw_event.get('summary') or ''}"
+                ).strip()
+                evidence_tokens = cls._alert_policy_match_tokens(evidence)
+                if not evidence_tokens:
+                    continue
+                if re.search(
+                    r"\b(?:no|not|without)\s+(?:visible\s+)?"
+                    r"(?:collision|crash|impact|drift|burnout|skid|spin|"
+                    r"smoke|fire|flame)\b",
+                    evidence,
+                    flags=re.IGNORECASE,
+                ):
+                    continue
+                if any(pattern <= evidence_tokens for pattern in patterns):
+                    return rule_key, title, severity, raw_event
+        return None
+
+    def _reconcile_general_hazard_alert_contract(
+        self,
+        channel_id: int,
+        summary_text: object,
+        batch_state: Mapping[str, Any],
+    ) -> Tuple[str, Dict[str, Any]]:
+        """Recover a small set of explicit general hazards from grounded events."""
+
+        state = copy.deepcopy(dict(batch_state))
+        existing_alerts = state.get("alerts")
+        if isinstance(existing_alerts, Sequence) and not isinstance(
+            existing_alerts,
+            (str, bytes, bytearray),
+        ) and existing_alerts:
+            return str(summary_text or ""), state
+        if str(state.get("contract_status") or "") != "parsed":
+            return str(summary_text or ""), state
+        candidate = self._general_hazard_event_candidate(state.get("events"))
+        if candidate is None:
+            return str(summary_text or ""), state
+        rule_key, title, severity, event = candidate
+        snapshot_indices = [
+            int(index)
+            for index in (
+                _parse_optional_int(value)
+                for value in cast(
+                    Sequence[Any],
+                    event.get("snapshot_indices") or [],
+                )
+            )
+            if index is not None and index > 0
+        ][:16]
+        if not snapshot_indices:
+            return str(summary_text or ""), state
+        event_summary = self._truncate_text(
+            event.get("summary") or event.get("label"),
+            180,
+        )
+        state["alerts"] = [
+            {
+                "title": title,
+                "description": self._truncate_text(
+                    f"Current structured VLM event matched general hazard: "
+                    f"{event_summary}",
+                    240,
+                ),
+                "severity": self._normalize_alert_severity(severity),
+                "state": str(event.get("state") or "new").strip().lower(),
+                "channel_id": int(channel_id),
+                "timestamp_ms": 0,
+                "snapshot_indices": snapshot_indices,
+                "source": "backend_general_hazard_reconciliation",
+                "hazard_rule": rule_key,
+            }
+        ]
+        state["contract_status"] = "parsed_alert_reconciled"
+        state["alert_reconciliation"] = {
+            "source": "current_structured_event_general_hazard",
+            "count": 1,
+            "rule": rule_key,
+        }
+        return self._render_reconciled_batch_state_summary(
+            summary_text,
+            state,
+        ), state
+
+    @staticmethod
     def _compact_json_key(value: object) -> str:
         return re.sub(r"[^a-z0-9]+", "", str(value or "").strip().lower())
 
@@ -13516,8 +14531,12 @@ class LuxriotManager:
             signal["baseline"] = baseline_info
         return signal
 
-    def _render_vector_signal_prompt(self, vector_signal: object) -> str:
-        compact = self._compact_vector_signal(vector_signal)
+    def _render_vector_signal_prompt(
+        self,
+        vector_signal: object,
+        frames: Optional[Sequence[Mapping[str, Any]]] = None,
+    ) -> str:
+        compact = self._vector_signal_prompt_view(vector_signal, frames)
         if not compact:
             return ""
         try:
@@ -13531,13 +14550,22 @@ class LuxriotManager:
         channel_id: int,
         base_prompt: Optional[str],
         vector_signal: Optional[Mapping[str, Any]] = None,
+        vector_signal_frames: Optional[Sequence[Mapping[str, Any]]] = None,
     ) -> str:
         rendered_json_prompt = self._get_rendered_json_alert_prompt(channel_id)
         base = self._strip_suffix_prompt(str(base_prompt or ""), rendered_json_prompt).strip()
-        alert_policy = self._get_rendered_alert_policy_prompt(channel_id)
+        with self.cache_lock:
+            raw_alert_policy = self._get_alert_policy_prompt_locked(channel_id)
+        alert_policy = self._render_alert_policy_prompt(raw_alert_policy)
+        alert_reconciliation = self._render_live_alert_reconciliation_prompt(
+            raw_alert_policy
+        )
         routine = self._get_channel_routine_prompt(channel_id)
         homeostasis = self._render_capture_homeostasis_prompt(channel_id)
-        vector_prompt = self._render_vector_signal_prompt(vector_signal)
+        vector_prompt = self._render_vector_signal_prompt(
+            vector_signal,
+            vector_signal_frames,
+        )
         parts = [
             part
             for part in (
@@ -13547,6 +14575,11 @@ class LuxriotManager:
                 homeostasis,
                 vector_prompt,
                 LIVE_OBSERVATION_STATE_PROMPT,
+                # Repeat only the concrete channel criteria at the final alert
+                # gate. Small VLMs otherwise describe a visible trigger
+                # correctly, then lose the earlier policy after the
+                # memory/homeostasis layers and return alerts: [].
+                alert_reconciliation,
                 rendered_json_prompt,
             )
             if str(part or "").strip()
@@ -17081,7 +18114,16 @@ class LuxriotManager:
             or len(source_frame_items)
         )
         base_system_prompt = self.get_effective_stream_system_prompt(channel_id)
-        system_prompt = self.compose_live_system_prompt(channel_id, base_system_prompt, vector_signal=vector_signal)
+        prompt_vector_signal = self._vector_signal_prompt_view(
+            vector_signal,
+            cast(Sequence[Mapping[str, Any]], frame_items),
+        )
+        system_prompt = self.compose_live_system_prompt(
+            channel_id,
+            base_system_prompt,
+            vector_signal=vector_signal,
+            vector_signal_frames=cast(Sequence[Mapping[str, Any]], frame_items),
+        )
         frame_b64_lengths = [
             len(str(frame.get("thumbnail") or ""))
             for frame in frame_items
@@ -17095,7 +18137,17 @@ class LuxriotManager:
             "batch_size": int(batch_size),
             "system_prompt_chars": len(system_prompt),
             "task_prompt_chars": len(str(prompt or "")),
-            "vector_signal_chars": len(json.dumps(vector_signal, ensure_ascii=False, sort_keys=True)) if vector_signal else 0,
+            "vector_signal_chars": (
+                len(
+                    json.dumps(
+                        prompt_vector_signal,
+                        ensure_ascii=False,
+                        sort_keys=True,
+                    )
+                )
+                if prompt_vector_signal
+                else 0
+            ),
             "total_image_base64_chars": int(sum(frame_b64_lengths)),
             "largest_frame_base64_chars": int(max(frame_b64_lengths) if frame_b64_lengths else 0),
             "warning_text_chars": self.lm_input_warning_chars,
@@ -17196,6 +18248,16 @@ class LuxriotManager:
         else:
             summary = self.lm_callback(messages, model_hint)
         batch_state = self._extract_batch_state(summary, frame_items)
+        summary, batch_state = self._reconcile_operator_alert_contract(
+            int(channel_id),
+            summary,
+            batch_state,
+        )
+        summary, batch_state = self._reconcile_general_hazard_alert_contract(
+            int(channel_id),
+            summary,
+            batch_state,
+        )
         submitted_at = self._coerce_float(batch.get("submitted_at"))
         created_at = submitted_at if submitted_at is not None else time.time()
         batch_start_ms = _parse_optional_int(batch.get("batch_start_ms"))
@@ -18027,8 +19089,18 @@ class LuxriotManager:
         severity = cls._normalize_alert_severity(alert.get("severity"))
         return f"{title}|{severity}"
 
-    def _bookmark_content_recently_sent_locked(self, channel_id: int, content_key: str, now_ms: int) -> bool:
-        window_sec = float(getattr(self, "alert_dedupe_window_sec", 600.0) or 0.0)
+    def _bookmark_content_recently_sent_locked(
+        self,
+        channel_id: int,
+        content_key: str,
+        now_ms: int,
+        window_sec: Optional[float] = None,
+    ) -> bool:
+        if window_sec is None:
+            window_sec = float(
+                getattr(self, "alert_dedupe_window_sec", 600.0) or 0.0
+            )
+        window_sec = max(0.0, float(window_sec))
         if window_sec <= 0:
             return False
         channel_cache = self.channel_bookmark_content_keys.get(int(channel_id)) or {}
@@ -18056,8 +19128,18 @@ class LuxriotManager:
             newest = sorted(channel_cache.items(), key=lambda item: item[1], reverse=True)[:1200]
             self.channel_bookmark_fingerprints[channel_key] = dict(newest)
 
-    def _mark_bookmark_content_sent_locked(self, channel_id: int, content_key: str, ts_ms: int) -> None:
-        window_sec = float(getattr(self, "alert_dedupe_window_sec", 600.0) or 0.0)
+    def _mark_bookmark_content_sent_locked(
+        self,
+        channel_id: int,
+        content_key: str,
+        ts_ms: int,
+        window_sec: Optional[float] = None,
+    ) -> None:
+        if window_sec is None:
+            window_sec = float(
+                getattr(self, "alert_dedupe_window_sec", 600.0) or 0.0
+            )
+        window_sec = max(0.0, float(window_sec))
         if window_sec <= 0:
             return
         channel_key = int(channel_id)
@@ -18162,8 +19244,31 @@ class LuxriotManager:
             content_key = self._bookmark_content_key(alert)
             now_ms = int(time.time() * 1000)
             alert_cooldown_sec = self._bookmark_cooldown_for_severity(cooldown_sec, alert["severity"])
+            configured_content_window_sec = float(
+                getattr(self, "alert_dedupe_window_sec", 600.0) or 0.0
+            )
+            # The operator-visible per-channel cooldown is authoritative.
+            # Content normalization protects against title/description drift,
+            # but must not silently turn a 10-second cooldown into the old
+            # global 10-minute suppression window. High/critical alerts have a
+            # zero severity cooldown and therefore bypass content dedupe too.
+            content_dedupe_window_sec = (
+                min(
+                    max(0.0, configured_content_window_sec),
+                    max(0.0, alert_cooldown_sec),
+                )
+                if configured_content_window_sec > 0
+                and alert_cooldown_sec > 0
+                else 0.0
+            )
             with self.cache_lock:
-                if self._bookmark_content_recently_sent_locked(int(channel_id), content_key, now_ms):
+                if self._bookmark_content_recently_sent_locked(
+                    int(channel_id),
+                    content_key,
+                    now_ms,
+                    content_dedupe_window_sec,
+                ):
+                    skipped_duplicate_count += 1
                     alert_events.append({**alert, "delivery_status": "deduplicated"})
                     continue
                 if self._bookmark_recently_sent_locked(int(channel_id), fingerprint, now_ms, alert_cooldown_sec):
@@ -18193,7 +19298,12 @@ class LuxriotManager:
                 continue
             with self.cache_lock:
                 self._mark_bookmark_sent_locked(int(channel_id), fingerprint, now_ms)
-                self._mark_bookmark_content_sent_locked(int(channel_id), content_key, now_ms)
+                self._mark_bookmark_content_sent_locked(
+                    int(channel_id),
+                    content_key,
+                    now_ms,
+                    content_dedupe_window_sec,
+                )
             sent_count += 1
             alert_events.append({**alert, "delivery_status": "sent"})
         return AlertDeliveryResult(

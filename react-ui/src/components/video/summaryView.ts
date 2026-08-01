@@ -112,20 +112,74 @@ export function summaryEntryKey(entry: SummaryEntry, index: number): string {
 }
 
 export function summaryAlertCounts(entry: SummaryEntry): Partial<Record<SummarySeverity, number>> {
-  const counts: Partial<Record<SummarySeverity, number>> = {}
-  for (const severity of SUMMARY_SEVERITIES) {
-    const value = Number(entry.alert_counts?.[severity] || 0)
-    if (Number.isFinite(value) && value > 0) counts[severity] = Math.floor(value)
-  }
-  if (!Object.keys(counts).length) {
-    const total = Number(entry.alert_total || 0)
-    const rawSeverity = String(entry.severity || '').trim().toLowerCase()
-    const severity = SUMMARY_SEVERITIES.includes(rawSeverity as SummarySeverity)
-      ? rawSeverity as SummarySeverity
+  const normalizeSeverity = (value: unknown): SummarySeverity => {
+    const raw = String(value || '').trim().toLowerCase()
+    const aliases: Record<string, SummarySeverity> = {
+      information: 'info',
+      informational: 'info',
+      warn: 'low',
+      warning: 'low',
+      medium: 'normal',
+      moderate: 'normal',
+      danger: 'high',
+      emergency: 'critical',
+    }
+    const normalized = aliases[raw] || raw
+    return SUMMARY_SEVERITIES.includes(normalized as SummarySeverity)
+      ? normalized as SummarySeverity
       : 'normal'
-    if (Number.isFinite(total) && total > 0) counts[severity] = Math.floor(total)
   }
-  return counts
+
+  const fromRawCounts = (rawCounts: unknown): Partial<Record<SummarySeverity, number>> => {
+    const counts: Partial<Record<SummarySeverity, number>> = {}
+    if (!rawCounts || typeof rawCounts !== 'object' || Array.isArray(rawCounts)) return counts
+    for (const [rawSeverity, rawValue] of Object.entries(rawCounts as Record<string, unknown>)) {
+      const value = Number(rawValue || 0)
+      if (!Number.isFinite(value) || value <= 0) continue
+      const severity = normalizeSeverity(rawSeverity)
+      counts[severity] = Number(counts[severity] || 0) + Math.floor(value)
+    }
+    return counts
+  }
+
+  const fromEvents = (rawEvents: unknown): Partial<Record<SummarySeverity, number>> => {
+    const counts: Partial<Record<SummarySeverity, number>> = {}
+    if (!Array.isArray(rawEvents)) return counts
+    for (const event of rawEvents) {
+      if (!event || typeof event !== 'object') continue
+      const severity = normalizeSeverity((event as Record<string, unknown>).severity)
+      counts[severity] = Number(counts[severity] || 0) + 1
+    }
+    return counts
+  }
+
+  const explicit = fromRawCounts(entry.alert_counts)
+  if (Object.keys(explicit).length) return explicit
+
+  const alertEvents = fromEvents(entry.alert_events)
+  if (Object.keys(alertEvents).length) return alertEvents
+
+  const batchState = entry.batch_state && typeof entry.batch_state === 'object'
+    ? entry.batch_state as Record<string, unknown>
+    : null
+  const stateAlerts = fromEvents(batchState?.alerts)
+  if (Object.keys(stateAlerts).length) return stateAlerts
+
+  const parts = splitSummaryMachineJson(entry.summary)
+  if (parts.machineJson) {
+    try {
+      const parsed = JSON.parse(parts.machineJson)
+      const parsedAlerts = fromEvents(parsed?.alerts)
+      if (Object.keys(parsedAlerts).length) return parsedAlerts
+    } catch {
+      // A malformed machine-state block remains visible to the operator, but
+      // must not hide alert metadata supplied by the backend.
+    }
+  }
+
+  const total = Number(entry.alert_total || 0)
+  if (!Number.isFinite(total) || total <= 0) return {}
+  return { [normalizeSeverity(entry.severity)]: Math.floor(total) }
 }
 
 export function summaryBurst(entry: SummaryEntry): SummaryBurst | null {

@@ -19,6 +19,7 @@ export interface AgentConsoleContext {
   section: 'home' | 'archive' | 'probes' | 'video'
   archive?: {
     channel_id?: number
+    channel_ids?: number[]
     source?: 'semantic_snapshot' | 'probe' | 'vlm_summary' | 'vlm_alert'
     probe_id?: string
     since_ms?: number
@@ -85,8 +86,13 @@ export function buildAgentConsoleContext(
   if (normalizedSection !== 'archive' || !filters) return context
 
   const archive: NonNullable<AgentConsoleContext['archive']> = {}
-  const channelId = positiveInt(filters.channelId)
-  if (channelId != null) archive.channel_id = channelId
+  const channelIds = Array.from(new Set(
+    (filters.channelIds?.length ? filters.channelIds : (filters.channelId ? [filters.channelId] : []))
+      .map(positiveInt)
+      .filter((value): value is number => value != null),
+  ))
+  if (channelIds.length === 1) archive.channel_id = channelIds[0]
+  else if (channelIds.length > 1) archive.channel_ids = channelIds
   if (ARCHIVE_SOURCES.has(String(filters.source || ''))) {
     archive.source = filters.source as NonNullable<typeof archive.source>
   }

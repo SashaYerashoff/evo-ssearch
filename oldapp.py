@@ -3669,6 +3669,79 @@ def _lm_admission_profiles() -> List[Dict[str, Any]]:
 _lm_admission_controller = get_lm_admission_controller()
 
 
+def _lm_response_text(data: Mapping[str, Any]) -> Tuple[str, str]:
+    choice = (data.get("choices") or [{}])[0]
+    message = choice.get("message", {}) or {}
+    content = message.get("content", "")
+    if isinstance(content, list):
+        parts = []
+        for part in content:
+            if isinstance(part, dict) and part.get("type") == "text":
+                parts.append(str(part.get("text", "")))
+        content_text = "\n".join(parts).strip()
+    else:
+        content_text = str(content).strip()
+    return content_text, str(choice.get("finish_reason") or "").strip().lower()
+
+
+def _lm_repetition_issue(content: str) -> Optional[str]:
+    """Identify a runaway prose loop without penalizing structured JSON arrays."""
+
+    text = str(content or "").strip()
+    if len(text) < 400:
+        return None
+    prose = re.split(
+        r"\b(?:BATCH_STATE_JSON|ALERTS_JSON|MEMORY_UPDATE_JSON)\s*:",
+        text,
+        maxsplit=1,
+        flags=re.IGNORECASE,
+    )[0]
+    normalized_units: Dict[str, int] = {}
+    for raw in re.split(r"(?<=[.!?])\s+|[\r\n]+", prose):
+        unit = re.sub(r"\s+", " ", raw).strip().lower()
+        if len(unit) < 48:
+            continue
+        normalized_units[unit] = normalized_units.get(unit, 0) + 1
+        if normalized_units[unit] >= 3:
+            return "repeated sentence"
+
+    words = re.findall(r"[a-z0-9][a-z0-9'_-]*", prose.lower())
+    if len(words) >= 80:
+        ngram_counts: Dict[Tuple[str, ...], int] = {}
+        for index in range(0, len(words) - 9):
+            ngram = tuple(words[index : index + 10])
+            count = ngram_counts.get(ngram, 0) + 1
+            ngram_counts[ngram] = count
+            if count >= 4:
+                return "repeated 10-token phrase"
+    return None
+
+
+def _with_concise_retry_instruction(
+    messages: Sequence[Mapping[str, Any]],
+) -> List[Dict[str, Any]]:
+    retry_messages = copy.deepcopy(list(messages))
+    instruction = (
+        "Generation quality guard: inspect every current image again, especially for visible people and actions. "
+        "Write each fact once, keep the prose concise, and finish the required machine-readable block. "
+        "Do not repeat a sentence or background detail."
+    )
+    if retry_messages and str(retry_messages[0].get("role") or "") == "system":
+        content = retry_messages[0].get("content")
+        if isinstance(content, list):
+            content.append({"type": "text", "text": instruction})
+        elif isinstance(content, str):
+            retry_messages[0]["content"] = f"{content}\n\n{instruction}".strip()
+        else:
+            retry_messages[0]["content"] = [{"type": "text", "text": instruction}]
+    else:
+        retry_messages.insert(
+            0,
+            {"role": "system", "content": [{"type": "text", "text": instruction}]},
+        )
+    return retry_messages
+
+
 def _call_lm_chat(
     messages: List[Dict[str, Any]],
     model_override: Optional[str] = None,
@@ -3705,15 +3778,19 @@ def _call_lm_chat(
     default_workload = "agent" if str(profile_kind or "").strip().lower() == "agent" else "vlm"
     requested_workload = str(workload_class or "").strip().lower()
     workload = requested_workload if requested_workload in {"agent", "interactive", "alert", "describe", "video", "vlm", "heartbeat", "rollup", "background"} else default_workload
-    if (
+    bounded_generation = (
         str(profile_kind or "").strip().lower() != "agent"
         or workload in {"rollup", "background"}
-    ):
+    )
+    if bounded_generation:
         # MTP/reasoning models can spend most or all of the completion budget
         # on an internal chain of thought.  Vision descriptions and scheduled
         # rollups need a bounded operator-facing answer; the interactive agent
         # keeps its own reasoning/tool-loop policy.
         payload["chat_template_kwargs"] = {"enable_thinking": False}
+        payload["repetition_penalty"] = float(
+            getattr(config, "LM_VIDEO_REPETITION_PENALTY", 1.08)
+        )
 
     def _response_error_detail(resp: Any) -> str:
         try:
@@ -3737,51 +3814,62 @@ def _call_lm_chat(
             return text[:500]
         return "empty error response"
 
-    try:
-        with _lm_admission_controller.admission(
-            resource,
-            workload=workload,
-            capacity=capacity,
-            timeout=float(profile.get("timeout") or config.LM_TIMEOUT),
-        ):
-            if preflight is not None:
-                preflight()
-            response = requests.post(
-                endpoint,
-                headers=headers,
-                json=payload,
-                timeout=int(profile.get("timeout") or config.LM_TIMEOUT),
-            )
-            response.raise_for_status()
-    except requests.HTTPError as exc:
-        resp = getattr(exc, "response", None) or response
-        detail = _response_error_detail(resp) if resp is not None else str(exc)
-        status = getattr(resp, "status_code", None)
-        status_text = f"HTTP {status}" if status else "HTTP error"
-        raise RuntimeError(
-            f"LM request failed for profile {profile['id']} "
-            f"(model {payload['model']}): {status_text}; {detail}"
-        ) from exc
-    except Exception as exc:
-        if bool(getattr(exc, "superseded", False)):
-            raise
-        raise RuntimeError(
-            f"LM request failed for profile {profile['id']} "
-            f"(model {payload['model']}): {exc}"
-        ) from exc
+    def _perform(request_payload: Mapping[str, Any]) -> Mapping[str, Any]:
+        response: Optional[requests.Response] = None
+        try:
+            with _lm_admission_controller.admission(
+                resource,
+                workload=workload,
+                capacity=capacity,
+                timeout=float(profile.get("timeout") or config.LM_TIMEOUT),
+            ):
+                if preflight is not None:
+                    preflight()
+                response = requests.post(
+                    endpoint,
+                    headers=headers,
+                    json=dict(request_payload),
+                    timeout=int(profile.get("timeout") or config.LM_TIMEOUT),
+                )
+                response.raise_for_status()
+        except requests.HTTPError as exc:
+            resp = getattr(exc, "response", None) or response
+            detail = _response_error_detail(resp) if resp is not None else str(exc)
+            status = getattr(resp, "status_code", None)
+            status_text = f"HTTP {status}" if status else "HTTP error"
+            raise RuntimeError(
+                f"LM request failed for profile {profile['id']} "
+                f"(model {request_payload['model']}): {status_text}; {detail}"
+            ) from exc
+        except Exception as exc:
+            if bool(getattr(exc, "superseded", False)):
+                raise
+            raise RuntimeError(
+                f"LM request failed for profile {profile['id']} "
+                f"(model {request_payload['model']}): {exc}"
+            ) from exc
+        data = response.json()
+        return data if isinstance(data, Mapping) else {}
 
-    data = response.json()
-    choice = (data.get("choices") or [{}])[0]
-    message = choice.get("message", {}) or {}
-    content = message.get("content", "")
-    if isinstance(content, list):
-        parts = []
-        for part in content:
-            if isinstance(part, dict) and part.get("type") == "text":
-                parts.append(str(part.get("text", "")))
-        content_text = "\n".join(parts).strip()
-    else:
-        content_text = str(content).strip()
+    data = _perform(payload)
+    content_text, finish_reason = _lm_response_text(data)
+    issue = _lm_repetition_issue(content_text) if bounded_generation else None
+    if issue:
+        retry_payload = copy.deepcopy(payload)
+        retry_payload["messages"] = _with_concise_retry_instruction(messages)
+        retry_payload["temperature"] = 0.0
+        retry_payload["repetition_penalty"] = max(
+            1.12,
+            float(retry_payload.get("repetition_penalty") or 1.0),
+        )
+        data = _perform(retry_payload)
+        content_text, finish_reason = _lm_response_text(data)
+        retry_issue = _lm_repetition_issue(content_text)
+        if retry_issue:
+            raise RuntimeError(
+                "LM response rejected after one guarded retry: "
+                f"{retry_issue} (finish_reason={finish_reason or 'unknown'})"
+            )
     return content_text or "(empty response from model)"
 
 

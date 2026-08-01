@@ -31,7 +31,16 @@ import {
   buildAuditQuery,
   buildArchiveCapacityQuery,
 } from './settings'
-import { buildCaptureInput, buildPromptSettingsPayload, buildSessionQuery, buildSummaryFeedQuery } from './video'
+import {
+  attentionStreamUrl,
+  buildSummaryBookmarkInput,
+  buildCaptureInput,
+  buildPromptSettingsPayload,
+  buildSessionQuery,
+  buildSummaryFeedQuery,
+  fullLiveMediaUrl,
+  recentFrameUrl,
+} from './video'
 import { API_PREFIXES } from '../../proxy-config'
 
 describe('React/backend contract normalizers', () => {
@@ -136,18 +145,49 @@ describe('React/backend contract normalizers', () => {
     })
   })
 
-  it('includes the operator live prompt when starting video capture', () => {
+  it('keeps model-view preview fresh across dense capture windows', () => {
+    expect(recentFrameUrl(112, 7)).toBe(
+      '/luxriot/recent_frame/112?stream=mainStream&fallback=snapshot&mode=latest&max_age_sec=60&_=7',
+    )
+  })
+
+  it('uses the credential-safe bounded broker for opt-in full live', () => {
+    expect(fullLiveMediaUrl(112, 9)).toBe(
+      '/luxriot/media/live/112?stream=mainStream&request=9',
+    )
+  })
+
+  it('uses the shared EVA attention ring for the model-view stream', () => {
+    expect(attentionStreamUrl(112, 8)).toBe(
+      '/luxriot/attention_stream/112?max_age_sec=60&request=8',
+    )
+  })
+
+  it('builds the same bounded L0 bookmark payload as the legacy console', () => {
+    expect(buildSummaryBookmarkInput({
+      channel_id: 112,
+      created_at: 1_785_000_000,
+      summary: 'Person entered\nMore evidence',
+    })).toEqual({
+      channel_id: 112,
+      title: 'Live summary: Person entered',
+      description: 'Person entered\nMore evidence',
+      severity: 'normal',
+      state: 'new',
+      timestamp_ms: 1_785_000_000_000,
+    })
+  })
+
+  it('starts video capture from persistent channel prompt settings', () => {
     expect(buildCaptureInput(7, {
       batch: '12',
       every: '5',
       model: '  auto ',
-      prompt: '  Watch the loading bay  ',
     })).toEqual({
       channel_id: 7,
       batch_size: 12,
       interval_sec: 5,
       model: 'auto',
-      prompt: 'Watch the loading bay',
     })
   })
 
@@ -184,6 +224,7 @@ describe('React/backend contract normalizers', () => {
     }
     const common = {
       channel_id: '7',
+      channel_ids: undefined,
       source: 'probe',
       probe_id: 'probe-1',
       hours: 72,
@@ -212,11 +253,28 @@ describe('React/backend contract normalizers', () => {
       untilMs: '9000',
     })).toEqual({
       channel_id: undefined,
+      channel_ids: undefined,
       source: 'vlm_summary',
       probe_id: undefined,
       hours: undefined,
       since_ms: '1000',
       until_ms: '9000',
+    })
+  })
+
+  it('keeps multi-stream archive scope across list and semantic search', () => {
+    expect(buildArchiveFilterPayload({
+      channelIds: ['9', '7', '9'],
+      source: 'semantic_snapshot',
+      hours: '6',
+    })).toEqual({
+      channel_id: undefined,
+      channel_ids: ['9', '7'],
+      source: 'semantic_snapshot',
+      probe_id: undefined,
+      hours: 6,
+      since_ms: undefined,
+      until_ms: undefined,
     })
   })
 

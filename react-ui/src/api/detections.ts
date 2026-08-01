@@ -2,6 +2,7 @@ import { api } from './client'
 import type { Channel, Detection, ArchiveFilters } from './types'
 
 const SOURCE_LABELS: Record<string, string> = {
+  semantic_snapshot: 'Continuous CLIP archive',
   probe: 'CLIP probe',
   vlm_summary: 'Video desc',
   vlm_alert: 'VLM alert',
@@ -69,8 +70,9 @@ function channelMap(channels: Channel[]): Map<number, string> {
   return new Map(channels.map((c) => [c.id, c.title]))
 }
 
-export interface ArchiveFilterPayload extends Record<string, string | number | undefined> {
+export interface ArchiveFilterPayload extends Record<string, string | number | string[] | undefined> {
   channel_id: string | undefined
+  channel_ids: string[] | undefined
   source: string | undefined
   probe_id: string | undefined
   hours: number | undefined
@@ -81,8 +83,14 @@ export interface ArchiveFilterPayload extends Record<string, string | number | u
 /** The shared backend filter contract used by list, text search and image search. */
 export function buildArchiveFilterPayload(f: ArchiveFilters): ArchiveFilterPayload {
   const customRange = !!(f.sinceMs || f.untilMs)
+  const channelIds = Array.from(new Set(
+    (f.channelIds?.length ? f.channelIds : (f.channelId ? [f.channelId] : []))
+      .map((value) => String(value || '').trim())
+      .filter((value) => /^\d+$/.test(value)),
+  ))
   return {
-    channel_id: f.channelId,
+    channel_id: channelIds.length === 1 ? channelIds[0] : undefined,
+    channel_ids: channelIds.length > 1 ? channelIds : undefined,
     source: f.source,
     probe_id: f.source === 'probe' ? f.probeId : undefined,
     hours: customRange ? undefined : Number(f.hours ?? '24'),
@@ -91,7 +99,7 @@ export function buildArchiveFilterPayload(f: ArchiveFilters): ArchiveFilterPaylo
   }
 }
 
-export function buildArchiveListQuery(f: ArchiveFilters, offset = 0): Record<string, string | number | undefined> {
+export function buildArchiveListQuery(f: ArchiveFilters, offset = 0): Record<string, string | number | string[] | undefined> {
   return {
     ...buildArchiveFilterPayload(f),
     limit: Number(f.rows || 24),
@@ -99,7 +107,7 @@ export function buildArchiveListQuery(f: ArchiveFilters, offset = 0): Record<str
   }
 }
 
-export function buildArchiveSearchPayload(f: ArchiveFilters): Record<string, string | number | undefined> {
+export function buildArchiveSearchPayload(f: ArchiveFilters): Record<string, string | number | string[] | undefined> {
   return {
     ...buildArchiveFilterPayload(f),
     limit: Number(f.rows || 24),
