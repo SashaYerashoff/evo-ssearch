@@ -216,7 +216,13 @@ function SummaryCard({
   return (
     <article className={`vid-sum ${collapsed ? 'collapsed' : ''} ${entry.coverage_gap ? 'coverage-gap' : ''}`}>
       <div className="vid-sum-head">
-        <button className="vid-sum-toggle" onClick={onToggle} aria-expanded={!collapsed}>
+        <button
+          className="vid-sum-toggle"
+          onClick={onToggle}
+          aria-expanded={!collapsed}
+          aria-label={collapsed ? 'Expand summary' : 'Collapse summary'}
+          title={collapsed ? 'Expand summary' : 'Collapse summary'}
+        >
           {collapsed ? <IconChevronRight size={15} /> : <IconChevronDown size={15} />}
           <span className="vid-level">{level}</span>
           {semantic && (
@@ -245,10 +251,6 @@ function SummaryCard({
           ))}
         </button>
         <div className="vid-sum-actions">
-          <button className="btn compact" onClick={onToggle} aria-expanded={!collapsed}>
-            {collapsed ? <IconChevronDown size={13} /> : <IconChevronRight size={13} />}
-            {collapsed ? 'Expand' : 'Collapse'}
-          </button>
           <button className="btn compact" onClick={() => copySummary(entry)} disabled={!entry.summary}>
             <IconCopy size={13} /> Copy
           </button>
