@@ -2646,6 +2646,56 @@ class LuxriotCaptureDispatchTests(unittest.TestCase):
             self.assertEqual(dispatched[1]["thumbnails"], [f"frame-{index}" for index in range(12, 24)])
             self.assertEqual([frame["thumbnail"] for frame in session.frames], ["frame-24"])
 
+    def test_summary_deadline_dispatches_without_a_followup_capture_frame(self):
+        dispatched = []
+        completed = threading.Event()
+        with tempfile.TemporaryDirectory() as temp:
+            manager = build_manager(
+                Path(temp),
+                config_overrides={"LUXRIOT_VECTOR_SIGNALS_ENABLED": False},
+            )
+
+            def dispatch(batch, workload):
+                dispatched.append((batch, workload))
+                completed.set()
+                return {"queued": False, "accepted": True}
+
+            manager.set_summary_dispatcher(dispatch)
+            session = LuxriotCaptureSession(
+                manager,
+                channel_id=7,
+                batch_size=12,
+                prompt="Describe.",
+                run_id="run-deadline",
+                interval_override=1.0,
+            )
+            session.summary_max_window_sec = 0.05
+            session.summary_worker_thread.start()
+            try:
+                with session.lock:
+                    session._admit_summary_frame_locked(
+                        {
+                            "thumbnail": "only-frame",
+                            "captured_at": 100.0,
+                            "time_sec": 100.0,
+                            "width": 24,
+                            "height": 16,
+                        }
+                    )
+
+                self.assertTrue(completed.wait(timeout=1.5))
+                self.assertEqual(len(dispatched), 1)
+                self.assertEqual(
+                    [frame["thumbnail"] for frame in dispatched[0][0]["frames"]],
+                    ["only-frame"],
+                )
+                self.assertEqual(session.frames, [])
+            finally:
+                session.stop_event.set()
+                with session.summary_condition:
+                    session.summary_condition.notify_all()
+                session.summary_worker_thread.join(timeout=1.0)
+
     def test_capture_cv_apex_is_the_same_frame_sent_to_clip_vlm_and_archive(self):
         probe_calls = []
         vlm_frames = []

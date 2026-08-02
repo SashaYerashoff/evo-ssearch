@@ -72,6 +72,9 @@ def test_port_vlm_uses_stable_vision_backend_and_content_watchdog(tmp_path):
     source = MODULE_PATH.read_text(encoding="utf-8")
     assert "--mm-encoder-attn-backend FLASH_ATTN" in source
     assert "--mm-processor-cache-gb 0" in source
+    assert "--max-num-seqs 8" in source
+    assert "--enforce-eager" not in source
+    assert "ExecStartPost={app_dir}/.venv/bin/python {app_dir}/scripts/wait_openai_endpoint.py --timeout 240" in source
     assert "eva-vlm-vision-watchdog.timer" in source
     assert "OnFailure=eva-vlm-vision-recover.service" in source
 
@@ -91,6 +94,8 @@ def test_port_vlm_uses_stable_vision_backend_and_content_watchdog(tmp_path):
         "EVA_BACKUP_PASSWORD": "e" * 64,
     }
     values = installer.render_runtime_env(answers, {}, passwords)
+    assert values["EVOSSEARCH_LM_PROFILE_AGENT_MAX_INFLIGHT"] == "8"
+    assert values["EVOSSEARCH_LM_PROFILE_VLM_MAX_INFLIGHT"] == "8"
     assert values["EVOSSEARCH_LM_VISION_HEALTH_STATE_FILE"] == str(
         answers.data_root / "state" / "vlm-vision-health.json"
     )

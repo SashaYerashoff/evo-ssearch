@@ -173,7 +173,7 @@ thresholds, alert policy, live sampling, or the live routine context.
 |---|---|
 | `EVOSSEARCH_LM_PROFILES` | e.g. `agent,vlm` |
 | `EVOSSEARCH_LM_PROFILE_<ID>_*` | Per-profile base URL / model / timeout / kind `[FIELD]` |
-| `EVOSSEARCH_LM_MAX_INFLIGHT` (`1`) | Endpoint-scoped in-process admission capacity fallback; clamped to 1–64 and valid only with the required single Gunicorn worker. The port appliance writes `4` per agent/VLM profile to match its vLLM `--max-num-seqs 4` |
+| `EVOSSEARCH_LM_MAX_INFLIGHT` (`1`) | Endpoint-scoped in-process admission capacity fallback; clamped to 1–64 and valid only with the required single Gunicorn worker. The port appliance writes `8` per agent/VLM profile to match its vLLM `--max-num-seqs 8`; one protected lane remains reserved for interactive/alert work |
 | `EVOSSEARCH_LM_PROFILE_<ID>_MAX_INFLIGHT` | Per-profile admission override, falling back to `EVOSSEARCH_LM_MAX_INFLIGHT`; profiles sharing an endpoint use the smallest configured capacity |
 | Shared-endpoint protected lane | With capacity >1, EVA keeps one physical request slot free for interactive agent or fast-alert work. L0 and L1–L3 cannot borrow it; capacity-one backends remain serial and do not deadlock |
 | LM admission order | On a shared endpoint: interactive agent, realtime alert, live L0, then L1-L3/background rollup. Rollups do not own a protected slot; the port topology should still route them to the separate agent/CPU endpoint |

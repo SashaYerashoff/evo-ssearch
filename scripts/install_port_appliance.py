@@ -1429,13 +1429,13 @@ def render_runtime_env(
             "EVOSSEARCH_LM_PROFILE_AGENT_BASE_URL": answers.vlm_url,
             "EVOSSEARCH_LM_PROFILE_AGENT_MODEL": answers.vlm_model,
             "EVOSSEARCH_LM_PROFILE_AGENT_TIMEOUT": "600",
-            "EVOSSEARCH_LM_PROFILE_AGENT_MAX_INFLIGHT": "4",
+            "EVOSSEARCH_LM_PROFILE_AGENT_MAX_INFLIGHT": "8",
             "EVOSSEARCH_LM_PROFILE_VLM_KIND": "vlm",
             "EVOSSEARCH_LM_PROFILE_VLM_ENABLED": "true",
             "EVOSSEARCH_LM_PROFILE_VLM_BASE_URL": answers.vlm_url,
             "EVOSSEARCH_LM_PROFILE_VLM_MODEL": answers.vlm_model,
             "EVOSSEARCH_LM_PROFILE_VLM_TIMEOUT": "600",
-            "EVOSSEARCH_LM_PROFILE_VLM_MAX_INFLIGHT": "4",
+            "EVOSSEARCH_LM_PROFILE_VLM_MAX_INFLIGHT": "8",
             "EVOSSEARCH_LUXRIOT_ROLLUP_L3_DEEP_BASE_URL": answers.deep_url,
             "EVOSSEARCH_LUXRIOT_ROLLUP_L3_DEEP_MODEL": answers.deep_model,
             "EVOSSEARCH_LUXRIOT_ROLLUP_L3_DEEP_ENABLED": (
@@ -1548,7 +1548,9 @@ Environment=HF_HUB_OFFLINE=1
 Environment=TRANSFORMERS_OFFLINE=1
 Environment=VLLM_USE_FLASHINFER_SAMPLER=0
 Environment=PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
-ExecStart={vllm} serve {model} --served-model-name {DEFAULT_VLM_MODEL} --host 127.0.0.1 --port 1234 --max-model-len 32768 --gpu-memory-utilization 0.75 --max-num-seqs 4 --max-num-batched-tokens 4096 --kv-cache-dtype fp8 --enforce-eager --attention-backend TRITON_ATTN --mm-encoder-attn-backend FLASH_ATTN --mm-processor-cache-gb 0 --limit-mm-per-prompt.image 16 --limit-mm-per-prompt.video 0 --mm-processor-kwargs.max_pixels 100352 --enable-auto-tool-choice --tool-call-parser hermes
+EnvironmentFile={env_file}
+ExecStart={vllm} serve {model} --served-model-name {DEFAULT_VLM_MODEL} --host 127.0.0.1 --port 1234 --max-model-len 32768 --gpu-memory-utilization 0.75 --max-num-seqs 8 --max-num-batched-tokens 4096 --kv-cache-dtype fp8 --attention-backend TRITON_ATTN --mm-encoder-attn-backend FLASH_ATTN --mm-processor-cache-gb 0 --limit-mm-per-prompt.image 16 --limit-mm-per-prompt.video 0 --mm-processor-kwargs.max_pixels 100352 --enable-auto-tool-choice --tool-call-parser hermes
+ExecStartPost={app_dir}/.venv/bin/python {app_dir}/scripts/wait_openai_endpoint.py --timeout 240
 Restart=on-failure
 RestartSec=10
 TimeoutStartSec=300
@@ -1583,7 +1585,7 @@ PrivateTmp=true
 Description=Run EVA VLM vision watchdog every minute
 
 [Timer]
-OnBootSec=90s
+OnBootSec=120s
 OnUnitActiveSec=60s
 AccuracySec=5s
 Persistent=true

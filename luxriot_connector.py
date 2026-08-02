@@ -4556,13 +4556,35 @@ class LuxriotCaptureSession:
 
     def _summary_worker(self) -> None:
         while True:
+            deadline_tick = False
             with self.summary_condition:
                 while not self.summary_queue and not self.stop_event.is_set():
                     self.summary_condition.wait(timeout=0.5)
+                    if not self.summary_queue and not self.stop_event.is_set():
+                        # A sparse or temporarily disconnected stream may not
+                        # deliver another frame to call _summarize_if_ready().
+                        # The L0 maximum window is a wall-clock contract, so
+                        # wake it independently of capture arrivals.
+                        deadline_tick = True
+                        break
                 if not self.summary_queue and self.stop_event.is_set():
                     return
-                frames_copy, workload_class, metadata = self.summary_queue.pop(0)
-                self.summary_inflight = True
+                if deadline_tick:
+                    work_item = None
+                else:
+                    work_item = self.summary_queue.pop(0)
+                    self.summary_inflight = True
+            if work_item is None:
+                try:
+                    self._summarize_if_ready(size_trigger=False)
+                except Exception as exc:
+                    with self.summary_condition:
+                        self._record_summary_failure_locked(
+                            f"summary deadline scheduler failed: {exc}",
+                            increment_dropped_batch=False,
+                        )
+                continue
+            frames_copy, workload_class, metadata = work_item
             try:
                 self._dispatch_summary_frames(
                     frames_copy,
