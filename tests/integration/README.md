@@ -5,6 +5,12 @@ contract and asserts **structure** (tool calls + `tool_result` fields), not LLM
 prose. Golden/unit tests gate the build; this is acceptance — opt-in, never in
 the default suite so model variability can't flake CI.
 
+Each scenario starts in a fresh agent session. Intentional multi-turn workflows
+declare their setup turns in the scenario catalog, so results are not silently
+contaminated by earlier, unrelated tests. The checker fails on an SSE stream
+without `done`, dangling tool calls, tool/context-budget exhaustion, a scenario's
+tool-count ceiling, invalid tool order, or a missing trusted UI projection.
+
 ## Principle
 - **Don't disable the secure gates.** Use an **admin** account, but keep
   `EVOSSEARCH_SECURE_DEPLOYMENT_REQUIRED=true`, preview-only, and the
@@ -24,9 +30,10 @@ the default suite so model variability can't flake CI.
    EVA_LIVE_OPERATOR_PASSWORD='...' \
    .venv/bin/python scripts/bootstrap_live_smoke_operator.py --channel-id 112 --set-password
    ```
-4. For deterministic needle/contamination scenarios, **seed** known
-   summary/archive/probe fixtures first (a known prose-only event; a probe with
-   known archive frames; a planted searchable incident).
+4. For deterministic archive needle/calibration scenarios, seed the provided
+   archive/probe fixtures. The separate `summary_seed` tag is only for an
+   environment where a known prose-only summary fixture has also been loaded;
+   `seed_demo_fixtures.py` intentionally does not mutate summary history.
 
 ## Run
 ```bash
@@ -36,6 +43,7 @@ EVA_LIVE_CHANNEL_REF='Zenbook webcam' \
 EVA_LIVE_NEEDLE_QUERY='person lying on the ground at night' \
 EVA_LIVE_PROBE_NAME='smoke: thumbs up gesture' \
 EVA_LIVE_INCLUDE=seed \
+EVA_LIVE_REPORT_PATH=/tmp/eva-agent-core.json \
 .venv/bin/pytest -q tests/integration/test_live_agent.py -s
 ```
 - `EVA_LIVE_INCLUDE` lists prerequisite tags you've set up (`seed`, `non_admin`).
@@ -53,6 +61,12 @@ EVA_LIVE_INCLUDE=seed \
   (default: `the active video-description channel`, which relies on the agent to resolve it).
 - `EVA_LIVE_NEEDLE_QUERY` is the seeded archive-search query.
 - `EVA_LIVE_PROBE_NAME` is the seeded/configured probe used by the calibration scenario.
+- `EVA_LIVE_SCENARIOS` optionally runs a comma-separated subset by exact name.
+- `EVA_LIVE_REPORT_PATH` writes a comparison-friendly JSON report containing
+  outcome, latency, tool count/sequence, UI effects, warnings, and final answer.
+- `EVA_LIVE_TIMEOUT` is the per-turn HTTP/SSE timeout in seconds (default `300`).
+- `EVA_LIVE_INCIDENT_ID` supplies the existing incident used by the opt-in
+  `follow_incident_stays_preview_only` scenario.
 - `EVA_LIVE_CSRF_COOKIE` overrides the CSRF cookie name (default `eva_csrf`).
 - `EVA_LIVE_VERIFY_TLS=1` enables TLS verification. By default the smoke accepts
   the local self-signed dev certificate.
@@ -70,7 +84,10 @@ t2 = session.ask("did that apply?", session_id=t.session_id)     # must report a
 
 ## What is / isn't covered here
 - **Covered (live):** tool wiring, SSE streaming, auth/CSRF, the structural
-  contracts above, the preview/apply lifecycle, broad-channel chunking.
+  contracts above, isolated and explicit multi-turn sessions, overnight review,
+  recent-alert research, transition/dwell counting, trusted Archive UI effects,
+  the preview/apply lifecycle, broad-channel chunking, and opt-in incident/deploy
+  workflows.
 - **Not here (build-gating golden/unit):** calibration verdict math, negation
   rejection, provenance/`delivery_status`, transition debounce, the status
   digest — those are deterministic and live in the normal pytest suite.

@@ -16,6 +16,8 @@ from __future__ import annotations
 
 import json
 import re
+import time
+from collections import Counter
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -74,6 +76,7 @@ class Transcript:
     """Structured view over one agent turn's SSE events (assert on this, not prose)."""
 
     events: List[Dict[str, Any]] = field(default_factory=list)
+    elapsed_seconds: float = 0.0
 
     @property
     def tool_calls(self) -> List[Tuple[str, Dict[str, Any]]]:
@@ -108,6 +111,66 @@ class Transcript:
     def errored(self) -> bool:
         return any(e.get("type") == "error" for e in self.events)
 
+    @property
+    def finished(self) -> bool:
+        return any(e.get("type") == "done" for e in self.events)
+
+    @property
+    def tool_call_count(self) -> int:
+        return sum(1 for event in self.events if event.get("type") == "tool_call")
+
+    @property
+    def ui_effects(self) -> List[Dict[str, Any]]:
+        effects: List[Dict[str, Any]] = []
+        for event in self.events:
+            if event.get("type") != "tool_result":
+                continue
+            for effect in event.get("ui_effects") or []:
+                if isinstance(effect, dict):
+                    effects.append(dict(effect))
+        return effects
+
+    @property
+    def budget_stops(self) -> List[Dict[str, Any]]:
+        stops: List[Dict[str, Any]] = []
+        for event in self.events:
+            if event.get("type") == "tool_budget":
+                stops.append(dict(event))
+            elif event.get("type") == "context_budget" and event.get("status") == "hard_stop":
+                stops.append(dict(event))
+        return stops
+
+    @property
+    def dangling_tool_calls(self) -> List[str]:
+        """Return calls that never received a matching tool_result event."""
+
+        call_ids = [
+            str(event.get("call_id"))
+            for event in self.events
+            if event.get("type") == "tool_call" and event.get("call_id")
+        ]
+        result_ids = {
+            str(event.get("call_id"))
+            for event in self.events
+            if event.get("type") == "tool_result" and event.get("call_id")
+        }
+        dangling = [call_id for call_id in call_ids if call_id not in result_ids]
+
+        # Recorded/legacy fixtures may omit call_id. Match those by tool name.
+        calls_without_ids = Counter(
+            str(event.get("name") or "")
+            for event in self.events
+            if event.get("type") == "tool_call" and not event.get("call_id")
+        )
+        results_without_ids = Counter(
+            str(event.get("name") or "")
+            for event in self.events
+            if event.get("type") == "tool_result" and not event.get("call_id")
+        )
+        for name, count in calls_without_ids.items():
+            dangling.extend([name] * max(0, count - results_without_ids[name]))
+        return dangling
+
     def called(self, name: str) -> bool:
         return any(n == name for n, _ in self.tool_calls)
 
@@ -137,6 +200,30 @@ class Transcript:
 
     def prose_has(self, pattern: str) -> bool:
         return re.search(pattern, self.text, flags=re.IGNORECASE) is not None
+
+
+def combine_transcripts(transcripts: List[Transcript]) -> Transcript:
+    """Combine an explicit multi-turn scenario without mixing setup prose.
+
+    Tool and budget events from setup turns remain observable, while prose and
+    terminal events come only from the final turn. This lets checks cover an
+    intentional workflow without warnings matching a clarification in turn one.
+    """
+
+    if not transcripts:
+        return Transcript()
+    events: List[Dict[str, Any]] = []
+    for transcript in transcripts[:-1]:
+        events.extend(
+            event
+            for event in transcript.events
+            if event.get("type") not in {"text", "session", "done"}
+        )
+    events.extend(transcripts[-1].events)
+    return Transcript(
+        events=events,
+        elapsed_seconds=sum(item.elapsed_seconds for item in transcripts),
+    )
 
 
 class EvaSession:
@@ -208,6 +295,7 @@ class EvaSession:
             body["session_id"] = session_id
         if image_b64:
             body["image_b64"] = image_b64
+        started = time.monotonic()
         resp = self.http.post(
             f"{self.base_url}/agent/chat",
             json=body,
@@ -216,7 +304,10 @@ class EvaSession:
             timeout=self.timeout,
         )
         resp.raise_for_status()
-        return Transcript(events=parse_sse_events(resp.iter_lines()))
+        return Transcript(
+            events=parse_sse_events(resp.iter_lines()),
+            elapsed_seconds=time.monotonic() - started,
+        )
 
     def apply_plan(self, plan_id: str, session_id: Optional[str] = None) -> Dict[str, Any]:
         """Simulate the UI 'Apply' button: commit a previewed action plan."""

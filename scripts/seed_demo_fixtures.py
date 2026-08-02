@@ -12,10 +12,12 @@ without restart):
 It does NOT seed summary history (that is in-memory, loaded at startup → would
 need a restart). The prose-only / contamination behavior stays a golden test.
 
-Idempotent: stable dedupe_keys, so re-running does not duplicate. Use --dry-run
-to preview without writing. Verify the imports below match this deployment
-before running (this script was authored against archive_store.add_detections's
-record contract and the app's text embedder).
+Idempotent within a UTC day: daily dedupe_keys keep the fixture inside a rolling
+24-hour scenario instead of silently aging out, while repeated runs on the same
+day do not duplicate. Use --dry-run to preview without writing. Verify the
+imports below match this deployment before running (this script was authored
+against archive_store.add_detections's record contract and the app's text
+embedder).
 
 Prints the env the live smoke expects:
     EVA_LIVE_CHANNEL_REF, EVA_LIVE_NEEDLE_QUERY, EVA_LIVE_PROBE_NAME
@@ -25,6 +27,7 @@ from __future__ import annotations
 import argparse
 import sys
 import warnings
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List
 
@@ -59,12 +62,15 @@ def _vec(embed_text, caption: str) -> List[float]:
 
 def _records(channel_id: int, embed_text) -> List[Dict[str, Any]]:
     base_ts = _now_ms() - 30 * 60 * 1000  # 30 min ago, inside typical windows
+    # Keep repeat runs idempotent for the current UTC day while ensuring an old
+    # seed does not silently age out of a "last 24 hours" acceptance scenario.
+    seed_run = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     needle_vec = _vec(embed_text, NEEDLE_CAPTION)
     pos_vec = _vec(embed_text, PROBE_POSITIVE)
     neg_vec = _vec(embed_text, PROBE_NEGATIVE)
     out: List[Dict[str, Any]] = [
         {
-            "dedupe_key": f"{SEED_TAG}:needle:{channel_id}",
+            "dedupe_key": f"{SEED_TAG}:{seed_run}:needle:{channel_id}",
             "timestamp_ms": base_ts,
             "probe_id": f"{SEED_TAG}:needle",
             "probe_name": "smoke needle",
@@ -78,7 +84,7 @@ def _records(channel_id: int, embed_text) -> List[Dict[str, Any]]:
     # a few positive + negative frames so calibration has a separable-ish set
     for i in range(4):
         out.append({
-            "dedupe_key": f"{SEED_TAG}:pos:{channel_id}:{i}",
+            "dedupe_key": f"{SEED_TAG}:{seed_run}:pos:{channel_id}:{i}",
             "timestamp_ms": base_ts + i * 1000,
             "probe_id": f"{SEED_TAG}:probe",
             "probe_name": PROBE_NAME,
@@ -90,7 +96,7 @@ def _records(channel_id: int, embed_text) -> List[Dict[str, Any]]:
         })
     for i in range(8):
         out.append({
-            "dedupe_key": f"{SEED_TAG}:neg:{channel_id}:{i}",
+            "dedupe_key": f"{SEED_TAG}:{seed_run}:neg:{channel_id}:{i}",
             "timestamp_ms": base_ts + 100 + i * 1000,
             "probe_id": f"{SEED_TAG}:probe",
             "probe_name": PROBE_NAME,
