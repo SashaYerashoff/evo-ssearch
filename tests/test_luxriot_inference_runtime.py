@@ -4169,6 +4169,81 @@ class LuxriotCaptureDispatchTests(unittest.TestCase):
             self.assertIn("evo down", result.last_error)
             self.assertIn("Luxriot bookmark send failed", "\n".join(logs.output))
 
+    def test_process_summary_alerts_records_exact_bookmark_delivery_timing(self):
+        with tempfile.TemporaryDirectory() as temp:
+            manager = build_manager(
+                Path(temp),
+                alert_parser=lambda *_args, **_kwargs: [
+                    {
+                        "title": "Collision risk",
+                        "description": "Two vessels are converging",
+                        "severity": "high",
+                    }
+                ],
+            )
+            manager.default_bookmark_enabled = True
+
+            with patch.object(manager, "send_bookmark_event", return_value={"success": True}):
+                result = manager.process_summary_alerts(
+                    7,
+                    "Batch summary\nALERTS_JSON:\n{\"alerts\":[]}",
+                    default_ts_ms=int(time.time() * 1000.0) - 50,
+                )
+
+            self.assertEqual(int(result), 1)
+            event = result.alert_events[0]
+            self.assertGreaterEqual(event["bookmark_ack_at_ms"], event["bookmark_attempted_at_ms"])
+            self.assertEqual(
+                event["bookmark_delivery_ms"],
+                event["bookmark_ack_at_ms"] - event["bookmark_attempted_at_ms"],
+            )
+            self.assertGreaterEqual(event["event_to_bookmark_ack_ms"], 0)
+            result_payload = result.as_dict()
+            self.assertEqual(
+                result_payload["bookmark_first_ack_at_ms"],
+                event["bookmark_ack_at_ms"],
+            )
+
+    def test_summary_batch_preserves_capture_queue_and_inference_latency_trace(self):
+        with tempfile.TemporaryDirectory() as temp:
+            manager = build_manager(
+                Path(temp),
+                lm_callback=lambda _messages, _model: "summary",
+            )
+            batch = manager.create_summary_batch(
+                channel_id=7,
+                run_id="run-7",
+                batch_size=2,
+                prompt="Describe activity.",
+                model_hint=None,
+                interval_sec=1.0,
+                frames=[
+                    {"captured_at": 100.0, "thumbnail": "ZmFrZQ=="},
+                    {"captured_at": 101.0, "thumbnail": "ZmFrZQ=="},
+                ],
+            )
+            batch["latency_trace"] = {
+                "batch_sealed_at_ms": 101_100,
+                "summary_enqueued_at_ms": 101_200,
+                "summary_dispatch_started_at_ms": 101_300,
+            }
+
+            entry = manager.run_summary_batch(batch)
+            normalized = manager._normalize_summary_log_entry(entry)
+
+            self.assertIsNotNone(normalized)
+            trace = normalized["latency_trace"]
+            self.assertEqual(trace["batch_first_frame_at_ms"], 100_000)
+            self.assertEqual(trace["batch_last_frame_at_ms"], 101_000)
+            self.assertEqual(trace["batch_sealed_at_ms"], 101_100)
+            self.assertEqual(trace["summary_enqueued_at_ms"], 101_200)
+            self.assertEqual(trace["summary_dispatch_started_at_ms"], 101_300)
+            self.assertGreaterEqual(trace["inference_completed_at_ms"], trace["inference_started_at_ms"])
+            self.assertEqual(
+                trace["inference_ms"],
+                trace["inference_completed_at_ms"] - trace["inference_started_at_ms"],
+            )
+
     def test_bookmark_delivery_deduplicates_normalized_title_and_severity(self):
         with tempfile.TemporaryDirectory() as temp:
             current = {"title": "Vehicle   burnout", "severity": "WARNING"}
@@ -4339,6 +4414,58 @@ class LuxriotCaptureDispatchTests(unittest.TestCase):
             self.assertEqual(third, 1)
             self.assertEqual(fourth, 1)
             self.assertEqual([item["severity"] for item in sent], ["info", "high", "high"])
+
+    def test_full_l0_suppresses_only_identical_recent_fast_phase_alert(self):
+        with tempfile.TemporaryDirectory() as temp:
+            current = {"title": "Collision risk"}
+
+            def parse_alerts(_text, _channel_id, _default_ts_ms=None):
+                return [
+                    {
+                        "title": current["title"],
+                        "description": "Visible converging trajectories",
+                        "severity": "high",
+                    }
+                ]
+
+            manager = build_manager(
+                Path(temp),
+                alert_parser=parse_alerts,
+                config_overrides={"VLM_FAST_ALERT_DEDUPE_WINDOW_SEC": 12.0},
+            )
+            manager.default_bookmark_enabled = True
+            sent = []
+            with patch.object(
+                manager,
+                "send_bookmark_event",
+                side_effect=lambda **kwargs: sent.append(kwargs) or {"success": True},
+            ):
+                fast = manager.process_summary_alerts(
+                    7,
+                    "Batch summary\nALERTS_JSON:\n{\"alerts\":[]}",
+                    default_ts_ms=1_781_700_000_000,
+                    delivery_lane="fast_alert",
+                )
+                repeated_full = manager.process_summary_alerts(
+                    7,
+                    "Batch summary\nALERTS_JSON:\n{\"alerts\":[]}",
+                    default_ts_ms=1_781_700_001_000,
+                )
+                current["title"] = "Person collapsed"
+                distinct_full = manager.process_summary_alerts(
+                    7,
+                    "Batch summary\nALERTS_JSON:\n{\"alerts\":[]}",
+                    default_ts_ms=1_781_700_002_000,
+                )
+
+            self.assertEqual(int(fast), 1)
+            self.assertEqual(int(repeated_full), 0)
+            self.assertEqual(
+                repeated_full.alert_events[0]["delivery_status"],
+                "fast_phase_duplicate",
+            )
+            self.assertEqual(int(distinct_full), 1)
+            self.assertEqual(len(sent), 2)
 
     def test_rollup_source_selection_preserves_salient_children_under_budget(self):
         with tempfile.TemporaryDirectory() as temp:

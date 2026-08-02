@@ -68,6 +68,35 @@ def test_port_profile_has_bounded_queue_and_context():
     assert installer.PORT_ENV["EVOSSEARCH_LM_VIDEO_REPETITION_PENALTY"] == "1.08"
 
 
+def test_port_vlm_uses_stable_vision_backend_and_content_watchdog(tmp_path):
+    source = MODULE_PATH.read_text(encoding="utf-8")
+    assert "--mm-encoder-attn-backend FLASH_ATTN" in source
+    assert "--mm-processor-cache-gb 0" in source
+    assert "eva-vlm-vision-watchdog.timer" in source
+    assert "OnFailure=eva-vlm-vision-recover.service" in source
+
+    answers = installer.Answers(
+        install_root=tmp_path / "opt",
+        data_root=tmp_path / "data",
+        config_root=tmp_path / "etc",
+        evo_url="http://evo.local",
+        evo_username="operator",
+        evo_password="secret",
+    )
+    passwords = {
+        "EVA_MIGRATOR_PASSWORD": "a" * 64,
+        "EVA_API_PASSWORD": "b" * 64,
+        "EVA_AUDIT_PASSWORD": "c" * 64,
+        "EVA_WORKER_PASSWORD": "d" * 64,
+        "EVA_BACKUP_PASSWORD": "e" * 64,
+    }
+    values = installer.render_runtime_env(answers, {}, passwords)
+    assert values["EVOSSEARCH_LM_VISION_HEALTH_STATE_FILE"] == str(
+        answers.data_root / "state" / "vlm-vision-health.json"
+    )
+    assert values["EVOSSEARCH_LM_VISION_HEALTH_MAX_AGE_SEC"] == "180"
+
+
 def test_vision_smoke_png_and_response_contract():
     png = installer._vision_smoke_png()
     assert png.startswith(b"\x89PNG\r\n\x1a\n")

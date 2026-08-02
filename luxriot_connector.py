@@ -467,6 +467,7 @@ SummaryArchiveBucketLoaderFn = Callable[[int, float, float, int], List[Dict[str,
 OperatorFeedbackReportLoaderFn = Callable[[int, float, float, int], Mapping[str, Any]]
 AlertProbeCallbackFn = Callable[[int, Sequence[Mapping[str, Any]]], Optional[Mapping[str, Any]]]
 AttentionEventCallbackFn = Callable[[str, Mapping[str, Any]], None]
+ProbeEmbeddingCallbackFn = Callable[[int, Mapping[str, Any]], None]
 
 
 class AlertDeliveryResult(int):
@@ -527,6 +528,15 @@ class AlertDeliveryResult(int):
                 error = _safe_error_text(raw_event.get("error"), 240)
                 if error:
                     event["error"] = error
+                for timing_key in (
+                    "bookmark_attempted_at_ms",
+                    "bookmark_ack_at_ms",
+                    "bookmark_delivery_ms",
+                    "event_to_bookmark_ack_ms",
+                ):
+                    timing_value = _parse_optional_int(raw_event.get(timing_key))
+                    if timing_value is not None and timing_value >= 0:
+                        event[timing_key] = int(timing_value)
                 snapshot_indices = [
                     int(snapshot_index)
                     for snapshot_index in (
@@ -543,7 +553,7 @@ class AlertDeliveryResult(int):
         return obj
 
     def as_dict(self) -> Dict[str, Any]:
-        return {
+        result = {
             "alerts_detected": self.alerts_detected,
             "alerts_parsed": self.parsed,
             "parser_alert_count": self.parsed,
@@ -557,6 +567,21 @@ class AlertDeliveryResult(int):
             "alert_parser_error": self.parser_error,
             "alert_events": list(self.alert_events),
         }
+        attempted = [
+            int(event["bookmark_attempted_at_ms"])
+            for event in self.alert_events
+            if _parse_optional_int(event.get("bookmark_attempted_at_ms")) is not None
+        ]
+        acknowledged = [
+            int(event["bookmark_ack_at_ms"])
+            for event in self.alert_events
+            if _parse_optional_int(event.get("bookmark_ack_at_ms")) is not None
+        ]
+        if attempted:
+            result["bookmark_first_attempt_at_ms"] = min(attempted)
+        if acknowledged:
+            result["bookmark_first_ack_at_ms"] = min(acknowledged)
+        return result
 
 
 def _parse_optional_int(value: object) -> Optional[int]:
@@ -2961,6 +2986,25 @@ class LuxriotCaptureSession:
                 ],
             },
         )
+        if embedding is not None and self.manager.probe_embedding_callback is not None:
+            try:
+                callback_payload = dict(embedding)
+                if isinstance(frame.get("capture_selection"), Mapping):
+                    callback_payload["capture_selection"] = dict(
+                        frame.get("capture_selection") or {}
+                    )
+                if isinstance(frame.get("motion_aggregate"), Mapping):
+                    callback_payload["motion_aggregate"] = dict(
+                        frame.get("motion_aggregate") or {}
+                    )
+                self.manager.probe_embedding_callback(
+                    int(self.channel_id),
+                    callback_payload,
+                )
+            except Exception:
+                # Realtime probe alerting is an optional side branch. It must
+                # never turn a successfully embedded apex into a capture error.
+                pass
 
     def _admit_embedding_completed_frame(
         self,
@@ -3829,6 +3873,8 @@ class LuxriotCaptureSession:
         if not frame_items:
             return True
         job_meta = dict(metadata or {})
+        dispatch_started_at_ms = int(time.time() * 1000.0)
+        job_meta.setdefault("summary_dispatch_started_at_ms", dispatch_started_at_ms)
         try:
             batch = self.manager.create_summary_batch(
                 channel_id=self.channel_id,
@@ -3858,6 +3904,18 @@ class LuxriotCaptureSession:
             ):
                 if key in job_meta:
                     batch[key] = copy.deepcopy(job_meta[key])
+            latency_trace = {
+                key: int(value)
+                for key in (
+                    "batch_sealed_at_ms",
+                    "summary_enqueued_at_ms",
+                    "summary_dispatch_started_at_ms",
+                )
+                if (value := _parse_optional_int(job_meta.get(key))) is not None
+                and value >= 0
+            }
+            if latency_trace:
+                batch["latency_trace"] = latency_trace
             batch["source_frame_count"] = max(
                 len(frame_items),
                 int(
@@ -3972,6 +4030,9 @@ class LuxriotCaptureSession:
             frames_copy
         )
         metadata = self._summary_job_metadata()
+        sealed_at_ms = int(time.time() * 1000.0)
+        metadata["batch_sealed_at_ms"] = sealed_at_ms
+        metadata["summary_enqueued_at_ms"] = sealed_at_ms
         metadata["source_frame_count"] = int(source_frame_count)
         if omitted_frames > 0:
             metadata["coalesced"] = {
@@ -4208,6 +4269,8 @@ class LuxriotCaptureSession:
                 else None
             )
             metadata = self._summary_job_metadata()
+            sealed_at_ms = int(time.time() * 1000.0)
+            metadata["batch_sealed_at_ms"] = sealed_at_ms
             (
                 frames_copy,
                 source_frame_count,
@@ -4242,6 +4305,7 @@ class LuxriotCaptureSession:
                     )
                     gap_batches.append(dropped_frames)
                 self.summary_queue.append((frames_copy, str(workload_class or "heartbeat"), metadata))
+                metadata["summary_enqueued_at_ms"] = int(time.time() * 1000.0)
                 self.summary_condition.notify_all()
                 queued = True
         for dropped_frames in gap_batches:
@@ -4251,6 +4315,7 @@ class LuxriotCaptureSession:
             )
         if queued:
             return True
+        metadata["summary_enqueued_at_ms"] = int(time.time() * 1000.0)
         return self._dispatch_summary_frames(
             frames_copy,
             workload_class=workload_class,
@@ -4310,6 +4375,7 @@ class LuxriotCaptureSession:
             episode_payload = json.loads(episode.printable())
             decision_payload = json.loads(job.decision.printable())
             metadata = self._summary_job_metadata()
+            sealed_at_ms = int(time.time() * 1000.0)
             metadata.update(
                 {
                     "batch_size": len(frames_copy),
@@ -4318,6 +4384,7 @@ class LuxriotCaptureSession:
                     "attention_episode": episode_payload,
                     "attention_decision": decision_payload,
                     "attention_phase": str(getattr(job, "phase", "") or ""),
+                    "batch_sealed_at_ms": sealed_at_ms,
                 }
             )
             workload_class = (
@@ -4327,10 +4394,12 @@ class LuxriotCaptureSession:
                 else "heartbeat"
             )
             if self.summary_worker_thread.is_alive():
+                metadata["summary_enqueued_at_ms"] = int(time.time() * 1000.0)
                 self.summary_queue.append((frames_copy, workload_class, metadata))
                 self.summary_condition.notify_all()
                 queued = True
             else:
+                metadata["summary_enqueued_at_ms"] = int(time.time() * 1000.0)
                 queued = False
 
         start_ms = (
@@ -4918,6 +4987,7 @@ class LuxriotManager:
     ) -> None:
         self.config = config
         self.lm_callback = lm_callback
+        self.rollup_lm_callback: Optional[Callable[..., str]] = None
         self.message_builder = message_builder
         self.jpeg_encoder = jpeg_encoder
         self.alert_parser = alert_parser
@@ -4935,6 +5005,7 @@ class LuxriotManager:
         self.operator_feedback_report_loader: Optional[OperatorFeedbackReportLoaderFn] = None
         self.alert_probe_callback: Optional[AlertProbeCallbackFn] = None
         self.attention_event_callback: Optional[AttentionEventCallbackFn] = None
+        self.probe_embedding_callback: Optional[ProbeEmbeddingCallbackFn] = None
         self.system_prompt = getattr(config, "LUXRIOT_SYSTEM_PROMPT_DEFAULT", "")
         self.alert_policy_prompt = str(getattr(config, "LUXRIOT_ALERT_POLICY_PROMPT", "") or "")
         self.local_video_registry = LocalVideoSourceRegistry(
@@ -5069,6 +5140,7 @@ class LuxriotManager:
         self.live_session_restore_errors: Dict[int, str] = {}
         self.channel_bookmark_fingerprints: Dict[int, Dict[str, int]] = {}
         self.channel_bookmark_content_keys: Dict[int, Dict[str, int]] = {}
+        self.channel_fast_alert_content_keys: Dict[int, Dict[str, int]] = {}
         self.default_bookmark_enabled = bool(getattr(config, "LUXRIOT_AUTO_BOOKMARKS", False))
         try:
             cooldown_value = float(getattr(config, "LUXRIOT_BOOKMARK_COOLDOWN_SEC", 60.0))
@@ -5972,7 +6044,7 @@ class LuxriotManager:
             and self.rollup_l3_deep_enabled
         ):
             return self._call_l3_deep_review
-        return self.lm_callback
+        return self.rollup_lm_callback or self.lm_callback
 
     def _call_l3_deep_review(
         self,
@@ -6745,6 +6817,14 @@ class LuxriotManager:
         callback: Optional[AttentionEventCallbackFn],
     ) -> None:
         self.attention_event_callback = callback
+
+    def set_probe_embedding_callback(
+        self,
+        callback: Optional[ProbeEmbeddingCallbackFn],
+    ) -> None:
+        """Observe each completed 1 Hz semantic apex without gating L0."""
+
+        self.probe_embedding_callback = callback
 
     def start_incident_focus(
         self,
@@ -9097,6 +9177,15 @@ class LuxriotManager:
             error = str(raw_event.get("error") or "").strip()
             if error:
                 event["error"] = error[:240]
+            for timing_key in (
+                "bookmark_attempted_at_ms",
+                "bookmark_ack_at_ms",
+                "bookmark_delivery_ms",
+                "event_to_bookmark_ack_ms",
+            ):
+                timing_value = _parse_optional_int(raw_event.get(timing_key))
+                if timing_value is not None and timing_value >= 0:
+                    event[timing_key] = int(timing_value)
             snapshot_indices = [
                 int(snapshot_index)
                 for snapshot_index in (
@@ -12366,6 +12455,30 @@ class LuxriotManager:
             "signal_digest": signal_digest,
             **alert_meta,
         }
+        raw_latency_trace = entry.get("latency_trace")
+        if isinstance(raw_latency_trace, Mapping):
+            latency_trace: Dict[str, int] = {}
+            for latency_key in (
+                "batch_first_frame_at_ms",
+                "batch_last_frame_at_ms",
+                "batch_sealed_at_ms",
+                "summary_enqueued_at_ms",
+                "summary_dispatch_started_at_ms",
+                "inference_started_at_ms",
+                "inference_completed_at_ms",
+                "inference_ms",
+                "alert_processing_started_at_ms",
+                "alert_processing_completed_at_ms",
+                "alert_processing_ms",
+                "bookmark_first_attempt_at_ms",
+                "bookmark_first_ack_at_ms",
+                "batch_end_to_bookmark_ack_ms",
+            ):
+                latency_value = _parse_optional_int(raw_latency_trace.get(latency_key))
+                if latency_value is not None and latency_value >= 0:
+                    latency_trace[latency_key] = int(latency_value)
+            if latency_trace:
+                normalized["latency_trace"] = latency_trace
         for field in (
             "archive_attempted",
             "archive_inserted",
@@ -13573,6 +13686,61 @@ class LuxriotManager:
         return None
 
     @staticmethod
+    def _extract_terminal_batch_state_fence(
+        text: object,
+    ) -> Optional[Tuple[Mapping[str, Any], int]]:
+        """Recover a markerless terminal BATCH_STATE_JSON object from a fence.
+
+        Small VLMs occasionally preserve the complete schema but omit only the
+        marker immediately before it.  Accepting arbitrary JSON from prose
+        would be unsafe, so this fallback requires the final fenced block and
+        the distinctive complete batch-state key set.
+        """
+
+        raw = str(text or "")
+        matches = list(
+            re.finditer(
+                r"```(?:json)?\s*(?P<body>.*?)\s*```",
+                raw,
+                flags=re.IGNORECASE | re.DOTALL,
+            )
+        )
+        if not matches:
+            return None
+        match = matches[-1]
+        if raw[match.end() :].strip():
+            return None
+        try:
+            payload = json.loads(match.group("body"))
+        except Exception:
+            return None
+        if not isinstance(payload, Mapping):
+            return None
+        required_keys = {
+            "version",
+            "cover",
+            "events",
+            "observed_states",
+            "routines",
+            "memory_pass",
+            "alerts",
+        }
+        if not required_keys.issubset(payload.keys()):
+            return None
+        if _parse_optional_int(payload.get("version")) != 1:
+            return None
+        if not isinstance(payload.get("cover"), Mapping):
+            return None
+        for key in ("events", "observed_states", "routines", "memory_pass", "alerts"):
+            value = payload.get(key)
+            if not isinstance(value, Sequence) or isinstance(
+                value,
+                (str, bytes, bytearray),
+            ):
+                return None
+        return cast(Mapping[str, Any], payload), int(match.start())
+
+    @staticmethod
     def _normalize_snapshot_indices(value: object, max_snapshot_index: int) -> List[int]:
         if not isinstance(value, Sequence) or isinstance(value, (str, bytes, bytearray)):
             value = [value] if value is not None else []
@@ -13700,10 +13868,19 @@ class LuxriotManager:
             summary_raw,
             flags=re.IGNORECASE,
         )
+        terminal_fence = (
+            cls._extract_terminal_batch_state_fence(summary_raw)
+            if marker_match is None
+            else None
+        )
         summary_prose = (
             summary_raw[: marker_match.start()]
             if marker_match is not None
-            else summary_raw
+            else (
+                summary_raw[: terminal_fence[1]]
+                if terminal_fence is not None
+                else summary_raw
+            )
         )
         catalogue = cls._model_snapshot_catalogue(frames)
         max_snapshot_index = max(catalogue.keys(), default=max(1, len(frames)))
@@ -13711,7 +13888,17 @@ class LuxriotManager:
             summary_raw,
             "BATCH_STATE_JSON:",
         )
-        contract_status = "parsed" if isinstance(raw, Mapping) else "missing_fallback"
+        if raw is None and terminal_fence is not None:
+            raw = terminal_fence[0]
+        contract_status = (
+            "parsed"
+            if marker_match is not None and isinstance(raw, Mapping)
+            else (
+                "parsed_terminal_fence"
+                if isinstance(raw, Mapping)
+                else "missing_fallback"
+            )
+        )
         payload = dict(raw or {})
 
         cover_raw = payload.get("cover")
@@ -13915,6 +14102,20 @@ class LuxriotManager:
         """Return a tiny deterministic English stem for alert-policy matching."""
 
         value = str(token or "").strip().lower()
+        posture_aliases = {
+            "move": "move",
+            "moved": "move",
+            "movement": "move",
+            "movements": "move",
+            "moves": "move",
+            "moving": "move",
+            "seated": "sit",
+            "seating": "sit",
+            "sits": "sit",
+            "sitting": "sit",
+        }
+        if value in posture_aliases:
+            return posture_aliases[value]
         if len(value) > 5 and value.endswith("ing"):
             value = value[:-3]
             if len(value) > 3 and value[-1:] == value[-2:-1]:
@@ -13932,7 +14133,15 @@ class LuxriotManager:
     @classmethod
     def _alert_policy_match_tokens(cls, value: object) -> Set[str]:
         tokens: Set[str] = set()
-        for raw_token in re.findall(r"[a-z0-9]+", str(value or "").casefold()):
+        match_text = re.sub(
+            r"\b(?:alert\s+)?(?:severity|level)\s*(?:is|=|:|-)?\s*"
+            r"(?:critical|emergency|high|danger|normal|moderate|medium|low|"
+            r"warning|warn|info|informational|information)\b",
+            " ",
+            str(value or "").casefold(),
+            flags=re.IGNORECASE,
+        )
+        for raw_token in re.findall(r"[a-z0-9]+", match_text):
             token = cls._alert_policy_match_stem(raw_token)
             if (
                 len(token) < 2
@@ -14020,6 +14229,15 @@ class LuxriotManager:
         policy_text: object,
         criterion: object,
     ) -> str:
+        inline_severity = re.search(
+            r"\b(?:alert\s+)?(?:severity|level)\s*(?:is|=|:|-)?\s*"
+            r"(?P<severity>critical|emergency|high|danger|normal|moderate|medium|low|"
+            r"warning|warn|info|informational|information)\b",
+            str(criterion or ""),
+            flags=re.IGNORECASE,
+        )
+        if inline_severity is not None:
+            return cls._normalize_alert_severity(inline_severity.group("severity"))
         criterion_tokens = cls._alert_policy_match_tokens(criterion)
         best_overlap = 0
         best_severity = "low"
@@ -14060,17 +14278,28 @@ class LuxriotManager:
         }:
             return None
         criterion_tokens = cls._alert_policy_match_tokens(criterion)
-        evidence_tokens = cls._alert_policy_match_tokens(
-            f"{event.get('label') or ''} {event.get('summary') or ''}"
-        )
+        evidence_text = f"{event.get('label') or ''} {event.get('summary') or ''}"
+        evidence_tokens = cls._alert_policy_match_tokens(evidence_text)
         if len(criterion_tokens) < 2 or not evidence_tokens:
             return None
         overlap = criterion_tokens & evidence_tokens
         if len(overlap) < 2:
             return None
         criterion_actions = criterion_tokens & _ALERT_POLICY_ACTION_STEMS
-        if criterion_actions and not (criterion_actions & evidence_tokens):
-            return None
+        if criterion_actions:
+            positive_actions: Set[str] = set()
+            for clause in re.split(r"[.;!?]|\bbut\b|\bhowever\b", evidence_text.casefold()):
+                raw_tokens = re.findall(r"[a-z0-9]+", clause)
+                stems = [cls._alert_policy_match_stem(token) for token in raw_tokens]
+                for index, stem in enumerate(stems):
+                    if stem not in criterion_actions:
+                        continue
+                    preceding = set(stems[max(0, index - 4) : index])
+                    if preceding & {"no", "not", "never", "without", "neither"}:
+                        continue
+                    positive_actions.add(stem)
+            if not (criterion_actions & positive_actions):
+                return None
         score = len(overlap) / max(1, len(criterion_tokens))
         threshold = 2.0 / 3.0 if len(criterion_tokens) <= 3 else 0.6
         return float(score) if score >= threshold else None
@@ -14088,9 +14317,13 @@ class LuxriotManager:
             text,
             flags=re.IGNORECASE,
         )
-        if marker is None:
-            return text
-        narrative = text[: marker.start()].rstrip()
+        if marker is not None:
+            narrative = text[: marker.start()].rstrip()
+        else:
+            terminal_fence = LuxriotManager._extract_terminal_batch_state_fence(text)
+            if terminal_fence is None:
+                return text
+            narrative = text[: terminal_fence[1]].rstrip()
         narrative = re.sub(
             r"```(?:json)?\s*$",
             "",
@@ -14128,11 +14361,12 @@ class LuxriotManager:
         summary_text: object,
         batch_state: Mapping[str, Any],
     ) -> Tuple[str, Dict[str, Any]]:
-        """Recover an omitted explicit operator alert from grounded L0 events.
+        """Recover an omitted explicit operator alert from grounded L0 state.
 
         The fallback cannot infer from prose, memory, CLIP, or homeostasis.  It
-        requires a model-produced current event with snapshot references and a
-        strong lexical match to an imperative operator criterion.
+        requires a model-produced current event or validated present-state with
+        snapshot references and a strong lexical match to an imperative
+        operator criterion.
         """
 
         state = copy.deepcopy(dict(batch_state))
@@ -14142,13 +14376,46 @@ class LuxriotManager:
             (str, bytes, bytearray),
         ) and existing_alerts:
             return str(summary_text or ""), state
-        if str(state.get("contract_status") or "") != "parsed":
+        if str(state.get("contract_status") or "") not in {
+            "parsed",
+            "parsed_terminal_fence",
+        }:
             return str(summary_text or ""), state
+        candidates: List[Tuple[str, Mapping[str, Any]]] = []
         events = state.get("events")
-        if not isinstance(events, Sequence) or isinstance(
+        if isinstance(events, Sequence) and not isinstance(
             events,
             (str, bytes, bytearray),
         ):
+            candidates.extend(
+                ("current_structured_event", raw_event)
+                for raw_event in events
+                if isinstance(raw_event, Mapping)
+            )
+        observed_states = state.get("observed_states")
+        if isinstance(observed_states, Sequence) and not isinstance(
+            observed_states,
+            (str, bytes, bytearray),
+        ):
+            for raw_state in observed_states:
+                if not isinstance(raw_state, Mapping):
+                    continue
+                if str(raw_state.get("state") or "").strip().lower() != "present":
+                    continue
+                if raw_state.get("validation_issues"):
+                    continue
+                candidates.append(
+                    (
+                        "current_structured_state",
+                        {
+                            "label": raw_state.get("label") or raw_state.get("key"),
+                            "summary": raw_state.get("evidence"),
+                            "state": "continuing",
+                            "snapshot_indices": raw_state.get("snapshot_indices"),
+                        },
+                    )
+                )
+        if not candidates:
             return str(summary_text or ""), state
         with self.cache_lock:
             policy_text = self._get_alert_policy_prompt_locked(channel_id)
@@ -14156,21 +14423,19 @@ class LuxriotManager:
         if not criteria:
             return str(summary_text or ""), state
 
-        best: Optional[Tuple[float, str, Mapping[str, Any]]] = None
+        best: Optional[Tuple[float, str, str, Mapping[str, Any]]] = None
         for criterion in criteria:
-            for raw_event in events:
-                if not isinstance(raw_event, Mapping):
-                    continue
-                score = self._operator_policy_event_match(criterion, raw_event)
+            for source, candidate_state in candidates:
+                score = self._operator_policy_event_match(criterion, candidate_state)
                 if score is None:
                     continue
-                candidate = (score, criterion, raw_event)
+                candidate = (score, criterion, source, candidate_state)
                 if best is None or candidate[0] > best[0]:
                     best = candidate
         if best is None:
             return str(summary_text or ""), state
 
-        score, criterion, event = best
+        score, criterion, reconciliation_source, event = best
         snapshot_indices = [
             int(index)
             for index in (
@@ -14213,7 +14478,7 @@ class LuxriotManager:
         state["alerts"] = [alert]
         state["contract_status"] = "parsed_alert_reconciled"
         state["alert_reconciliation"] = {
-            "source": "current_structured_event",
+            "source": reconciliation_source,
             "count": 1,
         }
         return self._render_reconciled_batch_state_summary(
@@ -14282,7 +14547,10 @@ class LuxriotManager:
             (str, bytes, bytearray),
         ) and existing_alerts:
             return str(summary_text or ""), state
-        if str(state.get("contract_status") or "") != "parsed":
+        if str(state.get("contract_status") or "") not in {
+            "parsed",
+            "parsed_terminal_fence",
+        }:
             return str(summary_text or ""), state
         candidate = self._general_hazard_event_candidate(state.get("events"))
         if candidate is None:
@@ -18895,6 +19163,7 @@ class LuxriotManager:
         if not frame_items:
             raise ValueError("summary batch has no valid frames")
         started = time.time()
+        inference_started_at_ms = int(started * 1000.0)
         messages = self.message_builder(
             f"#{channel_id}",
             frame_items,
@@ -18943,7 +19212,13 @@ class LuxriotManager:
             )
         else:
             summary = self.lm_callback(messages, model_hint)
+        inference_completed_at_ms = int(time.time() * 1000.0)
         batch_state = self._extract_batch_state(summary, frame_items)
+        if str(batch_state.get("contract_status") or "") == "parsed_terminal_fence":
+            summary = self._render_reconciled_batch_state_summary(
+                summary,
+                batch_state,
+            )
         summary, batch_state = self._reconcile_operator_alert_contract(
             int(channel_id),
             summary,
@@ -19000,6 +19275,19 @@ class LuxriotManager:
             ),
             "llm_input_stats": llm_input_stats,
         }
+        latency_trace = dict(batch.get("latency_trace") or {}) if isinstance(
+            batch.get("latency_trace"), Mapping
+        ) else {}
+        latency_trace.update(
+            {
+                "batch_first_frame_at_ms": int(batch_start_ms),
+                "batch_last_frame_at_ms": int(batch_end_ms),
+                "inference_started_at_ms": inference_started_at_ms,
+                "inference_completed_at_ms": inference_completed_at_ms,
+                "inference_ms": max(0, inference_completed_at_ms - inference_started_at_ms),
+            }
+        )
+        entry["latency_trace"] = latency_trace
         if frame_selection:
             entry["frame_selection"] = frame_selection
         coalesced_info = batch.get("coalesced")
@@ -19061,6 +19349,7 @@ class LuxriotManager:
             )
             tolerance_ms = max(1000, int(interval_sec * 1000.0))
             try:
+                alert_processing_started_at_ms = int(time.time() * 1000.0)
                 alert_delivery = self.process_summary_alerts(
                     channel_id,
                     str(normalized["summary"]),
@@ -19075,6 +19364,31 @@ class LuxriotManager:
                     last_error=_safe_error_text(exc, 240) or exc.__class__.__name__,
                 )
             accepted.update(alert_delivery.as_dict())
+            alert_processing_completed_at_ms = int(time.time() * 1000.0)
+            latency_trace = dict(accepted.get("latency_trace") or {}) if isinstance(
+                accepted.get("latency_trace"), Mapping
+            ) else {}
+            latency_trace.update(
+                {
+                    "alert_processing_started_at_ms": alert_processing_started_at_ms,
+                    "alert_processing_completed_at_ms": alert_processing_completed_at_ms,
+                    "alert_processing_ms": max(
+                        0,
+                        alert_processing_completed_at_ms - alert_processing_started_at_ms,
+                    ),
+                }
+            )
+            first_attempt = _parse_optional_int(accepted.get("bookmark_first_attempt_at_ms"))
+            first_ack = _parse_optional_int(accepted.get("bookmark_first_ack_at_ms"))
+            if first_attempt is not None:
+                latency_trace["bookmark_first_attempt_at_ms"] = first_attempt
+            if first_ack is not None:
+                latency_trace["bookmark_first_ack_at_ms"] = first_ack
+                latency_trace["batch_end_to_bookmark_ack_ms"] = max(
+                    0,
+                    first_ack - int(batch_end_ms),
+                )
+            accepted["latency_trace"] = latency_trace
             if self.alert_probe_callback is not None and alert_delivery.alert_events:
                 try:
                     derived_probe_meta = self.alert_probe_callback(
@@ -19856,6 +20170,7 @@ class LuxriotManager:
         default_ts_ms: Optional[int] = None,
         min_ts_ms: Optional[int] = None,
         max_ts_ms: Optional[int] = None,
+        delivery_lane: str = "full_l0",
     ) -> AlertDeliveryResult:
         diagnostics = self._alert_output_diagnostics(summary_text)
         structured_contract = bool(diagnostics.get("structured_alert_contract"))
@@ -19957,7 +20272,25 @@ class LuxriotManager:
                 and alert_cooldown_sec > 0
                 else 0.0
             )
+            normalized_delivery_lane = str(delivery_lane or "full_l0").strip().lower()
+            fast_alert_dedupe_window_sec = max(
+                0.0,
+                float(
+                    getattr(self.config, "VLM_FAST_ALERT_DEDUPE_WINDOW_SEC", 12.0)
+                    or 12.0
+                ),
+            )
             with self.cache_lock:
+                fast_cache = self.channel_fast_alert_content_keys.get(int(channel_id)) or {}
+                fast_sent_at = fast_cache.get(content_key)
+                if (
+                    normalized_delivery_lane != "fast_alert"
+                    and isinstance(fast_sent_at, int)
+                    and (now_ms - fast_sent_at) < int(fast_alert_dedupe_window_sec * 1000.0)
+                ):
+                    skipped_duplicate_count += 1
+                    alert_events.append({**alert, "delivery_status": "fast_phase_duplicate"})
+                    continue
                 if self._bookmark_content_recently_sent_locked(
                     int(channel_id),
                     content_key,
@@ -19972,6 +20305,7 @@ class LuxriotManager:
                     alert_events.append({**alert, "delivery_status": "cooldown_skipped"})
                     continue
             try:
+                bookmark_attempted_at_ms = int(time.time() * 1000.0)
                 self.send_bookmark_event(
                     channel_id=int(channel_id),
                     title=str(alert["title"]),
@@ -19981,9 +20315,20 @@ class LuxriotManager:
                     timestamp_ms=int(alert["timestamp_ms"]),
                 )
             except Exception as exc:
+                bookmark_ack_at_ms = int(time.time() * 1000.0)
                 failed_count += 1
                 last_error = _safe_error_text(exc, 240) or exc.__class__.__name__
-                alert_events.append({**alert, "delivery_status": "failed", "error": last_error})
+                alert_events.append(
+                    {
+                        **alert,
+                        "delivery_status": "failed",
+                        "error": last_error,
+                        "bookmark_attempted_at_ms": bookmark_attempted_at_ms,
+                        "bookmark_ack_at_ms": bookmark_ack_at_ms,
+                        "bookmark_delivery_ms": max(0, bookmark_ack_at_ms - bookmark_attempted_at_ms),
+                        "event_to_bookmark_ack_ms": max(0, bookmark_ack_at_ms - int(alert["timestamp_ms"])),
+                    }
+                )
                 LOGGER.warning(
                     "Luxriot bookmark send failed channel_id=%s title=%r severity=%s error=%s",
                     channel_id,
@@ -19992,6 +20337,7 @@ class LuxriotManager:
                     last_error,
                 )
                 continue
+            bookmark_ack_at_ms = int(time.time() * 1000.0)
             with self.cache_lock:
                 self._mark_bookmark_sent_locked(int(channel_id), fingerprint, now_ms)
                 self._mark_bookmark_content_sent_locked(
@@ -20000,8 +20346,30 @@ class LuxriotManager:
                     now_ms,
                     content_dedupe_window_sec,
                 )
+                if normalized_delivery_lane == "fast_alert":
+                    channel_fast_cache = self.channel_fast_alert_content_keys.setdefault(
+                        int(channel_id),
+                        {},
+                    )
+                    channel_fast_cache[content_key] = now_ms
+                    prune_before = now_ms - int(max(1.0, fast_alert_dedupe_window_sec) * 2000.0)
+                    for stale_key in [
+                        key
+                        for key, sent_at in channel_fast_cache.items()
+                        if int(sent_at) < prune_before
+                    ]:
+                        channel_fast_cache.pop(stale_key, None)
             sent_count += 1
-            alert_events.append({**alert, "delivery_status": "sent"})
+            alert_events.append(
+                {
+                    **alert,
+                    "delivery_status": "sent",
+                    "bookmark_attempted_at_ms": bookmark_attempted_at_ms,
+                    "bookmark_ack_at_ms": bookmark_ack_at_ms,
+                    "bookmark_delivery_ms": max(0, bookmark_ack_at_ms - bookmark_attempted_at_ms),
+                    "event_to_bookmark_ack_ms": max(0, bookmark_ack_at_ms - int(alert["timestamp_ms"])),
+                }
+            )
         return AlertDeliveryResult(
             sent_count,
             parsed=len(parsed_alerts),

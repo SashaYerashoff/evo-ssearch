@@ -406,6 +406,20 @@ class Config:
     LM_VLM_BALANCER_PROFILES = _get_list_env(
         'EVOSSEARCH_LM_VLM_BALANCER_PROFILES',
     )
+    LM_VISION_HEALTH_STATE_FILE = os.getenv(
+        'EVOSSEARCH_LM_VISION_HEALTH_STATE_FILE',
+        '',
+    ).strip()
+    try:
+        LM_VISION_HEALTH_MAX_AGE_SEC = float(
+            os.getenv('EVOSSEARCH_LM_VISION_HEALTH_MAX_AGE_SEC', '180')
+        )
+    except (TypeError, ValueError):
+        LM_VISION_HEALTH_MAX_AGE_SEC = 180.0
+    LM_VISION_HEALTH_MAX_AGE_SEC = min(
+        3600.0,
+        max(30.0, LM_VISION_HEALTH_MAX_AGE_SEC),
+    )
     LM_MAX_TIMEOUT = max(
         int(profile.get('timeout') or LM_TIMEOUT)
         for profile in LM_PROFILES.values()
@@ -1315,6 +1329,16 @@ class Config:
     if LUXRIOT_ROLLUP_LLM_CHAR_BUDGET < 2000:
         LUXRIOT_ROLLUP_LLM_CHAR_BUDGET = 2000
     try:
+        LUXRIOT_ROLLUP_CONTEXT_LIMIT_TOKENS = int(
+            os.getenv('EVOSSEARCH_LUXRIOT_ROLLUP_CONTEXT_LIMIT_TOKENS', '32768')
+        )
+    except (TypeError, ValueError):
+        LUXRIOT_ROLLUP_CONTEXT_LIMIT_TOKENS = 32768
+    LUXRIOT_ROLLUP_CONTEXT_LIMIT_TOKENS = min(
+        262144,
+        max(8192, LUXRIOT_ROLLUP_CONTEXT_LIMIT_TOKENS),
+    )
+    try:
         LUXRIOT_ROLLUP_LLM_MAX_NEW_PER_CALL = int(
             os.getenv('EVOSSEARCH_LUXRIOT_ROLLUP_LLM_MAX_NEW_PER_CALL', str(LUXRIOT_ROLLUP_L1_MAX_NEW_PER_CALL))
         )
@@ -1593,6 +1617,133 @@ class Config:
         PROBE_BOOKMARK_MAX_FRAME_GAP = 8
     if PROBE_BOOKMARK_MAX_FRAME_GAP < 1:
         PROBE_BOOKMARK_MAX_FRAME_GAP = 1
+    PROBE_REALTIME_BOOKMARK_ENABLED = _get_bool_env(
+        'EVOSSEARCH_PROBE_REALTIME_BOOKMARK_ENABLED',
+        'True',
+    )
+    try:
+        PROBE_REALTIME_CONFIRM_HITS = int(
+            os.getenv('EVOSSEARCH_PROBE_REALTIME_CONFIRM_HITS', '2')
+        )
+    except (TypeError, ValueError):
+        PROBE_REALTIME_CONFIRM_HITS = 2
+    PROBE_REALTIME_CONFIRM_HITS = min(3, max(1, PROBE_REALTIME_CONFIRM_HITS))
+    try:
+        PROBE_REALTIME_CONFIRM_WINDOW_SEC = float(
+            os.getenv('EVOSSEARCH_PROBE_REALTIME_CONFIRM_WINDOW_SEC', '3.2')
+        )
+    except (TypeError, ValueError):
+        PROBE_REALTIME_CONFIRM_WINDOW_SEC = 3.2
+    PROBE_REALTIME_CONFIRM_WINDOW_SEC = min(
+        10.0,
+        max(1.0, PROBE_REALTIME_CONFIRM_WINDOW_SEC),
+    )
+    try:
+        PROBE_REALTIME_MAX_EVENT_AGE_SEC = float(
+            os.getenv('EVOSSEARCH_PROBE_REALTIME_MAX_EVENT_AGE_SEC', '5.0')
+        )
+    except (TypeError, ValueError):
+        PROBE_REALTIME_MAX_EVENT_AGE_SEC = 5.0
+    PROBE_REALTIME_MAX_EVENT_AGE_SEC = min(
+        30.0,
+        max(1.0, PROBE_REALTIME_MAX_EVENT_AGE_SEC),
+    )
+    try:
+        PROBE_REALTIME_STRONG_SCORE_BOOST = float(
+            os.getenv('EVOSSEARCH_PROBE_REALTIME_STRONG_SCORE_BOOST', '0.06')
+        )
+    except (TypeError, ValueError):
+        PROBE_REALTIME_STRONG_SCORE_BOOST = 0.06
+    PROBE_REALTIME_STRONG_SCORE_BOOST = min(
+        1.0,
+        max(0.0, PROBE_REALTIME_STRONG_SCORE_BOOST),
+    )
+    try:
+        PROBE_REALTIME_WORKERS = int(
+            os.getenv('EVOSSEARCH_PROBE_REALTIME_WORKERS', '2')
+        )
+    except (TypeError, ValueError):
+        PROBE_REALTIME_WORKERS = 2
+    PROBE_REALTIME_WORKERS = min(8, max(1, PROBE_REALTIME_WORKERS))
+    try:
+        PROBE_REALTIME_QUEUE_CAPACITY = int(
+            os.getenv('EVOSSEARCH_PROBE_REALTIME_QUEUE_CAPACITY', '32')
+        )
+    except (TypeError, ValueError):
+        PROBE_REALTIME_QUEUE_CAPACITY = 32
+    PROBE_REALTIME_QUEUE_CAPACITY = min(
+        256,
+        max(PROBE_REALTIME_WORKERS, PROBE_REALTIME_QUEUE_CAPACITY),
+    )
+    VLM_FAST_ALERT_ENABLED = _get_bool_env(
+        'EVOSSEARCH_VLM_FAST_ALERT_ENABLED',
+        'True',
+    )
+    try:
+        VLM_FAST_ALERT_POST_ROLL_SEC = float(
+            os.getenv('EVOSSEARCH_VLM_FAST_ALERT_POST_ROLL_SEC', '2.5')
+        )
+    except (TypeError, ValueError):
+        VLM_FAST_ALERT_POST_ROLL_SEC = 2.5
+    VLM_FAST_ALERT_POST_ROLL_SEC = min(3.0, max(0.0, VLM_FAST_ALERT_POST_ROLL_SEC))
+    try:
+        VLM_FAST_ALERT_COOLDOWN_SEC = float(
+            os.getenv('EVOSSEARCH_VLM_FAST_ALERT_COOLDOWN_SEC', '12.0')
+        )
+    except (TypeError, ValueError):
+        VLM_FAST_ALERT_COOLDOWN_SEC = 12.0
+    VLM_FAST_ALERT_COOLDOWN_SEC = min(120.0, max(1.0, VLM_FAST_ALERT_COOLDOWN_SEC))
+    try:
+        VLM_FAST_ALERT_MAX_FRAMES = int(
+            os.getenv('EVOSSEARCH_VLM_FAST_ALERT_MAX_FRAMES', '6')
+        )
+    except (TypeError, ValueError):
+        VLM_FAST_ALERT_MAX_FRAMES = 6
+    VLM_FAST_ALERT_MAX_FRAMES = min(8, max(4, VLM_FAST_ALERT_MAX_FRAMES))
+    try:
+        VLM_FAST_ALERT_MAX_TOKENS = int(
+            os.getenv('EVOSSEARCH_VLM_FAST_ALERT_MAX_TOKENS', '128')
+        )
+    except (TypeError, ValueError):
+        VLM_FAST_ALERT_MAX_TOKENS = 128
+    VLM_FAST_ALERT_MAX_TOKENS = min(512, max(128, VLM_FAST_ALERT_MAX_TOKENS))
+    try:
+        VLM_FAST_ALERT_WORKERS = int(
+            os.getenv('EVOSSEARCH_VLM_FAST_ALERT_WORKERS', '2')
+        )
+    except (TypeError, ValueError):
+        VLM_FAST_ALERT_WORKERS = 2
+    VLM_FAST_ALERT_WORKERS = min(4, max(1, VLM_FAST_ALERT_WORKERS))
+    try:
+        VLM_FAST_ALERT_SEMANTIC_DELTA = float(
+            os.getenv('EVOSSEARCH_VLM_FAST_ALERT_SEMANTIC_DELTA', '0.22')
+        )
+    except (TypeError, ValueError):
+        VLM_FAST_ALERT_SEMANTIC_DELTA = 0.22
+    VLM_FAST_ALERT_SEMANTIC_DELTA = min(
+        1.0,
+        max(0.0, VLM_FAST_ALERT_SEMANTIC_DELTA),
+    )
+    try:
+        VLM_FAST_ALERT_MIN_MOVING_FRACTION = float(
+            os.getenv('EVOSSEARCH_VLM_FAST_ALERT_MIN_MOVING_FRACTION', '0.15')
+        )
+    except (TypeError, ValueError):
+        VLM_FAST_ALERT_MIN_MOVING_FRACTION = 0.15
+    VLM_FAST_ALERT_MIN_MOVING_FRACTION = min(
+        1.0,
+        max(0.0, VLM_FAST_ALERT_MIN_MOVING_FRACTION),
+    )
+    try:
+        VLM_FAST_ALERT_DEDUPE_WINDOW_SEC = float(
+            os.getenv('EVOSSEARCH_VLM_FAST_ALERT_DEDUPE_WINDOW_SEC', '12.0')
+        )
+    except (TypeError, ValueError):
+        VLM_FAST_ALERT_DEDUPE_WINDOW_SEC = 12.0
+    VLM_FAST_ALERT_DEDUPE_WINDOW_SEC = min(
+        120.0,
+        max(1.0, VLM_FAST_ALERT_DEDUPE_WINDOW_SEC),
+    )
 
     # Detection archive + adaptive retention
     DETECTIONS_ARCHIVE_ENABLED = _get_bool_env('EVOSSEARCH_DETECTIONS_ARCHIVE_ENABLED', 'True')

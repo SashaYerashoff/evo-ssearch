@@ -191,6 +191,9 @@ class ProbeBuffer:
         *,
         min_ts_ms: Optional[int] = None,
         max_ts_ms: Optional[int] = None,
+        roi_norm: Optional[Tuple[float, float, float, float]] = None,
+        embed_image_fn: Optional[Callable[[Image.Image], np.ndarray]] = None,
+        roi_padding: float = 0.05,
     ) -> List[Dict[str, Any]]:
         """Return P/N/M for every buffered embedding in a bounded time window."""
 
@@ -208,10 +211,33 @@ class ProbeBuffer:
             selected_idx.append(idx)
         if not selected_idx:
             return []
-        mat = np.stack(
-            [self.embeddings[idx] for idx in selected_idx],
-            axis=0,
-        ).astype(np.float32)
+        if roi_norm is None or embed_image_fn is None:
+            mat = np.stack(
+                [self.embeddings[idx] for idx in selected_idx],
+                axis=0,
+            ).astype(np.float32)
+        else:
+            roi_key = self._roi_key(roi_norm)
+            cache = self.roi_cache.setdefault(roi_key, {})
+            self._remember_roi_key(roi_key)
+            vectors: List[np.ndarray] = []
+            for idx in selected_idx:
+                meta_row = self.meta[idx]
+                uid = int(meta_row.get("uid") or 0)
+                cached = cache.get(uid)
+                if cached is not None:
+                    vectors.append(cached)
+                    continue
+                embedded = self._embed_roi_thumb(
+                    str(meta_row.get("thumb") or ""),
+                    roi_norm=roi_norm,
+                    embed_image_fn=embed_image_fn,
+                    roi_padding=roi_padding,
+                )
+                vec = embedded if embedded is not None else self.embeddings[idx]
+                cache[uid] = vec
+                vectors.append(vec)
+            mat = np.stack(vectors, axis=0).astype(np.float32)
         if int(mat.shape[1]) != int(pos_embs.shape[1]):
             raise ValueError(
                 "Probe vector dimension mismatch. Clear the live probe buffer after changing the CLIP model."
@@ -544,6 +570,64 @@ class ProbeManager:
         mat /= np.linalg.norm(mat, axis=1, keepdims=True) + 1e-8
         return mat
 
+    def score_current_frame(
+        self,
+        channel_id: int,
+        timestamp_ms: int,
+        positives: Sequence[str],
+        negatives: Sequence[str],
+        *,
+        embedding: np.ndarray,
+        thumbnail_b64: str = "",
+        roi_norm: Optional[Tuple[float, float, float, float]] = None,
+        roi_padding: float = 0.05,
+    ) -> Dict[str, Any]:
+        """Score one completed semantic frame without re-entering the buffer lock.
+
+        The capture callback already owns the exact full-frame vector. ROI
+        probes require one additional cropped embedding, but that work must not
+        hold ``ProbeManager.lock``: doing so can block subsequent 1 Hz capture
+        insertions behind the shared image microbatcher and turn fresh alarm
+        evidence into a stale FIFO.
+        """
+
+        pos_texts = [str(item).strip() for item in positives if str(item).strip()]
+        neg_texts = [str(item).strip() for item in negatives if str(item).strip()]
+        if not pos_texts:
+            return {"error": "Provide at least one positive probe."}
+        vector = ProbeBuffer._normalize_vec(
+            np.asarray(embedding, dtype=np.float32).flatten()
+        )
+        if roi_norm is not None:
+            scratch = ProbeBuffer(max_frames=1, thumb_edge=self.thumb_edge)
+            cropped = scratch._embed_roi_thumb(
+                str(thumbnail_b64 or ""),
+                roi_norm=roi_norm,
+                embed_image_fn=self.embed_image_fn,
+                roi_padding=roi_padding,
+            )
+            if cropped is None:
+                return {"error": "Current ROI frame could not be embedded."}
+            vector = cropped
+        pos_embs = self._embed_texts(pos_texts)
+        neg_embs = self._embed_texts(neg_texts)
+        if pos_embs.size == 0 or int(pos_embs.shape[1]) != int(vector.shape[0]):
+            return {"error": "Probe vector dimension mismatch."}
+        if neg_embs.size and int(neg_embs.shape[1]) != int(vector.shape[0]):
+            return {"error": "Negative probe vector dimension mismatch."}
+        pos_score = float((pos_embs @ vector).max())
+        neg_score = float((neg_embs @ vector).max()) if neg_embs.size else 0.0
+        return {
+            "result": {
+                "timestamp_ms": int(timestamp_ms),
+                "channel_id": int(channel_id),
+                "pos_score": pos_score,
+                "neg_score": neg_score,
+                "margin": pos_score - neg_score,
+            },
+            "scoring_embedding": vector,
+        }
+
     def score_frames(
         self,
         channel_id: int,
@@ -552,6 +636,8 @@ class ProbeManager:
         *,
         min_ts_ms: Optional[int] = None,
         max_ts_ms: Optional[int] = None,
+        roi_norm: Optional[Tuple[float, float, float, float]] = None,
+        roi_padding: float = 0.05,
     ) -> Dict[str, Any]:
         """Score all saved embedding snapshots without applying hit thresholds."""
 
@@ -576,6 +662,9 @@ class ProbeManager:
                     neg_embs,
                     min_ts_ms=min_ts_ms,
                     max_ts_ms=max_ts_ms,
+                    roi_norm=roi_norm,
+                    embed_image_fn=self.embed_image_fn if roi_norm is not None else None,
+                    roi_padding=roi_padding,
                 )
             except ValueError as exc:
                 buf.clear()

@@ -76,15 +76,17 @@ _ADMISSION_CLASS = {
     "heartbeat": "live_l0",
 }
 
-# Classes are deliberately strict at admission time.  L0 retains throughput by
-# borrowing the protected slot whenever the high-priority queue is empty.
+# Classes are deliberately strict at admission time. Interactive work and
+# urgent alerts own the protected lane. Full L0 is allowed to pre-empt
+# consolidation; an L1-L3 rollup must never delay current visual attention when
+# both profiles resolve to the same endpoint.
 _CLASS_PRIORITY = {
     "agent": 0,
     "alert": 1,
-    "rollup": 2,
-    "live_l0": 3,
+    "live_l0": 2,
+    "rollup": 3,
 }
-_PROTECTED_CLASSES = frozenset({"agent", "alert", "rollup"})
+_PROTECTED_CLASSES = frozenset({"agent", "alert"})
 
 
 @dataclass
@@ -153,7 +155,7 @@ class LMAdmissionController:
         waiter: _Waiter,
         now: float,
     ) -> tuple[int, int, int]:
-        # Class order is strict (agent > alert > rollup > live L0).  Aging is
+        # Class order is strict (agent > alert > live L0 > rollup). Aging is
         # retained as a same-class diagnostic/tiebreaker without allowing a
         # background job to jump an interactive operator turn.
         base = int(_CLASS_PRIORITY.get(waiter.admission_class, 3))
@@ -174,13 +176,24 @@ class LMAdmissionController:
         )
 
     def _live_limit(self, state: _ResourceState) -> int:
-        protected = min(self.protected_slots, state.capacity)
-        return max(0, state.capacity - protected)
+        # Capacity-one endpoints cannot reserve a slot without deadlocking all
+        # visual work. At capacity >= 2, keep the configured protected lane
+        # physically free instead of merely moving alerts to the front of a
+        # queue behind already-running long L0 requests.
+        protected = min(self.protected_slots, max(0, state.capacity - 1))
+        return max(1, state.capacity - protected)
 
     @staticmethod
     def _active_live_count(state: _ResourceState) -> int:
         return sum(
             waiter.admission_class == "live_l0"
+            for waiter in state.active.values()
+        )
+
+    @staticmethod
+    def _active_unprotected_count(state: _ResourceState) -> int:
+        return sum(
+            waiter.admission_class not in _PROTECTED_CLASSES
             for waiter in state.active.values()
         )
 
@@ -265,7 +278,17 @@ class LMAdmissionController:
                     raise LMAdmissionTimeout("LM admission queue timeout")
 
                 next_waiter = self._next_waiter(state, now)
-                if len(state.active) < state.capacity and next_waiter is waiter:
+                active_unprotected = self._active_unprotected_count(state)
+                unprotected_limit = self._live_limit(state)
+                protected_lane_available = (
+                    waiter.admission_class in _PROTECTED_CLASSES
+                    or active_unprotected < unprotected_limit
+                )
+                if (
+                    len(state.active) < state.capacity
+                    and next_waiter is waiter
+                    and protected_lane_available
+                ):
                     active_live = self._active_live_count(state)
                     live_limit = self._live_limit(state)
                     older_live_waiting = any(
@@ -291,15 +314,6 @@ class LMAdmissionController:
                         state.counters[
                             f"reserved_slot_admissions_{waiter.admission_class}"
                         ] += 1
-                    if (
-                        waiter.admission_class == "live_l0"
-                        and active_live >= live_limit
-                        and self.protected_slots > 0
-                    ):
-                        # This is safe because _next_waiter() returns a
-                        # protected waiter whenever one exists.
-                        state.counters["borrowed_slot_admissions_total"] += 1
-
                     state.waiting.remove(waiter)
                     waiter.admitted_at = now
                     state.active[waiter.ticket_id] = waiter
@@ -414,7 +428,7 @@ class LMAdmissionController:
                         "capacity": state.capacity,
                         "protected_slots": min(
                             self.protected_slots,
-                            state.capacity,
+                            max(0, state.capacity - 1),
                         ),
                         "live_l0_limit_while_protected_waiting": live_limit,
                         "active": len(state.active),
@@ -441,9 +455,11 @@ class LMAdmissionController:
                             "protected_waiting": protected_waiting,
                             "live_l0_active": active_live,
                             "borrowed_slots_active": (
-                                max(0, active_live - live_limit)
-                                if not protected_waiting
-                                else 0
+                                max(
+                                    0,
+                                    self._active_unprotected_count(state)
+                                    - live_limit,
+                                )
                             ),
                             "debt_current": state.reservation_debt,
                             "debt_max": state.reservation_debt_max,

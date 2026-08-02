@@ -173,8 +173,11 @@ thresholds, alert policy, live sampling, or the live routine context.
 |---|---|
 | `EVOSSEARCH_LM_PROFILES` | e.g. `agent,vlm` |
 | `EVOSSEARCH_LM_PROFILE_<ID>_*` | Per-profile base URL / model / timeout / kind `[FIELD]` |
-| `EVOSSEARCH_LM_MAX_INFLIGHT` (`1`) | Endpoint-scoped in-process admission capacity fallback; clamped to 1–64 and valid only with the required single Gunicorn worker |
+| `EVOSSEARCH_LM_MAX_INFLIGHT` (`1`) | Endpoint-scoped in-process admission capacity fallback; clamped to 1–64 and valid only with the required single Gunicorn worker. The port appliance writes `4` per agent/VLM profile to match its vLLM `--max-num-seqs 4` |
 | `EVOSSEARCH_LM_PROFILE_<ID>_MAX_INFLIGHT` | Per-profile admission override, falling back to `EVOSSEARCH_LM_MAX_INFLIGHT`; profiles sharing an endpoint use the smallest configured capacity |
+| Shared-endpoint protected lane | With capacity >1, EVA keeps one physical request slot free for interactive agent or fast-alert work. L0 and L1–L3 cannot borrow it; capacity-one backends remain serial and do not deadlock |
+| LM admission order | On a shared endpoint: interactive agent, realtime alert, live L0, then L1-L3/background rollup. Rollups do not own a protected slot; the port topology should still route them to the separate agent/CPU endpoint |
+| `EVOSSEARCH_LUXRIOT_ROLLUP_CONTEXT_LIMIT_TOKENS` (`32768`) | Conservative text-only L1-L3 context ceiling. Oversized source/corrective blocks are middle-compacted before the request while preserving metadata at the head and recent evidence/instructions at the tail |
 | `EVOSSEARCH_LM_VLM_BALANCER_ENABLED` | Static channel→profile routing across multiple VLM hosts |
 | `EVOSSEARCH_LM_VIDEO_DEFAULT_FRAMES` / `_MAX_FRAMES` | Offline/video-description frame limits |
 | `EVOSSEARCH_LM_VIDEO_MAX_EDGE` | Resize max edge before sending images to VLM |
@@ -182,6 +185,9 @@ thresholds, alert policy, live sampling, or the live routine context.
 | `EVOSSEARCH_LM_VIDEO_INPUT_WARNING_CHARS` (`24000`) | Warning threshold for text-side VLM/rollup input payloads |
 | `EVOSSEARCH_LM_VIDEO_IMAGE_PAYLOAD_WARNING_CHARS` (`2500000`) | Warning threshold for base64 image payload size |
 | `EVOSSEARCH_LM_VIDEO_CONTEXT_TOKENS_WARN` (`7000`) | Rough VLM context estimate (chars/4 + ~300 visual tokens per image) that adds an `llm_input_stats` warning before the model truncates; align with the serving `--max-model-len` |
+| `EVOSSEARCH_LM_VISION_HEALTH_STATE_FILE` | Optional content-aware VLM watchdog state. A first suspect result is warning-only when a recent successful canary exists and the watchdog threshold has not been reached; degraded, stale, or never-successful vision quarantines L0 results before memory or alerts |
+| `EVOSSEARCH_LM_VISION_HEALTH_MAX_AGE_SEC` (`180`) | Maximum accepted age of a successful dynamic vision canary; stale watchdog state fails the VLM gate closed. |
+| `EVOSSEARCH_GUNICORN_GRACEFUL_TIMEOUT` (`20`) | Maximum worker drain time during an appliance restart. Bounds a stuck ffmpeg/embedding child below the systemd stop timeout while preserving state through Gunicorn lifecycle hooks |
 
 ## Agent context budget
 
@@ -227,6 +233,9 @@ thresholds, alert policy, live sampling, or the live routine context.
 | `EVOSSEARCH_ARCHIVE_DISK_MIN_FREE_GB` (`2.0`) | Stop writing new filesystem snapshots below this free-space floor while continuing metadata rows |
 | `EVOSSEARCH_ARCHIVE_DISK_MIN_FREE_PERCENT` (`5.0`) | Stop writing new filesystem snapshots below this filesystem free-space percentage |
 | `EVOSSEARCH_PROBE_BOOKMARK_*` | Probe bookmark cooldown/dedup/thresholds |
+| `EVOSSEARCH_PROBE_REALTIME_BOOKMARK_ENABLED` (`true`) | Evaluate only operator-authored, bookmark-enabled text probes on each completed 1 Hz semantic apex. ROI text probes use a fresh crop and ROI embedding cache; automatic/VLM-derived and image-reference probes remain on the retrospective daemon and cannot enter this alarm lane |
+| `EVOSSEARCH_PROBE_REALTIME_CONFIRM_HITS` (`2`) / `_CONFIRM_WINDOW_SEC` (`3.2`) / `_MAX_EVENT_AGE_SEC` (`5`) | Require repeated current-frame evidence before a direct probe bookmark and reject stale embedding completions. A match exceeding both P and M floors by `_STRONG_SCORE_BOOST` (`0.06`) may pass immediately |
+| `EVOSSEARCH_PROBE_REALTIME_WORKERS` (`2`) / `_QUEUE_CAPACITY` (`32`) | Bounded asynchronous scoring/bookmark delivery; saturation drops the acceleration attempt, never the independent semantic archive or normal probe daemon |
 | `EVOSSEARCH_PROBE_CHANNEL_GROUPS_FILE` (`probe_channel_groups.json`) | Operator-defined channel groups for the Probes board. File-backed presentation state, not tenant archive data; losing it only un-groups the board and never affects probes |
 | `EVOSSEARCH_LUXRIOT_VECTOR_SIGNALS_ENABLED` (`true`) | Feed compact CLIP/road-CV attention cues into L0 video-description prompts |
 | `EVOSSEARCH_LUXRIOT_VECTOR_SIGNAL_PROBE_LIMIT` (`6`) | Max active channel probes scanned per L0 batch for vector/homeostasis cues |
@@ -273,6 +282,11 @@ markers reach the model via `VECTOR_SIGNALS_JSON.capture_attention`.
 | `EVOSSEARCH_LUXRIOT_ATTENTION_MAX_OUTSTANDING` (`1`) | Global queued/in-flight VLM episode limit |
 | `EVOSSEARCH_LUXRIOT_ATTENTION_POSTROLL_SEC` (`3`) | Burst post-roll collected before episode dispatch |
 | `EVOSSEARCH_LUXRIOT_ATTENTION_MAX_VLM_FRAMES` (`8`) | Maximum saved embedding frames in one episode |
+| `EVOSSEARCH_VLM_FAST_ALERT_ENABLED` (`true`) | Run a separate alert-only VLM phase after a measured CV burst; this does not replace or enter the visible full L0 memory stream |
+| `EVOSSEARCH_VLM_FAST_ALERT_POST_ROLL_SEC` (`2.5`) / `_MAX_FRAMES` (`6`) / `_MAX_TOKENS` (`128`) | Bound the control/pre/onset/apex/post evidence set and compact completion length. The short post-roll trades 1.5 seconds for enough visual trajectory to distinguish an event from a scene-change edge |
+| `EVOSSEARCH_VLM_FAST_ALERT_WORKERS` (`2`) | Admit two independent burst checks concurrently; the global LM admission controller still gives interactive agent work priority and bounds total inference pressure |
+| `EVOSSEARCH_VLM_FAST_ALERT_SEMANTIC_DELTA` (`0.22`) / `_MIN_MOVING_FRACTION` (`0.15`) | Also validate a large consecutive SigLIP scene change when CV confirms distributed motion. This catches meaningful changes on continuously active channels whose motion has become baseline; the vector delta only routes frames and is never alert proof |
+| `EVOSSEARCH_VLM_FAST_ALERT_COOLDOWN_SEC` (`12`) / `_DEDUPE_WINDOW_SEC` (`12`) | Bound repeated burst passes and suppress an identical fast-phase/full-L0 bookmark replay without suppressing differently titled hazards |
 | `EVOSSEARCH_LUXRIOT_ALERT_DERIVED_PROBES_ENABLED` (`false`) | Admit bounded, temporary attention-only probes from direct VLM alerts |
 | `EVOSSEARCH_LUXRIOT_ALERT_DERIVED_PROBE_TTL_SEC` (`300`) | TTL for alert-derived probes |
 

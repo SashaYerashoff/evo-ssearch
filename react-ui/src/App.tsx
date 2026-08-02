@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState, useCallback } from 'react'
-import type { AuthUser, Channel, ArchiveFilters } from './api/types'
+import type { AuthUser, Channel, ArchiveFilters, Detection } from './api/types'
 import { login as apiLogin, me as apiMe, logout as apiLogout } from './api/auth'
 import {
   canOpenSettings,
@@ -8,14 +8,16 @@ import {
   hasPermission,
   PERMISSION,
 } from './api/access'
-import { findParentAlert, getChannels } from './api/detections'
+import { findParentAlert, getChannels, normalizeDetection } from './api/detections'
 import type { Probe } from './api/probes'
 import { api, API_FORBIDDEN_EVENT, AUTH_EXPIRED_EVENT } from './api/client'
 import { TopBar } from './components/shell/TopBar'
+import { StatusConsole } from './components/shell/StatusConsole'
 import { LeftRail, SECTION_LABELS, type SectionId } from './components/shell/LeftRail'
 import { AgentEar } from './components/shell/AgentEar'
 import { AgentPanel, type AgentAction } from './components/shell/AgentPanel'
 import { ArchiveScreen } from './components/archive/ArchiveScreen'
+import { InspectorModal } from './components/archive/InspectorModal'
 import { MonitoringScreen } from './components/monitoring/MonitoringScreen'
 import { VideoScreen } from './components/video/VideoScreen'
 import type { SummaryEntry } from './api/video'
@@ -70,11 +72,7 @@ function LoginGate({ onDone }: { onDone: (u: AuthUser) => void }) {
 }
 
 export default function App() {
-  const {
-    savedPreferences,
-    isMotionReduced,
-    commitPreferences,
-  } = useAppearance()
+  const { isMotionReduced } = useAppearance()
   const [user, setUser] = useState<AuthUser | null>(null)
   const [ready, setReady] = useState(false)
   const [channels, setChannels] = useState<Channel[]>([])
@@ -87,6 +85,8 @@ export default function App() {
   const [settingsOpen, setSettingsOpen] = useState(false)
   const [appearanceOpen, setAppearanceOpen] = useState(false)
   const [drive, setDrive] = useState<AgentDrive | null>(null)
+  const [summaryReview, setSummaryReview] = useState<Detection | null>(null)
+  const [similarDrive, setSimilarDrive] = useState<{ detection: Detection; seq: number } | null>(null)
   const [probeDrive, setProbeDrive] = useState<ConsoleDrive | null>(null)
   const [videoDrive, setVideoDrive] = useState<ConsoleDrive | null>(null)
   const [archiveFilters, setArchiveFilters] = useState<ArchiveFilters | null>(null)
@@ -94,6 +94,7 @@ export default function App() {
   const [appVersion, setAppVersion] = useState('')
   const [serverStartedAtMs, setServerStartedAtMs] = useState<number | null>(null)
   const seqRef = useRef(0)
+  const summaryReviewOriginRef = useRef<HTMLElement | null>(null)
   const appliedEffectIds = useRef(new Set<string>())
   const visibleSections = (['home', 'archive', 'video', 'monitoring'] as SectionId[])
     .filter((candidate) => canViewSection(user, candidate))
@@ -201,20 +202,22 @@ export default function App() {
         selection_source: String(entry.thumbnail_selection_source || ''),
       },
     }
+    summaryReviewOriginRef.current = document.activeElement instanceof HTMLElement
+      ? document.activeElement
+      : null
+    const channelMap = new Map(channels.map((channel) => [channel.id, channel.title]))
+    setSummaryReview(normalizeDetection(raw, channelMap))
+  }, [channels])
+
+  const closeSummaryReview = useCallback(() => {
+    setSummaryReview(null)
+    window.requestAnimationFrame(() => summaryReviewOriginRef.current?.focus({ preventScroll: true }))
+  }, [])
+
+  const findSimilarFromSummary = useCallback((detection: Detection) => {
+    setSummaryReview(null)
     setSection('archive')
-    setDrive({
-      name: 'get_detections',
-      args: {
-        channel_id: channelId,
-        source: 'vlm_summary',
-        since_ms: Math.max(0, (batchStartMs || timestampMs) - 60_000),
-        until_ms: Math.max(batchEndMs || timestampMs, timestampMs) + 60_000,
-        open_detection_id: detectionId,
-      },
-      done: true,
-      result: { detections: [raw] },
-      seq: ++seqRef.current,
-    })
+    setSimilarDrive({ detection, seq: ++seqRef.current })
   }, [])
 
   const refreshChannels = useCallback(async () => {
@@ -314,16 +317,8 @@ export default function App() {
     <div className={`shell ${noAnim ? 'no-anim' : ''}`}>
       <NeuralBackground noAnim={noAnim} />
       <TopBar
-        user={user}
-        status={status}
         appVersion={appVersion}
         section={SECTION_LABELS[section]}
-        noAnim={noAnim}
-        canBenchmark={hasPermission(user, PERMISSION.diagnosticsView)}
-        onToggleNoAnim={() => commitPreferences({
-          ...savedPreferences,
-          motion: noAnim ? 'full' : 'reduced',
-        })}
         onAppearance={() => setAppearanceOpen(true)}
         onBrand={() => setSection('home')}
       />
@@ -351,6 +346,8 @@ export default function App() {
             <ArchiveScreen
               channels={channels}
               drive={drive}
+              similarDrive={similarDrive}
+              onSimilarDriveHandled={() => setSimilarDrive(null)}
               noAnim={noAnim}
               canReportFeedback={hasPermission(user, PERMISSION.bookmarksCreate)}
               canReportIncidents={hasPermission(user, PERMISSION.incidentsManage)}
@@ -373,6 +370,7 @@ export default function App() {
             <VideoScreen
               channels={channels}
               drive={videoDrive}
+              reviewOverlayOpen={!!summaryReview}
               onReloadChannels={refreshChannels}
               canCapture={hasPermission(user, PERMISSION.captureManage)}
               canManagePrompts={hasPermission(user, PERMISSION.promptsManage)}
@@ -398,6 +396,17 @@ export default function App() {
           />
         )}
         {appearanceOpen && <AppearanceModal onClose={() => setAppearanceOpen(false)} />}
+        {summaryReview && (
+          <InspectorModal
+            d={summaryReview}
+            channels={channels}
+            canReportFeedback={hasPermission(user, PERMISSION.bookmarksCreate)}
+            canReportIncidents={hasPermission(user, PERMISSION.incidentsManage)}
+            canExport={hasPermission(user, PERMISSION.dataExport)}
+            onClose={closeSummaryReview}
+            onFindSimilar={findSimilarFromSummary}
+          />
+        )}
         {hasPermission(user, PERMISSION.agentUse) && (
           <>
             <AgentEar open={agentOpen} onToggle={() => setAgentOpen((v) => !v)} />
@@ -419,6 +428,7 @@ export default function App() {
           </>
         )}
       </div>
+      <StatusConsole user={user} status={status} />
     </div>
   )
 }

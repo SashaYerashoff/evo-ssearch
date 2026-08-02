@@ -14,9 +14,16 @@ export function ToolTabs({ tabs, active, onSelect, children }: {
     <div className="tool-tabs">
       <div className="atp-tabrow">
         {tabs.map((t) => (
-          <button key={t.id} className={`atp-tab ${active === t.id ? 'on' : ''}`} onClick={() => onSelect(t.id)} title={t.label}>
+          <button
+            key={t.id}
+            className={`atp-tab ${active === t.id ? 'on' : ''}`}
+            onClick={() => onSelect(t.id)}
+            title={`${t.label}${t.summary && t.summary !== '—' ? ` · ${t.summary}` : ''}`}
+            aria-pressed={active === t.id}
+          >
             <b>{t.icon} {t.label}</b>
-            <span>{t.summary}</span>
+            <i className="atp-tab-sep" aria-hidden="true" />
+            <span className="atp-tab-summary">{t.summary}</span>
           </button>
         ))}
       </div>

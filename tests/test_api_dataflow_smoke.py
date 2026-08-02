@@ -3,6 +3,8 @@ import hashlib
 import inspect
 import re
 import tempfile
+import threading
+import time
 import unittest
 from io import BytesIO
 from pathlib import Path
@@ -10,6 +12,7 @@ from typing import Any, Dict, List, Set, Tuple
 from unittest.mock import patch
 
 import oldapp
+import numpy as np
 from PIL import Image
 
 from oldapp import (
@@ -695,6 +698,148 @@ class ApiDataflowSmokeTests(unittest.TestCase):
         self.assertEqual(gate["reason"], "local_source_no_recorder")
         send.assert_not_called()
         embed.assert_not_called()
+
+    def test_probe_bookmark_uses_current_embedding_and_records_delivery_timing(self) -> None:
+        timestamp_ms = int(time.time() * 1000.0) - 25
+        with (
+            patch.object(oldapp.luxriot_manager, "is_local_channel", return_value=False),
+            patch.object(
+                oldapp.luxriot_manager,
+                "send_bookmark_event",
+                return_value={"success": True},
+            ) as send,
+            patch("oldapp._embed_thumbnail_b64") as embed,
+        ):
+            sent, gate = oldapp._maybe_send_probe_bookmark(
+                {
+                    "id": f"probe-live-{timestamp_ms}",
+                    "name": "Immediate collision watch",
+                    "channel_id": 112,
+                    "bookmark": True,
+                    "bookmark_cooldown_sec": 0,
+                    "bookmark_dedupe_window_sec": 1,
+                },
+                {
+                    "timestamp_ms": timestamp_ms,
+                    "pos_score": 0.9,
+                    "neg_score": 0.1,
+                    "margin": 0.8,
+                    "thumbnail": "jpeg",
+                    "clip_vec": np.asarray([1.0, 0.0], dtype=np.float32),
+                },
+                source="probe_realtime",
+            )
+
+        self.assertTrue(sent)
+        self.assertEqual(gate["reason"], "sent")
+        self.assertGreaterEqual(gate["bookmark_ack_at_ms"], gate["bookmark_attempted_at_ms"])
+        self.assertEqual(
+            gate["bookmark_delivery_ms"],
+            gate["bookmark_ack_at_ms"] - gate["bookmark_attempted_at_ms"],
+        )
+        self.assertGreaterEqual(gate["event_to_bookmark_ack_ms"], 0)
+        send.assert_called_once()
+        embed.assert_not_called()
+
+    def test_fast_vlm_alert_waits_for_post_roll_after_burst(self) -> None:
+        runtime = oldapp._FastVlmAlertRuntime()
+        try:
+            trigger_ms = 100_000
+            with patch.object(runtime, "_submit") as submit:
+                runtime.observe(
+                    112,
+                    {
+                        "timestamp_ms": trigger_ms,
+                        "capture_selection": {"selection_mode": "burst"},
+                    },
+                )
+                submit.assert_not_called()
+                runtime.observe(
+                    112,
+                    {
+                        "timestamp_ms": trigger_ms + runtime.post_roll_ms,
+                        "capture_selection": {"selection_mode": "normal"},
+                    },
+                )
+                submit.assert_called_once()
+                channel_id, episode = submit.call_args.args
+                self.assertEqual(channel_id, 112)
+                self.assertEqual(episode["trigger_timestamp_ms"], trigger_ms)
+                self.assertEqual(
+                    episode["observed_post_timestamp_ms"],
+                    trigger_ms + runtime.post_roll_ms,
+                )
+        finally:
+            runtime.shutdown()
+
+    def test_realtime_probe_lane_coalesces_stale_channel_work(self) -> None:
+        runtime = oldapp._RealtimeProbeBookmarkRuntime()
+        started = threading.Event()
+        release = threading.Event()
+        completed = threading.Event()
+        seen: List[int] = []
+
+        def evaluate(_channel_id: int, observation: Dict[str, Any]) -> None:
+            seen.append(int(observation["timestamp_ms"]))
+            if len(seen) == 1:
+                started.set()
+                self.assertTrue(release.wait(2.0))
+            if len(seen) == 2:
+                completed.set()
+
+        try:
+            with patch.object(runtime, "_evaluate", side_effect=evaluate):
+                runtime.submit(112, {"timestamp_ms": 1})
+                self.assertTrue(started.wait(2.0))
+                runtime.submit(112, {"timestamp_ms": 2})
+                runtime.submit(112, {"timestamp_ms": 3})
+                release.set()
+                self.assertTrue(completed.wait(2.0))
+            self.assertEqual(seen, [1, 3])
+            self.assertEqual(runtime.status()["coalesced_total"], 2)
+        finally:
+            runtime.shutdown()
+
+    def test_fast_vlm_alert_routes_large_semantic_change_with_cv_motion(self) -> None:
+        runtime = oldapp._FastVlmAlertRuntime()
+        try:
+            runtime.semantic_delta_threshold = 0.2
+            runtime.min_moving_fraction = 0.15
+            with patch.object(runtime, "_submit") as submit:
+                runtime.observe(
+                    118,
+                    {
+                        "timestamp_ms": 100_000,
+                        "embedding": np.asarray([1.0, 0.0], dtype=np.float32),
+                        "capture_selection": {"selection_mode": "normal"},
+                        "motion_aggregate": {"moving_fraction": 0.5},
+                    },
+                )
+                runtime.observe(
+                    118,
+                    {
+                        "timestamp_ms": 101_000,
+                        "embedding": np.asarray([0.7, 0.714], dtype=np.float32),
+                        "capture_selection": {"selection_mode": "normal"},
+                        "motion_aggregate": {"moving_fraction": 0.5},
+                    },
+                )
+                submit.assert_not_called()
+                runtime.observe(
+                    118,
+                    {
+                        "timestamp_ms": 101_000 + runtime.post_roll_ms,
+                        "embedding": np.asarray([0.7, 0.714], dtype=np.float32),
+                        "capture_selection": {"selection_mode": "normal"},
+                        "motion_aggregate": {"moving_fraction": 0.5},
+                    },
+                )
+                submit.assert_called_once()
+                _channel, episode = submit.call_args.args
+                self.assertEqual(episode["reason"], "semantic_motion_change")
+                self.assertGreaterEqual(episode["semantic_delta"], 0.2)
+        finally:
+            runtime.shutdown()
 
     def test_detections_list_passes_multiple_channel_filters(self) -> None:
         captured: Dict[str, Any] = {}

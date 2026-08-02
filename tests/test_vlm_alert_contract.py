@@ -242,6 +242,44 @@ class VlmAlertPromptContractTests(unittest.TestCase):
         self.assertEqual(state["routines"], [])
         self.assertEqual(state["memory_pass"], [])
 
+    def test_batch_state_recovers_complete_terminal_json_fence_without_marker(self):
+        frames = [
+            {"thumbnail": "frame-one", "captured_at": 100.0},
+            {"thumbnail": "frame-two", "captured_at": 101.0},
+        ]
+        summary = (
+            "A cat remains on the shelf.\n\n"
+            "```json\n"
+            '{"version":1,"cover":{"snapshot_index":1,"kind":"routine"},'
+            '"scene":{"status":"matched","summary":"Cat on shelf"},'
+            '"events":[],"observed_states":[{"key":"cat","label":"cat",'
+            '"state":"present","snapshot_indices":[1],'
+            '"evidence":"Cat visible on shelf."}],'
+            '"routines":["Cat resting"],"memory_pass":[],"alerts":[]}\n'
+            "```"
+        )
+
+        state = LuxriotManager._extract_batch_state(summary, frames)
+        canonical = LuxriotManager._render_reconciled_batch_state_summary(
+            summary,
+            state,
+        )
+
+        self.assertEqual(state["contract_status"], "parsed_terminal_fence")
+        self.assertEqual(state["cover"]["snapshot_index"], 1)
+        self.assertEqual(state["observed_states"][0]["state"], "present")
+        self.assertIn("BATCH_STATE_JSON:", canonical)
+        self.assertNotIn("```", canonical)
+
+    def test_batch_state_rejects_unrelated_terminal_json_fence(self):
+        frames = [{"thumbnail": "frame-one", "captured_at": 100.0}]
+        summary = "Scene notes.\n```json\n{\"objects\":[\"cat\"]}\n```"
+
+        state = LuxriotManager._extract_batch_state(summary, frames)
+
+        self.assertEqual(state["contract_status"], "missing_fallback")
+        self.assertEqual(state["observed_states"], [])
+
     def test_batch_state_rejects_prose_state_conflict_and_ungrounded_absence(self):
         frames = [
             {"thumbnail": "frame-one", "captured_at": 100.0},
@@ -416,6 +454,119 @@ class VlmAlertPromptContractTests(unittest.TestCase):
 
             self.assertEqual(patched_summary, summary)
             self.assertEqual(reconciled["contract_status"], "parsed")
+            self.assertEqual(reconciled["alerts"], [])
+
+    def test_backend_reconciles_validated_present_state_and_inline_severity(self):
+        frames = [
+            {"thumbnail": f"frame-{index}", "captured_at": 100.0 + index}
+            for index in range(3)
+        ]
+        summary = (
+            "A person in a white shirt is seated at a desk, then stands.\n"
+            "BATCH_STATE_JSON:\n"
+            '{"version":1,"cover":{"snapshot_index":2,"kind":"transition"},'
+            '"events":[{"event_id":"stand","label":"person stands up",'
+            '"state":"new","snapshot_indices":[2],'
+            '"summary":"Person rises from the desk.","novelty":"novel"}],'
+            '"observed_states":[{"key":"person_in_white_shirt",'
+            '"label":"person in white shirt","state":"present",'
+            '"snapshot_indices":[1],'
+            '"evidence":"Person in white shirt is seated at desk."}],'
+            '"routines":[],"memory_pass":[],"alerts":[]}'
+        )
+        with tempfile.TemporaryDirectory() as temp:
+            manager = build_manager(Path(temp))
+            manager.update_prompt_settings(
+                channel_id=7,
+                alert_policy_prompt=(
+                    "Alert when person in white shirt is sitting in front of the camera, "
+                    "severity high."
+                ),
+            )
+            state = manager._extract_batch_state(summary, frames)
+
+            patched_summary, reconciled = manager._reconcile_operator_alert_contract(
+                7,
+                summary,
+                state,
+            )
+
+            self.assertEqual(reconciled["contract_status"], "parsed_alert_reconciled")
+            self.assertEqual(
+                reconciled["alert_reconciliation"]["source"],
+                "current_structured_state",
+            )
+            self.assertEqual(reconciled["alerts"][0]["severity"], "high")
+            self.assertEqual(reconciled["alerts"][0]["snapshot_indices"], [1])
+            self.assertEqual(len(manager._structured_alert_payloads(patched_summary)), 1)
+
+    def test_backend_does_not_reconcile_unknown_observed_state(self):
+        frames = [{"thumbnail": "frame-one", "captured_at": 100.0}]
+        summary = (
+            "The watched person cannot be confirmed.\n"
+            "BATCH_STATE_JSON:\n"
+            '{"version":1,"cover":{"snapshot_index":1,"kind":"routine"},'
+            '"events":[],"observed_states":[{"key":"person_in_white_shirt",'
+            '"label":"person in white shirt","state":"unknown",'
+            '"snapshot_indices":[1],"evidence":"View is obstructed."}],'
+            '"routines":[],"memory_pass":[],"alerts":[]}'
+        )
+        with tempfile.TemporaryDirectory() as temp:
+            manager = build_manager(Path(temp))
+            manager.update_prompt_settings(
+                channel_id=7,
+                alert_policy_prompt=(
+                    "Alert when person in white shirt is sitting in front of the camera, "
+                    "severity high."
+                ),
+            )
+            state = manager._extract_batch_state(summary, frames)
+
+            patched_summary, reconciled = manager._reconcile_operator_alert_contract(
+                7,
+                summary,
+                state,
+            )
+
+            self.assertEqual(patched_summary, summary)
+            self.assertEqual(reconciled["alerts"], [])
+
+    def test_backend_does_not_turn_negated_movement_into_operator_alert(self):
+        frames = [
+            {"thumbnail": f"frame-{index}", "captured_at": 100.0 + index}
+            for index in range(2)
+        ]
+        summary = (
+            "The cat remains stationary on the shelf.\n"
+            "BATCH_STATE_JSON:\n"
+            '{"version":1,"cover":{"snapshot_index":1,"kind":"routine"},'
+            '"events":[{"event_id":"cat_static","label":"cat remains seated",'
+            '"state":"continuing","snapshot_indices":[1,2],'
+            '"summary":"No movement detected; cat remains in the same position.",'
+            '"novelty":"routine"}],'
+            '"observed_states":[{"key":"cat_orlandina","label":"cat Orlandina",'
+            '"state":"present","snapshot_indices":[1,2],'
+            '"evidence":"Cat visible on shelf in both snapshots."}],'
+            '"routines":[],"memory_pass":[],"alerts":[]}'
+        )
+        with tempfile.TemporaryDirectory() as temp:
+            manager = build_manager(Path(temp))
+            manager.update_prompt_settings(
+                channel_id=7,
+                alert_policy_prompt=(
+                    "Monitor presence changes. Detect person movement and cat movement "
+                    "as significant events requiring alert."
+                ),
+            )
+            state = manager._extract_batch_state(summary, frames)
+
+            patched_summary, reconciled = manager._reconcile_operator_alert_contract(
+                7,
+                summary,
+                state,
+            )
+
+            self.assertEqual(patched_summary, summary)
             self.assertEqual(reconciled["alerts"], [])
 
     def test_backend_alert_reconciliation_never_promotes_memory_or_prose_without_event_evidence(self):

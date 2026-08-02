@@ -16,7 +16,7 @@ export interface FieldDef {
 }
 
 export interface Section { title: string; help?: string; fields?: FieldDef[]; kind?: 'severity' | 'capacity'; experimental?: boolean }
-export interface TabDef { id: string; label: string; custom?: 'env' | 'audit' | 'users'; sections?: Section[] }
+export interface TabDef { id: string; label: string; custom?: 'env' | 'audit' | 'users' | 'diagnostics'; sections?: Section[] }
 
 const CLIP_MODELS = ['ViT-B/32', 'ViT-B/16', 'ViT-L/14', 'ViT-L/14@336px'].map((v) => ({ v }))
 
@@ -156,6 +156,7 @@ export const TABS: TabDef[] = [
       { title: 'Estimated capacity', kind: 'capacity' },
     ],
   },
+  { id: 'diagnostics', label: 'Diagnostics', custom: 'diagnostics' },
   { id: 'users', label: 'Users', custom: 'users' },
   { id: 'audit', label: 'Audit', custom: 'audit' },
   { id: 'environment', label: 'Environment', custom: 'env' },

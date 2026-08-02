@@ -91,7 +91,7 @@
   --control-pad-x: 12px;
   --control-min-h: 38px;
   --section-gap: 14px;
-  --rail-w: 88px;
+  --rail-w: 0px;
 
   --backdrop-accent: rgba(56, 224, 212, 0.13);
   --backdrop-info: rgba(106, 168, 255, 0.14);

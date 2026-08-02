@@ -7,6 +7,7 @@ import { TABS, WRITABLE_KEYS, SEVERITY_KEYS, type FieldDef } from './defs'
 import { EnvTab } from './EnvTab'
 import { AuditTab } from './AuditTab'
 import { UsersTab } from './UsersTab'
+import { DiagnosticsTab } from './DiagnosticsTab'
 import { Dropdown } from '../shell/Dropdown'
 
 const DEFAULTS: Settings = {
@@ -159,7 +160,15 @@ export function SettingsModal({
     if (t.custom) return t.custom.includes(q)
     return !!t.sections?.some((sec) => sec.title.toLowerCase().includes(q) || sec.fields?.some((f) => fieldMatch(f.label)))
   }
-  const tabKind = (custom?: string) => custom === 'users' ? 'users' : custom === 'audit' ? 'audit' : custom === 'env' ? 'env' : 'settings'
+  const tabKind = (custom?: string) => custom === 'users'
+    ? 'users'
+    : custom === 'audit'
+      ? 'audit'
+      : custom === 'env'
+        ? 'env'
+        : custom === 'diagnostics'
+          ? 'diagnostics'
+          : 'settings'
   const permittedTabs = TABS.filter((candidate) => canViewSettingsTab(user, tabKind(candidate.custom)))
   const visibleTabs = permittedTabs.filter(tabHasMatch)
   const activeId = visibleTabs.some((t) => t.id === tab) ? tab : (visibleTabs[0]?.id ?? tab)
@@ -211,6 +220,7 @@ export function SettingsModal({
             )}
             {!loading && activeTab?.custom === 'env' && <EnvTab />}
             {!loading && activeTab?.custom === 'audit' && <AuditTab />}
+            {!loading && activeTab?.custom === 'diagnostics' && <DiagnosticsTab />}
             {!loading && activeTab?.custom === 'users' && (
               <UsersTab
                 currentUserId={user.id}

@@ -63,6 +63,7 @@ PORT_ENV = {
     "EVOSSEARCH_GUNICORN_WORKERS": "1",
     "EVOSSEARCH_GUNICORN_THREADS": "8",
     "EVOSSEARCH_GUNICORN_TIMEOUT": "240",
+    "EVOSSEARCH_GUNICORN_GRACEFUL_TIMEOUT": "20",
     "EVOSSEARCH_OFFLINE_MODE": "true",
     "EVOSSEARCH_SECURE_DEPLOYMENT_REQUIRED": "true",
     "EVOSSEARCH_AUTH_ENABLED": "true",
@@ -126,9 +127,23 @@ PORT_ENV = {
     "EVOSSEARCH_SEMANTIC_SNAPSHOT_ARCHIVE_ENABLED": "true",
     "EVOSSEARCH_SEMANTIC_SNAPSHOT_ARCHIVE_QUEUE": "512",
     "EVOSSEARCH_SEMANTIC_SNAPSHOT_ARCHIVE_BATCH_SIZE": "32",
+    "EVOSSEARCH_PROBE_REALTIME_BOOKMARK_ENABLED": "true",
+    "EVOSSEARCH_PROBE_REALTIME_CONFIRM_HITS": "2",
+    "EVOSSEARCH_PROBE_REALTIME_CONFIRM_WINDOW_SEC": "3.2",
+    "EVOSSEARCH_PROBE_REALTIME_MAX_EVENT_AGE_SEC": "5",
+    "EVOSSEARCH_VLM_FAST_ALERT_ENABLED": "true",
+    "EVOSSEARCH_VLM_FAST_ALERT_POST_ROLL_SEC": "2.5",
+    "EVOSSEARCH_VLM_FAST_ALERT_COOLDOWN_SEC": "12",
+    "EVOSSEARCH_VLM_FAST_ALERT_MAX_FRAMES": "6",
+    "EVOSSEARCH_VLM_FAST_ALERT_MAX_TOKENS": "128",
+    "EVOSSEARCH_VLM_FAST_ALERT_WORKERS": "2",
+    "EVOSSEARCH_VLM_FAST_ALERT_SEMANTIC_DELTA": "0.22",
+    "EVOSSEARCH_VLM_FAST_ALERT_MIN_MOVING_FRACTION": "0.15",
+    "EVOSSEARCH_VLM_FAST_ALERT_DEDUPE_WINDOW_SEC": "12",
     "EVOSSEARCH_LUXRIOT_ROLLUP_SCHEDULER_ENABLED": "true",
     "EVOSSEARCH_LUXRIOT_ROLLUP_LLM_LEVELS": "L1,L2,L3",
     "EVOSSEARCH_LUXRIOT_ROLLUP_LLM_MODEL": "agent",
+    "EVOSSEARCH_LUXRIOT_ROLLUP_CONTEXT_LIMIT_TOKENS": "32768",
     "EVOSSEARCH_LUXRIOT_ROLLUP_L3_DEEP_ENABLED": "true",
     "EVOSSEARCH_LUXRIOT_ROLLUP_L3_DEEP_CONNECT_TIMEOUT_SEC": "5",
     "EVOSSEARCH_LUXRIOT_ROLLUP_L3_DEEP_READ_TIMEOUT_SEC": "600",
@@ -1392,6 +1407,10 @@ def render_runtime_env(
             "EVOSSEARCH_INFERENCE_QUEUE_SPOOL_DIR": str(
                 answers.data_root / "inference-spool"
             ),
+            "EVOSSEARCH_LM_VISION_HEALTH_STATE_FILE": str(
+                answers.data_root / "state" / "vlm-vision-health.json"
+            ),
+            "EVOSSEARCH_LM_VISION_HEALTH_MAX_AGE_SEC": "180",
             "EVOSSEARCH_PROBE_CHANNEL_GROUPS_FILE": str(
                 answers.data_root / "state" / "probe_channel_groups.json"
             ),
@@ -1409,11 +1428,13 @@ def render_runtime_env(
             "EVOSSEARCH_LM_PROFILE_AGENT_BASE_URL": answers.vlm_url,
             "EVOSSEARCH_LM_PROFILE_AGENT_MODEL": answers.vlm_model,
             "EVOSSEARCH_LM_PROFILE_AGENT_TIMEOUT": "600",
+            "EVOSSEARCH_LM_PROFILE_AGENT_MAX_INFLIGHT": "4",
             "EVOSSEARCH_LM_PROFILE_VLM_KIND": "vlm",
             "EVOSSEARCH_LM_PROFILE_VLM_ENABLED": "true",
             "EVOSSEARCH_LM_PROFILE_VLM_BASE_URL": answers.vlm_url,
             "EVOSSEARCH_LM_PROFILE_VLM_MODEL": answers.vlm_model,
             "EVOSSEARCH_LM_PROFILE_VLM_TIMEOUT": "600",
+            "EVOSSEARCH_LM_PROFILE_VLM_MAX_INFLIGHT": "4",
             "EVOSSEARCH_LUXRIOT_ROLLUP_L3_DEEP_BASE_URL": answers.deep_url,
             "EVOSSEARCH_LUXRIOT_ROLLUP_L3_DEEP_MODEL": answers.deep_model,
             "EVOSSEARCH_LUXRIOT_ROLLUP_L3_DEEP_ENABLED": (
@@ -1526,7 +1547,7 @@ Environment=HF_HUB_OFFLINE=1
 Environment=TRANSFORMERS_OFFLINE=1
 Environment=VLLM_USE_FLASHINFER_SAMPLER=0
 Environment=PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
-ExecStart={vllm} serve {model} --served-model-name {DEFAULT_VLM_MODEL} --host 127.0.0.1 --port 1234 --max-model-len 32768 --gpu-memory-utilization 0.75 --max-num-seqs 4 --max-num-batched-tokens 4096 --kv-cache-dtype fp8 --enforce-eager --attention-backend TRITON_ATTN --mm-encoder-attn-backend TRITON_ATTN --limit-mm-per-prompt.image 16 --limit-mm-per-prompt.video 0 --mm-processor-kwargs.max_pixels 100352 --enable-auto-tool-choice --tool-call-parser hermes
+ExecStart={vllm} serve {model} --served-model-name {DEFAULT_VLM_MODEL} --host 127.0.0.1 --port 1234 --max-model-len 32768 --gpu-memory-utilization 0.75 --max-num-seqs 4 --max-num-batched-tokens 4096 --kv-cache-dtype fp8 --enforce-eager --attention-backend TRITON_ATTN --mm-encoder-attn-backend FLASH_ATTN --mm-processor-cache-gb 0 --limit-mm-per-prompt.image 16 --limit-mm-per-prompt.video 0 --mm-processor-kwargs.max_pixels 100352 --enable-auto-tool-choice --tool-call-parser hermes
 Restart=on-failure
 RestartSec=10
 TimeoutStartSec=300
@@ -1535,6 +1556,49 @@ KillMode=mixed
 
 [Install]
 WantedBy=multi-user.target
+"""
+        vision_state = answers.data_root / "state" / "vlm-vision-health.json"
+        watchdog = app_dir / "scripts" / "vlm_vision_watchdog.py"
+        python = app_dir / ".venv" / "bin" / "python"
+        units[Path("/etc/systemd/system/eva-vlm-vision-watchdog.service")] = f"""[Unit]
+Description=EVA content-aware VLM vision watchdog
+After=eva-vllm.service
+Requires=eva-vllm.service
+OnFailure=eva-vlm-vision-recover.service
+
+[Service]
+Type=oneshot
+User=eva
+Group=eva
+WorkingDirectory={app_dir}
+EnvironmentFile={env_file}
+Environment=EVOSSEARCH_CONFIG_ENV_FILE={env_file}
+ExecStart={python} {watchdog} --state-file {vision_state} --failure-threshold 2 --timeout 30
+Nice=10
+NoNewPrivileges=true
+PrivateTmp=true
+"""
+        units[Path("/etc/systemd/system/eva-vlm-vision-watchdog.timer")] = """[Unit]
+Description=Run EVA VLM vision watchdog every minute
+
+[Timer]
+OnBootSec=90s
+OnUnitActiveSec=60s
+AccuracySec=5s
+Persistent=true
+Unit=eva-vlm-vision-watchdog.service
+
+[Install]
+WantedBy=timers.target
+"""
+        units[Path("/etc/systemd/system/eva-vlm-vision-recover.service")] = """[Unit]
+Description=Recover EVA VLM after confirmed visual inference failure
+StartLimitIntervalSec=3600
+StartLimitBurst=3
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/systemctl restart eva-vllm.service
 """
     if answers.local_deep:
         binary = answers.install_root / "llama.cpp" / "build-port-cpu" / "bin" / "llama-server"
@@ -1566,6 +1630,13 @@ WantedBy=multi-user.target
     retired_units = []
     if not answers.local_vlm:
         retired_units.append(("eva-vllm", Path("/etc/systemd/system/eva-vllm.service")))
+        retired_units.extend(
+            (
+                ("eva-vlm-vision-watchdog.timer", Path("/etc/systemd/system/eva-vlm-vision-watchdog.timer")),
+                ("eva-vlm-vision-watchdog.service", Path("/etc/systemd/system/eva-vlm-vision-watchdog.service")),
+                ("eva-vlm-vision-recover", Path("/etc/systemd/system/eva-vlm-vision-recover.service")),
+            )
+        )
     if not answers.local_deep:
         retired_units.append(
             ("eva-deep-review", Path("/etc/systemd/system/eva-deep-review.service"))
@@ -1577,6 +1648,7 @@ WantedBy=multi-user.target
     services = ["postgresql", "eva-ai"]
     if answers.local_vlm:
         services.append("eva-vllm")
+        services.append("eva-vlm-vision-watchdog.timer")
     if answers.local_deep:
         services.append("eva-deep-review")
     runner.run(("systemctl", "enable", *services))
@@ -1831,6 +1903,9 @@ def start_and_verify(answers: Answers, runner: Runner) -> None:
             expected_model=answers.vlm_model,
         )
         _verify_vlm_vision(answers.vlm_url, answers.vlm_model)
+    if answers.local_vlm:
+        runner.run(("systemctl", "restart", "eva-vlm-vision-watchdog.service"))
+        runner.run(("systemctl", "restart", "eva-vlm-vision-watchdog.timer"))
     if answers.local_deep:
         runner.run(("systemctl", "restart", "eva-deep-review"))
     if answers.deep_url and not runner.dry_run:

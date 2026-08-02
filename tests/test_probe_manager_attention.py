@@ -1,4 +1,6 @@
+import base64
 import unittest
+from io import BytesIO
 from unittest.mock import patch
 
 import numpy as np
@@ -85,6 +87,48 @@ class ProbeManagerAttentionTests(unittest.TestCase):
                 ["dark background"],
             )
         self.assertEqual(calls, ["bright foreground", "dark background"])
+
+    def test_score_frames_honors_roi_for_current_frame(self):
+        def embed_image(image):
+            level = float(image.getpixel((0, 0))[0]) / 255.0
+            return np.asarray([level, 1.0 - level], dtype=np.float32)
+
+        def embed_text(text):
+            return (
+                np.asarray([1.0, 0.0], dtype=np.float32)
+                if "bright" in text.casefold()
+                else np.asarray([0.0, 1.0], dtype=np.float32)
+            )
+
+        def encode(image, **_kwargs):
+            output = BytesIO()
+            image.save(output, format="PNG")
+            return base64.b64encode(output.getvalue()).decode("ascii")
+
+        manager = ProbeManager(
+            embed_image_fn=embed_image,
+            embed_text_fn=embed_text,
+            jpeg_encoder=encode,
+        )
+        frame = Image.new("RGB", (8, 4), color=(0, 0, 0))
+        for x in range(4, 8):
+            for y in range(4):
+                frame.putpixel((x, y), (255, 255, 255))
+        with patch.object(ProbeBuffer, "_rebuild_index", return_value=None):
+            manager.add_frame(7, frame, 1_000)
+
+        full = manager.score_frames(7, ["bright"], ["dark"])["results"][0]
+        cropped = manager.score_frames(
+            7,
+            ["bright"],
+            ["dark"],
+            min_ts_ms=1_000,
+            max_ts_ms=1_000,
+            roi_norm=(0.5, 0.0, 0.5, 1.0),
+            roi_padding=0.0,
+        )["results"][0]
+        self.assertLess(full["margin"], -0.9)
+        self.assertGreater(cropped["margin"], 0.9)
 
 
 if __name__ == "__main__":

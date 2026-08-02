@@ -2,7 +2,7 @@ import { useState } from 'react'
 import { IconBolt } from '@tabler/icons-react'
 import { probesApi, type Benchmark } from '../../api/probes'
 
-// Top-panel benchmark indicator that doubles as the launch button.
+// Explicit diagnostic action; kept out of the operational status chrome.
 export function BenchmarkButton() {
   const [bench, setBench] = useState<Benchmark | null>(null)
   const [busy, setBusy] = useState(false)

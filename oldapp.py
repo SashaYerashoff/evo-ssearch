@@ -29,6 +29,7 @@ import threading
 import time
 import uuid
 import xml.etree.ElementTree as ET
+from concurrent.futures import ThreadPoolExecutor
 import requests
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
@@ -121,6 +122,7 @@ from luxriot_connector import DEFAULT_BATCH_STATE_JSON_PROMPT, LuxriotManager
 from probe_manager import ProbeManager
 from road_events import AutoSceneCardConfig, DecodedVideoFrame, infer_scene_card_from_frames
 from semantic_snapshot_archive import SemanticSnapshotArchiveWriter
+from vlm_vision_health import read_health_state
 from security import (
     ALL_CHANNELS,
     AuditEvent,
@@ -4183,6 +4185,21 @@ def _call_lm_chat(
         model_override=model_override,
         kind=profile_kind,
     )
+    is_vlm_request = str(profile_kind or '').strip().lower() == "vlm"
+
+    def _assert_visual_health(phase: str) -> None:
+        if not is_vlm_request:
+            return
+        vision_health = _check_vlm_vision_health(profile=profile)
+        if bool(vision_health.get("required")) and not bool(vision_health.get("ok")):
+            status = str(vision_health.get("status") or "unavailable")
+            raise RuntimeError(
+                "VLM visual inference is quarantined by the content-aware "
+                f"health gate (phase={phase}, status={status}); the batch was not admitted "
+                "to memory or alert processing."
+            )
+
+    _assert_visual_health("preflight")
     base_url = str(profile.get("base_url") or "").rstrip("/")
     if not base_url:
         raise RuntimeError("LM profile base URL is not configured.")
@@ -4301,6 +4318,9 @@ def _call_lm_chat(
                 "LM response rejected after one guarded retry: "
                 f"{retry_issue} (finish_reason={finish_reason or 'unknown'})"
             )
+    # Re-check after generation so a watchdog transition which happened while
+    # a long batch was running cannot race a stale result into L0 memory.
+    _assert_visual_health("postflight")
     return content_text or "(empty response from model)"
 
 
@@ -4338,6 +4358,88 @@ _call_video_understanding.eva_generation_preflight = True  # type: ignore[attr-d
 _call_video_understanding.eva_workload_class = True  # type: ignore[attr-defined]
 _call_video_understanding.eva_max_tokens_override = True  # type: ignore[attr-defined]
 _call_video_understanding.eva_resource_key = _video_understanding_resource_key  # type: ignore[attr-defined]
+
+
+def _call_rollup_understanding(
+    messages: List[Dict[str, Any]],
+    model_override: Optional[str] = None,
+    *,
+    preflight: Optional[Callable[[], None]] = None,
+    workload_class: Optional[str] = None,
+    max_tokens_override: Optional[int] = None,
+) -> str:
+    """Route text-only L1-L3 work through the agent profile, not the VLM gate."""
+
+    normalized_override = str(model_override or "").strip()
+    if normalized_override == "agent":
+        normalized_override = ""
+    completion_tokens = int(
+        max_tokens_override
+        if max_tokens_override is not None
+        else getattr(config, "LM_VIDEO_MAX_TOKENS", 768)
+    )
+    context_tokens = max(
+        8192,
+        int(getattr(config, "LUXRIOT_ROLLUP_CONTEXT_LIMIT_TOKENS", 32768) or 32768),
+    )
+    input_char_budget = max(
+        16000,
+        int(max(1024, context_tokens - completion_tokens - 2048) * 3.2),
+    )
+    bounded_messages = copy.deepcopy(messages)
+    text_parts: List[Tuple[int, int, str]] = []
+    total_chars = 0
+    for message_index, message in enumerate(bounded_messages):
+        content = message.get("content")
+        if not isinstance(content, list):
+            continue
+        for part_index, part in enumerate(content):
+            if not isinstance(part, Mapping) or str(part.get("type") or "") != "text":
+                continue
+            text_value = str(part.get("text") or "")
+            total_chars += len(text_value)
+            text_parts.append((message_index, part_index, text_value))
+    overflow = max(0, total_chars - input_char_budget)
+    # Trim the largest text blocks first, preserving both their metadata prefix
+    # and most recent/source-summary tail. The final corrective instruction is
+    # normally small and therefore survives intact.
+    for message_index, part_index, text_value in sorted(
+        text_parts,
+        key=lambda item: len(item[2]),
+        reverse=True,
+    ):
+        if overflow <= 0:
+            break
+        removable = max(0, len(text_value) - 4000)
+        remove = min(removable, overflow)
+        if remove <= 0:
+            continue
+        keep = len(text_value) - remove
+        head = min(max(1200, keep // 4), keep)
+        tail = max(0, keep - head)
+        compacted = (
+            text_value[:head]
+            + "\n\n[older rollup source text compacted to fit the configured context]\n\n"
+            + (text_value[-tail:] if tail else "")
+        )
+        content = bounded_messages[message_index].get("content")
+        if isinstance(content, list) and isinstance(content[part_index], dict):
+            content[part_index]["text"] = compacted
+        overflow -= remove
+    return _call_lm_chat(
+        bounded_messages,
+        model_override=normalized_override or None,
+        profile_id="agent",
+        profile_kind="agent",
+        preflight=preflight,
+        workload_class=workload_class or "rollup",
+        max_tokens_override=max_tokens_override,
+    )
+
+
+_call_rollup_understanding.eva_generation_preflight = True  # type: ignore[attr-defined]
+_call_rollup_understanding.eva_workload_class = True  # type: ignore[attr-defined]
+_call_rollup_understanding.eva_max_tokens_override = True  # type: ignore[attr-defined]
 
 
 def _parse_lm_alerts(text: str, default_channel_id: int, default_ts_ms: Optional[int] = None) -> List[Dict[str, Any]]:
@@ -4824,6 +4926,7 @@ luxriot_manager = LuxriotManager(
     probe_manager=None,  # will be assigned after probe_manager init
     runtime_state_store=_build_luxriot_runtime_state_store(),
 )
+luxriot_manager.rollup_lm_callback = _call_rollup_understanding
 try:
     with luxriot_manager.cache_lock:
         changed_prompt_defaults = False
@@ -5962,6 +6065,101 @@ def _check_inference_queue_ready() -> Dict[str, Any]:
         **status,
     )
 
+
+def _check_vlm_vision_health(
+    *,
+    profile: Optional[Mapping[str, Any]] = None,
+) -> Dict[str, Any]:
+    """Read the watchdog state used to quarantine stale visual features."""
+
+    configured_path = str(
+        getattr(config, "LM_VISION_HEALTH_STATE_FILE", "") or ""
+    ).strip()
+    if not configured_path:
+        return _component_result(True, "disabled", required=False)
+
+    state = read_health_state(configured_path)
+    status = str(state.get("status") or "invalid").strip().lower()
+    checked_at_epoch = state.get("checked_at_epoch")
+    try:
+        age_seconds = max(0.0, time.time() - float(checked_at_epoch))
+    except (TypeError, ValueError):
+        age_seconds = None
+    max_age = float(
+        getattr(config, "LM_VISION_HEALTH_MAX_AGE_SEC", 180.0) or 180.0
+    )
+    stale = age_seconds is None or age_seconds > max_age
+
+    profile_mismatch = False
+    if profile is not None:
+        expected_url = str(profile.get("base_url") or "").rstrip("/")
+        expected_model = str(profile.get("model") or "").strip()
+        state_url = str(state.get("base_url") or "").rstrip("/")
+        state_model = str(state.get("model") or "").strip()
+        profile_mismatch = bool(
+            (state_url and expected_url and state_url != expected_url)
+            or (state_model and expected_model and state_model != expected_model)
+        )
+
+    # A state file is scoped to the endpoint/model recorded by its watchdog.
+    # A different explicitly selected profile must use its own watchdog rather
+    # than being blocked by an unrelated local VLM health record.
+    if profile_mismatch:
+        return _component_result(
+            True,
+            "not_applicable",
+            required=False,
+            checked_at=state.get("checked_at"),
+            state_file=configured_path,
+        )
+
+    failures = max(0, _to_int(state.get("consecutive_failures"), 0))
+    failure_threshold = max(1, _to_int(state.get("failure_threshold"), 1))
+    last_success_recent = False
+    raw_last_success = str(state.get("last_success_at") or "").strip()
+    if raw_last_success:
+        try:
+            last_success_dt = datetime.fromisoformat(
+                raw_last_success.replace("Z", "+00:00")
+            )
+            if last_success_dt.tzinfo is None:
+                last_success_dt = last_success_dt.replace(tzinfo=timezone.utc)
+            last_success_recent = (
+                time.time() - last_success_dt.timestamp()
+            ) <= max_age
+        except (TypeError, ValueError):
+            last_success_recent = False
+    suspect_grace = bool(
+        status == "suspect"
+        and 0 < failures < failure_threshold
+        and last_success_recent
+    )
+    healthy = bool(
+        not stale
+        and (
+            (status == "healthy" and bool(state.get("ok")))
+            or suspect_grace
+        )
+    )
+    if stale:
+        effective_status = "stale"
+    else:
+        effective_status = status
+    return _component_result(
+        healthy,
+        effective_status,
+        required=True,
+        checked_at=state.get("checked_at"),
+        age_seconds=round(age_seconds, 3) if age_seconds is not None else None,
+        max_age_seconds=max_age,
+        consecutive_failures=state.get("consecutive_failures"),
+        failure_threshold=failure_threshold,
+        suspect_grace=suspect_grace,
+        latency_ms=state.get("latency_ms"),
+        error=state.get("error"),
+        state_file=configured_path,
+    )
+
 def _check_attention_ready() -> Dict[str, Any]:
     required = bool(
         getattr(config, "LUXRIOT_ATTENTION_STORAGE_ENABLED", False)
@@ -6042,6 +6240,8 @@ def _check_attention_ready() -> Dict[str, Any]:
                     "capture_apex_probe_dispatch_count",
                     "capture_apex_probe_failure_count",
                     "capture_apex_probe_skipped_count",
+                    "capture_apex_mode_counts",
+                    "capture_apex_last_selection",
                     "pending_frames",
                     "summary_queue_depth",
                     "summary_inflight",
@@ -6059,6 +6259,8 @@ def _check_attention_ready() -> Dict[str, Any]:
         writer=writer_stats,
         semantic_snapshot_archive=semantic_status,
         clip_microbatcher=clip_batch_status,
+        realtime_probe_bookmarks=realtime_probe_bookmarks.status(),
+        fast_vlm_alerts=fast_vlm_alerts.status(),
         capture_runtime=sorted(
             capture_runtime,
             key=lambda item: int(item.get("channel_id") or 0),
@@ -6399,6 +6601,7 @@ def ready():
         "authentication": _check_auth_ready(),
         "deployment_security": _check_deployment_security_ready(),
         "inference_queue": _check_inference_queue_ready(),
+        "vlm_vision": _check_vlm_vision_health(),
         "attention": _check_attention_ready(),
         "lm_profiles": _check_lm_profiles_ready(),
         "embedder": embedder_check,
@@ -6445,6 +6648,8 @@ def ready():
         required_names.append("deployment_security")
     if checks["inference_queue"].get("required"):
         required_names.append("inference_queue")
+    if checks["vlm_vision"].get("required"):
+        required_names.append("vlm_vision")
     if checks["attention"].get("required"):
         required_names.append("attention")
     if checks["lm_profiles"].get("required"):
@@ -7554,6 +7759,7 @@ ARCHIVE_SOURCE_ALIASES = {
     "probes_run": "probe",
     "probes_query": "probe",
     "probe_daemon": "probe",
+    "probe_realtime": "probe",
     "detection": "probe",
     "detections": "probe",
     "semantic_snapshot": "semantic_snapshot",
@@ -8464,7 +8670,17 @@ def _maybe_send_probe_bookmark(
     neg_score = _to_float(hit.get("neg_score"), 0.0)
     margin = _to_float(hit.get("margin"), 0.0)
     fps_hint = _to_optional_float(probe_like.get("fps"))
-    clip_vec = _embed_thumbnail_b64(hit.get("thumbnail"), "clip")
+    raw_clip_vec = hit.get("clip_vec")
+    clip_vec: Optional[np.ndarray]
+    if raw_clip_vec is not None:
+        try:
+            clip_vec = np.asarray(raw_clip_vec, dtype=np.float32).flatten()
+        except Exception:
+            clip_vec = None
+    else:
+        clip_vec = None
+    if clip_vec is None or clip_vec.size == 0:
+        clip_vec = _embed_thumbnail_b64(hit.get("thumbnail"), "clip")
     gate_config = probe_bookmark_gate.probe_config(probe_like)
 
     allow, gate_meta = probe_bookmark_gate.evaluate(
@@ -8485,6 +8701,9 @@ def _maybe_send_probe_bookmark(
         gate_meta["sent"] = False
         return False, gate_meta
 
+    bookmark_attempted_at_ms = int(time.time() * 1000)
+    gate_meta["bookmark_attempted_at_ms"] = bookmark_attempted_at_ms
+    gate_meta["event_to_bookmark_attempt_ms"] = max(0, bookmark_attempted_at_ms - ts_ms)
     try:
         luxriot_manager.send_bookmark_event(
             channel_id=channel_id,
@@ -8495,11 +8714,16 @@ def _maybe_send_probe_bookmark(
             timestamp_ms=ts_ms,
         )
     except Exception as exc:
+        bookmark_ack_at_ms = int(time.time() * 1000)
         gate_meta["sent"] = False
         gate_meta["reason"] = "send_error"
         gate_meta["error"] = str(exc)
+        gate_meta["bookmark_ack_at_ms"] = bookmark_ack_at_ms
+        gate_meta["bookmark_delivery_ms"] = max(0, bookmark_ack_at_ms - bookmark_attempted_at_ms)
+        gate_meta["event_to_bookmark_ack_ms"] = max(0, bookmark_ack_at_ms - ts_ms)
         return False, gate_meta
 
+    bookmark_ack_at_ms = int(time.time() * 1000)
     probe_bookmark_gate.mark_sent(
         channel_id=channel_id,
         probe_key=probe_key,
@@ -8511,6 +8735,9 @@ def _maybe_send_probe_bookmark(
     )
     gate_meta["sent"] = True
     gate_meta["reason"] = "sent"
+    gate_meta["bookmark_ack_at_ms"] = bookmark_ack_at_ms
+    gate_meta["bookmark_delivery_ms"] = max(0, bookmark_ack_at_ms - bookmark_attempted_at_ms)
+    gate_meta["event_to_bookmark_ack_ms"] = max(0, bookmark_ack_at_ms - ts_ms)
     return True, gate_meta
 
 
@@ -8535,6 +8762,9 @@ def _store_probe_hits(
     *,
     source: str,
     bookmark_sent: bool = False,
+    bookmark_hit_timestamp_ms: Optional[int] = None,
+    precomputed_clip_vec: Optional[np.ndarray] = None,
+    precomputed_embedding_space: Optional[Mapping[str, Any]] = None,
     extra_payload: Optional[Dict[str, Any]] = None,
 ) -> int:
     if not hits:
@@ -8571,10 +8801,18 @@ def _store_probe_hits(
         margin = _to_float(hit.get("margin"), 0.0)
         thumbnail_b64 = hit.get("thumbnail")
         archive_thumbnail_b64 = _resolve_archive_thumbnail(thumbnail_b64, ts_ms)
-        clip_vec, embedding_space = _embed_thumbnail_b64_with_space(
-            thumbnail_b64,
-            "clip",
-        )
+        if (
+            precomputed_clip_vec is not None
+            and bookmark_hit_timestamp_ms is not None
+            and ts_ms == int(bookmark_hit_timestamp_ms)
+        ):
+            clip_vec = np.asarray(precomputed_clip_vec, dtype=np.float32).flatten()
+            embedding_space = dict(precomputed_embedding_space or {})
+        else:
+            clip_vec, embedding_space = _embed_thumbnail_b64_with_space(
+                thumbnail_b64,
+                "clip",
+            )
         raw_image_path = str(hit.get("image_path") or hit.get("path") or "").strip() or None
         keep_record, saved_image_path, retention_meta = detection_archive.handle_hit(
             probe_id=probe_id,
@@ -8619,7 +8857,11 @@ def _store_probe_hits(
                 "channel_id": channel_id,
                 "severity": severity,
                 "bookmark_enabled": bookmark_enabled,
-                "bookmark_sent": bookmark_sent,
+                "bookmark_sent": bool(
+                    bookmark_sent
+                    and bookmark_hit_timestamp_ms is not None
+                    and ts_ms == int(bookmark_hit_timestamp_ms)
+                ),
                 "pos_score": pos_score,
                 "neg_score": neg_score,
                 "margin": margin,
@@ -8645,6 +8887,870 @@ def _store_probe_hits(
     except Exception as exc:
         print(f"Detections store write failed for {probe_id}: {exc}")
         return 0
+
+
+class _FastVlmAlertRuntime:
+    """Run a compact, priority VLM alert pass on a CV burst episode."""
+
+    def __init__(self) -> None:
+        self.enabled = bool(getattr(config, "VLM_FAST_ALERT_ENABLED", True))
+        self.post_roll_ms = int(
+            max(0.0, float(getattr(config, "VLM_FAST_ALERT_POST_ROLL_SEC", 1.0) or 1.0))
+            * 1000.0
+        )
+        self.cooldown_ms = int(
+            max(1.0, float(getattr(config, "VLM_FAST_ALERT_COOLDOWN_SEC", 12.0) or 12.0))
+            * 1000.0
+        )
+        self.max_frames = max(4, int(getattr(config, "VLM_FAST_ALERT_MAX_FRAMES", 6) or 6))
+        self.max_tokens = max(128, int(getattr(config, "VLM_FAST_ALERT_MAX_TOKENS", 128) or 128))
+        workers = max(1, int(getattr(config, "VLM_FAST_ALERT_WORKERS", 2) or 2))
+        self.semantic_delta_threshold = max(
+            0.0,
+            float(getattr(config, "VLM_FAST_ALERT_SEMANTIC_DELTA", 0.22) or 0.22),
+        )
+        self.min_moving_fraction = max(
+            0.0,
+            float(
+                getattr(config, "VLM_FAST_ALERT_MIN_MOVING_FRACTION", 0.15)
+                or 0.15
+            ),
+        )
+        self._executor = ThreadPoolExecutor(max_workers=workers, thread_name_prefix="eva-vlm-fast-alert")
+        self._capacity = threading.BoundedSemaphore(max(4, workers * 2))
+        self._lock = threading.RLock()
+        self._pending: Dict[int, Dict[str, Any]] = {}
+        self._last_dispatched_ms: Dict[int, int] = {}
+        self._previous_embeddings: Dict[int, np.ndarray] = {}
+        self._trigger_counts: Dict[str, int] = {
+            "cv_burst": 0,
+            "semantic_motion_change": 0,
+        }
+        self._last_semantic_delta: Dict[int, float] = {}
+        self._last_decisions: Dict[int, Dict[str, Any]] = {}
+        self._status: Dict[str, Any] = {
+            "enabled": self.enabled,
+            "workers": workers,
+            "submitted_total": 0,
+            "completed_total": 0,
+            "alert_batches_total": 0,
+            "bookmarks_sent_total": 0,
+            "rejected_total": 0,
+            "pending_channels": 0,
+            "last_latency_ms": None,
+            "last_trigger_to_inference_ms": None,
+            "last_inference_ms": None,
+            "last_event_to_bookmark_ack_ms": None,
+            "last_error": None,
+        }
+
+    @staticmethod
+    def _selection_mode(observation: Mapping[str, Any]) -> str:
+        selection = observation.get("capture_selection")
+        if not isinstance(selection, Mapping):
+            return ""
+        return str(selection.get("selection_mode") or "").strip().lower()
+
+    def observe(self, channel_id: int, observation: Mapping[str, Any]) -> None:
+        if not self.enabled:
+            return
+        timestamp_ms = _to_optional_int(observation.get("timestamp_ms"))
+        if timestamp_ms is None:
+            return
+        channel = int(channel_id)
+        mode = self._selection_mode(observation)
+        semantic_delta: Optional[float] = None
+        try:
+            embedding = np.asarray(
+                observation.get("embedding"),
+                dtype=np.float32,
+            ).flatten()
+            norm = float(np.linalg.norm(embedding))
+            if embedding.size and norm > 1e-8:
+                embedding = embedding / norm
+            else:
+                embedding = np.zeros((0,), dtype=np.float32)
+        except Exception:
+            embedding = np.zeros((0,), dtype=np.float32)
+        motion = (
+            observation.get("motion_aggregate")
+            if isinstance(observation.get("motion_aggregate"), Mapping)
+            else {}
+        )
+        moving_fraction = _to_float(
+            cast(Mapping[str, Any], motion).get("moving_fraction"),
+            0.0,
+        )
+        dispatch: Optional[Dict[str, Any]] = None
+        with self._lock:
+            previous = self._previous_embeddings.get(channel)
+            if (
+                previous is not None
+                and embedding.size
+                and previous.shape == embedding.shape
+            ):
+                semantic_delta = max(
+                    0.0,
+                    min(2.0, 1.0 - float(previous @ embedding)),
+                )
+                self._last_semantic_delta[channel] = round(semantic_delta, 6)
+            if embedding.size:
+                self._previous_embeddings[channel] = embedding
+            semantic_motion_change = bool(
+                semantic_delta is not None
+                and semantic_delta >= self.semantic_delta_threshold
+                and moving_fraction >= self.min_moving_fraction
+            )
+            trigger_reason = (
+                "capture_cv_burst"
+                if mode == "burst"
+                else (
+                    "semantic_motion_change"
+                    if semantic_motion_change
+                    else ""
+                )
+            )
+            pending = self._pending.get(channel)
+            last_dispatched = int(self._last_dispatched_ms.get(channel, 0))
+            if (
+                pending is None
+                and trigger_reason
+                and int(timestamp_ms) - last_dispatched >= self.cooldown_ms
+            ):
+                pending = {
+                    "trigger_timestamp_ms": int(timestamp_ms),
+                    "created_at_ms": int(time.time() * 1000.0),
+                    "reason": trigger_reason,
+                    "semantic_delta": semantic_delta,
+                    "moving_fraction": moving_fraction,
+                }
+                self._pending[channel] = pending
+                counter_key = (
+                    "cv_burst"
+                    if trigger_reason == "capture_cv_burst"
+                    else "semantic_motion_change"
+                )
+                self._trigger_counts[counter_key] = (
+                    self._trigger_counts.get(counter_key, 0) + 1
+                )
+            if pending is not None:
+                trigger_ms = int(pending["trigger_timestamp_ms"])
+                if int(timestamp_ms) >= trigger_ms + self.post_roll_ms:
+                    dispatch = dict(pending)
+                    dispatch["observed_post_timestamp_ms"] = int(timestamp_ms)
+                    self._pending.pop(channel, None)
+                    self._last_dispatched_ms[channel] = int(timestamp_ms)
+            self._status["pending_channels"] = len(self._pending)
+        if dispatch is not None:
+            self._submit(channel, dispatch)
+
+    def _submit(self, channel_id: int, episode: Mapping[str, Any]) -> None:
+        if not self._capacity.acquire(blocking=False):
+            with self._lock:
+                self._status["rejected_total"] += 1
+                self._status["last_error"] = "fast VLM queue capacity exhausted"
+            return
+        with self._lock:
+            self._status["submitted_total"] += 1
+
+        def run() -> None:
+            try:
+                self._run_episode(int(channel_id), dict(episode))
+            except Exception as exc:
+                with self._lock:
+                    self._status["last_error"] = f"{type(exc).__name__}: {exc}"[:500]
+            finally:
+                self._capacity.release()
+
+        try:
+            self._executor.submit(run)
+        except Exception as exc:
+            self._capacity.release()
+            with self._lock:
+                self._status["rejected_total"] += 1
+                self._status["last_error"] = f"{type(exc).__name__}: {exc}"[:500]
+
+    @staticmethod
+    def _frame_timestamp_ms(frame: Mapping[str, Any]) -> int:
+        timestamp_ms = luxriot_manager._batch_frame_timestamp_ms(frame)
+        return int(timestamp_ms or 0)
+
+    @staticmethod
+    def _frame_activity(frame: Mapping[str, Any]) -> float:
+        selection = frame.get("capture_selection")
+        if not isinstance(selection, Mapping):
+            return 0.0
+        return _to_float(selection.get("activity_x"), 0.0)
+
+    def _episode_frames(self, channel_id: int, trigger_ms: int, post_ms: int) -> List[Dict[str, Any]]:
+        with luxriot_manager.cache_lock:
+            session = luxriot_manager.sessions.get(int(channel_id))
+        if session is None:
+            return []
+        try:
+            frames = [
+                dict(item)
+                for item in session.recent_frame_items(90)
+                if isinstance(item, Mapping) and str(item.get("thumbnail") or "").strip()
+            ]
+        except Exception:
+            with session.lock:
+                frames = [
+                    dict(item)
+                    for item in session.recent_frames
+                    if isinstance(item, Mapping) and str(item.get("thumbnail") or "").strip()
+                ]
+        frames = [
+            frame
+            for frame in frames
+            if trigger_ms - 8000 <= self._frame_timestamp_ms(frame) <= post_ms + 1500
+        ]
+        frames.sort(key=self._frame_timestamp_ms)
+        if not frames:
+            return []
+        targets = [
+            trigger_ms - 4000,
+            trigger_ms - 2500,
+            trigger_ms - 1000,
+            trigger_ms,
+            trigger_ms + 1000,
+            post_ms,
+        ]
+        selected: Dict[int, Dict[str, Any]] = {}
+        for target in targets:
+            candidate = min(frames, key=lambda frame: abs(self._frame_timestamp_ms(frame) - target))
+            selected[self._frame_timestamp_ms(candidate)] = candidate
+        apex = max(frames, key=lambda frame: (self._frame_activity(frame), -abs(self._frame_timestamp_ms(frame) - trigger_ms)))
+        selected[self._frame_timestamp_ms(apex)] = apex
+        selected[self._frame_timestamp_ms(frames[-1])] = frames[-1]
+        ordered = sorted(selected.values(), key=self._frame_timestamp_ms)
+        if len(ordered) > self.max_frames:
+            ordered = ordered[: self.max_frames - 1] + [ordered[-1]]
+        for index, frame in enumerate(ordered):
+            timestamp = self._frame_timestamp_ms(frame)
+            roles: List[str] = []
+            if index == 0:
+                roles.append("control")
+            if timestamp < trigger_ms:
+                roles.append("pre")
+            if abs(timestamp - trigger_ms) <= 1000:
+                roles.append("onset")
+            if frame is apex:
+                roles.append("apex")
+            if timestamp > trigger_ms:
+                roles.append("post")
+            frame["attention_roles"] = roles or ["support"]
+        return ordered
+
+    def _run_episode(self, channel_id: int, episode: Mapping[str, Any]) -> None:
+        trigger_ms = _to_int(episode.get("trigger_timestamp_ms"), 0)
+        post_ms = _to_int(episode.get("observed_post_timestamp_ms"), trigger_ms)
+        frames = self._episode_frames(channel_id, trigger_ms, post_ms)
+        if len(frames) < 2:
+            raise RuntimeError("fast VLM episode has fewer than two evidence frames")
+        episode_id = str(
+            uuid.uuid5(
+                uuid.NAMESPACE_URL,
+                f"eva-fast-alert:{channel_id}:{trigger_ms}",
+            )
+        )
+        with luxriot_manager.cache_lock:
+            raw_policy = luxriot_manager._get_alert_policy_prompt_locked(channel_id)
+        rendered_policy = luxriot_manager._render_alert_policy_prompt(raw_policy)
+        role_lines = [
+            f"Snapshot {index + 1}: {','.join(frame.get('attention_roles') or ['support'])}; "
+            f"timestamp_ms={self._frame_timestamp_ms(frame)}"
+            for index, frame in enumerate(frames)
+        ]
+        system_prompt = (
+            "You are EVA AI's bounded realtime visual alert gate. Inspect only the supplied current "
+            "snapshots. CV motion and semantic probes selected the frames but are not visual proof. "
+            "Raise an alert only when the images themselves ground a current operator criterion or an "
+            "immediate safety hazard such as collision risk, fall/collapse, fire, or dangerous intrusion. "
+            "Do not describe routine. Return only `BATCH_STATE_JSON:` followed by one compact JSON object. "
+            "Always include version and alerts. Include events or observed_states only when they provide current "
+            "visual evidence for an operator criterion; omit cover, scene, routines, and memory_pass in this fast phase. "
+            "Each alert uses title, description, severity, state, "
+            "snapshot_indices, timestamp_ms. If uncertain, use alerts: [].\n\n"
+            + rendered_policy[:1600]
+        )
+        task_prompt = (
+            "Check this short pre/onset/apex/post episode for a current actionable alert.\n"
+            f"Attention routing reason={str(episode.get('reason') or 'unknown')}; "
+            f"semantic_delta={_to_float(episode.get('semantic_delta'), 0.0):.3f}; "
+            f"moving_fraction={_to_float(episode.get('moving_fraction'), 0.0):.3f}. "
+            "These signals select evidence but do not prove an alert.\n"
+            + "\n".join(role_lines)
+        )
+        messages = _build_luxriot_messages(
+            f"#{channel_id}",
+            frames,
+            task_prompt,
+            system_prompt,
+        )
+        inference_started_at_ms = int(time.time() * 1000.0)
+        summary = _call_video_understanding(
+            messages,
+            profile_id=None,
+            workload_class="alert",
+            max_tokens_override=self.max_tokens,
+        )
+        inference_completed_at_ms = int(time.time() * 1000.0)
+        batch_state = luxriot_manager._extract_batch_state(summary, frames)
+        if str(batch_state.get("contract_status") or "") == "parsed_terminal_fence":
+            summary = luxriot_manager._render_reconciled_batch_state_summary(summary, batch_state)
+        summary, batch_state = luxriot_manager._reconcile_operator_alert_contract(
+            channel_id,
+            summary,
+            batch_state,
+        )
+        summary, batch_state = luxriot_manager._reconcile_general_hazard_alert_contract(
+            channel_id,
+            summary,
+            batch_state,
+        )
+        batch_start_ms = min(self._frame_timestamp_ms(frame) for frame in frames)
+        batch_end_ms = max(self._frame_timestamp_ms(frame) for frame in frames)
+        with luxriot_manager._session_side_effect_lock_for(channel_id):
+            delivery = luxriot_manager.process_summary_alerts(
+                channel_id,
+                summary,
+                default_ts_ms=trigger_ms,
+                min_ts_ms=batch_start_ms - 1000,
+                max_ts_ms=batch_end_ms + 1000,
+                delivery_lane="fast_alert",
+            )
+        completed_at_ms = int(time.time() * 1000.0)
+        reconciled_alerts = batch_state.get("alerts")
+        alert_count = (
+            len(reconciled_alerts)
+            if isinstance(reconciled_alerts, Sequence)
+            and not isinstance(reconciled_alerts, (str, bytes, bytearray))
+            else 0
+        )
+        with self._lock:
+            self._status["completed_total"] += 1
+            self._status["bookmarks_sent_total"] += int(delivery)
+            self._status["last_latency_ms"] = max(0, completed_at_ms - trigger_ms)
+            self._status["last_trigger_to_inference_ms"] = max(
+                0,
+                inference_started_at_ms - trigger_ms,
+            )
+            self._status["last_inference_ms"] = max(
+                0,
+                inference_completed_at_ms - inference_started_at_ms,
+            )
+            delivery_payload = delivery.as_dict()
+            self._status["last_event_to_bookmark_ack_ms"] = _to_optional_int(
+                delivery_payload.get("bookmark_first_ack_at_ms")
+            )
+            if self._status["last_event_to_bookmark_ack_ms"] is not None:
+                self._status["last_event_to_bookmark_ack_ms"] = max(
+                    0,
+                    int(self._status["last_event_to_bookmark_ack_ms"]) - trigger_ms,
+                )
+            self._last_decisions[int(channel_id)] = {
+                "trigger_timestamp_ms": trigger_ms,
+                "reason": str(episode.get("reason") or "unknown"),
+                "semantic_delta": _to_optional_float(
+                    episode.get("semantic_delta")
+                ),
+                "moving_fraction": _to_optional_float(
+                    episode.get("moving_fraction")
+                ),
+                "frame_count": len(frames),
+                "contract_status": str(
+                    batch_state.get("contract_status") or "unknown"
+                ),
+                "alert_count": alert_count,
+                "summary_chars": len(str(summary or "")),
+                "completed_at_ms": completed_at_ms,
+                "latency_ms": max(0, completed_at_ms - trigger_ms),
+            }
+            self._status["last_error"] = None
+        if not delivery.alert_events:
+            luxriot_manager.emit_attention_event(
+                "scheduler_decision",
+                {
+                    "id": episode_id,
+                    "channel_id": channel_id,
+                    "episode_id": episode_id,
+                    "decided_at_ms": completed_at_ms,
+                    "action": "fast_vlm_no_alert",
+                    "record": {
+                        "trigger_timestamp_ms": trigger_ms,
+                        "frame_count": len(frames),
+                        "latency_ms": max(0, completed_at_ms - trigger_ms),
+                    },
+                },
+            )
+            return
+        with self._lock:
+            self._status["alert_batches_total"] += 1
+        archive_frames = luxriot_manager._summary_archive_frames(
+            frames,
+            batch_start_ms=batch_start_ms,
+            batch_end_ms=batch_end_ms,
+            sample_count=len(frames),
+            batch_state=batch_state,
+        )
+        counts: Dict[str, int] = {}
+        for event in delivery.alert_events:
+            severity = str(event.get("severity") or "normal").strip().lower()
+            counts[severity] = counts.get(severity, 0) + 1
+        delivery_payload = delivery.as_dict()
+        first_attempt_ms = _to_optional_int(
+            delivery_payload.get("bookmark_first_attempt_at_ms")
+        )
+        first_ack_ms = _to_optional_int(
+            delivery_payload.get("bookmark_first_ack_at_ms")
+        )
+        latency_trace = {
+            "batch_first_frame_at_ms": batch_start_ms,
+            "batch_last_frame_at_ms": batch_end_ms,
+            "batch_sealed_at_ms": post_ms,
+            "summary_enqueued_at_ms": post_ms,
+            "summary_dispatch_started_at_ms": inference_started_at_ms,
+            "inference_started_at_ms": inference_started_at_ms,
+            "inference_completed_at_ms": inference_completed_at_ms,
+            "inference_ms": max(0, inference_completed_at_ms - inference_started_at_ms),
+        }
+        if first_attempt_ms is not None:
+            latency_trace["bookmark_first_attempt_at_ms"] = first_attempt_ms
+        if first_ack_ms is not None:
+            latency_trace["bookmark_first_ack_at_ms"] = first_ack_ms
+            latency_trace["batch_end_to_bookmark_ack_ms"] = max(
+                0,
+                first_ack_ms - batch_end_ms,
+            )
+        entry: Dict[str, Any] = {
+            "channel_id": channel_id,
+            "run_id": f"fast-alert:{episode_id}",
+            "batch_id": f"fast-{episode_id}",
+            "summary": summary,
+            "batch_state": batch_state,
+            "frame_count": len(frames),
+            "source_frame_count": len(frames),
+            "selected_frame_count": len(frames),
+            "batch_size": len(frames),
+            "created_at": inference_started_at_ms / 1000.0,
+            "batch_start_ms": batch_start_ms,
+            "batch_end_ms": batch_end_ms,
+            "duration_sec": max(0.0, (inference_completed_at_ms - inference_started_at_ms) / 1000.0),
+            "prompt": task_prompt,
+            "archive_frames": archive_frames,
+            "alert_counts": counts,
+            "alert_total": sum(counts.values()),
+            "attention_episode_id": episode_id,
+            "attention_phase": "fast_alert",
+            "fast_alert_phase": True,
+            "latency_trace": latency_trace,
+            **delivery_payload,
+        }
+        luxriot_manager._archive_summary_entry(entry)
+        luxriot_manager.emit_attention_event(
+            "scheduler_decision",
+            {
+                "id": episode_id,
+                "channel_id": channel_id,
+                "episode_id": episode_id,
+                "decided_at_ms": completed_at_ms,
+                "action": "fast_vlm_alert_delivered",
+                "record": {
+                    "trigger_timestamp_ms": trigger_ms,
+                    "frame_count": len(frames),
+                    "bookmarks_sent": int(delivery),
+                    "latency_ms": max(0, completed_at_ms - trigger_ms),
+                },
+            },
+        )
+
+    def status(self) -> Dict[str, Any]:
+        with self._lock:
+            return {
+                **self._status,
+                "trigger_counts": dict(self._trigger_counts),
+                "last_semantic_delta_by_channel": {
+                    str(channel_id): value
+                    for channel_id, value in self._last_semantic_delta.items()
+                },
+                "last_decision_by_channel": {
+                    str(channel_id): dict(decision)
+                    for channel_id, decision in self._last_decisions.items()
+                },
+            }
+
+    def shutdown(self) -> None:
+        self._executor.shutdown(wait=False, cancel_futures=True)
+
+
+class _RealtimeProbeBookmarkRuntime:
+    """Evaluate operator bookmark probes on each completed 1 Hz embedding.
+
+    The five-second retrospective daemon remains responsible for ordinary
+    probe history and ROI/image probes. This lane is deliberately narrow: it
+    only accelerates explicitly operator-authored, bookmark-enabled text
+    probes, and it never promotes an automatic VLM probe into an alarm. ROI
+    probes are evaluated against a fresh crop rather than the completed
+    full-frame vector; image-reference probes remain on the retrospective
+    daemon because they require a separate evidence contract.
+    """
+
+    def __init__(self) -> None:
+        self.enabled = bool(
+            getattr(config, "PROBE_REALTIME_BOOKMARK_ENABLED", True)
+        )
+        self.confirm_hits = max(
+            1,
+            int(getattr(config, "PROBE_REALTIME_CONFIRM_HITS", 2) or 2),
+        )
+        self.confirm_window_ms = int(
+            max(
+                1.0,
+                float(
+                    getattr(config, "PROBE_REALTIME_CONFIRM_WINDOW_SEC", 3.2)
+                    or 3.2
+                ),
+            )
+            * 1000.0
+        )
+        self.max_event_age_ms = int(
+            max(
+                1.0,
+                float(
+                    getattr(config, "PROBE_REALTIME_MAX_EVENT_AGE_SEC", 5.0)
+                    or 5.0
+                ),
+            )
+            * 1000.0
+        )
+        self.strong_score_boost = max(
+            0.0,
+            float(
+                getattr(config, "PROBE_REALTIME_STRONG_SCORE_BOOST", 0.06)
+                or 0.06
+            ),
+        )
+        workers = max(
+            1,
+            int(getattr(config, "PROBE_REALTIME_WORKERS", 2) or 2),
+        )
+        capacity = max(
+            workers,
+            int(getattr(config, "PROBE_REALTIME_QUEUE_CAPACITY", 32) or 32),
+        )
+        self._executor = ThreadPoolExecutor(
+            max_workers=workers,
+            thread_name_prefix="eva-probe-realtime",
+        )
+        self._capacity = threading.BoundedSemaphore(capacity)
+        self._lock = threading.RLock()
+        # A semantic frame supersedes the previous unscheduled frame for the
+        # same channel.  Keeping a FIFO here would turn a short GPU/DB stall
+        # into evaluations of already stale evidence, precisely when the
+        # realtime lane is supposed to minimize event-to-bookmark latency.
+        self._inflight_channels: set[int] = set()
+        self._pending_latest: Dict[int, Dict[str, Any]] = {}
+        self._confirmations: Dict[Tuple[int, str], List[int]] = {}
+        self._bookmark_locks: Dict[Tuple[int, str], threading.Lock] = {}
+        self._status: Dict[str, Any] = {
+            "enabled": self.enabled,
+            "workers": workers,
+            "queue_capacity": capacity,
+            "submitted_total": 0,
+            "coalesced_total": 0,
+            "rejected_total": 0,
+            "evaluated_total": 0,
+            "matched_total": 0,
+            "confirmed_total": 0,
+            "bookmarks_sent_total": 0,
+            "last_event_age_ms": None,
+            "max_event_age_ms_observed": 0,
+            "last_evaluation_ms": None,
+            "last_event_to_bookmark_ack_ms": None,
+            "last_error": None,
+        }
+
+    def submit(self, channel_id: int, observation: Mapping[str, Any]) -> None:
+        if not self.enabled:
+            return
+        channel_key = int(channel_id)
+        payload = dict(observation)
+        with self._lock:
+            self._status["submitted_total"] += 1
+            if channel_key in self._inflight_channels:
+                self._pending_latest[channel_key] = payload
+                self._status["coalesced_total"] += 1
+                return
+        if not self._capacity.acquire(blocking=False):
+            with self._lock:
+                self._status["rejected_total"] += 1
+                self._status["last_error"] = "realtime probe queue capacity exhausted"
+            return
+        with self._lock:
+            self._inflight_channels.add(channel_key)
+
+        def run() -> None:
+            try:
+                current = payload
+                while True:
+                    # If this channel waited for an executor worker, discard
+                    # its original frame and start with the newest one.
+                    with self._lock:
+                        current = self._pending_latest.pop(channel_key, current)
+                    try:
+                        self._evaluate(channel_key, current)
+                    except Exception as exc:
+                        with self._lock:
+                            self._status["last_error"] = (
+                                f"{type(exc).__name__}: {exc}"
+                            )[:500]
+                    with self._lock:
+                        next_payload = self._pending_latest.pop(channel_key, None)
+                        if next_payload is None:
+                            # Remove the inflight marker while holding the same
+                            # lock used by submit(), so a frame arriving at this
+                            # boundary starts a new worker instead of vanishing.
+                            self._inflight_channels.discard(channel_key)
+                            break
+                        current = next_payload
+            finally:
+                with self._lock:
+                    if channel_key in self._inflight_channels:
+                        self._inflight_channels.discard(channel_key)
+                        self._pending_latest.pop(channel_key, None)
+                self._capacity.release()
+
+        try:
+            self._executor.submit(run)
+        except Exception as exc:
+            self._capacity.release()
+            with self._lock:
+                self._inflight_channels.discard(channel_key)
+                self._pending_latest.pop(channel_key, None)
+                self._status["rejected_total"] += 1
+                self._status["last_error"] = f"{type(exc).__name__}: {exc}"[:500]
+
+    def _confirmed(
+        self,
+        channel_id: int,
+        probe_id: str,
+        timestamp_ms: int,
+        *,
+        strong: bool,
+    ) -> Tuple[bool, int]:
+        key = (int(channel_id), str(probe_id))
+        cutoff = int(timestamp_ms) - self.confirm_window_ms
+        with self._lock:
+            timestamps = [
+                value
+                for value in self._confirmations.get(key, [])
+                if cutoff <= int(value) <= int(timestamp_ms)
+            ]
+            if int(timestamp_ms) not in timestamps:
+                timestamps.append(int(timestamp_ms))
+            timestamps = sorted(timestamps)[-max(3, self.confirm_hits) :]
+            self._confirmations[key] = timestamps
+        return bool(strong or len(timestamps) >= self.confirm_hits), len(timestamps)
+
+    def _bookmark_lock(self, channel_id: int, probe_id: str) -> threading.Lock:
+        key = (int(channel_id), str(probe_id))
+        with self._lock:
+            lock = self._bookmark_locks.get(key)
+            if lock is None:
+                lock = threading.Lock()
+                self._bookmark_locks[key] = lock
+            return lock
+
+    def _evaluate(self, channel_id: int, observation: Mapping[str, Any]) -> None:
+        timestamp_ms = _to_optional_int(observation.get("timestamp_ms"))
+        if timestamp_ms is None:
+            return
+        evaluated_at_ms = int(time.time() * 1000.0)
+        event_age_ms = max(0, evaluated_at_ms - int(timestamp_ms))
+        with self._lock:
+            self._status["last_event_age_ms"] = event_age_ms
+            self._status["max_event_age_ms_observed"] = max(
+                int(self._status.get("max_event_age_ms_observed") or 0),
+                event_age_ms,
+            )
+        if event_age_ms > self.max_event_age_ms:
+            with self._lock:
+                self._status["rejected_total"] += 1
+                self._status["last_error"] = (
+                    f"semantic apex was stale ({event_age_ms} ms)"
+                )
+            return
+        thumbnail = str(observation.get("thumbnail") or "").strip()
+        raw_embedding = observation.get("embedding")
+        try:
+            clip_vec = np.asarray(raw_embedding, dtype=np.float32).flatten()
+        except Exception:
+            clip_vec = np.zeros((0,), dtype=np.float32)
+        embedding_space = (
+            dict(observation.get("embedding_space") or {})
+            if isinstance(observation.get("embedding_space"), Mapping)
+            else {}
+        )
+        probes = probes_store.list_probes()
+        for raw_probe in probes:
+            probe = dict(raw_probe)
+            if _to_int(probe.get("channel_id"), 0) != int(channel_id):
+                continue
+            if probe.get("enabled") is False or not bool(probe.get("bookmark")):
+                continue
+            if normalize_probe_origin(probe) != "operator":
+                continue
+            image_probe = probe.get("image_probe")
+            if isinstance(image_probe, Mapping) and bool(image_probe.get("data")) and image_probe.get("enabled") is not False:
+                continue
+            positives = [
+                str(item).strip()
+                for item in probe.get("positives") or []
+                if str(item or "").strip()
+            ]
+            if not positives:
+                continue
+            probe_roi_enabled, probe_roi_norm = _parse_probe_roi(probe)
+            result = probe_manager.score_current_frame(
+                int(channel_id),
+                int(timestamp_ms),
+                positives,
+                probe.get("negatives") or [],
+                embedding=clip_vec,
+                thumbnail_b64=thumbnail,
+                roi_norm=probe_roi_norm if probe_roi_enabled else None,
+                roi_padding=PROBE_ROI_PADDING,
+            )
+            score_raw = result.get("result") if isinstance(result, Mapping) else None
+            if not isinstance(score_raw, Mapping):
+                continue
+            score = dict(score_raw)
+            score_embedding = np.asarray(
+                result.get("scoring_embedding"),
+                dtype=np.float32,
+            ).flatten()
+            with self._lock:
+                self._status["evaluated_total"] += 1
+            pos_floor = _to_float(
+                probe.get("pos_floor"),
+                config.PROBE_POS_FLOOR_DEFAULT,
+            )
+            margin_floor = _to_float(
+                probe.get("margin"),
+                config.PROBE_MARGIN_DEFAULT,
+            )
+            pos_score = _to_float(score.get("pos_score"), 0.0)
+            margin = _to_float(score.get("margin"), 0.0)
+            if pos_score < pos_floor or margin < margin_floor:
+                continue
+            with self._lock:
+                self._status["matched_total"] += 1
+            strong = bool(
+                pos_score >= pos_floor + self.strong_score_boost
+                and margin >= margin_floor + self.strong_score_boost
+            )
+            confirmed, confirmation_hits = self._confirmed(
+                int(channel_id),
+                _probe_identity(probe),
+                int(timestamp_ms),
+                strong=strong,
+            )
+            if not confirmed:
+                continue
+            with self._lock:
+                self._status["confirmed_total"] += 1
+            hit = {
+                **score,
+                "thumbnail": thumbnail,
+                "clip_vec": score_embedding,
+                "confirmation_hits": confirmation_hits,
+                "confirmation_required": self.confirm_hits,
+                "strong_match": strong,
+            }
+            with self._bookmark_lock(int(channel_id), _probe_identity(probe)):
+                bookmark_sent, bookmark_gate = _maybe_send_probe_bookmark(
+                    probe,
+                    hit,
+                    source="probe_realtime",
+                )
+            bookmark_gate["embedding_completed_at_ms"] = evaluated_at_ms
+            bookmark_gate["embedding_event_age_ms"] = event_age_ms
+            bookmark_gate["confirmation_hits"] = confirmation_hits
+            bookmark_gate["confirmation_required"] = self.confirm_hits
+            bookmark_gate["strong_match"] = strong
+            updated_at_ms = int(time.time() * 1000.0)
+            runtime_hit = {
+                key: value
+                for key, value in hit.items()
+                if key != "clip_vec"
+            }
+            patch_runtime = getattr(probes_store, "patch_probe_runtime", None)
+            if callable(patch_runtime):
+                patch_runtime(
+                    str(probe.get("id") or ""),
+                    {
+                        "last_hit": runtime_hit,
+                        "bookmark_gate": bookmark_gate,
+                        "bookmark_gate_updated_at_ms": updated_at_ms,
+                    },
+                )
+            if not bookmark_sent:
+                continue
+            with self._lock:
+                self._status["bookmarks_sent_total"] += 1
+                self._status["last_event_to_bookmark_ack_ms"] = (
+                    _to_optional_int(bookmark_gate.get("event_to_bookmark_ack_ms"))
+                )
+                self._status["last_error"] = None
+            _store_probe_hits(
+                probe,
+                [hit],
+                source="probe_realtime",
+                bookmark_sent=True,
+                bookmark_hit_timestamp_ms=int(timestamp_ms),
+                precomputed_clip_vec=clip_vec if clip_vec.size else None,
+                precomputed_embedding_space=embedding_space,
+                extra_payload={
+                    "realtime": True,
+                    "roi_enabled": probe_roi_enabled,
+                    "roi_norm": _probe_roi_norm_to_payload(probe_roi_norm),
+                    "embedding_completed_at_ms": evaluated_at_ms,
+                    "embedding_event_age_ms": event_age_ms,
+                    "bookmark_gate": bookmark_gate,
+                },
+            )
+        with self._lock:
+            self._status["last_evaluation_ms"] = max(
+                0,
+                int(time.time() * 1000.0) - evaluated_at_ms,
+            )
+
+    def status(self) -> Dict[str, Any]:
+        with self._lock:
+            return {
+                **self._status,
+                "inflight_channels": len(self._inflight_channels),
+                "pending_latest_channels": len(self._pending_latest),
+            }
+
+    def shutdown(self) -> None:
+        self._executor.shutdown(wait=False, cancel_futures=True)
+
+
+fast_vlm_alerts = _FastVlmAlertRuntime()
+realtime_probe_bookmarks = _RealtimeProbeBookmarkRuntime()
+
+
+def _observe_completed_probe_embedding(
+    channel_id: int,
+    observation: Mapping[str, Any],
+) -> None:
+    fast_vlm_alerts.observe(channel_id, observation)
+    realtime_probe_bookmarks.submit(channel_id, observation)
+
+
+luxriot_manager.set_probe_embedding_callback(_observe_completed_probe_embedding)
 
 
 _VLM_ARCHIVE_SEVERITY_ORDER = ("critical", "high", "normal", "low", "info")
@@ -8708,6 +9814,15 @@ def _vlm_archive_alert_events(raw_events: Any, channel_id: int) -> List[Dict[str
         error = str(raw_event.get("error") or "").strip()
         if error:
             event["error"] = error[:240]
+        for timing_key in (
+            "bookmark_attempted_at_ms",
+            "bookmark_ack_at_ms",
+            "bookmark_delivery_ms",
+            "event_to_bookmark_ack_ms",
+        ):
+            timing_value = _to_optional_int(raw_event.get(timing_key))
+            if timing_value is not None and timing_value >= 0:
+                event[timing_key] = int(timing_value)
         raw_snapshot_indices = raw_event.get("snapshot_indices")
         if isinstance(raw_snapshot_indices, Sequence) and not isinstance(
             raw_snapshot_indices,
@@ -8910,6 +10025,12 @@ def _vlm_summary_frame_records(entry: Mapping[str, Any]) -> Tuple[List[Dict[str,
         else {},
         "batch_state": batch_state,
         "batch_cover": batch_cover,
+        "latency_trace": dict(entry.get("latency_trace") or {})
+        if isinstance(entry.get("latency_trace"), Mapping)
+        else {},
+        "attention_episode_id": str(entry.get("attention_episode_id") or "") or None,
+        "attention_phase": str(entry.get("attention_phase") or "") or None,
+        "fast_alert_phase": bool(entry.get("fast_alert_phase")),
     }
 
     records: List[Dict[str, Any]] = []
@@ -9055,6 +10176,15 @@ def _vlm_summary_frame_records(entry: Mapping[str, Any]) -> Tuple[List[Dict[str,
             event_payload["id"] = parent_alert_id
             if alert_event.get("error"):
                 event_payload["error"] = str(alert_event.get("error") or "")[:240]
+            for timing_key in (
+                "bookmark_attempted_at_ms",
+                "bookmark_ack_at_ms",
+                "bookmark_delivery_ms",
+                "event_to_bookmark_ack_ms",
+            ):
+                timing_value = _to_optional_int(alert_event.get(timing_key))
+                if timing_value is not None and timing_value >= 0:
+                    event_payload[timing_key] = int(timing_value)
             event_hash = hashlib.sha1(
                 json.dumps(event_payload, ensure_ascii=False, sort_keys=True).encode("utf-8", errors="ignore")
             ).hexdigest()[:12]
@@ -9362,10 +10492,14 @@ def _probe_daemon() -> None:
                             recent = (hits + recent)[:PROBE_MAX_STORED_HITS]
                             probe['recent_hits'] = recent
                             bookmark_sent = False
+                            bookmark_hit_timestamp_ms: Optional[int] = None
                             bookmark_gate: Dict[str, Any] = {"reason": "bookmark_disabled", "source": "probe_daemon"}
                             if probe.get('bookmark'):
                                 bookmark_hit = _select_probe_bookmark_hit(cast(Sequence[Mapping[str, Any]], hits))
                                 if bookmark_hit is not None:
+                                    bookmark_hit_timestamp_ms = _to_optional_int(
+                                        bookmark_hit.get("timestamp_ms")
+                                    )
                                     bookmark_sent, bookmark_gate = _maybe_send_probe_bookmark(
                                         probe,
                                         bookmark_hit,
@@ -9393,6 +10527,7 @@ def _probe_daemon() -> None:
                                     hits,
                                     source='probe_daemon',
                                     bookmark_sent=bookmark_sent,
+                                    bookmark_hit_timestamp_ms=bookmark_hit_timestamp_ms,
                                     extra_payload={
                                         'frames_indexed': result.get('frames_indexed'),
                                         'roi_enabled': probe_roi_enabled,
@@ -17440,6 +18575,11 @@ def _shutdown_background_workers() -> None:
     global _inference_queue_runtime, _inference_worker_db_pool
     global _attention_writer, _live_clip_batcher, semantic_snapshot_writer
     try:
+        realtime_probe_bookmarks.shutdown()
+        fast_vlm_alerts.shutdown()
+    except Exception:
+        pass
+    try:
         luxriot_manager.stop_attention_scheduler()
         luxriot_manager.stop_all_streams(
             stop_video=True,
@@ -17447,6 +18587,19 @@ def _shutdown_background_workers() -> None:
             pause_analytics=False,
             update_desired=False,
         )
+    except Exception:
+        pass
+    # Embedding workers can be blocked waiting for the CLIP/SigLIP
+    # microbatcher.  Stop that dependency first so pending futures resolve;
+    # the previous inverse order could hold a Gunicorn restart until systemd
+    # killed the worker at its 30-second stop timeout.
+    try:
+        if _live_clip_batcher is not None:
+            _live_clip_batcher.stop(timeout_sec=5.0)
+            _live_clip_batcher = None
+    except Exception:
+        pass
+    try:
         luxriot_manager.stop_probe_embedding_executor(wait=True)
     except Exception:
         pass
@@ -17460,12 +18613,6 @@ def _shutdown_background_workers() -> None:
         if semantic_snapshot_writer is not None:
             semantic_snapshot_writer.stop(drain=True, timeout=5.0)
             semantic_snapshot_writer = None
-    except Exception:
-        pass
-    try:
-        if _live_clip_batcher is not None:
-            _live_clip_batcher.stop(timeout_sec=5.0)
-            _live_clip_batcher = None
     except Exception:
         pass
     try:

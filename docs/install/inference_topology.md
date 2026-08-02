@@ -37,6 +37,15 @@ EVOSSEARCH_LM_PROFILE_VLM_MODEL=qwen/qwen3-vl-4b
 EVOSSEARCH_AGENT_CONTEXT_LIMIT_TOKENS=65536
 ```
 
+For the local appliance profile, `eva-vlm-vision-watchdog.timer` sends a fresh
+control image every minute. Unlike `/health`, it verifies that the multimodal
+encoder perceives new ordered visual facts. The first mismatch quarantines L0
+only when no recent successful canary exists; otherwise it remains a visible
+`suspect` warning. A second consecutive mismatch quarantines L0 and triggers a
+bounded `eva-vllm` restart. Stale watchdog state also fails closed.
+The appliance runs the Qwen3-VL vision encoder with `FLASH_ATTN` and disables
+the multimodal processor cache because live video frames are unique.
+
 For the full configured budget, the agent inference server must expose at least
 the same 65,536-token context. For llama.cpp use `-c 65536`; for vLLM set the
 equivalent max model length and confirm `/v1/models` reports `meta.n_ctx` or

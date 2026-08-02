@@ -1,4 +1,4 @@
-import { useEffect, useState, useCallback, useRef } from 'react'
+import { useEffect, useState, useCallback, useMemo, useRef } from 'react'
 import {
   IconAdjustmentsHorizontal,
   IconFilter,
@@ -14,6 +14,7 @@ import {
   buildArchiveSearchPayload,
   detectionsFromResult,
   getArchiveProbeOptions,
+  detImageSrc,
   listArchive,
   normalizeDetection,
   searchText,
@@ -23,6 +24,12 @@ import { FilterBar, TIMES } from './FilterBar'
 import { ToolTabs } from '../shell/ToolTabs'
 import { DetectionCard } from './DetectionCard'
 import { InspectorModal } from './InspectorModal'
+import {
+  archiveScoreRange,
+  archiveScoreThreshold,
+  formatArchiveScore,
+  passesArchiveScoreThreshold,
+} from './archiveScore'
 
 export type ArchiveTool = null | 'filters' | 'search' | 'text' | 'image'
 type Tool = Exclude<ArchiveTool, null>
@@ -64,16 +71,19 @@ function agentHoursFromArgs(args: any): string | null {
 const DEFAULT_FILTERS: ArchiveFilters = { source: '', hours: '24', sortBy: 'similarity', rows: '24' }
 
 export function ArchiveScreen({
-  channels, drive, noAnim, canReportFeedback, canReportIncidents, canExport, onFilters, onRefreshChannels,
+  channels, drive, similarDrive, noAnim, canReportFeedback, canReportIncidents, canExport, onFilters, onRefreshChannels,
+  onSimilarDriveHandled,
 }: {
   channels: Channel[]
   drive?: AgentDrive | null
+  similarDrive?: { detection: Detection; seq: number } | null
   noAnim?: boolean
   canReportFeedback?: boolean
   canReportIncidents?: boolean
   canExport?: boolean
   onFilters?: (f: ArchiveFilters) => void
   onRefreshChannels?: () => Promise<void> | void
+  onSimilarDriveHandled?: () => void
 }) {
   const [filters, setFilters] = useState<ArchiveFilters>(DEFAULT_FILTERS)
   const [items, setItems] = useState<Detection[]>([])
@@ -81,7 +91,7 @@ export function ArchiveScreen({
   const [error, setError] = useState<string | null>(null)
   const [note, setNote] = useState('')
   const [selected, setSelected] = useState<Detection | null>(null)
-  const [minMatch, setMinMatch] = useState(0)
+  const [scoreSliderPercent, setScoreSliderPercent] = useState(0)
   const [textValue, setTextValue] = useState('')
   const [agentStep, setAgentStep] = useState<string | null>(null)
   const [agentTyping, setAgentTyping] = useState(false)
@@ -128,6 +138,7 @@ export function ArchiveScreen({
       setTotal(result.total)
       setHasMore(result.hasMore)
       setResultMode('list')
+      if (!append) setScoreSliderPercent(0)
       setAppliedFilters({ ...filters })
       if (!append) setSelected(null)
       setNote(result.items.length ? `${last} loaded` : '0 loaded')
@@ -156,6 +167,7 @@ export function ArchiveScreen({
       const results = await searchText(q, filters, channels)
       if (requestSeq.current !== seq) return
       setItems(results); setNote(`${results.length} matches · “${q}”`)
+      setScoreSliderPercent(0)
       setNextOffset(0); setTotal(results.length); setHasMore(false); setResultMode('search')
       setAppliedFilters({ ...filters }); setSelected(null)
     } catch (e: any) {
@@ -183,6 +195,7 @@ export function ArchiveScreen({
       const cmap = new Map(channels.map((c) => [c.id, c.title]))
       const results = (res.results || []).map((x: any) => normalizeDetection(x, cmap))
       setItems(results); setNote(`${results.length} similar · ${label}`)
+      setScoreSliderPercent(0)
       setNextOffset(0); setTotal(results.length); setHasMore(false); setResultMode('search')
       setAppliedFilters({ ...filters }); setSelected(null)
     } catch (e: any) {
@@ -195,14 +208,33 @@ export function ArchiveScreen({
     }
   }, [filters, channels])
 
-  const runSimilar = useCallback((d: Detection) => {
+  const runSimilar = useCallback(async (d: Detection) => {
     setSelected(null)
-    if (!d.thumbnail) { setError('No image on this frame.'); return }
-    const bin = atob(d.thumbnail)
-    const bytes = new Uint8Array(bin.length)
-    for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i)
-    runImageSearch(new Blob([bytes], { type: 'image/jpeg' }), `“${d.probeName}”`)
+    try {
+      let blob: Blob
+      if (d.thumbnail) {
+        const bin = atob(d.thumbnail)
+        const bytes = new Uint8Array(bin.length)
+        for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i)
+        blob = new Blob([bytes], { type: 'image/jpeg' })
+      } else {
+        const source = detImageSrc(d)
+        if (!source) throw new Error('No image on this frame.')
+        const response = await fetch(source, { credentials: 'same-origin' })
+        if (!response.ok) throw new Error(`Could not load the reference frame (${response.status}).`)
+        blob = await response.blob()
+      }
+      await runImageSearch(blob, `“${d.probeName}”`)
+    } catch (exception: any) {
+      setError(exception?.message || 'Could not search from this frame.')
+    }
   }, [runImageSearch])
+
+  useEffect(() => {
+    if (!similarDrive) return
+    void runSimilar(similarDrive.detection)
+    onSimilarDriveHandled?.()
+  }, [similarDrive?.seq]) // eslint-disable-line react-hooks/exhaustive-deps
 
   // agent "types" the query into the search box (visual only — no fetch; results come from the tool_result)
   const animateTyping = useCallback(async (q: string) => {
@@ -216,7 +248,9 @@ export function ArchiveScreen({
     }
   }, [noAnim])
 
-  useEffect(() => { runLoad() }, []) // eslint-disable-line react-hooks/exhaustive-deps
+  useEffect(() => {
+    if (!similarDrive) void runLoad()
+  }, []) // eslint-disable-line react-hooks/exhaustive-deps
   useEffect(() => { onFilters?.(filters) }, [filters]) // eslint-disable-line react-hooks/exhaustive-deps
   useEffect(() => {
     const seq = ++probeRequestSeq.current
@@ -302,6 +336,7 @@ export function ArchiveScreen({
       if (!error) {
         const found = detectionsFromResult(result, channels)
         setItems(found)
+        setScoreSliderPercent(0)
         setNextOffset(0); setTotal(found.length); setHasMore(false); setResultMode('search')
         setAppliedFilters({ ...filters })
         setNote(`Agent · ${found.length} frame${found.length === 1 ? '' : 's'} · ${prettyTool(name)}`)
@@ -318,7 +353,9 @@ export function ArchiveScreen({
     return () => clearTimeout(t)
   }, [drive?.seq]) // eslint-disable-line react-hooks/exhaustive-deps
 
-  const displayed = minMatch > 0 ? items.filter((d) => (d.matchPct ?? 0) >= minMatch) : items
+  const scoreRange = useMemo(() => archiveScoreRange(items), [items])
+  const scoreThreshold = archiveScoreThreshold(scoreRange, scoreSliderPercent)
+  const displayed = items.filter((d) => passesArchiveScoreThreshold(d, scoreThreshold))
   const filtersDirty = !!appliedFilters && JSON.stringify(appliedFilters) !== JSON.stringify(filters)
   const archiveMatchCount = resultMode === 'list' ? total : items.length
 
@@ -353,7 +390,14 @@ export function ArchiveScreen({
     (filters.sinceMs || filters.untilMs) ? 'custom range' : (TIMES.find((t) => t.v === (filters.hours || '24'))?.label || 'Last 24h'),
   ].filter(Boolean).join(' · ')
   const q = textValue.trim()
-  const textSummary = (q ? `“${q.length > 26 ? q.slice(0, 26) + '…' : q}”` : '—') + (minMatch > 0 ? ` · ≥ ${minMatch}%` : '')
+  const scoreLabel = !scoreRange.hasScores
+    ? 'No scores'
+    : !scoreRange.hasSpread
+      ? `All @ ${formatArchiveScore(scoreRange.min)}`
+      : scoreThreshold > 0
+        ? `≥ ${formatArchiveScore(scoreThreshold)}`
+        : 'All'
+  const textSummary = (q ? `“${q.length > 26 ? q.slice(0, 26) + '…' : q}”` : '—') + (scoreThreshold > 0 ? ` · ${scoreLabel}` : '')
 
   const TOOL_META: Record<typeof openTool, { Icon: any; label: string; summary: string }> = {
     filters: { Icon: IconFilter, label: 'Filters', summary: filtersSummary },
@@ -388,8 +432,20 @@ export function ArchiveScreen({
         </form>
         {/* similarity threshold for the text-query results — filters out weak matches */}
         <div className="atp-min">
-          <label><IconAdjustmentsHorizontal size={12} /> Min match · {minMatch}%</label>
-          <input type="range" min={0} max={100} step={1} value={minMatch} onChange={(e) => setMinMatch(Number(e.target.value))} />
+          <label title="The slider is normalized to the score range returned by this query">
+            <IconAdjustmentsHorizontal size={12} /> Min match · {scoreLabel}
+          </label>
+          <input
+            type="range" min={0} max={100} step={1}
+            value={scoreRange.hasSpread ? scoreSliderPercent : 0}
+            disabled={!scoreRange.hasSpread}
+            onChange={(e) => setScoreSliderPercent(Number(e.target.value))}
+          />
+          {scoreRange.hasScores && (
+            <span className="atp-score-range">
+              {displayed.length}/{items.length} · range {formatArchiveScore(scoreRange.min)}–{formatArchiveScore(scoreRange.max)}
+            </span>
+          )}
         </div>
       </div>
     )

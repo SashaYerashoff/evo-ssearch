@@ -399,6 +399,16 @@ describe('React/backend contract normalizers', () => {
     })
     expect(canOpenSettings(scopedAudit)).toBe(true)
     expect(canViewSettingsTab(scopedAudit, 'audit')).toBe(false)
+
+    const diagnosticsOnly = mapUser({
+      id: 'diagnostics',
+      username: 'diagnostics',
+      permissions: ['diagnostics:view'],
+      allowedChannelIds: ['*'],
+    })
+    expect(canOpenSettings(diagnosticsOnly)).toBe(true)
+    expect(canViewSettingsTab(diagnosticsOnly, 'diagnostics')).toBe(true)
+    expect(canViewSettingsTab(diagnosticsOnly, 'settings')).toBe(false)
   })
 
   it('validates explicit user channel selections', () => {

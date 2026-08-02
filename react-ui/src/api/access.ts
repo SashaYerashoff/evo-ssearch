@@ -81,6 +81,7 @@ export function canOpenSettings(user: AuthUser | null | undefined): boolean {
     PERMISSION.settingsManage,
     PERMISSION.usersManage,
     PERMISSION.auditView,
+    PERMISSION.diagnosticsView,
   ])
 }
 
@@ -96,11 +97,12 @@ export function canViewSection(user: AuthUser | null | undefined, section: Acces
   return hasPermission(user, PERMISSION.agentUse)
 }
 
-export type SettingsTabKind = 'settings' | 'users' | 'audit' | 'env'
+export type SettingsTabKind = 'settings' | 'users' | 'audit' | 'env' | 'diagnostics'
 
 export function canViewSettingsTab(user: AuthUser | null | undefined, kind: SettingsTabKind): boolean {
   if (kind === 'users') return hasPermission(user, PERMISSION.usersManage)
   if (kind === 'audit') return hasPermission(user, PERMISSION.auditView) && hasAllChannelScope(user)
   if (kind === 'env') return hasPermission(user, PERMISSION.settingsManage)
+  if (kind === 'diagnostics') return hasPermission(user, PERMISSION.diagnosticsView)
   return hasPermission(user, PERMISSION.settingsView)
 }

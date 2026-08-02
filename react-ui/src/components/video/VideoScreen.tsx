@@ -326,6 +326,7 @@ function SummaryCard({
 export function VideoScreen({
   channels,
   drive,
+  reviewOverlayOpen = false,
   onReloadChannels,
   canCapture,
   canManagePrompts,
@@ -336,6 +337,7 @@ export function VideoScreen({
 }: {
   channels: Channel[]
   drive?: ConsoleDrive | null
+  reviewOverlayOpen?: boolean
   onReloadChannels?: () => Promise<void> | void
   canCapture: boolean
   canManagePrompts: boolean
@@ -380,6 +382,7 @@ export function VideoScreen({
   const [summaryImage, setSummaryImage] = useState<{ src: string; title: string } | null>(null)
   const [incidentDraft, setIncidentDraft] = useState<IncidentDraftInput | null>(null)
   const feedRef = useRef<HTMLDivElement>(null)
+  const reviewOverlayScrollRef = useRef<number | null>(null)
   const feedRequestRef = useRef(0)
   const modelPreviewRef = useRef<HTMLImageElement>(null)
   const livePreviewImageRef = useRef<HTMLImageElement>(null)
@@ -562,9 +565,28 @@ export function VideoScreen({
     if (!live || activeTab !== 'review') return
     const t = window.setInterval(loadFeed, 3000); return () => window.clearInterval(t)
   }, [activeTab, live, loadFeed])
+
   useEffect(() => {
-    if (live) feedRef.current?.scrollTo({ top: feedRef.current.scrollHeight, behavior: 'smooth' })
-  }, [feed, live])
+    const feedElement = feedRef.current
+    if (reviewOverlayOpen) {
+      if (reviewOverlayScrollRef.current === null && feedElement) {
+        reviewOverlayScrollRef.current = feedElement.scrollTop
+      }
+      return
+    }
+    if (reviewOverlayScrollRef.current === null) return
+    const savedScrollTop = reviewOverlayScrollRef.current
+    reviewOverlayScrollRef.current = null
+    window.requestAnimationFrame(() => {
+      if (feedRef.current) feedRef.current.scrollTop = savedScrollTop
+    })
+  }, [reviewOverlayOpen])
+
+  useEffect(() => {
+    if (live && !reviewOverlayOpen) {
+      feedRef.current?.scrollTo({ top: feedRef.current.scrollHeight, behavior: 'smooth' })
+    }
+  }, [feed, live, reviewOverlayOpen])
   // The model view is a cheap snapshot of EVA's existing attention ring.
   // Full live is a bounded second Luxriot stream and renews from its broker
   // lease rather than being torn down on every summary cadence tick.
