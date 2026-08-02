@@ -63,7 +63,10 @@ EVA_LIVE_REPORT_PATH=/tmp/eva-agent-core.json \
 - `EVA_LIVE_PROBE_NAME` is the seeded/configured probe used by the calibration scenario.
 - `EVA_LIVE_SCENARIOS` optionally runs a comma-separated subset by exact name.
 - `EVA_LIVE_REPORT_PATH` writes a comparison-friendly JSON report containing
-  outcome, latency, tool count/sequence, UI effects, warnings, and final answer.
+  outcome, latency, tool count/sequence, compact per-call result sizes,
+  server-reported context metrics, budget stops, UI effects, warnings, and final
+  answer. This makes context growth and repeated-tool loops diagnosable without
+  relying on model prose.
 - `EVA_LIVE_TIMEOUT` is the per-turn HTTP/SSE timeout in seconds (default `300`).
 - `EVA_LIVE_INCIDENT_ID` supplies the existing incident used by the opt-in
   `follow_incident_stays_preview_only` scenario.

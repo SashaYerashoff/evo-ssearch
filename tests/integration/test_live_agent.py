@@ -132,6 +132,9 @@ class LiveAgentSmoke(unittest.TestCase):
                 "elapsed_seconds": round(transcript.elapsed_seconds, 3),
                 "tool_call_count": transcript.tool_call_count,
                 "tool_calls": [name for name, _args in transcript.tool_calls],
+                "tool_trace": transcript.tool_trace,
+                "context_metrics": transcript.context_metrics,
+                "budget_stops": transcript.budget_stops,
                 "ui_effects": [
                     {
                         "target": effect.get("target"),

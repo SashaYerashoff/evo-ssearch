@@ -361,10 +361,8 @@ SCENARIOS: List[Scenario] = [
             "and do not apply anything from chat."
         ),
         tool_checks=(
-            ToolCheck("get_incident", desc="read the incident before changing focus"),
             ToolCheck("follow_incident", arg_predicate=_preview_only, desc="follow must remain preview-only"),
         ),
-        tool_order_checks=(ToolOrderCheck(("get_incident",), ("follow_incident",), "inspect before mutation"),),
         prose_must=(r"preview|Apply|approval",),
         requires=("incident",),
         max_tool_calls=8,

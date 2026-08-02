@@ -109,18 +109,20 @@ AGENT_INTENT_TOOL_CALL_LIMITS: Dict[str, int] = {
     "runtime": 3,
     "prompt_policy": 6,
     "video_research": AGENT_VIDEO_RESEARCH_MAX_TOOL_CALLS,
-    "counted_state": 4,
+    "counted_state": 6,
     "deployment": 8,
     "archive_research": 12,
     "probe_management": 16,
     "bookmark": 6,
     "summary_restore": 8,
-    "incident_control": 4,
+    "incident_control": 6,
 }
 AGENT_SKILL_TOOL_CALL_LIMITS: Dict[str, int] = {
     "archive_research": 12,
     "cross_channel_correlation": 10,
-    "multi_channel_event_sweep": 10,
+    # One three-channel chunk can require window + inventory + one summary,
+    # signal review, and evidence frame per channel (11 calls total).
+    "multi_channel_event_sweep": 12,
     "probe_tuning": 16,
     "prompt_tuning": 6,
     "protocol_deploy": 8,
@@ -9173,6 +9175,130 @@ def _format_agent_video_streams(
     return "\n".join(lines)
 
 
+def _build_scoped_agent_system_prompt(
+    *,
+    tool_intents: Sequence[str],
+    now_str: str,
+    channels_str: str,
+    video_stream_block: str,
+    probe_block: str,
+    probe_count: int,
+    secure_rules: str,
+    active_skills_block: str,
+) -> Optional[str]:
+    """Build the small route-specific prompt used by live agent turns.
+
+    Prompt/probe mutation routes temporarily retain the exhaustive legacy rules;
+    the remaining routes use a compact core plus only the rules for their
+    selected workflow.  The active playbook remains the load-bearing detail.
+    """
+
+    intents = {str(item) for item in tool_intents}
+    if intents.intersection(
+        {"probe_management", "prompt_policy", "bookmark", "summary_restore"}
+    ):
+        return None
+
+    parts = [
+        (
+            "You are EVA's interactive intellectual core within an intelligent "
+            "security system. You connect the operator with accumulated visual "
+            "memory and controlled actions; do not imitate a human guard, invent "
+            "deployment rules, or substitute memory/attention signals for current "
+            "visual evidence. Be concise and operator-focused."
+        ),
+        f"Current reference time ({AGENT_SITE_TIMEZONE}): {now_str}",
+        f"Available channels: {channels_str}",
+        (
+            "Common evidence and action rules:\n"
+            "- Never fabricate runtime, detection, coverage, incident, or action facts.\n"
+            "- Routine memory is prior context; CLIP/SigLIP P/N/M and motion are attention cues; "
+            "summary prose is a candidate; structured state/alert events are stronger; an archive "
+            "frame analyzed by describe_frame is the strongest visual evidence available in chat.\n"
+            "- State coverage gaps and unchecked scope explicitly. No coverage means unknown, not calm.\n"
+            "- Do not infer identity, intent, guilt, legality, intoxication, or medical state from video.\n"
+            "- Never claim a write was applied without a tool result with status=applied or a trusted UI receipt.\n"
+            "- Chat write tools are preview-only. Tell the operator to use UI Apply.\n"
+            "- Use markdown and summarize bounded results instead of dumping raw records."
+        ),
+    ]
+
+    if intents.intersection({"runtime", "channel_inventory", "video_research", "deployment"}):
+        parts.append(
+            "Static runtime orientation (not a live status receipt):\n"
+            + video_stream_block
+        )
+
+    if "video_research" in intents:
+        parts.append(
+            "Video research route:\n"
+            "- Normalize a relative window once; reuse the frozen server window.\n"
+            "- Without named channels, inventory first. Review no more than the returned bounded scope.\n"
+            "- Use L2/L1 as a map and L0/frames for exact event evidence. Do not answer from only the newest row.\n"
+            "- Report returned coverage, truncation, unchecked channels, and pipeline health separately from incidents.\n"
+            "- Raw VLM alert emissions are not distinct incidents; preserve episode/delivery/dedup counts.\n"
+            "- A cover is navigation, not proof. Mark prose-only events unconfirmed and drill frames for important claims.\n"
+            "- When the server says the bounded overview is complete, stop calling tools and synthesize."
+        )
+
+    if "counted_state" in intents:
+        parts.append(
+            "Counted-state route:\n"
+            "- Normalize the window before counting. Use a saved metric only when the operator names one.\n"
+            "- Otherwise use track_visual_state_transitions with visible positive and background states; avoid literal negation.\n"
+            "- Counts and dwell durations are sampled visual candidates. Cite boundary evidence and unknown duration."
+        )
+
+    if "incident_control" in intents:
+        parts.append(
+            "Incident control route:\n"
+            "- For an explicit report/create request, normalize the window and call draft_incident with preview=true.\n"
+            "- The server-owned draft spans the event and returns its evidence digest; do not rebuild it with repeated reads.\n"
+            "- Follow/stop are preview-only in chat. Never silently enable focus or apply an incident draft."
+        )
+
+    if "deployment" in intents:
+        parts.append(
+            "Protocol Deploy route:\n"
+            "- Durable tools own state; copy channel IDs from operator/inventory and never reconstruct state from chat.\n"
+            "- If survey-only scope and no groups are explicit, complete start -> configure -> survey and return the proposal.\n"
+            "- Otherwise stop only for a genuinely missing operator choice. Never apply a deployment from chat."
+        )
+
+    if "archive_research" in intents:
+        parts.append(
+            "Archive research route:\n"
+            "- Resolve channel/time scope and report search coverage. Semantic matches rank attention, not factual confirmation.\n"
+            "- Preserve source semantics: probe, semantic snapshot, VLM summary, and VLM alert are different evidence classes.\n"
+            "- Use describe_frame before saying a visual claim is confirmed."
+        )
+
+    if "help" in intents:
+        parts.append(
+            "Documentation route:\n"
+            "- Call lookup_help and cite its document/section. Respect restricted matches and required permissions.\n"
+            "- If the indexed guide has no relevant answer, say it is not documented instead of inventing UI steps."
+        )
+
+    if "runtime" in intents:
+        parts.append(
+            "Runtime status route:\n"
+            "- Call list_video_summary_channels. active_runtime_streams and runtime_problem_channels are authoritative.\n"
+            "- Distinguish capture frames, queued summary batches, queue frames, dropped work, model/profile, and last error."
+        )
+
+    if "probe_management" in intents:
+        parts.append(
+            f"Configured semantic probes ({probe_count} total):\n{probe_block}"
+        )
+
+    if secure_rules:
+        parts.append("Secure mutation boundary:" + secure_rules)
+    if active_skills_block:
+        parts.append(active_skills_block.strip())
+    return "\n\n".join(part for part in parts if str(part).strip())
+
+
 def build_system_prompt(
     probes_store: Any,
     detections_store: Any,
@@ -9180,6 +9306,7 @@ def build_system_prompt(
     active_skill_slugs: Optional[Sequence[str]] = None,
     allowed_channel_ids: Optional[Sequence[str]] = None,
     secure_tool_mode: bool = False,
+    tool_intents: Optional[Sequence[str]] = None,
 ) -> str:
     try:
         import datetime as _dt
@@ -9274,6 +9401,20 @@ def build_system_prompt(
         if secure_tool_mode
         else ""
     )
+
+    if tool_intents is not None:
+        scoped_prompt = _build_scoped_agent_system_prompt(
+            tool_intents=tool_intents,
+            now_str=now_str,
+            channels_str=channels_str,
+            video_stream_block=video_stream_block,
+            probe_block=probe_block,
+            probe_count=len(probes),
+            secure_rules=secure_rules,
+            active_skills_block=active_skills_block,
+        )
+        if scoped_prompt is not None:
+            return scoped_prompt
 
     return (
         f"You are EVA's interactive intellectual core within an intelligent security system "
@@ -9433,6 +9574,7 @@ _TOOL_INTENT_GROUPS: Dict[str, frozenset[str]] = {
     "counted_state": frozenset({
         "normalize_time_window",
         "query_counted_state_metric",
+        "track_visual_state_transitions",
     }),
     "deployment": frozenset({
         "start_deployment",
@@ -9478,6 +9620,7 @@ _TOOL_INTENT_GROUPS: Dict[str, frozenset[str]] = {
         "get_video_summary_restore_status",
     }),
     "incident_control": frozenset({
+        "normalize_time_window",
         "get_incident",
         "draft_incident",
         "follow_incident",
@@ -9607,6 +9750,12 @@ def _select_relevant_tool_schemas(
         # intent (especially important for small local models).
         allowed_names = skill_tool_names
 
+    if "counted_state" in intents:
+        if context.get("counted_state_saved_metric"):
+            allowed_names.discard("track_visual_state_transitions")
+        else:
+            allowed_names.discard("query_counted_state_metric")
+
     # A broad video request without a named channel must inventory scope first.
     # Once the inventory result is remembered, detail tools become available in
     # the same turn.
@@ -9671,6 +9820,51 @@ def _seed_turn_tool_context(user_text: Any) -> Dict[str, Any]:
         )
     )
     context["tool_intents"] = _classify_tool_intents(routing_text, context)
+    if "counted_state" in context["tool_intents"]:
+        context["counted_state_saved_metric"] = bool(
+            re.search(
+                r"\b(?:metric|profile|configured counter|saved counter)\b|"
+                r"метрик|профил|сохран[её]нн\w*\s+сч[её]тчик",
+                normalized_unicode,
+            )
+        )
+        if re.search(
+            r"\b(?:workstation|desk|computer)\b|рабоч\w*\s+мест|компьютер|стол",
+            normalized_unicode,
+        ):
+            context["counted_state_pattern"] = "workstation_occupancy"
+    if "incident_control" in context["tool_intents"]:
+        if re.search(
+            r"\b(?:report|create|draft)\b.{0,24}\bincident\b|"
+            r"(?:созда|состав|оформ).{0,28}инцидент",
+            normalized_unicode,
+        ):
+            context["incident_operation"] = "draft"
+        elif re.search(
+            r"\bfollow\b.{0,24}\bincident\b|след.{0,24}инцидент",
+            normalized_unicode,
+        ):
+            context["incident_operation"] = "follow"
+        elif re.search(
+            r"\bstop\b.{0,24}\bincident\b|останов.{0,24}инцидент",
+            normalized_unicode,
+        ):
+            context["incident_operation"] = "stop"
+        else:
+            context["incident_operation"] = "get"
+    if "deployment" in context["tool_intents"]:
+        context["deployment_survey_only"] = bool(
+            re.search(
+                r"\bsurvey[\s-]*only\b|только\s+обзор|только\s+осмотр",
+                normalized_unicode,
+            )
+        )
+        context["deployment_no_groups"] = bool(
+            re.search(
+                r"\b(?:no|without)\s+groups?\b|без\s+групп",
+                normalized_unicode,
+            )
+        )
     user_text_value = routing_text.strip()
     if context.get("vlm_alert_policy_request"):
         context["vlm_alert_criterion"] = _extract_vlm_alert_criterion(user_text_value)
@@ -9768,7 +9962,129 @@ def _turn_tool_call_limit(context: Mapping[str, Any]) -> int:
         limit = AGENT_SKILL_TOOL_CALL_LIMITS.get(str(slug))
         if limit is not None:
             limits.append(int(limit))
-    return max(1, min(limits)) if limits else AGENT_MAX_TOOL_CALLS_PER_TURN
+    # Helper intents compose into a dominant bounded workflow.  Taking the
+    # minimum made channel inventory (4 calls) truncate video research (10)
+    # and incident_control truncate its evidence playbook.  The largest
+    # selected workflow budget wins, still capped at 16 calls globally here.
+    return (
+        max(1, min(16, max(limits)))
+        if limits
+        else AGENT_MAX_TOOL_CALLS_PER_TURN
+    )
+
+
+def _required_bounded_workflow_tool_call(
+    context: Mapping[str, Any],
+    schemas: Sequence[Mapping[str, Any]],
+) -> Optional[_ToolCall]:
+    """Return the next deterministic workflow step with grounded arguments.
+
+    This keeps W/C/AGG/MUT/TERM transitions in the harness.  Every argument
+    below comes from operator text, a prior compact result, or a closed visible
+    state template; the model is not asked to reconstruct durable state.
+    """
+
+    available = _tool_schema_names(schemas)
+    intents = {str(item) for item in (context.get("tool_intents") or ())}
+    relative_range = str(context.get("operator_relative_range") or "").strip()
+    time_window = context.get("time_window")
+
+    if (
+        relative_range
+        and not isinstance(time_window, Mapping)
+        and "normalize_time_window" in available
+        and intents.intersection({"incident_control", "counted_state"})
+    ):
+        return _ToolCall(
+            id=f"required-workflow-window-{uuid.uuid4().hex[:12]}",
+            name="normalize_time_window",
+            args={"relative_range": relative_range},
+        )
+
+    if (
+        context.get("incident_operation") == "draft"
+        and not context.get("incident_draft_completed")
+        and context.get("channel_id") is not None
+        and (isinstance(time_window, Mapping) or relative_range)
+        and "draft_incident" in available
+    ):
+        return _ToolCall(
+            id=f"required-incident-draft-{uuid.uuid4().hex[:12]}",
+            name="draft_incident",
+            args={"channel_id": int(context["channel_id"]), "preview": True},
+        )
+
+    if (
+        "counted_state" in intents
+        and not context.get("counted_state_completed")
+        and not context.get("counted_state_saved_metric")
+        and context.get("counted_state_pattern") == "workstation_occupancy"
+        and context.get("channel_id") is not None
+        and isinstance(time_window, Mapping)
+        and "track_visual_state_transitions" in available
+    ):
+        return _ToolCall(
+            id=f"required-workstation-state-{uuid.uuid4().hex[:12]}",
+            name="track_visual_state_transitions",
+            args={
+                "channel_id": int(context["channel_id"]),
+                "subject_query": "workstation occupancy",
+                "positive_state_query": "person seated or standing at the workstation",
+                "negative_state_query": "empty workstation with an unoccupied chair",
+                "positive_label": "occupied",
+                "negative_label": "unoccupied",
+                "sources": ["semantic_snapshot"],
+            },
+        )
+
+    if (
+        "deployment" in intents
+        and context.get("deployment_survey_only")
+        and context.get("deployment_no_groups")
+        and context.get("channel_id") is not None
+    ):
+        deployment_id = str(context.get("deployment_id") or "").strip()
+        stage = str(context.get("deployment_stage") or "").strip()
+        if not deployment_id and "start_deployment" in available:
+            return _ToolCall(
+                id=f"required-deploy-start-{uuid.uuid4().hex[:12]}",
+                name="start_deployment",
+                args={"target_channel_count": 1, "resume_latest": False},
+            )
+        if (
+            deployment_id
+            and stage in {"", "inventory"}
+            and "configure_deployment" in available
+        ):
+            return _ToolCall(
+                id=f"required-deploy-configure-{uuid.uuid4().hex[:12]}",
+                name="configure_deployment",
+                args={
+                    "deployment_id": deployment_id,
+                    "channel_ids": [int(context["channel_id"])],
+                    "groups": [],
+                },
+            )
+        if (
+            deployment_id
+            and stage == "scope_configured"
+            and "survey_deployment" in available
+        ):
+            return _ToolCall(
+                id=f"required-deploy-survey-{uuid.uuid4().hex[:12]}",
+                name="survey_deployment",
+                args={"deployment_id": deployment_id, "fast_mode": False},
+            )
+
+    return None
+
+
+def _bounded_workflow_plan_completed(context: Mapping[str, Any]) -> bool:
+    return bool(
+        context.get("incident_draft_completed")
+        or context.get("counted_state_completed")
+        or context.get("deployment_survey_completed")
+    )
 
 
 def _required_video_research_tool_call(
@@ -9959,6 +10275,7 @@ def _apply_turn_tool_context(tool_name: str, args: Dict[str, Any], context: Dict
         "list_attention_bursts",
         "count_video_summary_events",
         "track_visual_state_transitions",
+        "query_counted_state_metric",
         "calibrate_probe_from_archive",
         "prepare_probe_calibration_batch",
         "list_video_summary_channels",
@@ -9966,7 +10283,15 @@ def _apply_turn_tool_context(tool_name: str, args: Dict[str, Any], context: Dict
         "generate_report",
         "draft_incident",
     }
-    if operator_relative_range and tool_name in summary_tools:
+    # Once normalize_time_window has frozen an absolute window, pass that
+    # window downstream instead of also leaking the original relative phrase.
+    # Some bounded tools (notably track_visual_state_transitions) intentionally
+    # expose only from_ts/to_ts and reject unknown relative_range parameters.
+    if (
+        operator_relative_range
+        and tool_name in summary_tools
+        and not isinstance(context.get("time_window"), Mapping)
+    ):
         prepared["relative_range"] = operator_relative_range
     if tool_name == "list_video_summary_channels" and context.get("runtime_status_only"):
         prepared["runtime_only"] = True
@@ -10017,6 +10342,7 @@ def _apply_turn_tool_context(tool_name: str, args: Dict[str, Any], context: Dict
         "describe_frame",
         "count_video_summary_events",
         "track_visual_state_transitions",
+        "query_counted_state_metric",
         "calibrate_probe_from_archive",
         "prepare_probe_calibration_batch",
         "generate_report",
@@ -10051,6 +10377,11 @@ def _apply_turn_tool_context(tool_name: str, args: Dict[str, Any], context: Dict
 
     if tool_name == "prepare_probe_calibration_batch" and not prepared.get("job_id") and context.get("workflow_job_id"):
         prepared["job_id"] = context.get("workflow_job_id")
+
+    if tool_name in {"draft_incident", "follow_incident", "stop_incident_follow"}:
+        # Chat may only prepare a MUT preview.  Application remains the trusted
+        # UI approval path even when the operator says "apply" in prose.
+        prepared["preview"] = True
 
     if tool_name == "get_video_summaries" and context.get("wants_video_evidence"):
         prepared.setdefault("include_evidence_frames", True)
@@ -10102,6 +10433,24 @@ def _remember_turn_tool_result(tool_name: str, result: Any, context: Dict[str, A
                 context["incident_id"] = incident_id
             if incident.get("revision") is not None:
                 context["incident_revision"] = incident.get("revision")
+        if tool_name == "draft_incident" and result.get("status") == "preview":
+            context["incident_draft_completed"] = True
+        return
+
+    if tool_name in {
+        "start_deployment",
+        "configure_deployment",
+        "survey_deployment",
+        "get_deployment_status",
+    }:
+        deployment_id = str(result.get("deployment_id") or "").strip()
+        if deployment_id:
+            context["deployment_id"] = deployment_id
+        stage = str(result.get("stage") or "").strip()
+        if stage:
+            context["deployment_stage"] = stage
+        if tool_name == "survey_deployment" and result.get("survey_count") is not None:
+            context["deployment_survey_completed"] = True
         return
 
     if tool_name == "normalize_time_window":
@@ -10161,7 +10510,13 @@ def _remember_turn_tool_result(tool_name: str, result: Any, context: Dict[str, A
                 context["channel_id"] = channel_id
         return
 
-    if tool_name in {"get_video_summaries", "count_video_summary_events", "track_visual_state_transitions", "calibrate_probe_from_archive"}:
+    if tool_name in {
+        "get_video_summaries",
+        "count_video_summary_events",
+        "track_visual_state_transitions",
+        "query_counted_state_metric",
+        "calibrate_probe_from_archive",
+    }:
         channel_id = _opt_int(result.get("channel_id"))
         if channel_id is None and tool_name == "calibrate_probe_from_archive":
             processed = result.get("processed_channel_ids") if isinstance(result.get("processed_channel_ids"), list) else []
@@ -10177,6 +10532,8 @@ def _remember_turn_tool_result(tool_name: str, result: Any, context: Dict[str, A
                 }
                 completed.add(int(channel_id))
                 context["video_detail_completed_channel_ids"] = sorted(completed)
+        if tool_name in {"track_visual_state_transitions", "query_counted_state_metric"}:
+            context["counted_state_completed"] = True
         time_window = result.get("time_window")
         if isinstance(time_window, Mapping) and time_window.get("from_ts") is not None and time_window.get("to_ts") is not None:
             context["time_window"] = {
@@ -10323,6 +10680,7 @@ def _new_turn_signal_ledger(user_text: Any = "") -> Dict[str, Any]:
         "context_budget": [],
         "time_windows": [],
         "coverage": [],
+        "summary_findings": [],
         "evidence": [],
         "semantic_signals": [],
         "help_docs": [],
@@ -10528,6 +10886,7 @@ def _record_turn_signal_ledger(
     if tool_name == "get_video_summaries":
         coverage = result.get("coverage") if isinstance(result.get("coverage"), Mapping) else {}
         evidence_frames = result.get("evidence_frames") if isinstance(result.get("evidence_frames"), list) else []
+        entries = result.get("entries") if isinstance(result.get("entries"), list) else []
         _signal_ledger_append(
             ledger,
             "coverage",
@@ -10558,6 +10917,47 @@ def _record_turn_signal_ledger(
                     "note": "missing image_url means no frame returned in this result set, not proof none exists",
                 },
             )
+        _signal_ledger_append(
+            ledger,
+            "summary_findings",
+            {
+                "channel_id": result.get("channel_id"),
+                "depth": result.get("depth"),
+                "items": [
+                    {
+                        "time": row.get("time") or row.get("window_start"),
+                        "window_end": row.get("window_end"),
+                        "alert_counts": row.get("alert_counts"),
+                        "state_transition_count": row.get("state_transition_count"),
+                        "summary": _compact_signal_value(row.get("summary"), 240),
+                    }
+                    for row in entries[:2]
+                    if isinstance(row, Mapping)
+                ],
+            },
+            limit=8,
+        )
+        return
+
+    if tool_name in {
+        "start_deployment",
+        "configure_deployment",
+        "survey_deployment",
+        "get_deployment_status",
+    }:
+        _signal_ledger_append(
+            ledger,
+            "actions",
+            {
+                "tool": tool_name,
+                "deployment_id": result.get("deployment_id"),
+                "stage": result.get("stage"),
+                "next_action": result.get("next_action"),
+                "selected_channel_ids": result.get("selected_channel_ids"),
+                "survey_count": result.get("survey_count"),
+            },
+            limit=8,
+        )
         return
 
     if tool_name in {"search_archive", "get_detections", "build_research_batch"}:
@@ -10767,6 +11167,7 @@ def _format_turn_signal_ledger_message(ledger: Mapping[str, Any]) -> Optional[st
         ("Context budget signals", "context_budget"),
         ("Time window signals", "time_windows"),
         ("Coverage/health signals", "coverage"),
+        ("Notable summary findings", "summary_findings"),
         ("Evidence/frame signals", "evidence"),
         ("Semantic/CLIP/count signals", "semantic_signals"),
         ("Documentation/help signals", "help_docs"),
@@ -10778,7 +11179,7 @@ def _format_turn_signal_ledger_message(ledger: Mapping[str, Any]) -> Optional[st
         rows = ledger.get(key)
         if not isinstance(rows, list) or not rows:
             continue
-        compact_rows = rows[:6]
+        compact_rows = rows[:8] if key == "summary_findings" else rows[:6]
         text = json.dumps(compact_rows, ensure_ascii=False, default=str)
         if len(text) > 1200:
             text = text[:1199].rstrip() + "…"
@@ -10787,9 +11188,92 @@ def _format_turn_signal_ledger_message(ledger: Mapping[str, Any]) -> Optional[st
         "Answer discipline: report coverage/truncation/errors when present; separate visual evidence from summary text and CLIP candidates; cite docs for help answers; ask to narrow/continue when scope or tool budget is incomplete."
     )
     message = "\n".join(lines)
-    if len(message) > 4200:
-        message = message[:4100].rstrip() + "\n[ledger truncated: use detailed tool results for specifics]"
+    if len(message) > 6500:
+        message = message[:6400].rstrip() + "\n[ledger truncated: use detailed tool results for specifics]"
     return message
+
+
+_TURN_LEDGER_PREFIX = "Internal per-turn signal ledger."
+
+
+def _upsert_turn_signal_ledger_message(
+    messages: List[Dict[str, Any]],
+    ledger: Mapping[str, Any],
+) -> None:
+    content = _format_turn_signal_ledger_message(ledger)
+    if not content:
+        return
+    for message in messages:
+        if (
+            str(message.get("role") or "") == "system"
+            and str(message.get("content") or "").startswith(_TURN_LEDGER_PREFIX)
+        ):
+            message["content"] = content
+            return
+    messages.append({"role": "system", "content": content})
+
+
+def _collapse_prior_research_tool_messages(
+    messages: Sequence[Mapping[str, Any]],
+    *,
+    keep_recent: int = 1,
+) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
+    """Replace older read payloads with receipts backed by the turn ledger.
+
+    Tool-call/result protocol shape stays intact and the full result has already
+    been emitted to the UI.  The LM keeps the newest detail payload plus the
+    compact cross-tool ledger, rather than accumulating every raw result.
+    """
+
+    compacted = [dict(message) for message in messages]
+    collapsible = {
+        "list_video_summary_channels",
+        "get_video_summaries",
+        "get_detections",
+        "search_archive",
+        "get_visual_window_signals",
+        "count_video_summary_events",
+        "track_visual_state_transitions",
+    }
+    indices = [
+        index
+        for index, message in enumerate(compacted)
+        if str(message.get("role") or "") == "tool"
+        and str(message.get("name") or "") in collapsible
+    ]
+    keep = set(indices[-max(0, int(keep_recent)):]) if keep_recent else set()
+    changed = 0
+    for index in indices:
+        if index in keep:
+            continue
+        message = compacted[index]
+        raw_content = message.get("content")
+        try:
+            payload = json.loads(raw_content) if isinstance(raw_content, str) else raw_content
+        except Exception:
+            payload = {}
+        payload = payload if isinstance(payload, Mapping) else {}
+        coverage = payload.get("coverage") if isinstance(payload.get("coverage"), Mapping) else {}
+        receipt = {
+            "tool": message.get("name"),
+            "channel_id": payload.get("channel_id"),
+            "depth": payload.get("depth"),
+            "count": payload.get("count") or payload.get("returned"),
+            "coverage_status": coverage.get("status"),
+            "details_in_turn_ledger": True,
+            "context_compacted": True,
+        }
+        message["content"] = json.dumps(
+            {key: value for key, value in receipt.items() if value is not None},
+            ensure_ascii=False,
+            default=str,
+        )
+        changed += 1
+    return compacted, {
+        "collapsed_research_tool_messages": changed,
+        "kept_recent_tool_messages": min(len(indices), max(0, int(keep_recent))),
+        "estimated_tokens": _estimate_context_tokens(compacted),
+    }
 
 
 def _final_response_is_incomplete(value: Any) -> bool:
@@ -11274,18 +11758,6 @@ class AgentRunner:
                 yield _sse({"type": "text", "content": clarification})
                 yield _sse({"type": "done", "session_id": session_id})
                 return
-        system_prompt = build_system_prompt(
-            self._ps,
-            self._ds,
-            self._lxm,
-            active_skill_slugs=requested_skill_slugs,
-            allowed_channel_ids=(
-                sorted(tool_context.allowed_channel_ids)
-                if tool_context is not None
-                else None
-            ),
-            secure_tool_mode=tool_context is not None,
-        )
         context_limit_reader = getattr(self._lm_client, "context_limit_tokens", None)
         if callable(context_limit_reader):
             try:
@@ -11322,6 +11794,19 @@ class AgentRunner:
         requested_skill_tool_names = _skill_tool_names(requested_skill_slugs)
         if requested_skill_tool_names:
             turn_tool_context["skill_tool_names"] = sorted(requested_skill_tool_names)
+        system_prompt = build_system_prompt(
+            self._ps,
+            self._ds,
+            self._lxm,
+            active_skill_slugs=requested_skill_slugs,
+            allowed_channel_ids=(
+                sorted(tool_context.allowed_channel_ids)
+                if tool_context is not None
+                else None
+            ),
+            secure_tool_mode=tool_context is not None,
+            tool_intents=turn_tool_context.get("tool_intents") or [],
+        )
         trusted_research_messages: List[Dict[str, Any]] = []
         console_context_message = trusted_console_context_message(console_context)
         if console_context_message:
@@ -11375,6 +11860,7 @@ class AgentRunner:
             {"phase": "initial_prompt", **initial_budget},
             limit=4,
         )
+        yield _sse({"type": "context_metrics", "phase": "initial_prompt", **initial_budget})
 
         # Accumulated messages from this turn (to persist after streaming)
         new_assistant_messages: List[Dict[str, Any]] = []
@@ -11509,19 +11995,27 @@ class AgentRunner:
             # This prevents a small local model from narrating an intended
             # lookup without actually executing it.
             lm_response: _LMResponse
-            required_call = _required_video_research_tool_call(
+            required_call = _required_bounded_workflow_tool_call(
                 turn_tool_context,
                 available_tool_schemas,
             )
+            if required_call is None:
+                required_call = _required_video_research_tool_call(
+                    turn_tool_context,
+                    available_tool_schemas,
+                )
             if (
                 required_call is None
-                and _video_overview_research_plan_completed(turn_tool_context)
+                and (
+                    _bounded_workflow_plan_completed(turn_tool_context)
+                    or _video_overview_research_plan_completed(turn_tool_context)
+                )
             ):
                 in_flight.append(
                     {
                         "role": "system",
                         "content": (
-                            "The bounded server-owned video overview plan is complete. "
+                            "The bounded server-owned workflow plan is complete. "
                             "Do not call more tools in this turn. Synthesize the completed "
                             "inventory and summary results now; state coverage and any "
                             "unchecked scope."
@@ -11532,7 +12026,7 @@ class AgentRunner:
                     {
                         "type": "research_plan_complete",
                         "tool_calls_used": tool_calls_used,
-                        "message": "Bounded video overview complete; preparing the answer.",
+                        "message": "Bounded workflow complete; preparing the answer.",
                     }
                 )
                 break
@@ -11841,17 +12335,65 @@ class AgentRunner:
 
                 in_flight.append(result_msg)
                 new_assistant_messages.append(result_msg)
+
+            research_intents = set(turn_tool_context.get("tool_intents") or ())
+            research_skills = set(
+                turn_tool_context.get("active_skill_slugs") or ()
+            )
+            if (
+                research_intents.intersection(
+                    {
+                        "video_research",
+                        "archive_research",
+                        "incident_control",
+                        "counted_state",
+                        "deployment",
+                    }
+                )
+                or research_skills.intersection(
+                    {
+                        "archive_research",
+                        "cross_channel_correlation",
+                        "multi_channel_event_sweep",
+                        "video_event_check",
+                        "video_incident_timeline",
+                        "video_summary_review",
+                    }
+                )
+            ):
+                in_flight, research_compaction = _collapse_prior_research_tool_messages(
+                    in_flight,
+                    keep_recent=1,
+                )
+                if research_compaction.get("collapsed_research_tool_messages"):
+                    _signal_ledger_append(
+                        turn_signal_ledger,
+                        "context_budget",
+                        {"phase": "research_ledger_compaction", **research_compaction},
+                        limit=4,
+                    )
+                _upsert_turn_signal_ledger_message(in_flight, turn_signal_ledger)
+                post_tool_budget = _context_budget_snapshot(
+                    in_flight,
+                    tool_schemas=available_tool_schemas,
+                    context_policy=context_policy,
+                )
+                yield _sse({
+                    "type": "context_metrics",
+                    "phase": "post_tool_batch",
+                    "tool_calls_used": tool_calls_used,
+                    **post_tool_budget,
+                })
             if stop_tool_loop_after_batch:
                 break
 
         # ── final streaming text response ──────────────────────────────────
-        signal_ledger_message = _format_turn_signal_ledger_message(turn_signal_ledger)
-        if signal_ledger_message:
-            in_flight.append({"role": "system", "content": signal_ledger_message})
+        _upsert_turn_signal_ledger_message(in_flight, turn_signal_ledger)
         final_budget = _context_budget_snapshot(
             in_flight,
             context_policy=context_policy,
         )
+        yield _sse({"type": "context_metrics", "phase": "pre_final", **final_budget})
         if final_budget["estimated_tokens"] >= context_policy["hard_tokens"]:
             in_flight, final_compaction = _compact_tool_messages_for_context_budget(
                 in_flight,

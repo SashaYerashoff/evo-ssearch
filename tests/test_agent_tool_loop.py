@@ -234,8 +234,83 @@ class AgentToolLoopTests(unittest.TestCase):
         )
         self.assertEqual(
             names("How many times did the person leave the workstation?"),
-            {"normalize_time_window", "query_counted_state_metric"},
+            {"normalize_time_window", "track_visual_state_transitions"},
         )
+
+    def test_composed_intents_use_dominant_bounded_workflow_budget(self):
+        context = _seed_turn_tool_context(
+            "Show recent VLM alerts across active channels for the last hour"
+        )
+        self.assertIn("video_research", context["tool_intents"])
+        self.assertIn("channel_inventory", context["tool_intents"])
+        self.assertEqual(
+            agent._turn_tool_call_limit(context),
+            agent.AGENT_VIDEO_RESEARCH_MAX_TOOL_CALLS,
+        )
+
+        incident = _seed_turn_tool_context(
+            "Report incident on channel 112 for the last 10 minutes"
+        )
+        incident["active_skill_slugs"] = ["video_incident_timeline"]
+        self.assertEqual(agent._turn_tool_call_limit(incident), 10)
+
+        sweep = _seed_turn_tool_context(
+            "Across all active channels, where was the most concerning activity in the last hour?"
+        )
+        sweep["active_skill_slugs"] = ["multi_channel_event_sweep"]
+        self.assertEqual(agent._turn_tool_call_limit(sweep), 12)
+
+    def test_required_bounded_workflows_use_grounded_short_paths(self):
+        counted = _seed_turn_tool_context(
+            "On channel 112 during the last hour, how many times did a person leave the workstation?"
+        )
+        schemas = _select_relevant_tool_schemas(agent._TOOL_SCHEMAS, counted)
+        call = agent._required_bounded_workflow_tool_call(counted, schemas)
+        self.assertEqual(call.name, "normalize_time_window")
+        counted["time_window"] = {
+            "from_ts": 100.0,
+            "to_ts": 200.0,
+            "since_ms": 100_000,
+            "until_ms": 200_000,
+        }
+        call = agent._required_bounded_workflow_tool_call(counted, schemas)
+        self.assertEqual(call.name, "track_visual_state_transitions")
+        self.assertNotRegex(call.args["negative_state_query"], r"\b(?:no|not|without)\b")
+
+        incident = _seed_turn_tool_context(
+            "Report incident on channel 112 for the last 10 minutes"
+        )
+        incident["skill_tool_names"] = [
+            "normalize_time_window",
+            "draft_incident",
+        ]
+        schemas = _select_relevant_tool_schemas(agent._TOOL_SCHEMAS, incident)
+        call = agent._required_bounded_workflow_tool_call(incident, schemas)
+        self.assertEqual(call.name, "normalize_time_window")
+        incident["time_window"] = {
+            "from_ts": 100.0,
+            "to_ts": 200.0,
+            "since_ms": 100_000,
+            "until_ms": 200_000,
+        }
+        call = agent._required_bounded_workflow_tool_call(incident, schemas)
+        self.assertEqual(call.name, "draft_incident")
+        self.assertIs(call.args["preview"], True)
+
+        deploy = _seed_turn_tool_context(
+            "Protocol Deploy in survey-only mode for channel 112, no groups"
+        )
+        schemas = _select_relevant_tool_schemas(agent._TOOL_SCHEMAS, deploy)
+        call = agent._required_bounded_workflow_tool_call(deploy, schemas)
+        self.assertEqual(call.name, "start_deployment")
+        deploy.update({"deployment_id": "deploy-1", "deployment_stage": "inventory"})
+        call = agent._required_bounded_workflow_tool_call(deploy, schemas)
+        self.assertEqual(call.name, "configure_deployment")
+        self.assertEqual(call.args["channel_ids"], [112])
+        self.assertEqual(call.args["groups"], [])
+        deploy["deployment_stage"] = "scope_configured"
+        call = agent._required_bounded_workflow_tool_call(deploy, schemas)
+        self.assertEqual(call.name, "survey_deployment")
 
     def test_routing_repairs_common_operator_typos_and_inherits_followup_intent(self):
         initial = _seed_turn_tool_context(
@@ -562,7 +637,7 @@ class AgentToolLoopTests(unittest.TestCase):
             "video_incident_timeline": {
                 "normalize_time_window", "list_video_summary_channels",
                 "get_video_summaries", "get_visual_window_signals",
-                "get_detections", "describe_frame",
+                "get_detections", "describe_frame", "draft_incident",
             },
             "video_summary_review": {
                 "normalize_time_window", "list_video_summary_channels",
@@ -1432,7 +1507,7 @@ class AgentToolLoopTests(unittest.TestCase):
         self.assertNotIn("Context budget signals", stored_text)
 
     def test_context_hard_stop_prevents_more_tools_without_persisting_notice(self):
-        history = [{"role": "user", "content": "previous " + ("x" * 1200)}]
+        history = [{"role": "user", "content": "previous " + ("x" * 5000)}]
         runner = AgentRunner.__new__(AgentRunner)
         runner.store = _FakeStore(history=history)
         runner._lm_client = _FakeLMClient(tool_rounds=1)
@@ -1446,7 +1521,7 @@ class AgentToolLoopTests(unittest.TestCase):
         try:
             agent.AGENT_CONTEXT_HARD_TOKENS = 200
             agent.AGENT_CONTEXT_WARNING_TOKENS = 100
-            events = list(runner.stream_chat("session-1", "current " + ("z" * 1200)))
+            events = list(runner.stream_chat("session-1", "current " + ("z" * 5000)))
         finally:
             agent.AGENT_CONTEXT_HARD_TOKENS = original_hard
             agent.AGENT_CONTEXT_WARNING_TOKENS = original_warning
@@ -1464,6 +1539,46 @@ class AgentToolLoopTests(unittest.TestCase):
         )
         self.assertNotIn("Agent context budget is near", stored_text)
 
+    def test_research_tool_payloads_collapse_into_protocol_safe_receipts(self):
+        messages = [
+            {"role": "system", "content": "base"},
+            {"role": "assistant", "tool_calls": [{"id": "a"}]},
+            {
+                "role": "tool",
+                "tool_call_id": "a",
+                "name": "get_video_summaries",
+                "content": json.dumps({
+                    "channel_id": 112,
+                    "count": 5,
+                    "coverage": {"status": "covered"},
+                    "entries": [{"summary": "x" * 4000}],
+                }),
+            },
+            {"role": "assistant", "tool_calls": [{"id": "b"}]},
+            {
+                "role": "tool",
+                "tool_call_id": "b",
+                "name": "get_video_summaries",
+                "content": json.dumps({
+                    "channel_id": 118,
+                    "count": 4,
+                    "coverage": {"status": "partial"},
+                    "entries": [{"summary": "y" * 4000}],
+                }),
+            },
+        ]
+        compacted, metrics = agent._collapse_prior_research_tool_messages(
+            messages,
+            keep_recent=1,
+        )
+        first = json.loads(compacted[2]["content"])
+        second = json.loads(compacted[4]["content"])
+        self.assertTrue(first["details_in_turn_ledger"])
+        self.assertEqual(first["coverage_status"], "covered")
+        self.assertIn("entries", second)
+        self.assertEqual(metrics["collapsed_research_tool_messages"], 1)
+        self.assertEqual(compacted[2]["tool_call_id"], "a")
+
     def test_incident_control_intent_exposes_only_bounded_command_surface(self):
         context = _seed_turn_tool_context(
             "Follow incident 00000000-0000-0000-0000-000000000117"
@@ -1475,6 +1590,7 @@ class AgentToolLoopTests(unittest.TestCase):
         self.assertEqual(
             exposed,
             {
+                "normalize_time_window",
                 "get_incident",
                 "draft_incident",
                 "follow_incident",
@@ -1489,11 +1605,37 @@ class AgentToolLoopTests(unittest.TestCase):
         )
         prepared = _apply_turn_tool_context(
             "draft_incident",
-            {"preview": True},
+            {"preview": False},
             context,
         )
         self.assertEqual(prepared["channel_id"], 112)
         self.assertEqual(prepared["relative_range"], "last 10 minutes")
+        self.assertIs(prepared["preview"], True)
+
+    def test_normalized_window_replaces_relative_range_for_bounded_tools(self):
+        context = _seed_turn_tool_context(
+            "On channel 112 during the last hour, how many times did a person leave the workstation?"
+        )
+        context["time_window"] = {
+            "from_ts": 100.0,
+            "to_ts": 200.0,
+            "since_ms": 100_000,
+            "until_ms": 200_000,
+        }
+
+        prepared = _apply_turn_tool_context(
+            "track_visual_state_transitions",
+            {
+                "positive_state_query": "person at the workstation",
+                "negative_state_query": "empty workstation",
+            },
+            context,
+        )
+
+        self.assertNotIn("relative_range", prepared)
+        self.assertEqual(prepared["from_ts"], 100.0)
+        self.assertEqual(prepared["to_ts"], 200.0)
+        self.assertEqual(prepared["channel_id"], 112)
 
     def test_generic_incident_research_does_not_select_incident_mutations(self):
         context = _seed_turn_tool_context(

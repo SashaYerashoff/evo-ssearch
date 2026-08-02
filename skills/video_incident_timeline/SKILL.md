@@ -20,6 +20,7 @@ Tools:
 - `get_visual_window_signals`
 - `get_detections`
 - `describe_frame`
+- `draft_incident`
 
 Default order:
 1. Normalize the period with `normalize_time_window`.
@@ -31,6 +32,7 @@ Default order:
 7. Use `depth="live"`/`L0` only around selected event windows.
 8. Pull VLM archive frames with `include_evidence_frames=true` or `get_detections source="vlm_summary"/"vlm_alert"`.
 9. Before saying visual confirmation, call `describe_frame` on the relevant returned `detection_id` or frame image and use that description as the visual basis.
+10. When the operator explicitly asks to **report/create/draft an incident**, prefer the bounded `draft_incident` path after time/channel resolution. Call it with `preview=true`; its server-owned builder gathers the incident-spanning evidence and returns a digest for UI approval. Do not spend the turn reconstructing the same draft through repeated archive reads, and never apply it from chat.
 
 Output:
 - Scope and coverage.

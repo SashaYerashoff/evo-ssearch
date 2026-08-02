@@ -37,7 +37,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-SEED_TAG = "live-smoke-seed-v1"
+SEED_TAG = "live-smoke-seed-v2"
 NEEDLE_CAPTION = "a person lying motionless on the ground at night near a wall"
 PROBE_POSITIVE = "a person making a thumbs up hand gesture"
 PROBE_NEGATIVE = "a person typing on a keyboard with both hands"
@@ -60,7 +60,11 @@ def _vec(embed_text, caption: str) -> List[float]:
     return [float(x) for x in list(arr)]
 
 
-def _records(channel_id: int, embed_text) -> List[Dict[str, Any]]:
+def _records(
+    channel_id: int,
+    embed_text,
+    embedding_space: Dict[str, Any] | None = None,
+) -> List[Dict[str, Any]]:
     base_ts = _now_ms() - 30 * 60 * 1000  # 30 min ago, inside typical windows
     # Keep repeat runs idempotent for the current UTC day while ensuring an old
     # seed does not silently age out of a "last 24 hours" acceptance scenario.
@@ -68,6 +72,14 @@ def _records(channel_id: int, embed_text) -> List[Dict[str, Any]]:
     needle_vec = _vec(embed_text, NEEDLE_CAPTION)
     pos_vec = _vec(embed_text, PROBE_POSITIVE)
     neg_vec = _vec(embed_text, PROBE_NEGATIVE)
+    space_payload = dict(embedding_space or {})
+
+    def payload(**values: Any) -> Dict[str, Any]:
+        result = dict(values)
+        if space_payload:
+            result["embedding_space"] = dict(space_payload)
+        return result
+
     out: List[Dict[str, Any]] = [
         {
             "dedupe_key": f"{SEED_TAG}:{seed_run}:needle:{channel_id}",
@@ -78,7 +90,7 @@ def _records(channel_id: int, embed_text) -> List[Dict[str, Any]]:
             "severity": "info",
             "source": "vlm_summary",
             "clip_vec": needle_vec,
-            "payload": {"caption": NEEDLE_CAPTION, "seed": SEED_TAG},
+            "payload": payload(caption=NEEDLE_CAPTION, seed=SEED_TAG),
         }
     ]
     # a few positive + negative frames so calibration has a separable-ish set
@@ -92,7 +104,11 @@ def _records(channel_id: int, embed_text) -> List[Dict[str, Any]]:
             "severity": "info",
             "source": "vlm_summary",
             "clip_vec": pos_vec,
-            "payload": {"caption": PROBE_POSITIVE, "seed": SEED_TAG, "role": "positive"},
+            "payload": payload(
+                caption=PROBE_POSITIVE,
+                seed=SEED_TAG,
+                role="positive",
+            ),
         })
     for i in range(8):
         out.append({
@@ -104,7 +120,11 @@ def _records(channel_id: int, embed_text) -> List[Dict[str, Any]]:
             "severity": "info",
             "source": "vlm_summary",
             "clip_vec": neg_vec,
-            "payload": {"caption": PROBE_NEGATIVE, "seed": SEED_TAG, "role": "negative"},
+            "payload": payload(
+                caption=PROBE_NEGATIVE,
+                seed=SEED_TAG,
+                role="negative",
+            ),
         })
     return out
 
@@ -156,12 +176,17 @@ def main() -> int:
 
     detections_store = getattr(oldapp, "detections_store", None)
     embed_text = getattr(oldapp, "get_text_embedding", None) or getattr(oldapp, "get_probe_text_embedding", None)
-    if detections_store is None or embed_text is None:
-        print("could not resolve detections_store / text embedder from oldapp", file=sys.stderr)
+    embedding_space_reader = getattr(oldapp, "get_probe_embedding_space", None)
+    if detections_store is None or embed_text is None or not callable(embedding_space_reader):
+        print(
+            "could not resolve detections_store / text embedder / embedding space from oldapp",
+            file=sys.stderr,
+        )
         return 2
 
     try:
-        records = _records(args.channel_id, embed_text)
+        embedding_space = dict(embedding_space_reader() or {})
+        records = _records(args.channel_id, embed_text, embedding_space)
         print(f"prepared {len(records)} seed records for channel {args.channel_id} (tag={SEED_TAG})")
         if args.dry_run:
             print("dry-run: not writing")

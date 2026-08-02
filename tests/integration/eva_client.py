@@ -5,8 +5,9 @@ Grounded on the actual endpoints (oldapp.py):
   - POST /agent/chat            {message, session_id?, image_b64?} -> SSE text/event-stream
   - POST /agent/action-plans/<plan_id>/execute  {session_id?} -> JSON {success, result}  (the UI "Apply")
 
-SSE event types yielded by the agent: tool_call, tool_result, tool_progress,
-tool_budget, text, session, done, error.
+SSE event types yielded by the agent include tool_call, tool_result,
+tool_progress, tool_budget, context_budget, context_metrics, text, session,
+done, and error.
 
 This is an *acceptance smoke* client: assert structure (tool calls/results,
 safe_to_apply, restricted_matches, delivery_status, action receipts), not LLM prose.
@@ -139,6 +140,38 @@ class Transcript:
             elif event.get("type") == "context_budget" and event.get("status") == "hard_stop":
                 stops.append(dict(event))
         return stops
+
+    @property
+    def context_metrics(self) -> List[Dict[str, Any]]:
+        return [
+            dict(event)
+            for event in self.events
+            if event.get("type") == "context_metrics"
+        ]
+
+    @property
+    def tool_trace(self) -> List[Dict[str, Any]]:
+        results_by_call_id = {
+            str(event.get("call_id")): event.get("result")
+            for event in self.events
+            if event.get("type") == "tool_result" and event.get("call_id")
+        }
+        trace: List[Dict[str, Any]] = []
+        for event in self.events:
+            if event.get("type") != "tool_call":
+                continue
+            call_id = str(event.get("call_id") or "")
+            result = results_by_call_id.get(call_id)
+            try:
+                result_chars = len(json.dumps(result, ensure_ascii=False, default=str))
+            except Exception:
+                result_chars = len(str(result or ""))
+            trace.append({
+                "name": str(event.get("name") or ""),
+                "args": dict(event.get("args") or {}),
+                "result_chars": result_chars,
+            })
+        return trace
 
     @property
     def dangling_tool_calls(self) -> List[str]:

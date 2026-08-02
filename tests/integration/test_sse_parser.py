@@ -78,6 +78,31 @@ class SseParserTest(unittest.TestCase):
         self.assertEqual(self.t.budget_stops, [])
         self.assertEqual(self.t.ui_effects[0]["target"], "probes")
 
+    def test_context_metrics_and_compact_tool_trace_are_reported(self) -> None:
+        transcript = Transcript(events=parse_sse_events(iter(_sse(
+            {
+                "type": "context_metrics",
+                "phase": "post_tool_batch",
+                "estimated_tokens": 1234,
+            },
+            {
+                "type": "tool_call",
+                "call_id": "trace-1",
+                "name": "get_video_summaries",
+                "args": {"channel_id": 112},
+            },
+            {
+                "type": "tool_result",
+                "call_id": "trace-1",
+                "name": "get_video_summaries",
+                "result": {"count": 2},
+            },
+        ))))
+
+        self.assertEqual(transcript.context_metrics[0]["estimated_tokens"], 1234)
+        self.assertEqual(transcript.tool_trace[0]["name"], "get_video_summaries")
+        self.assertGreater(transcript.tool_trace[0]["result_chars"], 0)
+
     def test_combined_workflow_keeps_setup_tools_but_only_final_prose(self) -> None:
         setup = Transcript(events=parse_sse_events(iter(_sse(
             {"type": "tool_call", "call_id": "c1", "name": "normalize_time_window", "args": {}},

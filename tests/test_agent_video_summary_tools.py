@@ -596,6 +596,26 @@ class AgentVideoSummaryToolTests(unittest.TestCase):
         self.assertIn("Available channels: 1353 (Office lobby), 1463 (Street loop)", prompt)
         self.assertNotIn("Luxriot not connected", prompt)
 
+    def test_live_turn_uses_small_route_specific_video_prompt(self):
+        legacy = build_system_prompt(
+            _ProbeStore(),
+            _DetectionStore(),
+            _SummaryManager(),
+        )
+        scoped = build_system_prompt(
+            _ProbeStore(),
+            _DetectionStore(),
+            _SummaryManager(),
+            tool_intents=["video_research", "channel_inventory"],
+            secure_tool_mode=True,
+        )
+
+        self.assertLess(len(scoped), len(legacy) // 2)
+        self.assertIn("Normalize a relative window once", scoped)
+        self.assertIn("No coverage means unknown, not calm", scoped)
+        self.assertIn("Chat write tools are preview-only", scoped)
+        self.assertNotIn("For broad calibration across many channels", scoped)
+
     def test_channel_ref_resolution_reads_channels_through_get_channels(self):
         tools = _tools(manager=_ChannelsMethodOnlyManager())
 
