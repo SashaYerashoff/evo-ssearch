@@ -345,6 +345,11 @@
 .archive-toolbar { display: flex; align-items: stretch; gap: 16px; flex-wrap: wrap; padding: 12px 14px; border: 1px solid var(--line); border-radius: 12px; background: var(--panel); }
 .archive-toolbar .filter-block { align-self: stretch; }
 
+/* Archive result-card bodies are positioned stacking contexts of their own. Keep
+   the filter console in a higher context so every dropdown can cross the results
+   grid without later card rows painting through it. */
+.archive-screen > .tool-tabs { position: relative; z-index: 10; }
+
 /* folder-style tool tabs (Archive / Video / Monitoring): tab headers on top,
    the active tab's content opens in a panel below */
 .tool-tabs { display: flex; flex-direction: column; }

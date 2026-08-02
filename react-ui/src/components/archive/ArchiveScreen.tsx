@@ -462,7 +462,7 @@ export function ArchiveScreen({
   }
 
   return (
-    <div className="center-scroll">
+    <div className="center-scroll archive-screen">
       {(agentStep || agentTyping) && (
         <div className="agent-driving">
           <span className="ad-dot" /><IconSparkles size={15} />
