@@ -68,6 +68,19 @@ def _profile_env_key(profile_id: str, suffix: str) -> str:
     return f'EVOSSEARCH_LM_PROFILE_{normalized}_{suffix}'
 
 
+def _get_lm_profile_max_inflight(profile_id: str, default: int = 1) -> int:
+    """Return the endpoint concurrency advertised for one named profile."""
+
+    raw = os.getenv(_profile_env_key(profile_id, 'MAX_INFLIGHT'))
+    if raw is None or not str(raw).strip():
+        raw = os.getenv('EVOSSEARCH_LM_MAX_INFLIGHT', str(default))
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        value = int(default)
+    return max(1, min(64, value))
+
+
 def _get_lm_profiles(
     *,
     base_url: str,
@@ -708,6 +721,33 @@ class Config:
     LUXRIOT_ATTENTION_REQUESTS_PER_MINUTE = max(
         0.2,
         min(120.0, LUXRIOT_ATTENTION_REQUESTS_PER_MINUTE),
+    )
+    # Slot-seconds measure wall-clock occupancy. A batching server can execute
+    # several live L0 requests concurrently, so charging every request its full
+    # wall time would silently turn a six-request/minute budget into roughly two
+    # requests/minute once inference takes ~30 seconds. Keep one protected lane
+    # for agent/alert work and let the operator override the derived live width.
+    _LUXRIOT_ATTENTION_L0_SLOT_PARALLELISM_DEFAULT = max(
+        1,
+        min(
+            3,
+            _get_lm_profile_max_inflight(LM_VLM_PROFILE_ID, 1) - 1,
+        ),
+    )
+    try:
+        LUXRIOT_ATTENTION_L0_SLOT_PARALLELISM = float(
+            os.getenv(
+                'EVOSSEARCH_LUXRIOT_ATTENTION_L0_SLOT_PARALLELISM',
+                str(_LUXRIOT_ATTENTION_L0_SLOT_PARALLELISM_DEFAULT),
+            )
+        )
+    except (TypeError, ValueError):
+        LUXRIOT_ATTENTION_L0_SLOT_PARALLELISM = float(
+            _LUXRIOT_ATTENTION_L0_SLOT_PARALLELISM_DEFAULT
+        )
+    LUXRIOT_ATTENTION_L0_SLOT_PARALLELISM = max(
+        1.0,
+        min(16.0, LUXRIOT_ATTENTION_L0_SLOT_PARALLELISM),
     )
     try:
         LUXRIOT_ATTENTION_MAX_OUTSTANDING = int(

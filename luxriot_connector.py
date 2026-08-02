@@ -3764,6 +3764,12 @@ class LuxriotCaptureSession:
                 ) or any(bool(frame.get("incident_focus")) for frame in self.frames)
                 workload_class = "heartbeat"
                 budget_mode = AttentionMode.QUIET
+                coalesce_all = False
+                compacted_pending = any(
+                    self._summary_source_weight(frame) > 1
+                    for frame in self.frames
+                    if isinstance(frame, Mapping)
+                )
                 if adaptive:
                     profile = self._summary_profile_locked()
                     budget_mode = profile.mode
@@ -3792,14 +3798,17 @@ class LuxriotCaptureSession:
                         pending_count > 0
                         and pending_age_sec >= deadline_sec
                     )
+                    # Preserve the ordinary <=60 s batch boundary. Once
+                    # backpressure has already compacted omitted observations,
+                    # processing only the oldest prefix would instead create a
+                    # FIFO visual backlog whose output is stale on arrival.
+                    coalesce_all = bool(ready_by_deadline and compacted_pending)
                     frame_limit = min(
                         int(profile.max_frames),
-                        (
-                            pending_count
-                            if ready_by_size
-                            else self._summary_deadline_frame_limit_locked(
-                                deadline_sec
-                            )
+                        pending_count
+                        if ready_by_size or coalesce_all
+                        else self._summary_deadline_frame_limit_locked(
+                            deadline_sec
                         ),
                     )
                     if profile.mode in {
@@ -3816,13 +3825,14 @@ class LuxriotCaptureSession:
                         pending_count > 0
                         and pending_age_sec >= float(self.summary_max_window_sec)
                     )
+                    coalesce_all = bool(ready_by_deadline and compacted_pending)
                     frame_limit = min(
                         int(self.summary_max_batch_frames),
-                        (
-                            int(self.batch_size)
-                            if ready_by_size
-                            else self._summary_deadline_frame_limit_locked()
-                        ),
+                        pending_count
+                        if coalesce_all
+                        else int(self.batch_size)
+                        if ready_by_size
+                        else self._summary_deadline_frame_limit_locked(),
                     )
             if not ready_by_size and not ready_by_deadline:
                 return
@@ -3839,6 +3849,7 @@ class LuxriotCaptureSession:
             if not self._enqueue_summary_batch(
                 workload_class=workload_class,
                 frame_limit=frame_limit,
+                coalesce_all=coalesce_all,
             ):
                 return
 
@@ -4124,19 +4135,35 @@ class LuxriotCaptureSession:
         frames: Sequence[Mapping[str, Any]],
         target_count: int,
     ) -> Tuple[List[Dict[str, Any]], int]:
-        """Thin a merged window to target size, never sacrificing burst seconds."""
+        """Thin a merged window without allowing backpressure to freeze time.
+
+        The first and, critically, the newest observation are stable anchors.
+        Older code filled slots from the beginning of the list; once a pending
+        accumulator reached 16 frames every newly arriving frame was therefore
+        the one omitted. A deferred L0 could remain visually frozen for minutes
+        even while capture and the embedding archive were current.
+        """
 
         items = [dict(frame) for frame in frames if isinstance(frame, Mapping)]
         items.sort(key=cls._frame_captured_at)
         target = max(1, int(target_count))
         if len(items) <= target:
             return items, 0
-        keep: Set[int] = set()
+        if target == 1:
+            return [items[-1]], len(items) - 1
+
+        keep: Set[int] = {0, len(items) - 1}
         burst_indices = [
             index for index, frame in enumerate(items)
-            if cls._frame_capture_mode(frame) == "burst"
+            if index not in keep and cls._frame_capture_mode(frame) == "burst"
         ]
-        for index in burst_indices[:target]:
+        burst_indices.sort(
+            key=lambda index: (
+                -cls._frame_activity_x(items[index]),
+                -index,
+            )
+        )
+        for index in burst_indices[: max(0, target - len(keep))]:
             keep.add(index)
         if len(keep) < target:
             # Strong normal seconds may claim at most half the remaining
@@ -4157,9 +4184,25 @@ class LuxriotCaptureSession:
         if len(keep) < target:
             remaining = [index for index in range(len(items)) if index not in keep]
             need = target - len(keep)
-            step = len(remaining) / float(need)
-            for slot in range(need):
-                keep.add(remaining[min(len(remaining) - 1, int(slot * step))])
+            if need >= len(remaining):
+                keep.update(remaining)
+            elif need == 1:
+                keep.add(remaining[len(remaining) // 2])
+            else:
+                step = (len(remaining) - 1) / float(need - 1)
+                for slot in range(need):
+                    keep.add(
+                        remaining[
+                            min(
+                                len(remaining) - 1,
+                                int(round(slot * step)),
+                            )
+                        ]
+                    )
+                for index in remaining:
+                    if len(keep) >= target:
+                        break
+                    keep.add(index)
         kept = [items[index] for index in sorted(keep)]
         return kept, len(items) - len(kept)
 
@@ -4252,6 +4295,7 @@ class LuxriotCaptureSession:
         workload_class: str = "heartbeat",
         *,
         frame_limit: Optional[int] = None,
+        coalesce_all: bool = False,
     ) -> bool:
         gap_batches: List[List[Dict[str, Any]]] = []
         queued = False
@@ -4259,8 +4303,31 @@ class LuxriotCaptureSession:
             take_count = len(self.frames)
             if frame_limit is not None:
                 take_count = min(take_count, max(1, int(frame_limit)))
-            frames_copy = list(self.frames[:take_count])
-            del self.frames[:take_count]
+            if coalesce_all and self.frames:
+                pending = list(self.frames)
+                total_source_count = sum(
+                    self._summary_source_weight(frame)
+                    for frame in pending
+                    if isinstance(frame, Mapping)
+                )
+                frames_copy, _ = self._subsample_coalesced_frames(
+                    pending,
+                    take_count,
+                )
+                retained_source_count = sum(
+                    self._summary_source_weight(frame)
+                    for frame in frames_copy
+                )
+                if frames_copy and total_source_count > retained_source_count:
+                    frames_copy[0]["_eva_summary_source_weight"] = (
+                        self._summary_source_weight(frames_copy[0])
+                        + total_source_count
+                        - retained_source_count
+                    )
+                self.frames.clear()
+            else:
+                frames_copy = list(self.frames[:take_count])
+                del self.frames[:take_count]
             if not frames_copy:
                 return True
             self._summary_batch_opened_monotonic = (
@@ -5324,6 +5391,17 @@ class LuxriotManager:
         self._l0_slot_seconds_ewma = (
             self._l0_cost_budget_config.reference_l0_slot_seconds
         )
+        try:
+            l0_slot_parallelism = float(
+                getattr(
+                    config,
+                    "LUXRIOT_ATTENTION_L0_SLOT_PARALLELISM",
+                    1.0,
+                )
+            )
+        except (TypeError, ValueError):
+            l0_slot_parallelism = 1.0
+        self._l0_slot_parallelism = max(1.0, min(16.0, l0_slot_parallelism))
         try:
             self.lm_input_warning_chars = int(getattr(config, "LM_VIDEO_INPUT_WARNING_CHARS", 24000))
         except (TypeError, ValueError):
@@ -7403,7 +7481,8 @@ class LuxriotManager:
             slot_seconds=max(
                 1.0,
                 float(self._l0_slot_seconds_ewma)
-                * max(0.5, frames / 8.0),
+                * max(0.5, frames / 8.0)
+                / float(self._l0_slot_parallelism),
             ),
         )
         with self._l0_cost_budget_lock:
@@ -7564,6 +7643,15 @@ class LuxriotManager:
                 "burst_debt_l0": round(float(state.debt_l0(config)), 3),
                 "slot_seconds_ewma": round(
                     float(self._l0_slot_seconds_ewma),
+                    3,
+                ),
+                "slot_parallelism": round(
+                    float(self._l0_slot_parallelism),
+                    3,
+                ),
+                "effective_reference_slot_seconds": round(
+                    float(self._l0_slot_seconds_ewma)
+                    / float(self._l0_slot_parallelism),
                     3,
                 ),
                 "admitted_total": int(self._l0_cost_budget_admitted),
@@ -8650,28 +8738,40 @@ class LuxriotManager:
         }
         if not terms:
             return False
-        prose = " ".join(str(summary_prose or "").lower().split())
+        raw_prose = str(summary_prose or "").lower()
+        clauses = [
+            " ".join(clause.split())
+            for clause in re.split(r"(?<=[.!?])\s+|[\r\n]+", raw_prose)
+            if clause.strip()
+        ]
         for term in terms:
             escaped = re.escape(term)
-            negative = bool(
+            relevant = [
+                clause
+                for clause in clauses
+                if re.search(rf"\b{escaped}\b", clause, flags=re.IGNORECASE)
+            ]
+            negative = any(
                 re.search(
-                    rf"\b(?:no|not|without|absent|missing|unconfirmed|"
-                    rf"cannot\s+confirm|can't\s+confirm|no\s+(?:visual\s+)?evidence)"
-                    rf"\b.{{0,80}}\b{escaped}\b"
+                    rf"\b(?:no\s+(?:visual\s+)?evidence(?:\s+of|\s+for)?|"
+                    rf"cannot\s+confirm|can't\s+confirm)\b.{{0,80}}\b{escaped}\b"
+                    rf"|\b(?:no|without)\s+(?:visible\s+)?\b{escaped}\b"
                     rf"|\b{escaped}\b.{{0,80}}\b(?:not\s+visible|not\s+present|"
                     rf"absent|missing|unconfirmed|no\s+(?:visual\s+)?evidence)\b",
-                    prose,
+                    clause,
                     flags=re.IGNORECASE,
                 )
+                for clause in relevant
             )
-            positive = bool(
+            positive = any(
                 re.search(
                     rf"\b{escaped}\b.{{0,60}}\b(?:is|remains|was|appears)?\s*"
                     rf"(?:directly\s+)?(?:visible|present|seen|observed|detected)\b"
                     rf"|\b(?:visible|present|seen|observed|detected)\b.{{0,60}}\b{escaped}\b",
-                    prose,
+                    clause,
                     flags=re.IGNORECASE,
                 )
+                for clause in relevant
             )
             if (state == "present" and negative) or (
                 state == "absent" and positive

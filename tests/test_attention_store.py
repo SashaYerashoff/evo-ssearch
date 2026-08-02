@@ -346,6 +346,45 @@ class FakePool:
 
 
 class PostgresStoreTests(unittest.TestCase):
+    def test_child_writes_are_guarded_when_parent_telemetry_was_dropped(self):
+        connection = FakeConnection()
+        store = PostgresAttentionStore(FakePool(connection), TENANT_ID)
+        snap = snapshot()
+        cv = interval()
+        missing_episode_id = uid()
+        result = store.write_batch(
+            AttentionBatch(
+                probe_scores=(probe_score(snap.id),),
+                links=(
+                    IntervalEvidenceLink(
+                        id=uid(),
+                        interval_id=cv.id,
+                        occurred_at_ms=1000,
+                        kind="embedding",
+                        role="support",
+                        embedding_snapshot_id=snap.id,
+                    ),
+                ),
+                decisions=(
+                    SchedulerDecisionRecord(
+                        id=uid(),
+                        channel_id=112,
+                        episode_id=missing_episode_id,
+                        decided_at_ms=2000,
+                        action="fast_vlm_no_alert",
+                        record={"frame_count": 6},
+                    ),
+                ),
+            )
+        )
+
+        self.assertTrue(result.ok)
+        sql = "\n".join(statement for statement, _params in connection.calls)
+        self.assertIn("FROM archive.attention_embedding_snapshots", sql)
+        self.assertIn("FROM archive.attention_intervals", sql)
+        self.assertIn("FROM archive.attention_episodes", sql)
+        self.assertIn("ELSE NULL", sql)
+
     def test_query_is_tenant_channel_time_scoped_and_limit_is_bounded(self):
         connection = FakeConnection()
         store = PostgresAttentionStore(FakePool(connection), TENANT_ID)

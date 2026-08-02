@@ -375,6 +375,8 @@ class L0BatchDeliveryContractTests(unittest.TestCase):
             self.assertEqual(len(dispatched), 1)
             frames, metadata = dispatched[0]
             self.assertEqual(len(frames), 16)
+            self.assertEqual(frames[0]["captured_at"], 100.0)
+            self.assertEqual(frames[-1]["captured_at"], 139.0)
             self.assertFalse(
                 any("_eva_summary_source_weight" in frame for frame in frames)
             )

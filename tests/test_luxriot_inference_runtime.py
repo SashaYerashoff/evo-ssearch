@@ -947,6 +947,17 @@ class LuxriotSummaryBackpressureTests(unittest.TestCase):
         self.assertEqual(kept_modes.count("burst"), 3)
         stamps = [frame["captured_at"] for frame in kept]
         self.assertEqual(stamps, sorted(stamps))
+        self.assertEqual(stamps[0], 100.0)
+        self.assertEqual(stamps[-1], 125.0)
+
+    def test_single_frame_coalescing_keeps_the_newest_observation(self):
+        kept, omitted = LuxriotCaptureSession._subsample_coalesced_frames(
+            self._frames(100.0, 8),
+            1,
+        )
+
+        self.assertEqual(omitted, 7)
+        self.assertEqual([frame["captured_at"] for frame in kept], [107.0])
 
     def test_exhausted_coalescing_leaves_an_explicit_coverage_gap(self):
         with tempfile.TemporaryDirectory() as temp:

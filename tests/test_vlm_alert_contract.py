@@ -311,6 +311,31 @@ class VlmAlertPromptContractTests(unittest.TestCase):
             by_key["cat orlandina"]["validation_issues"],
         )
 
+    def test_state_conflict_does_not_cross_sentence_boundaries(self):
+        frames = [
+            {"thumbnail": "frame-one", "captured_at": 100.0},
+            {"thumbnail": "frame-two", "captured_at": 101.0},
+        ]
+        summary = (
+            "No other people or animals are visible. "
+            "A grey Sphynx cat (Orlandina) is visible on the shelf.\n"
+            "BATCH_STATE_JSON:\n"
+            '{"version":1,"cover":{"snapshot_index":1},"events":[],'
+            '"observed_states":[{"key":"cat_orlandina",'
+            '"label":"Sphynx cat (Orlandina)","state":"present",'
+            '"snapshot_indices":[1,2],'
+            '"evidence":"Grey Sphynx cat visible on shelf in both snapshots"}],'
+            '"routines":[],"memory_pass":[],"alerts":[]}'
+        )
+
+        state = LuxriotManager._extract_batch_state(summary, frames)
+
+        self.assertEqual(state["observed_states"][0]["state"], "present")
+        self.assertNotIn(
+            "validation_issues",
+            state["observed_states"][0],
+        )
+
     def test_alert_policy_prompt_is_separate_from_stream_prompt(self):
         with tempfile.TemporaryDirectory() as temp:
             manager = build_manager(Path(temp))

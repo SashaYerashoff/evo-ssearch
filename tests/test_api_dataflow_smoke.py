@@ -19,6 +19,8 @@ from oldapp import (
     _MUTATION_ENDPOINT_PERMISSIONS,
     _SENSITIVE_ENDPOINT_PERMISSIONS,
     _build_detection_search_result,
+    _bound_rollup_messages,
+    _attention_batch_from_event,
     _env_precedence_report,
     _expired_stored_probe_lineage_payload,
     _store_vlm_summary_archive_frames,
@@ -98,6 +100,60 @@ class ApiDataflowSmokeTests(unittest.TestCase):
         config.OFFLINE_VIDEO_ENABLED = True
         config.PROBE_SNAP_ENABLED = True
         config.INDEXED_FOLDER_ENABLED = True
+
+    def test_rollup_context_bounds_string_and_list_text_content(self):
+        messages = [
+            {"role": "system", "content": "S" * 6000},
+            {
+                "role": "user",
+                "content": [{"type": "text", "text": "U" * 6000}],
+            },
+            {"role": "user", "content": "final instruction"},
+        ]
+
+        bounded = _bound_rollup_messages(messages, 5000)
+        bounded_chars = sum(
+            len(message["content"])
+            if isinstance(message.get("content"), str)
+            else sum(
+                len(str(part.get("text") or ""))
+                for part in message.get("content") or []
+                if isinstance(part, dict) and part.get("type") == "text"
+            )
+            for message in bounded
+        )
+
+        self.assertLessEqual(bounded_chars, 5000)
+        self.assertEqual(messages[0]["content"], "S" * 6000)
+        self.assertEqual(bounded[-1]["content"], "final instruction")
+        self.assertIn("older rollup source text compacted", bounded[0]["content"])
+
+    def test_fast_attention_outcome_keeps_episode_and_decision_atomic(self):
+        episode_id = "cccd01a6-0a88-4d79-b0bd-fc0286812129"
+        batch = _attention_batch_from_event(
+            "scheduler_decision",
+            {
+                "id": episode_id,
+                "channel_id": 112,
+                "episode_id": episode_id,
+                "decided_at_ms": 2000,
+                "action": "fast_vlm_no_alert",
+                "record": {"frame_count": 6},
+                "episode": {
+                    "id": episode_id,
+                    "channel_id": 112,
+                    "started_at_ms": 1000,
+                    "ended_at_ms": 1900,
+                    "trigger": "fast_vlm_alert",
+                    "status": "closed",
+                    "record": {"frame_count": 6},
+                },
+            },
+        )
+
+        self.assertEqual(len(batch.episodes), 1)
+        self.assertEqual(len(batch.decisions), 1)
+        self.assertEqual(batch.decisions[0].episode_id, batch.episodes[0].id)
 
     def tearDown(self) -> None:
         config.AUTH_ENABLED = self._orig_auth_enabled

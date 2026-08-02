@@ -279,6 +279,7 @@ markers reach the model via `VECTOR_SIGNALS_JSON.capture_attention`.
 | `EVOSSEARCH_LUXRIOT_ATTENTION_STORAGE_ENABLED` (`false`) | Require PostgreSQL attention telemetry (`20260726_0008`) |
 | `EVOSSEARCH_LUXRIOT_ATTENTION_RING_SECONDS` (`90`) | Bounded in-memory evidence ring; stores selected embedding frames, never dense CV frames |
 | `EVOSSEARCH_LUXRIOT_ATTENTION_REQUESTS_PER_MINUTE` (`6`) | Global VLM token-bucket refill rate across channels |
+| `EVOSSEARCH_LUXRIOT_ATTENTION_L0_SLOT_PARALLELISM` (auto: VLM max-inflight minus one, capped at `3`) | Converts measured L0 wall time into effective batched slot cost. The reserved endpoint lane remains available to interactive agent and alert work; set `1` for a serial llama.cpp/CPU endpoint |
 | `EVOSSEARCH_LUXRIOT_ATTENTION_MAX_OUTSTANDING` (`1`) | Global queued/in-flight VLM episode limit |
 | `EVOSSEARCH_LUXRIOT_ATTENTION_POSTROLL_SEC` (`3`) | Burst post-roll collected before episode dispatch |
 | `EVOSSEARCH_LUXRIOT_ATTENTION_MAX_VLM_FRAMES` (`8`) | Maximum saved embedding frames in one episode |

@@ -4360,6 +4360,86 @@ _call_video_understanding.eva_max_tokens_override = True  # type: ignore[attr-de
 _call_video_understanding.eva_resource_key = _video_understanding_resource_key  # type: ignore[attr-defined]
 
 
+def _compact_rollup_text(text: str, target_chars: int) -> str:
+    """Keep source metadata/head and recent tail within an exact char limit."""
+
+    value = str(text or "")
+    target = max(0, int(target_chars))
+    if len(value) <= target:
+        return value
+    marker = "\n\n[older rollup source text compacted]\n\n"
+    if target <= len(marker) + 32:
+        return value[-target:] if target else ""
+    payload_chars = target - len(marker)
+    head = min(max(256, payload_chars // 4), payload_chars)
+    tail = max(0, payload_chars - head)
+    return value[:head] + marker + (value[-tail:] if tail else "")
+
+
+def _bound_rollup_messages(
+    messages: Sequence[Mapping[str, Any]],
+    input_char_budget: int,
+) -> List[Dict[str, Any]]:
+    """Bound both OpenAI string content and multimodal text parts.
+
+    Rollups are normally text-only and frequently use plain string ``content``.
+    The old limiter inspected list-style multimodal parts only, leaving the
+    actual L3 source text untouched and allowing a one-token context overflow.
+    """
+
+    bounded_messages = copy.deepcopy(list(messages))
+    text_parts: List[Tuple[int, Optional[int], str]] = []
+    for message_index, message in enumerate(bounded_messages):
+        content = message.get("content")
+        if isinstance(content, str):
+            text_parts.append((message_index, None, content))
+            continue
+        if not isinstance(content, list):
+            continue
+        for part_index, part in enumerate(content):
+            if not isinstance(part, Mapping) or str(part.get("type") or "") != "text":
+                continue
+            text_parts.append(
+                (message_index, part_index, str(part.get("text") or ""))
+            )
+
+    budget = max(1, int(input_char_budget))
+    current: Dict[Tuple[int, Optional[int]], str] = {
+        (message_index, part_index): value
+        for message_index, part_index, value in text_parts
+    }
+
+    def apply_value(key: Tuple[int, Optional[int]], value: str) -> None:
+        message_index, part_index = key
+        if part_index is None:
+            bounded_messages[message_index]["content"] = value
+            return
+        content = bounded_messages[message_index].get("content")
+        if isinstance(content, list) and isinstance(content[part_index], dict):
+            content[part_index]["text"] = value
+
+    total_chars = sum(len(value) for value in current.values())
+    for minimum in (1024, 256, 0):
+        while total_chars > budget:
+            reducible = [
+                (len(value) - minimum, key, value)
+                for key, value in current.items()
+                if len(value) > minimum
+            ]
+            if not reducible:
+                break
+            _, key, value = max(reducible, key=lambda item: item[0])
+            reduction_needed = total_chars - budget
+            target = max(minimum, len(value) - reduction_needed)
+            compacted = _compact_rollup_text(value, target)
+            current[key] = compacted
+            apply_value(key, compacted)
+            total_chars -= len(value) - len(compacted)
+        if total_chars <= budget:
+            break
+    return bounded_messages
+
+
 def _call_rollup_understanding(
     messages: List[Dict[str, Any]],
     model_override: Optional[str] = None,
@@ -4383,49 +4463,10 @@ def _call_rollup_understanding(
         int(getattr(config, "LUXRIOT_ROLLUP_CONTEXT_LIMIT_TOKENS", 32768) or 32768),
     )
     input_char_budget = max(
-        16000,
-        int(max(1024, context_tokens - completion_tokens - 2048) * 3.2),
+        12000,
+        int(max(1024, context_tokens - completion_tokens - 4096) * 2.5),
     )
-    bounded_messages = copy.deepcopy(messages)
-    text_parts: List[Tuple[int, int, str]] = []
-    total_chars = 0
-    for message_index, message in enumerate(bounded_messages):
-        content = message.get("content")
-        if not isinstance(content, list):
-            continue
-        for part_index, part in enumerate(content):
-            if not isinstance(part, Mapping) or str(part.get("type") or "") != "text":
-                continue
-            text_value = str(part.get("text") or "")
-            total_chars += len(text_value)
-            text_parts.append((message_index, part_index, text_value))
-    overflow = max(0, total_chars - input_char_budget)
-    # Trim the largest text blocks first, preserving both their metadata prefix
-    # and most recent/source-summary tail. The final corrective instruction is
-    # normally small and therefore survives intact.
-    for message_index, part_index, text_value in sorted(
-        text_parts,
-        key=lambda item: len(item[2]),
-        reverse=True,
-    ):
-        if overflow <= 0:
-            break
-        removable = max(0, len(text_value) - 4000)
-        remove = min(removable, overflow)
-        if remove <= 0:
-            continue
-        keep = len(text_value) - remove
-        head = min(max(1200, keep // 4), keep)
-        tail = max(0, keep - head)
-        compacted = (
-            text_value[:head]
-            + "\n\n[older rollup source text compacted to fit the configured context]\n\n"
-            + (text_value[-tail:] if tail else "")
-        )
-        content = bounded_messages[message_index].get("content")
-        if isinstance(content, list) and isinstance(content[part_index], dict):
-            content[part_index]["text"] = compacted
-        overflow -= remove
+    bounded_messages = _bound_rollup_messages(messages, input_char_budget)
     return _call_lm_chat(
         bounded_messages,
         model_override=normalized_override or None,
@@ -5329,7 +5370,14 @@ def _attention_batch_from_event(
             else ()
         )
     if kind == "scheduler_decision":
-        return AttentionBatch(decisions=(SchedulerDecisionRecord(**dict(payload)),))
+        decision_payload = dict(payload)
+        raw_episode = decision_payload.pop("episode", None)
+        return AttentionBatch(
+            episodes=(AttentionEpisodeRecord(**dict(raw_episode)),)
+            if isinstance(raw_episode, Mapping)
+            else (),
+            decisions=(SchedulerDecisionRecord(**decision_payload),),
+        )
     if kind == "probe_lineage":
         raw_items = payload.get("records")
         return AttentionBatch(
@@ -9082,6 +9130,61 @@ class _FastVlmAlertRuntime:
             return 0.0
         return _to_float(selection.get("activity_x"), 0.0)
 
+    @staticmethod
+    def _emit_attention_outcome(
+        *,
+        episode_id: str,
+        channel_id: int,
+        episode: Mapping[str, Any],
+        batch_start_ms: int,
+        batch_end_ms: int,
+        completed_at_ms: int,
+        frame_count: int,
+        action: str,
+        alert_count: int,
+        bookmarks_sent: int,
+    ) -> None:
+        """Persist the fast episode and its decision in one writer batch."""
+
+        reason = str(episode.get("reason") or "unknown")
+        record = {
+            "trigger_timestamp_ms": _to_int(
+                episode.get("trigger_timestamp_ms"),
+                batch_start_ms,
+            ),
+            "reason": reason,
+            "semantic_delta": _to_optional_float(episode.get("semantic_delta")),
+            "moving_fraction": _to_optional_float(episode.get("moving_fraction")),
+            "frame_count": int(frame_count),
+            "alert_count": int(alert_count),
+            "bookmarks_sent": int(bookmarks_sent),
+            "latency_ms": max(
+                0,
+                int(completed_at_ms)
+                - _to_int(episode.get("trigger_timestamp_ms"), batch_start_ms),
+            ),
+        }
+        luxriot_manager.emit_attention_event(
+            "scheduler_decision",
+            {
+                "id": episode_id,
+                "channel_id": int(channel_id),
+                "episode_id": episode_id,
+                "decided_at_ms": int(completed_at_ms),
+                "action": str(action),
+                "record": record,
+                "episode": {
+                    "id": episode_id,
+                    "channel_id": int(channel_id),
+                    "started_at_ms": int(batch_start_ms),
+                    "ended_at_ms": int(batch_end_ms),
+                    "trigger": "fast_vlm_alert",
+                    "status": "closed",
+                    "record": record,
+                },
+            },
+        )
+
     def _episode_frames(self, channel_id: int, trigger_ms: int, post_ms: int) -> List[Dict[str, Any]]:
         with luxriot_manager.cache_lock:
             session = luxriot_manager.sessions.get(int(channel_id))
@@ -9269,20 +9372,17 @@ class _FastVlmAlertRuntime:
             }
             self._status["last_error"] = None
         if not delivery.alert_events:
-            luxriot_manager.emit_attention_event(
-                "scheduler_decision",
-                {
-                    "id": episode_id,
-                    "channel_id": channel_id,
-                    "episode_id": episode_id,
-                    "decided_at_ms": completed_at_ms,
-                    "action": "fast_vlm_no_alert",
-                    "record": {
-                        "trigger_timestamp_ms": trigger_ms,
-                        "frame_count": len(frames),
-                        "latency_ms": max(0, completed_at_ms - trigger_ms),
-                    },
-                },
+            self._emit_attention_outcome(
+                episode_id=episode_id,
+                channel_id=channel_id,
+                episode=episode,
+                batch_start_ms=batch_start_ms,
+                batch_end_ms=batch_end_ms,
+                completed_at_ms=completed_at_ms,
+                frame_count=len(frames),
+                action="fast_vlm_no_alert",
+                alert_count=0,
+                bookmarks_sent=0,
             )
             return
         with self._lock:
@@ -9348,21 +9448,17 @@ class _FastVlmAlertRuntime:
             **delivery_payload,
         }
         luxriot_manager._archive_summary_entry(entry)
-        luxriot_manager.emit_attention_event(
-            "scheduler_decision",
-            {
-                "id": episode_id,
-                "channel_id": channel_id,
-                "episode_id": episode_id,
-                "decided_at_ms": completed_at_ms,
-                "action": "fast_vlm_alert_delivered",
-                "record": {
-                    "trigger_timestamp_ms": trigger_ms,
-                    "frame_count": len(frames),
-                    "bookmarks_sent": int(delivery),
-                    "latency_ms": max(0, completed_at_ms - trigger_ms),
-                },
-            },
+        self._emit_attention_outcome(
+            episode_id=episode_id,
+            channel_id=channel_id,
+            episode=episode,
+            batch_start_ms=batch_start_ms,
+            batch_end_ms=batch_end_ms,
+            completed_at_ms=completed_at_ms,
+            frame_count=len(frames),
+            action="fast_vlm_alert_delivered",
+            alert_count=alert_count,
+            bookmarks_sent=int(delivery),
         )
 
     def status(self) -> Dict[str, Any]:

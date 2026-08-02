@@ -771,9 +771,13 @@ class PostgresAttentionStore:
                                 pos_score, neg_score, margin, pos_floor,
                                 margin_threshold, threshold_state
                             )
-                            VALUES (
+                            SELECT
                                 %s, %s, %s, %s, %s, %s,
                                 %s, %s, %s, %s, %s, %s
+                            WHERE EXISTS (
+                                SELECT 1
+                                FROM archive.attention_embedding_snapshots
+                                WHERE tenant_id = %s AND id = %s
                             )
                             ON CONFLICT DO NOTHING
                             """,
@@ -790,6 +794,8 @@ class PostgresAttentionStore:
                                 item.pos_floor,
                                 item.margin_threshold,
                                 item.threshold_state,
+                                self.tenant_id,
+                                item.embedding_snapshot_id,
                             ),
                         )
                     )
@@ -840,7 +846,20 @@ class PostgresAttentionStore:
                                 tenant_id, id, interval_id, occurred_at_ms,
                                 kind, role, embedding_snapshot_id, apex_ref
                             )
-                            VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                            SELECT %s, %s, %s, %s, %s, %s, %s, %s
+                            WHERE EXISTS (
+                                SELECT 1
+                                FROM archive.attention_intervals
+                                WHERE tenant_id = %s AND id = %s
+                            )
+                              AND (
+                                %s::uuid IS NULL
+                                OR EXISTS (
+                                    SELECT 1
+                                    FROM archive.attention_embedding_snapshots
+                                    WHERE tenant_id = %s AND id = %s
+                                )
+                              )
                             ON CONFLICT (tenant_id, id) DO NOTHING
                             """,
                             (
@@ -852,6 +871,11 @@ class PostgresAttentionStore:
                                 item.role,
                                 item.embedding_snapshot_id,
                                 item.apex_ref,
+                                self.tenant_id,
+                                item.interval_id,
+                                item.embedding_snapshot_id,
+                                self.tenant_id,
+                                item.embedding_snapshot_id,
                             ),
                         )
                     )
@@ -920,13 +944,28 @@ class PostgresAttentionStore:
                                 decided_at_ms, action, record_json,
                                 canonical_json
                             )
-                            VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                            VALUES (
+                                %s, %s, %s,
+                                CASE
+                                    WHEN %s::uuid IS NULL THEN NULL
+                                    WHEN EXISTS (
+                                        SELECT 1
+                                        FROM archive.attention_episodes
+                                        WHERE tenant_id = %s AND id = %s
+                                    ) THEN %s::uuid
+                                    ELSE NULL
+                                END,
+                                %s, %s, %s, %s
+                            )
                             ON CONFLICT (tenant_id, id) DO NOTHING
                             """,
                             (
                                 self.tenant_id,
                                 item.id,
                                 item.channel_id,
+                                item.episode_id,
+                                self.tenant_id,
+                                item.episode_id,
                                 item.episode_id,
                                 item.decided_at_ms,
                                 item.action,
@@ -939,7 +978,13 @@ class PostgresAttentionStore:
             if _is_missing_attention_relation(exc):
                 error = "not_migrated"
             else:
+                constraint = str(
+                    getattr(getattr(exc, "diag", None), "constraint_name", "")
+                    or ""
+                ).strip()
                 error = type(exc).__name__
+                if constraint:
+                    error = f"{error}:{constraint}"
             return AttentionWriteResult(
                 ok=False,
                 accepted_records=batch.record_count,
