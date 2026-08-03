@@ -8,7 +8,8 @@ import {
   hasPermission,
   PERMISSION,
 } from './api/access'
-import { findParentAlert, getChannels, normalizeDetection } from './api/detections'
+import { findParentAlert, getChannelsStatus, normalizeDetection } from './api/detections'
+import { deriveLuxriotLinkStatus, type LuxriotLinkState } from './api/luxriotStatus'
 import type { Probe } from './api/probes'
 import { api, API_FORBIDDEN_EVENT, AUTH_EXPIRED_EVENT } from './api/client'
 import { TopBar } from './components/shell/TopBar'
@@ -20,7 +21,7 @@ import { ArchiveScreen } from './components/archive/ArchiveScreen'
 import { InspectorModal } from './components/archive/InspectorModal'
 import { MonitoringScreen } from './components/monitoring/MonitoringScreen'
 import { VideoScreen } from './components/video/VideoScreen'
-import type { SummaryEntry } from './api/video'
+import { videoApi, type SummaryEntry } from './api/video'
 import { SettingsModal } from './components/settings/SettingsModal'
 import { HomeScreen } from './components/home/HomeScreen'
 import { NeuralBackground } from './components/shell/NeuralBackground'
@@ -36,7 +37,8 @@ export interface ConsoleDrive {
 }
 
 export interface StatusData {
-  luxriot: boolean
+  luxriot: LuxriotLinkState
+  luxriotDetail: string
   channels: number
   probes: number
   agent: 'idle' | 'working'
@@ -76,7 +78,13 @@ export default function App() {
   const [user, setUser] = useState<AuthUser | null>(null)
   const [ready, setReady] = useState(false)
   const [channels, setChannels] = useState<Channel[]>([])
-  const [status, setStatus] = useState<StatusData>({ luxriot: false, channels: 0, probes: 0, agent: 'idle' })
+  const [status, setStatus] = useState<StatusData>({
+    luxriot: 'checking',
+    luxriotDetail: 'Waiting for Luxriot status.',
+    channels: 0,
+    probes: 0,
+    agent: 'idle',
+  })
   const [section, setSection] = useState<SectionId>('home')
   const [agentOpen, setAgentOpen] = useState(false)
   const [agentFull, setAgentFull] = useState(false)
@@ -223,17 +231,40 @@ export default function App() {
   const refreshChannels = useCallback(async () => {
     if (!user || !hasPermission(user, PERMISSION.streamsView)) {
       setChannels([])
-      setStatus((s) => ({ ...s, luxriot: false, channels: 0 }))
+      setStatus((s) => ({
+        ...s,
+        luxriot: 'checking',
+        luxriotDetail: 'Luxriot status is unavailable for the current role.',
+        channels: 0,
+      }))
       return
     }
     try {
-      const ch = await getChannels()
-      const allowed = filterAllowedChannels(user, ch)
+      const [channelStatus, streams] = await Promise.all([
+        getChannelsStatus(true),
+        videoApi.streams().catch(() => null),
+      ])
+      const allowed = filterAllowedChannels(user, channelStatus.channels)
+      const link = deriveLuxriotLinkStatus(
+        channelStatus.channels,
+        channelStatus.inventory,
+        streams,
+      )
       setChannels(allowed)
-      setStatus((s) => ({ ...s, luxriot: true, channels: allowed.length }))
-    } catch {
+      setStatus((s) => ({
+        ...s,
+        luxriot: link.state,
+        luxriotDetail: link.detail,
+        channels: allowed.length,
+      }))
+    } catch (exception: any) {
       setChannels([])
-      setStatus((s) => ({ ...s, luxriot: false }))
+      setStatus((s) => ({
+        ...s,
+        luxriot: 'offline',
+        luxriotDetail: exception?.message || 'EVA could not query Luxriot.',
+        channels: 0,
+      }))
     }
   }, [user])
 
@@ -257,7 +288,13 @@ export default function App() {
       setSection('home')
       setSettingsOpen(false)
       setAgentOpen(false)
-      setStatus({ luxriot: false, channels: 0, probes: 0, agent: 'idle' })
+      setStatus({
+        luxriot: 'checking',
+        luxriotDetail: 'Waiting for Luxriot status.',
+        channels: 0,
+        probes: 0,
+        agent: 'idle',
+      })
     }
     const forbidden = (event: Event) => {
       const detail = (event as CustomEvent)?.detail

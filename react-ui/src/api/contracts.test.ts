@@ -14,6 +14,7 @@ import {
 } from './access'
 import { mapUser } from './auth'
 import { apiErrorMessage, shouldAttachCsrf } from './client'
+import { deriveLuxriotLinkStatus } from './luxriotStatus'
 import {
   incidentExportUrl,
   incidentPath,
@@ -51,6 +52,74 @@ import {
 import { API_PREFIXES } from '../../proxy-config'
 
 describe('React/backend contract normalizers', () => {
+  it('does not treat a cached channel list or a healthy USB camera as Luxriot connectivity', () => {
+    const channels = [
+      { id: 112, title: 'Zenbook webcam', server: 101 },
+      { id: 900001, title: 'Direct USB webcam', server: 'local-v4l2', source: 'local_v4l2' },
+    ]
+    const status = deriveLuxriotLinkStatus(
+      channels,
+      {
+        cached: true,
+        stale: true,
+        last_success_at: 940,
+        last_error: 'Luxriot channels request timed out',
+      },
+      {
+        video_streams: [{ channel_id: 900001, running: true, last_live_segment_frames: 12 }],
+      },
+      1000,
+    )
+
+    expect(status.state).toBe('offline')
+    expect(status.detail).toContain('cached channel list')
+
+    const captureStillActive = deriveLuxriotLinkStatus(
+      channels,
+      {
+        cached: true,
+        stale: true,
+        last_success_at: 940,
+        last_error: 'Luxriot channels request timed out',
+      },
+      {
+        video_streams: [
+          { channel_id: 112, running: true, last_live_segment_frames: 8 },
+          { channel_id: 900001, running: true, last_live_segment_frames: 12 },
+        ],
+      },
+      1000,
+    )
+    expect(captureStillActive.state).toBe('stale')
+    expect(captureStillActive.detail).toContain('1 upstream capture signal is still active')
+  })
+
+  it('separates a reachable Luxriot server from stale upstream camera signals', () => {
+    const channels = [{ id: 112, title: 'Zenbook webcam', server: 101 }]
+    expect(deriveLuxriotLinkStatus(
+      channels,
+      { cached: true, stale: false, last_success_at: 999 },
+      { video_streams: [{ channel_id: 112, running: true, last_live_segment_frames: 8 }] },
+      1000,
+    ).state).toBe('connected')
+
+    const stale = deriveLuxriotLinkStatus(
+      channels,
+      { cached: true, stale: false, last_success_at: 999 },
+      {
+        video_streams: [{
+          channel_id: 112,
+          running: true,
+          last_live_segment_frames: 0,
+          last_live_segment_error: 'ffmpeg live segment timed out',
+        }],
+      },
+      1000,
+    )
+    expect(stale.state).toBe('stale')
+    expect(stale.detail).toContain('1 configured signal is stale')
+  })
+
   it('maps the camelCase audit response to the UI model', () => {
     expect(normalizeAuditEvent({
       occurredAt: '2026-07-24T12:00:00Z',

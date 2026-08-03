@@ -13,7 +13,8 @@ export interface Channel {
   id: number
   title: string
   guid?: string
-  server?: number
+  server?: number | string
+  source?: string
 }
 
 /** Unified detection view-model (normalized from list + search rows). */

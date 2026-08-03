@@ -265,6 +265,7 @@
 }
 .status-console > span { display: inline-flex; align-items: center; gap: 6px; min-width: 0; }
 .status-console .ok { color: var(--success); }
+.status-console .warn { color: var(--warning); }
 .status-console .err { color: var(--danger); }
 .status-console .active { color: var(--accent); }
 .status-console-dot { width: 5px; height: 5px; border-radius: 50%; background: currentColor; box-shadow: 0 0 6px currentColor; }

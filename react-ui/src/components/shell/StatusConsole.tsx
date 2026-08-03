@@ -2,10 +2,16 @@ import type { AuthUser } from '../../api/types'
 import type { StatusData } from '../../App'
 
 export function StatusConsole({ user, status }: { user: AuthUser; status: StatusData }) {
+  const luxriot = {
+    checking: { className: '', label: 'checking' },
+    connected: { className: 'ok', label: 'connected' },
+    stale: { className: 'warn', label: 'signal stale' },
+    offline: { className: 'err', label: 'offline' },
+  }[status.luxriot]
   return (
     <div className="status-console" role="status" aria-label="EVA runtime status">
-      <span className={status.luxriot ? 'ok' : 'err'}>
-        <i className="status-console-dot" /> Luxriot {status.luxriot ? 'connected' : 'offline'}
+      <span className={luxriot.className} title={status.luxriotDetail}>
+        <i className="status-console-dot" /> Luxriot {luxriot.label}
       </span>
       <i className="status-console-sep" />
       <span>{status.channels} channel{status.channels === 1 ? '' : 's'}</span>

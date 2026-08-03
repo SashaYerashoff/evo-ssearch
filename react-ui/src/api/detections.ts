@@ -1,5 +1,6 @@
 import { api } from './client'
 import type { Channel, Detection, ArchiveFilters } from './types'
+import type { LuxriotInventoryStatus } from './luxriotStatus'
 
 const SOURCE_LABELS: Record<string, string> = {
   semantic_snapshot: 'Continuous CLIP archive',
@@ -8,11 +9,29 @@ const SOURCE_LABELS: Record<string, string> = {
   vlm_alert: 'VLM alert',
 }
 
+export interface LuxriotChannelsStatus {
+  channels: Channel[]
+  inventory: LuxriotInventoryStatus | null
+}
+
+export async function getChannelsStatus(force = false): Promise<LuxriotChannelsStatus> {
+  const res = await api.get('/luxriot/channels', force ? { force: '1' } : undefined)
+  return {
+    channels: (res?.channels || []).map((c: any) => ({
+      id: c.id,
+      title: c.title,
+      guid: c.guid,
+      server: c.server,
+      source: c.source,
+    })),
+    inventory: res?.inventory && typeof res.inventory === 'object'
+      ? res.inventory as LuxriotInventoryStatus
+      : null,
+  }
+}
+
 export async function getChannels(): Promise<Channel[]> {
-  const res = await api.get('/luxriot/channels')
-  return (res?.channels || []).map((c: any) => ({
-    id: c.id, title: c.title, guid: c.guid, server: c.server,
-  }))
+  return (await getChannelsStatus()).channels
 }
 
 function num(v: any): number | null {
