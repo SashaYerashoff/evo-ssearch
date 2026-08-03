@@ -403,6 +403,7 @@
 .atp-text { display: flex; align-items: center; gap: 8px; }
 .atp-text input { flex: 1 1 auto; min-width: 0; background: var(--void-tile); border: 1px solid var(--line-2); border-radius: 9px; color: var(--text); padding: 9px 11px; font-size: 13.5px; outline: none; }
 .atp-text input:focus { border-color: var(--accent-line); }
+.atp-search-submit { min-width: 106px; justify-content: center; }
 .atp-image { flex: 0 0 auto; align-self: flex-start; }
 /* search controls on one line: sort · results · min match */
 .atp-sc { display: flex; align-items: flex-end; gap: 12px; }
@@ -678,6 +679,10 @@
 }
 @keyframes spin { to { transform: rotate(360deg); } }
 .spin { animation: spin .8s linear infinite; }
+.sr-only {
+  position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px;
+  overflow: hidden; clip: rect(0, 0, 0, 0); white-space: nowrap; border: 0;
+}
 
 /* ---- inspector modal ---- */
 .scrim {

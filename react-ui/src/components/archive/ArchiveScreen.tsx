@@ -3,6 +3,7 @@ import {
   IconAdjustmentsHorizontal,
   IconFilter,
   IconLetterT,
+  IconLoader2,
   IconPhoto,
   IconSearch,
   IconSparkles,
@@ -88,6 +89,7 @@ export function ArchiveScreen({
   const [filters, setFilters] = useState<ArchiveFilters>(DEFAULT_FILTERS)
   const [items, setItems] = useState<Detection[]>([])
   const [loading, setLoading] = useState(false)
+  const [textSearchPending, setTextSearchPending] = useState(false)
   const [error, setError] = useState<string | null>(null)
   const [note, setNote] = useState('')
   const [selected, setSelected] = useState<Detection | null>(null)
@@ -116,6 +118,7 @@ export function ArchiveScreen({
     requestSeq.current++
     loadingRef.current = false
     setLoading(false)
+    setTextSearchPending(false)
     setNextOffset(0)
     setFilters((f) => ({ ...f, ...p }))
   }, [])
@@ -124,6 +127,7 @@ export function ArchiveScreen({
     if (loadingRef.current) return
     loadingRef.current = true
     const seq = ++requestSeq.current
+    setTextSearchPending(false)
     setLoading(true); setError(null)
     try {
       const result = await listArchive(filters, channels, requestedOffset)
@@ -160,8 +164,9 @@ export function ArchiveScreen({
   }, [filters, channels])
 
   const runText = useCallback(async (q: string) => {
-    loadingRef.current = false
+    loadingRef.current = true
     const seq = ++requestSeq.current
+    setTextSearchPending(true)
     setLoading(true); setError(null)
     try {
       const results = await searchText(q, filters, channels)
@@ -175,6 +180,7 @@ export function ArchiveScreen({
     } finally {
       if (requestSeq.current === seq) {
         loadingRef.current = false
+        setTextSearchPending(false)
         setLoading(false)
       }
     }
@@ -183,6 +189,7 @@ export function ArchiveScreen({
   const runImageSearch = useCallback(async (blob: Blob, label: string) => {
     loadingRef.current = false
     const seq = ++requestSeq.current
+    setTextSearchPending(false)
     setLoading(true); setError(null)
     try {
       const form = new FormData()
@@ -332,6 +339,7 @@ export function ArchiveScreen({
       requestSeq.current++
       loadingRef.current = false
       setLoading(false)
+      setTextSearchPending(false)
       setAgentTyping(false)
       if (!error) {
         const found = detectionsFromResult(result, channels)
@@ -397,7 +405,9 @@ export function ArchiveScreen({
       : scoreThreshold > 0
         ? `≥ ${formatArchiveScore(scoreThreshold)}`
         : 'All'
-  const textSummary = (q ? `“${q.length > 26 ? q.slice(0, 26) + '…' : q}”` : '—') + (scoreThreshold > 0 ? ` · ${scoreLabel}` : '')
+  const textSummary = textSearchPending
+    ? 'Searching archive…'
+    : (q ? `“${q.length > 26 ? q.slice(0, 26) + '…' : q}”` : '—') + (scoreThreshold > 0 ? ` · ${scoreLabel}` : '')
 
   const TOOL_META: Record<typeof openTool, { Icon: any; label: string; summary: string }> = {
     filters: { Icon: IconFilter, label: 'Filters', summary: filtersSummary },
@@ -422,14 +432,24 @@ export function ArchiveScreen({
       </div>
     )
     if (openTool === 'text') return (
-      <div className="atp-open atp-group atp-textgroup" key="text">
+      <div className="atp-open atp-group atp-textgroup" key="text" aria-busy={textSearchPending}>
         <span className="atp-glabel"><IconLetterT size={13} /> Text query</span>
-        <form className="atp-text" onSubmit={(e) => { e.preventDefault(); const v = textValue.trim(); if (v) runText(v) }}>
+        <form className="atp-text" onSubmit={(e) => {
+          e.preventDefault()
+          const v = textValue.trim()
+          if (v && !textSearchPending) void runText(v)
+        }}>
           <input placeholder="describe an archived scene…" autoFocus={!agentTyping}
             value={textValue} readOnly={agentTyping} className={agentTyping ? 'agent-caret' : ''}
             onChange={(e) => setTextValue(e.target.value)} />
-          <button className="btn primary" disabled={agentTyping || !textValue.trim()}><IconSearch size={15} /> Search</button>
+          <button className="btn primary atp-search-submit" disabled={agentTyping || textSearchPending || !textValue.trim()}>
+            {textSearchPending ? <IconLoader2 className="spin" size={15} /> : <IconSearch size={15} />}
+            {textSearchPending ? 'Searching…' : 'Search'}
+          </button>
         </form>
+        <span className="sr-only" role="status" aria-live="polite">
+          {textSearchPending ? 'Semantic archive search in progress.' : ''}
+        </span>
         {/* similarity threshold for the text-query results — filters out weak matches */}
         <div className="atp-min">
           <label title="The slider is normalized to the score range returned by this query">
@@ -486,13 +506,20 @@ export function ArchiveScreen({
           <span>{archiveMatchCount === 1 ? 'archive match' : 'archive matches'}</span>
         </div>
         <div className="archive-results-context">
-          {note || `${items.length} loaded`}
+          {textSearchPending
+            ? `Searching archive for “${q}” · current results remain visible`
+            : (note || `${items.length} loaded`)}
           {filtersDirty ? ' · Filters changed — load to apply' : ''}
         </div>
       </div>
 
       {error && <div className="empty-state" style={{ color: 'var(--danger)', padding: 30 }}>{error}</div>}
-      {loading && items.length === 0 && <div className="loading-state"><div className="spinner" /><div>Loading archive…</div></div>}
+      {loading && items.length === 0 && (
+        <div className="loading-state">
+          <div className="spinner" />
+          <div>{textSearchPending ? 'Searching semantic archive…' : 'Loading archive…'}</div>
+        </div>
+      )}
       {!loading && !error && displayed.length === 0 && <div className="empty-state">No archived frames for these filters.</div>}
 
       {displayed.length > 0 && (
