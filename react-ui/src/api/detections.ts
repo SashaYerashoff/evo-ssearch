@@ -3,8 +3,8 @@ import type { Channel, Detection, ArchiveFilters } from './types'
 import type { LuxriotInventoryStatus } from './luxriotStatus'
 
 const SOURCE_LABELS: Record<string, string> = {
-  semantic_snapshot: 'Continuous CLIP archive',
-  probe: 'CLIP probe',
+  semantic_snapshot: 'Continuous semantic archive',
+  probe: 'Semantic probe',
   vlm_summary: 'Video desc',
   vlm_alert: 'VLM alert',
 }
@@ -149,19 +149,40 @@ export async function listArchive(
   }
 }
 
-export async function searchText(query: string, f: ArchiveFilters, channels: Channel[]): Promise<Detection[]> {
+export async function searchText(
+  query: string,
+  f: ArchiveFilters,
+  channels: Channel[],
+): Promise<{ items: Detection[]; coverage: ArchiveSearchCoverage }> {
   const res = await api.postJson('/detections/search_text', {
     query,
     ...buildArchiveSearchPayload(f),
   })
   const cmap = channelMap(channels)
-  return (res.results || []).map((d: any) => normalizeDetection(d, cmap))
+  return {
+    items: (res.results || []).map((d: any) => normalizeDetection(d, cmap)),
+    coverage: (res.coverage && typeof res.coverage === 'object') ? res.coverage : {},
+  }
 }
 
 export interface ArchiveProbeOption {
   id: string
   name: string
   hitCount: number
+}
+
+export interface ArchiveSearchCoverage {
+  status?: string
+  partial?: boolean
+  note?: string
+  searched_channel_ids?: number[]
+  failed_channel_ids?: number[]
+  failed_sources?: string[]
+  embedding_space?: Record<string, unknown>
+  embedding_space_excluded_shards?: number
+  embedding_space_excluded_vectors?: number
+  visual_evidence_excluded?: number
+  [key: string]: unknown
 }
 
 export interface AlertFeedbackReason {

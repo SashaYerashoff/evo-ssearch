@@ -7833,7 +7833,7 @@ def _archive_source_label(value: Any) -> str:
     if source == "probe":
         return "Probe hit"
     if source == "semantic_snapshot":
-        return "Continuous CLIP snapshot"
+        return "Continuous semantic snapshot"
     if source == "vlm_summary":
         return "Video description"
     if source == "vlm_alert":
@@ -11230,6 +11230,8 @@ def _parse_detection_filters(payload: Dict[str, Any], default_hours: float = DET
         hours = parsed_hours if parsed_hours is not None else float(default_hours)
         if hours > 0:
             since_ms = int(time.time() * 1000 - (hours * 3600 * 1000))
+    if since_ms is not None and until_ms is not None and since_ms > until_ms:
+        raise ValueError("since_ms must be less than or equal to until_ms")
 
     return {
         "probe_id": probe_id,
@@ -11541,6 +11543,7 @@ def _finalize_detection_search_results(
     mode: str,
     sort_by: str,
     limit: int,
+    stats: Optional[Dict[str, int]] = None,
 ) -> List[Dict[str, Any]]:
     """Hydrate and optionally DINO-rerank an already complete CLIP ranking."""
 
@@ -11618,11 +11621,13 @@ def _finalize_detection_search_results(
     else:
         scored.sort(key=lambda row: row[1], reverse=True)
 
-    top_scored = scored[:limit]
+    # Hydrate beyond the visible limit so rows whose retained thumbnail is
+    # missing do not become empty cards or displace usable evidence.
+    hydration_pool = scored[: min(len(scored), max(limit, limit * 4))]
     hydrated_by_id: Dict[int, Dict[str, Any]] = {}
     try:
         hydrated_rows = detections_store.fetch_detections_by_ids(
-            [det_id for det_id, *_rest in top_scored],
+            [det_id for det_id, *_rest in hydration_pool],
             include_vectors=False,
             include_thumbnail=True,
         )
@@ -11636,9 +11641,13 @@ def _finalize_detection_search_results(
         hydrated_by_id = {}
 
     results: List[Dict[str, Any]] = []
-    for det_id, final_score, clip_score, dino_score, dino_fallback in top_scored:
+    visual_evidence_excluded = 0
+    for det_id, final_score, clip_score, dino_score, dino_fallback in hydration_pool:
         item = hydrated_by_id.get(det_id) or candidate_map.get(det_id)
         if not item:
+            continue
+        if not _detection_has_renderable_evidence(item):
+            visual_evidence_excluded += 1
             continue
         results.append(
             _build_detection_search_result(
@@ -11651,7 +11660,30 @@ def _finalize_detection_search_results(
                 dino_fallback=dino_fallback,
             )
         )
+        if len(results) >= limit:
+            break
+    if stats is not None:
+        stats["visual_evidence_excluded"] = visual_evidence_excluded
     return results
+
+
+def _detection_has_renderable_evidence(item: Mapping[str, Any]) -> bool:
+    """Return true only when an archive result can render an actual frame."""
+
+    if str(item.get("thumbnail") or "").strip():
+        return True
+    image_path = str(item.get("image_path") or "").strip()
+    if not image_path:
+        payload = item.get("payload")
+        if isinstance(payload, Mapping):
+            image_path = str(payload.get("image_path") or "").strip()
+    if not image_path:
+        return False
+    try:
+        detection_archive.resolve_archive_image_path(image_path)
+        return True
+    except Exception:
+        return False
 
 
 def _detection_row_matches_filters(
@@ -11721,6 +11753,11 @@ def _embedding_shard_matches_space(
     if ":e" in normalized_key:
         return False
     return not embedding_space_requires_identity(expected_space)
+
+
+def _archive_shard_channel_id(shard_key: Any) -> Optional[int]:
+    match = re.search(r"(?:^|:)ch(\d+)(?::|$)", str(shard_key or ""))
+    return int(match.group(1)) if match else None
 
 
 def _search_semantic_snapshot_shards(
@@ -11796,6 +11833,7 @@ def _search_semantic_snapshot_shards(
         coverage["shards_searched"] = 0
         coverage["embedding_space_excluded_shards"] = excluded_shards
         coverage["embedding_space_excluded_vectors"] = excluded_vectors
+        coverage["embedding_space"] = dict(expected_space)
         return [], coverage
 
     query_dim = (
@@ -11810,7 +11848,16 @@ def _search_semantic_snapshot_shards(
         shard_key = str(summary.get("shard_key") or "").strip()
         if not shard_key:
             continue
-        index_obj, shard_ids = detection_clip_shard_cache.get(shard_key)
+        try:
+            index_obj, shard_ids = detection_clip_shard_cache.get(shard_key)
+        except Exception:
+            app.logger.warning(
+                "Archive semantic shard unavailable shard=%s",
+                shard_key,
+                exc_info=True,
+            )
+            failed_shards.append(shard_key)
+            continue
         if index_obj is None or shard_ids is None or shard_ids.size == 0:
             failed_shards.append(shard_key)
             continue
@@ -11920,6 +11967,7 @@ def _search_semantic_snapshot_shards(
         clip_hits.extend(shard_hits[:limit])
     clip_hits.sort(key=lambda item: item[1], reverse=True)
 
+    finalize_stats: Dict[str, int] = {}
     results = _finalize_detection_search_results(
         clip_hits=clip_hits,
         candidate_map=candidate_map,
@@ -11927,6 +11975,7 @@ def _search_semantic_snapshot_shards(
         mode=mode,
         sort_by=sort_by,
         limit=limit,
+        stats=finalize_stats,
     )
     timestamps = [
         int(item.get("timestamp_ms") or 0)
@@ -11953,8 +12002,22 @@ def _search_semantic_snapshot_shards(
         "search_strategy": "hourly_sharded_exact",
         "shards_searched": len(states),
         "shards_failed": failed_shards,
+        "failed_channel_ids": sorted(
+            {
+                channel
+                for channel in (
+                    _archive_shard_channel_id(shard_key)
+                    for shard_key in failed_shards
+                )
+                if channel is not None
+            }
+        ),
         "embedding_space_excluded_shards": excluded_shards,
         "embedding_space_excluded_vectors": excluded_vectors,
+        "embedding_space": dict(expected_space),
+        "visual_evidence_excluded": int(
+            finalize_stats.get("visual_evidence_excluded") or 0
+        ),
         "note": (
             "Continuous semantic snapshots were ranked across every matching embedding-space shard."
             if not failed_shards
@@ -12008,22 +12071,42 @@ def _search_detections_archive(
             "vlm_summary",
             "probe",
         ):
-            scoped_payload = _search_detections_archive(
-                clip_query_vec=clip_query_vec,
-                dino_query_vec=dino_query_vec,
-                mode=mode,
-                probe_id=None,
-                channel_id=channel_id,
-                channel_ids=channel_ids,
-                source=scoped_source,
-                since_ms=since_ms,
-                until_ms=until_ms,
-                limit=limit,
-                sort_by=sort_by,
-                candidate_limit=candidate_limit,
-                include_coverage=True,
-            )
-            scoped_results, scoped_coverage = scoped_payload
+            try:
+                scoped_results, scoped_coverage = (
+                    _search_detections_archive_resilient(
+                        clip_query_vec=clip_query_vec,
+                        dino_query_vec=dino_query_vec,
+                        mode=mode,
+                        probe_id=None,
+                        channel_id=channel_id,
+                        channel_ids=channel_ids,
+                        source=scoped_source,
+                        since_ms=since_ms,
+                        until_ms=until_ms,
+                        limit=limit,
+                        sort_by=sort_by,
+                        candidate_limit=candidate_limit,
+                    )
+                )
+            except Exception as exc:
+                failure_code = _recoverable_archive_search_failure(exc)
+                if failure_code is None:
+                    raise
+                app.logger.warning(
+                    "Archive source omitted from partial search source=%s reason=%s",
+                    scoped_source,
+                    failure_code,
+                )
+                scoped_results = []
+                scoped_coverage = _failed_archive_search_coverage(
+                    source=scoped_source,
+                    channel_id=channel_id,
+                    channel_ids=channel_ids,
+                    since_ms=since_ms,
+                    until_ms=until_ms,
+                    limit=limit,
+                    reason=failure_code,
+                )
             source_results.extend(scoped_results)
             source_coverages[scoped_source] = scoped_coverage
 
@@ -12059,6 +12142,40 @@ def _search_detections_archive(
             bool(item.get("truncated"))
             for item in source_coverages.values()
         )
+        failed_sources = sorted(
+            source_name
+            for source_name, item in source_coverages.items()
+            if str(item.get("status") or "") == "failed"
+        )
+        failed_channel_ids = sorted(
+            {
+                int(channel)
+                for item in source_coverages.values()
+                for channel in (item.get("failed_channel_ids") or [])
+                if _to_optional_int(channel) is not None
+            }
+        )
+        searched_channel_ids = sorted(
+            {
+                int(channel)
+                for item in source_coverages.values()
+                for channel in (item.get("searched_channel_ids") or [])
+                if _to_optional_int(channel) is not None
+            }
+        )
+        partial = bool(
+            failed_sources
+            or failed_channel_ids
+            or any(bool(item.get("partial")) for item in source_coverages.values())
+        )
+        embedding_space = next(
+            (
+                item.get("embedding_space")
+                for item in source_coverages.values()
+                if isinstance(item.get("embedding_space"), Mapping)
+            ),
+            {},
+        )
         coverage = {
             "candidate_limit": candidate_limit,
             "scanned_candidates": sum(
@@ -12079,10 +12196,31 @@ def _search_detections_archive(
             "must_state_coverage": truncated,
             "search_strategy": "source_fanout",
             "sources": source_coverages,
+            "partial": partial,
+            "failed_sources": failed_sources,
+            "failed_channel_ids": failed_channel_ids,
+            "searched_channel_ids": searched_channel_ids,
+            "embedding_space": dict(embedding_space),
+            "embedding_space_excluded_shards": sum(
+                int(item.get("embedding_space_excluded_shards") or 0)
+                for item in source_coverages.values()
+            ),
+            "embedding_space_excluded_vectors": sum(
+                int(item.get("embedding_space_excluded_vectors") or 0)
+                for item in source_coverages.values()
+            ),
+            "visual_evidence_excluded": sum(
+                int(item.get("visual_evidence_excluded") or 0)
+                for item in source_coverages.values()
+            ),
             "note": (
-                "All archive evidence sources were searched independently."
-                if not truncated
-                else "At least one non-continuous archive source used a limited candidate window."
+                "Available archive evidence was returned; unavailable sources or channels were excluded."
+                if partial
+                else (
+                    "All archive evidence sources were searched independently."
+                    if not truncated
+                    else "At least one non-continuous archive source used a limited candidate window."
+                )
             ),
         }
         return (merged, coverage) if include_coverage else merged
@@ -12099,6 +12237,19 @@ def _search_detections_archive(
     if channel_ids and len(channel_ids) > 1:
         channel_scope = {"channel_ids": list(channel_ids)}
     total_candidates: Optional[int] = None
+    all_space_candidates: Optional[int] = None
+    try:
+        all_space_candidates = detections_store.count_vector_candidates(
+            probe_id=probe_id,
+            source=source,
+            since_ms=since_ms,
+            until_ms=until_ms,
+            only_with_clip=True,
+            **channel_scope,
+        )
+    except Exception:
+        # Epoch accounting is informative and must never make the search fail.
+        all_space_candidates = None
     try:
         total_candidates = detections_store.count_vector_candidates(
             probe_id=probe_id,
@@ -12111,6 +12262,10 @@ def _search_detections_archive(
         )
     except AttributeError:
         total_candidates = None
+    embedding_space_excluded_vectors = max(
+        0,
+        int(all_space_candidates or 0) - int(total_candidates or 0),
+    )
 
     candidates = detections_store.list_vector_candidates(
         probe_id=probe_id,
@@ -12170,6 +12325,8 @@ def _search_detections_archive(
             channel_id=channel_id,
             channel_ids=channel_ids,
         )
+        coverage["embedding_space"] = dict(expected_space)
+        coverage["embedding_space_excluded_vectors"] = embedding_space_excluded_vectors
         return ([], coverage) if include_coverage else []
 
     clip_hits, candidate_map = _search_detection_clip_shards(candidates, clip_query_vec, limit)
@@ -12215,8 +12372,11 @@ def _search_detections_archive(
             channel_id=channel_id,
             channel_ids=channel_ids,
         )
+        coverage["embedding_space"] = dict(expected_space)
+        coverage["embedding_space_excluded_vectors"] = embedding_space_excluded_vectors
         return ([], coverage) if include_coverage else []
 
+    finalize_stats: Dict[str, int] = {}
     results = _finalize_detection_search_results(
         clip_hits=clip_hits,
         candidate_map=candidate_map,
@@ -12224,6 +12384,7 @@ def _search_detections_archive(
         mode=mode,
         sort_by=sort_by,
         limit=limit,
+        stats=finalize_stats,
     )
     coverage = _build_detection_search_coverage(
         candidates=candidates,
@@ -12236,7 +12397,305 @@ def _search_detections_archive(
         channel_id=channel_id,
         channel_ids=channel_ids,
     )
+    coverage["embedding_space"] = dict(expected_space)
+    coverage["embedding_space_excluded_vectors"] = embedding_space_excluded_vectors
+    coverage["visual_evidence_excluded"] = int(
+        finalize_stats.get("visual_evidence_excluded") or 0
+    )
     return (results, coverage) if include_coverage else results
+
+
+def _recoverable_archive_search_failure(exc: Exception) -> Optional[str]:
+    name = type(exc).__name__.lower()
+    message = str(exc).lower()
+    if "querycanceled" in name or "statement timeout" in message:
+        return "statement_timeout"
+    if "timeout" in name or "timed out" in message:
+        return "timeout"
+    if "operationalerror" in name or "connection" in message:
+        return "storage_unavailable"
+    if isinstance(exc, ArchiveStoreNotReady):
+        return "archive_not_ready"
+    return None
+
+
+def _failed_archive_search_coverage(
+    *,
+    source: Optional[str],
+    channel_id: Optional[int],
+    channel_ids: Optional[Sequence[int]],
+    since_ms: Optional[int],
+    until_ms: Optional[int],
+    limit: int,
+    reason: str,
+) -> Dict[str, Any]:
+    requested = sorted(
+        {
+            int(value)
+            for value in (
+                list(channel_ids or [])
+                + ([channel_id] if channel_id is not None else [])
+            )
+            if _to_optional_int(value) is not None
+        }
+    )
+    return {
+        "status": "failed",
+        "partial": True,
+        "source": source,
+        "channel_id": channel_id,
+        "channel_ids": requested,
+        "searched_channel_ids": [],
+        "failed_channel_ids": requested,
+        "requested_since_ms": since_ms,
+        "requested_until_ms": until_ms,
+        "result_limit": int(limit),
+        "scanned_candidates": 0,
+        "total_candidates": 0,
+        "truncated": True,
+        "must_state_coverage": True,
+        "failure_reason": reason,
+        "note": "This archive scope was unavailable and was excluded from the result.",
+    }
+
+
+def _merge_archive_search_results(
+    groups: Sequence[Sequence[Dict[str, Any]]],
+    *,
+    sort_by: str,
+    limit: int,
+) -> List[Dict[str, Any]]:
+    deduped: Dict[int, Dict[str, Any]] = {}
+    without_id: List[Dict[str, Any]] = []
+    for group in groups:
+        for item in group:
+            det_id = _to_optional_int(item.get("detection_id"))
+            if det_id is None:
+                without_id.append(item)
+                continue
+            previous = deduped.get(det_id)
+            if previous is None or float(item.get("similarity") or 0.0) > float(
+                previous.get("similarity") or 0.0
+            ):
+                deduped[det_id] = item
+    merged = [*deduped.values(), *without_id]
+    if sort_by == "time":
+        merged.sort(
+            key=lambda item: int(item.get("timestamp_ms") or 0),
+            reverse=True,
+        )
+    else:
+        merged.sort(
+            key=lambda item: float(item.get("similarity") or 0.0),
+            reverse=True,
+        )
+    return merged[: max(1, int(limit))]
+
+
+def _search_detections_archive_resilient(
+    *,
+    clip_query_vec: np.ndarray,
+    dino_query_vec: Optional[np.ndarray],
+    mode: str,
+    probe_id: Optional[str],
+    channel_id: Optional[int],
+    source: Optional[str],
+    since_ms: Optional[int],
+    until_ms: Optional[int],
+    limit: int,
+    sort_by: str,
+    candidate_limit: int,
+    channel_ids: Optional[Sequence[int]] = None,
+) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
+    """Return partial archive results when one selected channel is unhealthy."""
+
+    requested_channels = sorted(
+        {
+            int(value)
+            for value in (
+                list(channel_ids or [])
+                + ([channel_id] if channel_id is not None else [])
+            )
+            if _to_optional_int(value) is not None
+        }
+    )
+    try:
+        payload = _search_detections_archive(
+            clip_query_vec=clip_query_vec,
+            dino_query_vec=dino_query_vec,
+            mode=mode,
+            probe_id=probe_id,
+            channel_id=channel_id,
+            channel_ids=channel_ids,
+            source=source,
+            since_ms=since_ms,
+            until_ms=until_ms,
+            limit=limit,
+            sort_by=sort_by,
+            candidate_limit=candidate_limit,
+            include_coverage=True,
+        )
+        if isinstance(payload, tuple):
+            results, coverage = payload
+        else:
+            results = cast(List[Dict[str, Any]], payload)
+            coverage = {}
+        coverage = dict(coverage)
+        failed_from_coverage = sorted(
+            {
+                int(value)
+                for value in (coverage.get("failed_channel_ids") or [])
+                if _to_optional_int(value) is not None
+            }
+        )
+        if failed_from_coverage:
+            failed_set = set(failed_from_coverage)
+            results = [
+                item
+                for item in results
+                if _to_optional_int(item.get("channel_id")) not in failed_set
+            ]
+            coverage["status"] = "partial"
+            coverage["partial"] = True
+        else:
+            coverage.setdefault("status", "complete")
+            coverage.setdefault("partial", False)
+        if requested_channels:
+            coverage["searched_channel_ids"] = [
+                channel
+                for channel in requested_channels
+                if channel not in failed_from_coverage
+            ]
+            coverage["failed_channel_ids"] = failed_from_coverage
+        return results, coverage
+    except Exception as exc:
+        failure_reason = _recoverable_archive_search_failure(exc)
+        if failure_reason is None:
+            raise
+        app.logger.warning(
+            "Archive search scope failed source=%s channels=%s reason=%s; retrying independently",
+            source,
+            requested_channels,
+            failure_reason,
+        )
+        if len(requested_channels) <= 1:
+            return [], _failed_archive_search_coverage(
+                source=source,
+                channel_id=channel_id,
+                channel_ids=channel_ids,
+                since_ms=since_ms,
+                until_ms=until_ms,
+                limit=limit,
+                reason=failure_reason,
+            )
+
+    result_groups: List[List[Dict[str, Any]]] = []
+    channel_coverages: Dict[str, Dict[str, Any]] = {}
+    searched_channels: List[int] = []
+    failed_channels: List[int] = []
+    for scoped_channel in requested_channels:
+        try:
+            payload = _search_detections_archive(
+                clip_query_vec=clip_query_vec,
+                dino_query_vec=dino_query_vec,
+                mode=mode,
+                probe_id=probe_id,
+                channel_id=scoped_channel,
+                channel_ids=[scoped_channel],
+                source=source,
+                since_ms=since_ms,
+                until_ms=until_ms,
+                limit=limit,
+                sort_by=sort_by,
+                candidate_limit=candidate_limit,
+                include_coverage=True,
+            )
+            if isinstance(payload, tuple):
+                channel_results, channel_coverage = payload
+            else:
+                channel_results = cast(List[Dict[str, Any]], payload)
+                channel_coverage = {}
+            result_groups.append(channel_results)
+            searched_channels.append(scoped_channel)
+            channel_coverages[str(scoped_channel)] = dict(channel_coverage)
+        except Exception as exc:
+            reason = _recoverable_archive_search_failure(exc)
+            if reason is None:
+                raise
+            failed_channels.append(scoped_channel)
+            channel_coverages[str(scoped_channel)] = _failed_archive_search_coverage(
+                source=source,
+                channel_id=scoped_channel,
+                channel_ids=[scoped_channel],
+                since_ms=since_ms,
+                until_ms=until_ms,
+                limit=limit,
+                reason=reason,
+            )
+
+    results = _merge_archive_search_results(
+        result_groups,
+        sort_by=sort_by,
+        limit=limit,
+    )
+    successful_coverages = [
+        item
+        for channel, item in channel_coverages.items()
+        if int(channel) in searched_channels
+    ]
+    embedding_space = next(
+        (
+            item.get("embedding_space")
+            for item in successful_coverages
+            if isinstance(item.get("embedding_space"), Mapping)
+        ),
+        {},
+    )
+    coverage = {
+        "status": "partial" if failed_channels else "complete",
+        "partial": bool(failed_channels),
+        "search_strategy": "channel_fallback",
+        "source": source,
+        "channel_id": None,
+        "channel_ids": requested_channels,
+        "searched_channel_ids": searched_channels,
+        "failed_channel_ids": failed_channels,
+        "requested_since_ms": since_ms,
+        "requested_until_ms": until_ms,
+        "result_limit": int(limit),
+        "scanned_candidates": sum(
+            int(item.get("scanned_candidates") or 0)
+            for item in successful_coverages
+        ),
+        "total_candidates": sum(
+            int(item.get("total_candidates") or 0)
+            for item in successful_coverages
+        ),
+        "truncated": bool(failed_channels) or any(
+            bool(item.get("truncated")) for item in successful_coverages
+        ),
+        "must_state_coverage": bool(failed_channels),
+        "embedding_space": dict(embedding_space),
+        "embedding_space_excluded_shards": sum(
+            int(item.get("embedding_space_excluded_shards") or 0)
+            for item in successful_coverages
+        ),
+        "embedding_space_excluded_vectors": sum(
+            int(item.get("embedding_space_excluded_vectors") or 0)
+            for item in successful_coverages
+        ),
+        "visual_evidence_excluded": sum(
+            int(item.get("visual_evidence_excluded") or 0)
+            for item in successful_coverages
+        ),
+        "channels": channel_coverages,
+        "note": (
+            "Search completed for available channels; failed channels were excluded."
+            if failed_channels
+            else "Search completed independently for every requested channel."
+        ),
+    }
+    return results, coverage
 
 
 def _build_segment_search_results(
@@ -16502,7 +16961,7 @@ def detections_search_text():
         return jsonify({'error': 'text_embedding_failed'}), 500
 
     try:
-        search_payload = _search_detections_archive(
+        search_payload = _search_detections_archive_resilient(
             clip_query_vec=clip_query_vec,
             dino_query_vec=None,
             mode=mode,
@@ -16515,13 +16974,8 @@ def detections_search_text():
             limit=limit,
             sort_by=sort_by,
             candidate_limit=candidate_limit,
-            include_coverage=True,
         )
-        if isinstance(search_payload, tuple):
-            results, coverage = search_payload
-        else:
-            results = cast(List[Dict[str, Any]], search_payload)
-            coverage = {}
+        results, coverage = search_payload
         return jsonify(
             {
                 'results': results,
@@ -16613,7 +17067,7 @@ def detections_search_image():
             dino_query_vec = None
 
     try:
-        search_payload = _search_detections_archive(
+        search_payload = _search_detections_archive_resilient(
             clip_query_vec=clip_query_vec,
             dino_query_vec=dino_query_vec,
             mode=mode,
@@ -16626,13 +17080,8 @@ def detections_search_image():
             limit=limit,
             sort_by=sort_by,
             candidate_limit=candidate_limit,
-            include_coverage=True,
         )
-        if isinstance(search_payload, tuple):
-            results, coverage = search_payload
-        else:
-            results = cast(List[Dict[str, Any]], search_payload)
-            coverage = {}
+        results, coverage = search_payload
         return jsonify(
             {
                 'results': results,
@@ -16689,6 +17138,8 @@ def detections_list():
             until_ms = int(until_ms_raw)
         except Exception:
             return jsonify({'error': 'until_ms must be an integer'}), 400
+    if since_ms is not None and until_ms is not None and since_ms > until_ms:
+        return jsonify({'error': 'since_ms must be less than or equal to until_ms'}), 400
 
     hours_raw = (request.args.get('hours') or '').strip()
     if since_ms is None:

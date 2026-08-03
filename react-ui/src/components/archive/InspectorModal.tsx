@@ -251,6 +251,7 @@ export function InspectorModal({
                     onClick={() => setZoom(true)}
                     onError={() => {
                       if (previewSrc && src !== previewSrc) setSrc(previewSrc)
+                      else setSrc('')
                     }}
                   />
                   <button className="inspect-expand" title="View full frame" onClick={() => setZoom(true)}>

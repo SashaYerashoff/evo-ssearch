@@ -1,3 +1,4 @@
+import { useEffect, useState } from 'react'
 import { IconVideo } from '@tabler/icons-react'
 import type { Detection } from '../../api/types'
 import { detImageSrc } from '../../api/detections'
@@ -10,12 +11,16 @@ function fmtTime(ms: number | null): string {
 
 export function DetectionCard({ d, onClick }: { d: Detection; onClick: () => void }) {
   const src = detImageSrc(d)
+  const [imageFailed, setImageFailed] = useState(false)
   const sev = d.severity.toLowerCase()
+  useEffect(() => setImageFailed(false), [src])
   return (
     <button className="card" onClick={onClick}>
       <div className="card-thumb">
         <span className="card-tag">{d.sourceLabel}</span>
-        {src ? <img src={src} alt={d.probeName} loading="lazy" /> : <IconVideo size={24} />}
+        {src && !imageFailed
+          ? <img src={src} alt={d.probeName} loading="lazy" onError={() => setImageFailed(true)} />
+          : <span className="card-thumb-missing"><IconVideo size={22} /> Preview unavailable</span>}
       </div>
       <div className="card-body">
         <div className="card-title-row">

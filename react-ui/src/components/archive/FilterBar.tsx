@@ -18,10 +18,10 @@ import type { ArchiveProbeOption } from '../../api/detections'
 
 const SOURCES = [
   { v: '', label: 'All evidence' },
-  { v: 'semantic_snapshot', label: 'Continuous CLIP archive' },
+  { v: 'semantic_snapshot', label: 'Continuous semantic archive' },
   { v: 'vlm_summary', label: 'Video descriptions' },
   { v: 'vlm_alert', label: 'VLM alerts' },
-  { v: 'probe', label: 'CLIP probes' },
+  { v: 'probe', label: 'Semantic probes' },
 ]
 export const TIMES = [
   { v: '1', label: 'Last 1h' }, { v: '6', label: 'Last 6h' }, { v: '24', label: 'Last 24h' },
@@ -185,10 +185,10 @@ export function FilterBar({
           icon={<IconFilter size={15} />}
           value={filters.probeId || ''}
           disabled={probesLoading}
-          title={probesLoading ? 'Loading archived probes' : 'Filter archived CLIP probe hits'}
+          title={probesLoading ? 'Loading archived probes' : 'Filter archived semantic probe hits'}
           onChange={(v) => onChange({ probeId: v })}
           options={[
-            { value: '', label: probesLoading ? 'Loading probes…' : 'All CLIP probes' },
+            { value: '', label: probesLoading ? 'Loading probes…' : 'All semantic probes' },
             ...probes.map((p) => ({ value: p.id, label: `${p.name} (${p.hitCount})` })),
           ]}
         />
@@ -205,6 +205,13 @@ export function FilterBar({
                 <button key={t.v} type="button" className={`qf-opt ${!custom && (filters.hours || '24') === t.v ? 'on' : ''}`}
                   onClick={() => { onChange({ hours: t.v, sinceMs: undefined, untilMs: undefined }); setTimeOpen(false) }}>{t.label}</button>
               ))}
+              <div className="qf-sep" />
+              <button type="button" className={`qf-opt pick ${custom ? 'on' : ''}`} onClick={() => {
+                setTimeOpen(false)
+                setRangeOpen(true)
+              }}>
+                <IconCalendarEvent size={14} /> Custom range…
+              </button>
             </div>
           )}
         </div>

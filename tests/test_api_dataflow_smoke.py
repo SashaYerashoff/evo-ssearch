@@ -1091,6 +1091,20 @@ class ApiDataflowSmokeTests(unittest.TestCase):
         self.assertEqual(captured["source"], "vlm_summary")
         self.assertEqual(response.get_json()["filters"]["source"], "vlm_summary")
 
+    def test_detection_archive_rejects_reversed_time_range_before_search(self) -> None:
+        text_response = self.client.post(
+            "/detections/search_text",
+            json={"query": "person", "since_ms": 2_000, "until_ms": 1_000},
+        )
+        list_response = self.client.get(
+            "/detections/list?since_ms=2000&until_ms=1000"
+        )
+
+        self.assertEqual(text_response.status_code, 400, text_response.get_json())
+        self.assertEqual(list_response.status_code, 400, list_response.get_json())
+        self.assertIn("since_ms", text_response.get_json()["error"])
+        self.assertIn("since_ms", list_response.get_json()["error"])
+
     def test_detection_text_search_accepts_continuous_clip_archive(self) -> None:
         captured: Dict[str, Any] = {}
 
@@ -1145,6 +1159,7 @@ class ApiDataflowSmokeTests(unittest.TestCase):
                 "channel_id": 7,
                 "source": "semantic_snapshot",
                 "shard_key": ch7_shard,
+                "thumbnail": "dGVzdA==",
                 "payload": {"embedding_space": embedding_space},
             },
             2: {
@@ -1155,6 +1170,7 @@ class ApiDataflowSmokeTests(unittest.TestCase):
                 "channel_id": 7,
                 "source": "semantic_snapshot",
                 "shard_key": ch7_shard,
+                "thumbnail": "dGVzdA==",
                 "payload": {"embedding_space": embedding_space},
             },
             3: {
@@ -1165,6 +1181,7 @@ class ApiDataflowSmokeTests(unittest.TestCase):
                 "channel_id": 8,
                 "source": "semantic_snapshot",
                 "shard_key": ch8_shard,
+                "thumbnail": "dGVzdA==",
                 "payload": {"embedding_space": embedding_space},
             },
             4: {
@@ -1175,6 +1192,7 @@ class ApiDataflowSmokeTests(unittest.TestCase):
                 "channel_id": 8,
                 "source": "semantic_snapshot",
                 "shard_key": ch8_shard,
+                "thumbnail": "dGVzdA==",
                 "payload": {"embedding_space": embedding_space},
             },
         }
@@ -1261,6 +1279,68 @@ class ApiDataflowSmokeTests(unittest.TestCase):
         self.assertEqual(coverage["scanned_candidates"], 4)
         self.assertEqual(coverage["shards_searched"], 2)
         self.assertFalse(coverage["truncated"])
+
+    def test_detection_search_falls_back_to_healthy_channels(self) -> None:
+        class QueryCanceled(Exception):
+            pass
+
+        def search(**kwargs):
+            if kwargs.get("channel_ids") == [7, 8]:
+                raise QueryCanceled("canceling statement due to statement timeout")
+            if kwargs.get("channel_id") == 7:
+                return ([{
+                    "detection_id": 71,
+                    "channel_id": 7,
+                    "timestamp_ms": 1_000,
+                    "similarity": 0.9,
+                }], {"scanned_candidates": 1, "total_candidates": 1})
+            raise QueryCanceled("canceling statement due to statement timeout")
+
+        with patch("oldapp._search_detections_archive", side_effect=search):
+            results, coverage = oldapp._search_detections_archive_resilient(
+                clip_query_vec=oldapp.np.asarray([1.0, 0.0], dtype=oldapp.np.float32),
+                dino_query_vec=None,
+                mode="clip",
+                probe_id=None,
+                channel_id=None,
+                channel_ids=[7, 8],
+                source="vlm_summary",
+                since_ms=0,
+                until_ms=5_000,
+                limit=12,
+                sort_by="similarity",
+                candidate_limit=20_000,
+            )
+
+        self.assertEqual([item["detection_id"] for item in results], [71])
+        self.assertEqual(coverage["searched_channel_ids"], [7])
+        self.assertEqual(coverage["failed_channel_ids"], [8])
+        self.assertTrue(coverage["partial"])
+
+    def test_detection_search_omits_rows_without_visual_evidence(self) -> None:
+        rows = {
+            1: {"id": 1, "channel_id": 7, "timestamp_ms": 1_000},
+            2: {"id": 2, "channel_id": 7, "timestamp_ms": 2_000, "thumbnail": "dGVzdA=="},
+        }
+
+        class Store:
+            def fetch_detections_by_ids(self, ids, **_kwargs):
+                return [rows[item] for item in ids]
+
+        stats = {}
+        with patch("oldapp.detections_store", Store()):
+            results = oldapp._finalize_detection_search_results(
+                clip_hits=[(1, 0.95), (2, 0.90)],
+                candidate_map=rows,
+                dino_query_vec=None,
+                mode="clip",
+                sort_by="similarity",
+                limit=2,
+                stats=stats,
+            )
+
+        self.assertEqual([item["detection_id"] for item in results], [2])
+        self.assertEqual(stats["visual_evidence_excluded"], 1)
 
     def test_detection_search_result_preserves_vlm_payload_for_review(self) -> None:
         result = _build_detection_search_result(

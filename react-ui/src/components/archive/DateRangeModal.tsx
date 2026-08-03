@@ -52,6 +52,9 @@ export function DateRangeModal({ sinceMs, untilMs, onApply, onClear, onClose }: 
   const [to, setTo] = useState(toInput(initTo))
   const [fromView, setFromView] = useState(new Date(initFrom.getFullYear(), initFrom.getMonth(), 1))
   const [toView, setToView] = useState(new Date(initTo.getFullYear(), initTo.getMonth(), 1))
+  const fromValue = from ? new Date(from).getTime() : null
+  const toValue = to ? new Date(to).getTime() : null
+  const invalidRange = fromValue != null && toValue != null && fromValue > toValue
 
   // close on outside click — but ignore the calendar toggle button
   useEffect(() => {
@@ -67,7 +70,10 @@ export function DateRangeModal({ sinceMs, untilMs, onApply, onClear, onClose }: 
     const cur = val ? new Date(val) : new Date()
     setVal(toInput(new Date(d.getFullYear(), d.getMonth(), d.getDate(), cur.getHours() || 0, cur.getMinutes() || 0)))
   }
-  const apply = () => onApply(from ? String(new Date(from).getTime()) : undefined, to ? String(new Date(to).getTime()) : undefined)
+  const apply = () => {
+    if (invalidRange) return
+    onApply(fromValue != null ? String(fromValue) : undefined, toValue != null ? String(toValue) : undefined)
+  }
 
   return (
     <div className="daterange-pop" ref={ref} onMouseDown={(e) => e.stopPropagation()}>
@@ -87,9 +93,10 @@ export function DateRangeModal({ sinceMs, untilMs, onApply, onClear, onClose }: 
           <Calendar view={toView} onView={setToView} selected={to ? new Date(to) : null} onPick={pickDate(to, setTo)} />
         </div>
       </div>
+      {invalidRange && <div className="dr-error" role="alert">The end of the period must be after its start.</div>}
       <div className="dr-actions">
         <button className="mon-btn" onClick={() => { onClear(); onClose() }}><IconTrash size={15} /> Clear range</button>
-        <button className="mon-btn accent" onClick={() => { apply(); onClose() }}><IconCheck size={15} /> Apply range</button>
+        <button className="mon-btn accent" disabled={invalidRange} onClick={() => { apply(); onClose() }}><IconCheck size={15} /> Apply range</button>
       </div>
     </div>
   )

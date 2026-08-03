@@ -1,6 +1,7 @@
 import { useEffect, useState, useCallback, useMemo, useRef } from 'react'
 import {
   IconAdjustmentsHorizontal,
+  IconAlertTriangle,
   IconFilter,
   IconLetterT,
   IconLoader2,
@@ -20,6 +21,7 @@ import {
   normalizeDetection,
   searchText,
   type ArchiveProbeOption,
+  type ArchiveSearchCoverage,
 } from '../../api/detections'
 import { FilterBar, TIMES } from './FilterBar'
 import { ToolTabs } from '../shell/ToolTabs'
@@ -31,6 +33,7 @@ import {
   formatArchiveScore,
   passesArchiveScoreThreshold,
 } from './archiveScore'
+import { archiveCoverageMessages } from './archiveCoverage'
 
 export type ArchiveTool = null | 'filters' | 'search' | 'text' | 'image'
 type Tool = Exclude<ArchiveTool, null>
@@ -90,6 +93,7 @@ export function ArchiveScreen({
   const [items, setItems] = useState<Detection[]>([])
   const [loading, setLoading] = useState(false)
   const [textSearchPending, setTextSearchPending] = useState(false)
+  const [searchCoverage, setSearchCoverage] = useState<ArchiveSearchCoverage | null>(null)
   const [error, setError] = useState<string | null>(null)
   const [note, setNote] = useState('')
   const [selected, setSelected] = useState<Detection | null>(null)
@@ -119,6 +123,7 @@ export function ArchiveScreen({
     loadingRef.current = false
     setLoading(false)
     setTextSearchPending(false)
+    setSearchCoverage(null)
     setNextOffset(0)
     setFilters((f) => ({ ...f, ...p }))
   }, [])
@@ -128,6 +133,7 @@ export function ArchiveScreen({
     loadingRef.current = true
     const seq = ++requestSeq.current
     setTextSearchPending(false)
+    if (!append) setSearchCoverage(null)
     setLoading(true); setError(null)
     try {
       const result = await listArchive(filters, channels, requestedOffset)
@@ -169,14 +175,19 @@ export function ArchiveScreen({
     setTextSearchPending(true)
     setLoading(true); setError(null)
     try {
-      const results = await searchText(q, filters, channels)
+      const searchResult = await searchText(q, filters, channels)
       if (requestSeq.current !== seq) return
+      const results = searchResult.items
+      setSearchCoverage(searchResult.coverage)
       setItems(results); setNote(`${results.length} matches · “${q}”`)
       setScoreSliderPercent(0)
       setNextOffset(0); setTotal(results.length); setHasMore(false); setResultMode('search')
       setAppliedFilters({ ...filters }); setSelected(null)
     } catch (e: any) {
-      if (requestSeq.current === seq) setError(e?.message || 'Text search failed')
+      if (requestSeq.current === seq) {
+        setSearchCoverage(null)
+        setError(e?.message || 'Text search failed')
+      }
     } finally {
       if (requestSeq.current === seq) {
         loadingRef.current = false
@@ -187,7 +198,7 @@ export function ArchiveScreen({
   }, [filters, channels])
 
   const runImageSearch = useCallback(async (blob: Blob, label: string) => {
-    loadingRef.current = false
+    loadingRef.current = true
     const seq = ++requestSeq.current
     setTextSearchPending(false)
     setLoading(true); setError(null)
@@ -201,12 +212,16 @@ export function ArchiveScreen({
       if (requestSeq.current !== seq) return
       const cmap = new Map(channels.map((c) => [c.id, c.title]))
       const results = (res.results || []).map((x: any) => normalizeDetection(x, cmap))
+      setSearchCoverage((res.coverage && typeof res.coverage === 'object') ? res.coverage : null)
       setItems(results); setNote(`${results.length} similar · ${label}`)
       setScoreSliderPercent(0)
       setNextOffset(0); setTotal(results.length); setHasMore(false); setResultMode('search')
       setAppliedFilters({ ...filters }); setSelected(null)
     } catch (e: any) {
-      if (requestSeq.current === seq) setError(e?.message || 'Image search failed')
+      if (requestSeq.current === seq) {
+        setSearchCoverage(null)
+        setError(e?.message || 'Image search failed')
+      }
     } finally {
       if (requestSeq.current === seq) {
         loadingRef.current = false
@@ -340,6 +355,7 @@ export function ArchiveScreen({
       loadingRef.current = false
       setLoading(false)
       setTextSearchPending(false)
+      setSearchCoverage(null)
       setAgentTyping(false)
       if (!error) {
         const found = detectionsFromResult(result, channels)
@@ -366,6 +382,10 @@ export function ArchiveScreen({
   const displayed = items.filter((d) => passesArchiveScoreThreshold(d, scoreThreshold))
   const filtersDirty = !!appliedFilters && JSON.stringify(appliedFilters) !== JSON.stringify(filters)
   const archiveMatchCount = resultMode === 'list' ? total : items.length
+  const coverageMessages = useMemo(
+    () => archiveCoverageMessages(searchCoverage, channels),
+    [searchCoverage, channels],
+  )
 
   // keep the offset in a ref so the observer reads the latest value WITHOUT being torn down
   // and rebuilt on every load (which was re-firing instantly and loading the whole archive)
@@ -512,6 +532,13 @@ export function ArchiveScreen({
           {filtersDirty ? ' · Filters changed — load to apply' : ''}
         </div>
       </div>
+
+      {coverageMessages.length > 0 && (
+        <div className="archive-coverage-notice" role="status" aria-live="polite">
+          <IconAlertTriangle size={16} />
+          <div>{coverageMessages.map((message) => <div key={message}>{message}</div>)}</div>
+        </div>
+      )}
 
       {error && <div className="empty-state" style={{ color: 'var(--danger)', padding: 30 }}>{error}</div>}
       {loading && items.length === 0 && (

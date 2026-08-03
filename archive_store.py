@@ -903,7 +903,11 @@ class PostgresDetectionsStore(_TenantRepository):
                 with self.pool.transaction(self._context(), readonly=True) as connection:
                     rows = connection.execute(
                         f"""
-                        SELECT {self._select_columns(include_thumbnail=include_thumbnail)}
+                        SELECT {self._select_columns(
+                            include_thumbnail=include_thumbnail,
+                            include_vectors=include_vectors,
+                            include_payload=False,
+                        )}
                         FROM archive.detections
                         {where_sql}
                         ORDER BY event_timestamp_ms DESC, id DESC
@@ -968,7 +972,10 @@ class PostgresDetectionsStore(_TenantRepository):
                 with self.pool.transaction(self._context(), readonly=True) as connection:
                     rows = connection.execute(
                         f"""
-                        SELECT {self._select_columns(include_thumbnail=include_thumbnail)}
+                        SELECT {self._select_columns(
+                            include_thumbnail=include_thumbnail,
+                            include_vectors=include_vectors,
+                        )}
                         FROM archive.detections
                         {where_sql}
                         """,
@@ -1642,13 +1649,50 @@ class PostgresDetectionsStore(_TenantRepository):
         ]
 
     @staticmethod
-    def _select_columns(*, include_thumbnail: bool = True) -> str:
+    def _select_columns(
+        *,
+        include_thumbnail: bool = True,
+        include_vectors: bool = False,
+        include_payload: bool = True,
+    ) -> str:
         thumbnail_expr = "thumbnail_b64" if include_thumbnail else "NULL::text AS thumbnail_b64"
+        # Candidate enumeration only needs the embedding-space identity from
+        # payload_json. VLM summaries can contain several KB of repeated text,
+        # so selecting the whole payload for tens of thousands of candidates
+        # can exceed the request statement timeout before FAISS even runs.
+        payload_expr = (
+            "payload_json"
+            if include_payload
+            else (
+                "CASE WHEN payload_json ? 'embedding_space' "
+                "THEN jsonb_build_object('embedding_space', payload_json->'embedding_space') "
+                "ELSE NULL::jsonb END AS payload_json"
+            )
+        )
+        # Preserve the cheap has_clip/has_dino flags consumed by _row_to_dict
+        # without transferring the full vectors unless the caller explicitly
+        # needs them. A SigLIP2 vector is several KB per row.
+        clip_expr = (
+            "clip_vec"
+            if include_vectors
+            else (
+                "CASE WHEN clip_vec IS NULL THEN NULL::bytea "
+                "ELSE decode('00', 'hex') END AS clip_vec"
+            )
+        )
+        dino_expr = (
+            "dino_vec"
+            if include_vectors
+            else (
+                "CASE WHEN dino_vec IS NULL THEN NULL::bytea "
+                "ELSE decode('00', 'hex') END AS dino_vec"
+            )
+        )
         return (
             "id, event_timestamp_ms, recorded_at_ms, probe_id, probe_name, "
             "channel_id, severity, bookmark_enabled, bookmark_sent, pos_score, "
-            f"neg_score, margin, {thumbnail_expr}, source, payload_json, shard_key, "
-            "image_path, clip_vec, dino_vec"
+            f"neg_score, margin, {thumbnail_expr}, source, {payload_expr}, shard_key, "
+            f"image_path, {clip_expr}, {dino_expr}"
         )
 
     def _build_where(
