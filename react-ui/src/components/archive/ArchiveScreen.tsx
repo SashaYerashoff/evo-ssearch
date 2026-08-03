@@ -111,6 +111,9 @@ export function ArchiveScreen({
   const loadingRef = useRef(false)
   const loadMoreRef = useRef<HTMLDivElement>(null)
   const nextOffsetRef = useRef(0)   // read by the observer without re-creating it each load
+  // Distinguishes a live agent run from re-playing a finished drive on (re)mount:
+  // only true once we've actually seen an in-progress action this mount.
+  const sawAgentProgress = useRef(false)
 
   const patch = useCallback((p: Partial<ArchiveFilters>) => {
     requestSeq.current++
@@ -317,6 +320,7 @@ export function ArchiveScreen({
       }
     }
     if (!done) {
+      sawAgentProgress.current = true
       setAgentStep(prettyTool(name))
       if (VIEW_TOOLS.has(name)) {
         // agent drives the console controls: channel / source / time / sort / rows visibly change
@@ -348,6 +352,10 @@ export function ArchiveScreen({
         }
       }
     }
+    // A finished drive replayed on (re)mount — with no in-progress step seen — is stale:
+    // load its frames but don't flash the "Agent is searching…" banner when nothing is running.
+    if (!sawAgentProgress.current) { setAgentStep(null); return }
+    sawAgentProgress.current = false
     setAgentStep(error ? `${prettyTool(name)} — failed` : prettyTool(name))
     const t = setTimeout(() => setAgentStep(null), error ? 2600 : 700)
     return () => clearTimeout(t)

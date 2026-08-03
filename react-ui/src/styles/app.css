@@ -775,6 +775,32 @@
 .gate-card input:focus { border-color: var(--accent-line); }
 .gate-err { color: var(--danger); font-size: 13px; min-height: 16px; }
 
+/* password field with a show/hide eye pinned inside it */
+.gate-pw { position: relative; display: flex; }
+.gate-pw input { flex: 1; padding-right: 42px; }
+.gate-pw-eye {
+  position: absolute; right: 6px; top: 50%; transform: translateY(-50%);
+  display: grid; place-items: center; width: 30px; height: 30px;
+  background: transparent; border: none; border-radius: 8px;
+  color: var(--text-mut); transition: color .15s, background .15s;
+}
+.gate-pw-eye:hover { color: var(--accent); background: var(--accent-soft); }
+
+/* remember-me row */
+.gate-remember { display: flex; align-items: center; gap: 8px; font-size: 13px; color: var(--text-2); cursor: pointer; user-select: none; }
+.gate-remember input { width: 15px; height: 15px; accent-color: var(--accent); cursor: pointer; }
+
+/* keep the sign-in CTA muted until hovered, so it doesn't shout on the login card */
+.gate-card .btn.primary {
+  color: var(--accent); background: var(--accent-bg);
+  border: 1px solid var(--accent-line); box-shadow: none;
+  transition: color .16s, background .16s, box-shadow .16s;
+}
+.gate-card .btn.primary:hover:not(:disabled) {
+  color: var(--primary-text); background: linear-gradient(135deg, var(--accent), var(--accent-2));
+  border-color: transparent; box-shadow: var(--glow);
+}
+
 /* ---- agent half-screen dock (in-flow, toggled) ---- */
 .agent-ear.on { box-shadow: 0 0 26px -2px rgba(56,224,212,0.75); filter: brightness(1.08); }
 /* AGENT ear — pinned to the far-right gutter, vertically centred, never moves */

@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState, useCallback } from 'react'
+import { IconEye, IconEyeOff } from '@tabler/icons-react'
 import type { AuthUser, Channel, ArchiveFilters, Detection } from './api/types'
 import { login as apiLogin, me as apiMe, logout as apiLogout } from './api/auth'
 import {
@@ -42,15 +43,31 @@ export interface StatusData {
   agent: 'idle' | 'working'
 }
 
+const REMEMBER_KEY = 'eva.auth.remember'
+const REMEMBER_USER_KEY = 'eva.auth.user'
+const readRemember = (): boolean => { try { return localStorage.getItem(REMEMBER_KEY) === '1' } catch { return false } }
+const readRememberedUser = (): string => { try { return localStorage.getItem(REMEMBER_USER_KEY) || '' } catch { return '' } }
+
 function LoginGate({ onDone }: { onDone: (u: AuthUser) => void }) {
-  const [u, setU] = useState('admin')
+  const [u, setU] = useState(() => readRememberedUser() || 'admin')
   const [p, setP] = useState('')
+  const [showPw, setShowPw] = useState(false)
+  const [remember, setRemember] = useState(readRemember)
   const [err, setErr] = useState('')
   const [busy, setBusy] = useState(false)
   async function submit(e: React.FormEvent) {
     e.preventDefault()
     setBusy(true); setErr('')
-    try { onDone(await apiLogin(u, p)) }
+    try {
+      const user = await apiLogin(u, p, remember)
+      // Remember only keeps a long-lived session + the username for pre-fill.
+      // The password is never stored — the server session cookie is what persists.
+      try {
+        if (remember) { localStorage.setItem(REMEMBER_KEY, '1'); localStorage.setItem(REMEMBER_USER_KEY, u) }
+        else { localStorage.removeItem(REMEMBER_KEY); localStorage.removeItem(REMEMBER_USER_KEY) }
+      } catch { /* storage blocked */ }
+      onDone(user)
+    }
     catch (ex: any) { setErr(ex?.message || 'Sign in failed') }
     finally { setBusy(false) }
   }
@@ -61,7 +78,17 @@ function LoginGate({ onDone }: { onDone: (u: AuthUser) => void }) {
         <h1>EVA AI</h1>
         <div className="brand-sub">Command console · sign in</div>
         <input placeholder="Username" value={u} onChange={(e) => setU(e.target.value)} autoFocus />
-        <input placeholder="Password" type="password" value={p} onChange={(e) => setP(e.target.value)} />
+        <div className="gate-pw">
+          <input placeholder="Password" type={showPw ? 'text' : 'password'} value={p} onChange={(e) => setP(e.target.value)} />
+          <button type="button" className="gate-pw-eye" onClick={() => setShowPw((v) => !v)}
+            title={showPw ? 'Hide password' : 'Show password'} aria-label={showPw ? 'Hide password' : 'Show password'}>
+            {showPw ? <IconEyeOff size={18} /> : <IconEye size={18} />}
+          </button>
+        </div>
+        <label className="gate-remember">
+          <input type="checkbox" checked={remember} onChange={(e) => setRemember(e.target.checked)} />
+          <span>Remember me on this device</span>
+        </label>
         <div className="gate-err">{err}</div>
         <button className="btn primary" disabled={busy} style={{ justifyContent: 'center' }}>
           {busy ? 'Signing in…' : 'Sign in'}

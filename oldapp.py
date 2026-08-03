@@ -6845,6 +6845,7 @@ def auth_login():
     data = _json_body()
     username = str(data.get("username") or "").strip()
     password = str(data.get("password") or "")
+    remember = bool(data.get("remember"))
     if not username or not password:
         try:
             _write_security_audit(
@@ -6863,6 +6864,9 @@ def auth_login():
             password=password,
             client_ip=_source_ip(),
             user_agent=str(request.headers.get("User-Agent") or "")[:1024] or None,
+            session_ttl=timedelta(hours=int(config.AUTH_SESSION_REMEMBER_TTL_HOURS))
+            if remember
+            else None,
         )
     except LoginThrottled as exc:
         try:
