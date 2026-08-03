@@ -4,6 +4,21 @@ Notable changes per release. Detail lives in `readiness/RELEASE_NOTES_<version>.
 Authoritative current state: [docs/00_CANON/facts.md](docs/00_CANON/facts.md).
 Format loosely follows Keep a Changelog.
 
+## Unreleased
+
+- **Maritime deployment profile:** Protocol Deploy can assign each selected
+  channel a port-gate, coastline, or mixed-PTZ role and preview bounded
+  maritime L0–L3 prompts plus four role-specific shadow probes. Global pan,
+  tilt, zoom, preset cuts, and settling create explicit scene epochs and
+  coverage state instead of object-motion bursts; recurring views are matched
+  before preset-specific probes regain authority, while independent one-Hz
+  SigLIP2 indexing continues. React operator chrome can be switched between
+  English and Latvian without translating evidence or model content.
+- **Ventspils client freeze boundary:** the offline port appliance defaults to
+  the React console with a legacy URL fallback, records the exact clean client
+  branch revision in its manifest, and refuses an accidental dirty or `main`
+  bundle unless an explicit recovery override is supplied.
+
 ## β 0.8.5 — 2026-07-27 release candidate (adaptive attention and memory)
 
 - **Adaptive L0 delivery:** each channel now owns one bounded accumulator.

@@ -5,6 +5,8 @@ Trigger phrases:
 - `Protocol: Deploy`
 - `protocol deploy`
 - `протокол деплой`
+- `Protocol: Deploy, maritime`
+- `port/coast deployment`
 
 Goal: commission a fresh EVA installation for at most eight
 homeostatically-regulated channels without keeping deployment state in chat.
@@ -23,6 +25,8 @@ Tools:
 ## Durable flow
 
 1. Call `start_deployment` with `target_channel_count=8`.
+   - Pass `deployment_profile=maritime` only when the operator explicitly asks
+     for port, sea-gate, fairway, or coastline monitoring.
    - If it resumes an unfinished deployment, continue from `next_action`.
    - Never invent a channel ID.
 2. Show the compact inventory. Ask the operator which 1–8 channels to use and
@@ -30,6 +34,10 @@ Tools:
    group.
 3. Call `configure_deployment` with the chosen `channel_ids` and optional
    `groups`. This only updates the durable draft.
+   - For a maritime deployment, assign every selected channel exactly one
+     operator-confirmed role: `maritime_gate`, `maritime_coast`, or
+     `maritime_mixed_ptz`. Preserve an operator-provided location label; never
+     infer a port from a camera overlay or channel title.
 4. Call `survey_deployment` once. Use `fast_mode=false` unless the operator asks
    for the fastest possible setup.
    - Treat its scene fingerprints as provisional visual observations.
@@ -42,6 +50,8 @@ Tools:
      `low|balanced|high`;
    - any state whose transitions or dwell time should be counted;
    - the preferred local quiet window for preemptible 9B consolidation.
+   - for maritime deployments, whether the reviewed role-specific starter set
+     should be included with `starter_policy_mode=shadow`.
 6. Translate only the operator's answer into `requirements` and `quiet_window`,
    then call `configure_deployment` again.
    - Alert descriptions belong to VLM Alert Criteria, not the L0 role prompt.
@@ -83,6 +93,31 @@ semantic snapshots exist and the operator approves the calibrated proposal.
 Never reuse CLIP thresholds or interpret rejected legacy vectors as evidence
 that an event did not occur. Continue live L0 from CV-selected frames while
 this calibration debt is open.
+
+## Maritime PTZ contract
+
+- Camera-global pan, tilt, zoom, preset cuts, and settling are coverage state,
+  not vessel motion or a homeostatic burst.
+- `VECTOR_SIGNALS_JSON.camera_scene` owns `camera_motion`, `scene_epoch`,
+  recurring `preset_id`, coverage status, and whether preset-specific spatial
+  probes are eligible. It is routing metadata, not visual evidence.
+- A new view starts provisional. Previously calibrated spatial probes are
+  frozen until the recurring view is confirmed. The continuous one-Hz
+  SigLIP2 semantic archive remains enabled independently.
+- During PTZ motion or an unavailable/unconfirmed view, say the relevant
+  vessel/zone was `not observed`; never convert missing view coverage into
+  absence or a quiet baseline.
+- `maritime_gate` starters narrow attention to passage, fairway obstruction,
+  close approach, and small-craft/large-vessel interaction.
+- `maritime_coast` starters narrow attention to shore contact, nearshore
+  loitering, visible distress, and unexpected coastline activity.
+- `maritime_mixed_ptz` starters are view-agnostic until the backend confirms a
+  recurring preset. All starter probes carry `attention_only=true`, do not
+  bookmark independently, and require independent SigLIP2 calibration plus
+  operator approval before regulatory promotion.
+- Maritime L1/L2/L3 prompts preserve event chronology and explicit coverage;
+  an eight-hour report must not collapse uncovered presets into “nothing
+  happened.”
 
 ## Count and duration questions
 

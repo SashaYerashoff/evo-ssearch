@@ -11,6 +11,21 @@ SIGLIP2_REVISION="${EVA_PORT_SIGLIP2_REVISION:-75de2d55ec2d0b4efc50b3e9ad70dba96
 SIGLIP2_CACHE_REPO="${EVA_PORT_SIGLIP2_CACHE_REPO:-/mnt/eva-llamacpp-lab/models/huggingface/models--google--siglip2-base-patch16-224}"
 LLAMA_SOURCE="${EVA_PORT_LLAMA_SOURCE:-/mnt/eva-llamacpp-lab/src/llama.cpp}"
 REACT_UI_ROOT="${REPO_ROOT}/react-ui"
+EXPECTED_BRANCH="${EVA_PORT_EXPECTED_BRANCH:-feature/maritime-port-specs}"
+RELEASE_FLAVOR="${EVA_PORT_RELEASE_FLAVOR:-ventspils-maritime-client}"
+SOURCE_BRANCH="$(git -C "${REPO_ROOT}" branch --show-current)"
+SOURCE_COMMIT="$(git -C "${REPO_ROOT}" rev-parse HEAD)"
+
+if [[ "${SOURCE_BRANCH}" != "${EXPECTED_BRANCH}" && "${EVA_PORT_ALLOW_OTHER_BRANCH:-0}" != "1" ]]; then
+    echo "ERROR: port client bundle must be built from ${EXPECTED_BRANCH}; current branch is ${SOURCE_BRANCH}." >&2
+    echo "Set EVA_PORT_ALLOW_OTHER_BRANCH=1 only for an explicitly reviewed recovery build." >&2
+    exit 1
+fi
+if [[ -n "$(git -C "${REPO_ROOT}" status --porcelain --untracked-files=normal)" && "${EVA_PORT_ALLOW_DIRTY:-0}" != "1" ]]; then
+    echo "ERROR: port client bundle requires a clean committed working tree." >&2
+    echo "Commit the release candidate, or set EVA_PORT_ALLOW_DIRTY=1 only for a labelled diagnostic build." >&2
+    exit 1
+fi
 
 for required in \
     "${MODEL_VLM}/model.safetensors" \
@@ -109,6 +124,28 @@ install -p -m 0644 \
 install -p -m 0644 \
     "${REPO_ROOT}/deployment/port_4070s/REPOSITORY_BACKUP.txt" \
     "${STAGING_ROOT}/repository-backup/README.txt"
+python3 - "${STAGING_ROOT}/SOURCE_REVISION.json" "${SOURCE_BRANCH}" "${SOURCE_COMMIT}" "${RELEASE_FLAVOR}" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+target, branch, commit, flavor = sys.argv[1:]
+Path(target).write_text(
+    json.dumps(
+        {
+            "format": 1,
+            "release_flavor": flavor,
+            "branch": branch,
+            "commit": commit,
+            "working_tree_clean": True,
+        },
+        indent=2,
+        sort_keys=True,
+    )
+    + "\n",
+    encoding="utf-8",
+)
+PY
 git -C "${REPO_ROOT}" bundle create \
     "${STAGING_ROOT}/repository-backup/evo-ssearch-all-refs.bundle" \
     --all

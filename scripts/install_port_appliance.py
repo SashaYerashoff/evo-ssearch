@@ -57,9 +57,10 @@ PORT_ENV = {
     "EVOSSEARCH_HOST": "127.0.0.1",
     "EVOSSEARCH_PORT": "5000",
     "EVOSSEARCH_DEBUG": "false",
-    # Keep the mature console as the appliance default until React parity is
-    # accepted. Operators can pilot React at /?ui=react without a restart.
-    "EVOSSEARCH_UI_MODE": "legacy",
+    # The Ventspils maritime client release ships the accepted React console.
+    # The mature legacy console remains available as an emergency per-request
+    # fallback at /?ui=legacy without changing service configuration.
+    "EVOSSEARCH_UI_MODE": "react",
     "EVOSSEARCH_GUNICORN_WORKERS": "1",
     "EVOSSEARCH_GUNICORN_THREADS": "8",
     "EVOSSEARCH_GUNICORN_TIMEOUT": "240",
@@ -557,8 +558,13 @@ def read_manifest(bundle_root: Path) -> dict:
 
 def verify_critical_payload(bundle_root: Path, manifest: Mapping) -> None:
     required = (
+        "SOURCE_REVISION.json",
         "repo/VERSION",
         "repo/alembic.ini",
+        "repo/camera_scene.py",
+        "repo/maritime_profiles.py",
+        "repo/docs/maritime_port_profile.md",
+        "repo/react-ui/dist/index.html",
         "repo/migrations/versions/20260801_0011_incidents.py",
         "wheelhouse",
         "apt/Packages.gz",

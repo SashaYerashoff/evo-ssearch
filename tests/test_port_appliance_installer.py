@@ -35,6 +35,9 @@ def test_usb_builder_builds_react_for_node_free_runtime():
     )
     assert "--exclude=react-ui/node_modules/" in builder
     assert "--delete-excluded" in builder
+    assert 'EXPECTED_BRANCH="${EVA_PORT_EXPECTED_BRANCH:-feature/maritime-port-specs}"' in builder
+    assert "port client bundle requires a clean committed working tree" in builder
+    assert "SOURCE_REVISION.json" in builder
     for local_only_pattern in (
         "--exclude='.env*'",
         "--exclude='.venv*'",
@@ -57,7 +60,34 @@ def test_port_profile_shares_bounded_gpu_with_siglip2():
     assert installer.PORT_ENV["EVOSSEARCH_LUXRIOT_ATTENTION_EMBEDDING_CADENCE_MS"] == "1000"
     assert installer.PORT_ENV["EVOSSEARCH_LUXRIOT_SUMMARY_MAX_BATCH_FRAMES"] == "16"
     assert installer.PORT_ENV["EVOSSEARCH_EMBEDDER_EAGER_LOAD"] == "true"
-    assert installer.PORT_ENV["EVOSSEARCH_UI_MODE"] == "legacy"
+    assert installer.PORT_ENV["EVOSSEARCH_UI_MODE"] == "react"
+
+
+def test_port_payload_requires_maritime_runtime_and_react_assets():
+    source = MODULE_PATH.read_text(encoding="utf-8")
+    for relative in (
+        "SOURCE_REVISION.json",
+        "repo/camera_scene.py",
+        "repo/maritime_profiles.py",
+        "repo/docs/maritime_port_profile.md",
+        "repo/react-ui/dist/index.html",
+    ):
+        assert f'"{relative}"' in source
+
+    finalizer = (ROOT / "scripts" / "finalize_port_usb_bundle.py").read_text(
+        encoding="utf-8"
+    )
+    assert '"release_flavor": "ventspils-maritime-client"' in finalizer
+    assert "Refusing to finalize an uncommitted port client bundle" in finalizer
+
+
+def test_predeploy_gate_runs_react_tests_and_production_build():
+    gate = (ROOT / "scripts" / "predeploy_acceptance.sh").read_text(
+        encoding="utf-8"
+    )
+    assert '"${NPM}" --prefix "${REACT_ROOT}" test -- --run' in gate
+    assert '"${NPM}" --prefix "${REACT_ROOT}" run build' in gate
+    assert "React build did not produce dist/index.html" in gate
 
 
 def test_port_profile_has_bounded_queue_and_context():

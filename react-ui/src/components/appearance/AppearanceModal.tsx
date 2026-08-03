@@ -19,6 +19,7 @@ import {
   type CustomColorKey,
 } from '../../appearance/appearance'
 import { useAppearance } from '../../appearance/AppearanceProvider'
+import { useI18n, type UiLanguage } from '../../i18n/I18nProvider'
 
 const COLOR_FIELDS: ReadonlyArray<{ key: CustomColorKey; label: string; help: string }> = [
   { key: 'canvas', label: 'Canvas', help: 'Application background' },
@@ -29,6 +30,7 @@ const COLOR_FIELDS: ReadonlyArray<{ key: CustomColorKey; label: string; help: st
 ]
 
 export function AppearanceModal({ onClose }: { onClose: () => void }) {
+  const { language, setLanguage, t } = useI18n()
   const {
     savedPreferences,
     previewPreferences,
@@ -100,7 +102,7 @@ export function AppearanceModal({ onClose }: { onClose: () => void }) {
       >
         <div className="modal-head appearance-head">
           <div>
-            <div className="modal-title" id="appearance-title">Appearance</div>
+            <div className="modal-title" id="appearance-title">{t('appearance.title')}</div>
             <div className="brand-sub">Choose a balanced preset, then tune its operational palette.</div>
           </div>
           <button className="modal-close" onClick={closeWithoutSaving} aria-label="Close appearance settings">
@@ -109,6 +111,24 @@ export function AppearanceModal({ onClose }: { onClose: () => void }) {
         </div>
 
         <div className="appearance-body">
+          <section className="appearance-section">
+            <div className="appearance-section-head">
+              <div>
+                <h3>{t('appearance.language')}</h3>
+                <p>{t('appearance.languageHelp')}</p>
+              </div>
+            </div>
+            <OptionGroup
+              label={t('appearance.language')}
+              value={language}
+              options={[
+                { value: 'en', label: t('appearance.english') },
+                { value: 'lv', label: t('appearance.latvian') },
+              ]}
+              onChange={(value) => setLanguage(value as UiLanguage)}
+            />
+          </section>
+
           <section className="appearance-section">
             <div className="appearance-section-head">
               <div>

@@ -221,7 +221,38 @@ class RoadMotionAnalyzer:
         values = flow.reshape(-1, 2)
         dx = float(np.median(values[:, 0])) if values.size else 0.0
         dy = float(np.median(values[:, 1])) if values.size else 0.0
-        return {"dx": dx, "dy": dy, "magnitude": float((dx * dx + dy * dy) ** 0.5)}
+        magnitudes = np.linalg.norm(values, axis=1) if values.size else np.asarray([], dtype=np.float32)
+        median_magnitude = float(np.median(magnitudes)) if magnitudes.size else 0.0
+        translation = float((dx * dx + dy * dy) ** 0.5)
+
+        # A PTZ zoom produces radial flow whose median dx/dy is near zero.  A
+        # robust radial projection lets the camera-scene tracker distinguish
+        # that global view change from local object motion without decoding a
+        # second optical-flow pass.
+        height, width = flow.shape[:2]
+        yy, xx = np.mgrid[0:height, 0:width].astype(np.float32)
+        xx -= (max(1, width) - 1) / 2.0
+        yy -= (max(1, height) - 1) / 2.0
+        radius = np.sqrt(xx * xx + yy * yy)
+        radius = np.maximum(radius, 1.0)
+        residual_x = flow[:, :, 0] - dx
+        residual_y = flow[:, :, 1] - dy
+        radial_projection = (residual_x * xx + residual_y * yy) / radius
+        zoom = float(np.median(radial_projection)) if radial_projection.size else 0.0
+        median_abs_zoom = (
+            float(np.median(np.abs(radial_projection)))
+            if radial_projection.size
+            else 0.0
+        )
+        return {
+            "dx": dx,
+            "dy": dy,
+            "magnitude": translation,
+            "median_flow_magnitude": median_magnitude,
+            "coherence": translation / max(1e-6, median_magnitude),
+            "zoom": zoom,
+            "zoom_coherence": abs(zoom) / max(1e-6, median_abs_zoom),
+        }
 
     def _scene_cut_metrics(self, previous: np.ndarray, current: np.ndarray) -> dict[str, float]:
         diff = cv2.absdiff(previous, current).astype(np.float32) / 255.0

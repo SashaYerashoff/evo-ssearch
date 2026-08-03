@@ -46,6 +46,7 @@ import {
   type SummaryPeriodBounds,
   type SummaryResolution,
 } from './summaryView'
+import { useI18n } from '../../i18n/I18nProvider'
 
 function asTimestampMs(value: unknown): number | null {
   const number = Number(value)
@@ -53,10 +54,10 @@ function asTimestampMs(value: unknown): number | null {
   return number > 1e12 ? number : number * 1000
 }
 
-function fmtTimestamp(value: unknown): string {
+function fmtTimestamp(value: unknown, locale: string): string {
   const ms = asTimestampMs(value)
   if (!ms) return '—'
-  return new Date(ms).toLocaleString([], {
+  return new Date(ms).toLocaleString(locale, {
     month: 'short',
     day: 'numeric',
     hour: '2-digit',
@@ -112,20 +113,20 @@ function initialChannelId(channels: Channel[], storageKey: string): number | nul
   return channels[0]?.id ?? null
 }
 
-function summaryRange(entry: SummaryEntry): string {
+function summaryRange(entry: SummaryEntry, locale: string): string {
   const start = asTimestampMs(entry.batch_start_ms ?? entry.window_start)
   const end = asTimestampMs(entry.batch_end_ms ?? entry.window_end)
-  if (!start || !end || end <= start) return fmtTimestamp(entry.created_at ?? entry.window_end)
+  if (!start || !end || end <= start) return fmtTimestamp(entry.created_at ?? entry.window_end, locale)
   const startDate = new Date(start)
   const endDate = new Date(end)
   const sameDay = startDate.toDateString() === endDate.toDateString()
-  const startLabel = startDate.toLocaleString([], {
+  const startLabel = startDate.toLocaleString(locale, {
     month: 'short',
     day: 'numeric',
     hour: '2-digit',
     minute: '2-digit',
   })
-  const endLabel = endDate.toLocaleString([], sameDay
+  const endLabel = endDate.toLocaleString(locale, sameDay
     ? { hour: '2-digit', minute: '2-digit' }
     : { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' })
   return `${startLabel}–${endLabel}`
@@ -159,6 +160,7 @@ function SummaryCard({
   onToggle,
   onImage,
   onReportIncident,
+  locale,
 }: {
   entry: SummaryEntry
   selectedDepth: string
@@ -169,12 +171,17 @@ function SummaryCard({
   onToggle: () => void
   onImage: (src: string, title: string) => void
   onReportIncident: (input: IncidentDraftInput) => void
+  locale: string
 }) {
+  const { t } = useI18n()
   const [bookmarkState, setBookmarkState] = useState<'idle' | 'saving' | 'saved' | 'failed'>('idle')
   const level = summaryLevel(entry, selectedDepth)
   const alerts = summaryAlertCounts(entry)
   const burst = summaryBurst(entry)
   const semantic = summarySemanticStatus(entry)
+  const cameraScene = entry.vector_signal?.camera_scene
+  const cameraMotion = String(cameraScene?.camera_motion || '').trim().toLowerCase()
+  const cameraCoverage = String(cameraScene?.coverage_status || '').trim().toLowerCase()
   const parts = splitSummaryMachineJson(entry.summary)
   const thumbnailId = Number(entry.thumbnail_detection_id)
   const thumbnailSrc = Number.isInteger(thumbnailId) && thumbnailId > 0
@@ -229,7 +236,7 @@ function SummaryCard({
             <span className={`vid-semantic ${semantic.tone}`} title={semantic.title}>{semantic.label}</span>
           )}
           <span className="vid-channel-pill">#{entry.channel_id ?? '?'}</span>
-          <span className="vid-sum-ts">{summaryRange(entry)}</span>
+          <span className="vid-sum-ts">{summaryRange(entry, locale)}</span>
           {contentStats.length > 0 && <span className="vid-sum-stats">{contentStats.join(' · ')}</span>}
           {coalesced > 1 && <span className="vid-meta-chip">coalesced ×{coalesced}</span>}
           {burst && (
@@ -244,6 +251,19 @@ function SummaryCard({
             <span className="vid-meta-chip transition">{entry.state_transition_total} transitions</span>
           )}
           {entry.coverage_gap && <span className="vid-meta-chip gap">coverage gap</span>}
+          {cameraMotion && cameraMotion !== 'steady' && (
+            <span
+              className="vid-meta-chip gap"
+              title={`Camera scene epoch ${Number(cameraScene?.scene_epoch || 0)} · object absence is not evaluated while this view is unavailable`}
+            >
+              PTZ {cameraMotion.replace(/_/g, ' ')}
+            </span>
+          )}
+          {cameraMotion === 'steady' && cameraCoverage === 'unknown_view' && (
+            <span className="vid-meta-chip" title="Spatial probes remain unconfirmed for this PTZ view">
+              view unconfirmed
+            </span>
+          )}
           {SUMMARY_SEVERITIES.filter((severity) => Number(alerts[severity] || 0) > 0).map((severity) => (
             <span key={severity} className={`vid-sev sev-${severity}`}>
               {severity} <strong>{alerts[severity]}</strong>
@@ -252,11 +272,11 @@ function SummaryCard({
         </button>
         <div className="vid-sum-actions">
           <button className="btn compact" onClick={() => copySummary(entry)} disabled={!entry.summary}>
-            <IconCopy size={13} /> Copy
+            <IconCopy size={13} /> {t('common.copy')}
           </button>
           {canExport && (
             <button className="btn compact" onClick={() => exportSummary(entry, level)} disabled={!entry.summary}>
-              <IconDownload size={13} /> Export
+              <IconDownload size={13} /> {t('common.export')}
             </button>
           )}
           {canCreateBookmarks && level === 'L0' && !entry.coverage_gap && (
@@ -268,17 +288,17 @@ function SummaryCard({
             >
               <IconBookmark size={13} />
               {bookmarkState === 'saving'
-                ? 'Saving…'
+                ? t('common.saving')
                 : bookmarkState === 'saved'
-                  ? 'Bookmarked'
+                  ? t('common.bookmarked')
                   : bookmarkState === 'failed'
-                    ? 'Retry bookmark'
-                    : 'Bookmark'}
+                    ? t('common.retry')
+                    : t('common.bookmark')}
             </button>
           )}
           {canReportIncidents && incidentInput && (
             <button className="btn compact" onClick={() => onReportIncident(incidentInput)}>
-              <IconFileDescription size={13} /> Report incident
+              <IconFileDescription size={13} /> {t('common.reportIncident')}
             </button>
           )}
         </div>
@@ -289,7 +309,7 @@ function SummaryCard({
           {thumbnailSrc && (
             <button
               className="vid-sum-thumbnail"
-              onClick={() => onImage(thumbnailSrc, `${level} · ${summaryRange(entry)}`)}
+              onClick={() => onImage(thumbnailSrc, `${level} · ${summaryRange(entry, locale)}`)}
               title={String(entry.cover_reason || 'Open the representative VLM input')}
             >
               <img src={thumbnailSrc} alt="Representative VLM input" loading="lazy" />
@@ -348,6 +368,7 @@ export function VideoScreen({
   canExport: boolean
   onReviewSummary?: (entry: SummaryEntry) => void
 }) {
+  const { locale, t } = useI18n()
   const [activeTab, setActiveTab] = useState<VideoWorkspaceTab>('review')
   const [reviewChannelId, setReviewChannelId] = useState<number | null>(() => initialChannelId(channels, REVIEW_CHANNEL_STORAGE_KEY))
   const [settingsChannelId, setSettingsChannelId] = useState<number | null>(() => initialChannelId(channels, SETTINGS_CHANNEL_STORAGE_KEY))
@@ -920,9 +941,9 @@ export function VideoScreen({
           <div className="vid-feed-card vid-review-feed">
           <div className="vid-feed-heading">
             <div>
-              <div className="mon-panel-title">Stream summaries</div>
+              <div className="mon-panel-title">{t('video.summaries')}</div>
               <div className="vid-feed-meta">
-                {channelName(reviewChannelId ?? -1) || 'No channel'} · #{reviewChannelId ?? '—'} · {resolution === 'AUTO' ? `Auto → ${renderedDepth}` : renderedDepth} · {feed.length} summaries
+                {channelName(reviewChannelId ?? -1) || t('video.noChannel')} · #{reviewChannelId ?? '—'} · {resolution === 'AUTO' ? `${t('resolution.auto')} → ${renderedDepth}` : renderedDepth} · {feed.length} summaries
                 {live ? ' · following live' : ' · fixed view'}
               </div>
             </div>
@@ -932,7 +953,7 @@ export function VideoScreen({
             {feed.length === 0 && (
               <div className="vid-feed-empty">
                 {noFrame && <div className="vid-feed-note"><IconAlertTriangle size={16} /> No fresh EVA frame is available for this channel yet.</div>}
-                <div className="empty-state">No summaries yet for this channel.</div>
+                <div className="empty-state">{t('video.noSummaries')}</div>
               </div>
             )}
             {feed.map((entry, index) => {
@@ -955,6 +976,7 @@ export function VideoScreen({
                     }
                   }}
                   onReportIncident={setIncidentDraft}
+                  locale={locale}
                 />
               )
             })}

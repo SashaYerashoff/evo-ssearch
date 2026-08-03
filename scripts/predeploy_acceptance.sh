@@ -4,6 +4,8 @@ set -Eeuo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 PYTEST="${PYTEST:-${ROOT}/.venv/bin/pytest}"
 PYTHON="${PYTHON:-${ROOT}/.venv/bin/python}"
+NPM="${NPM:-npm}"
+REACT_ROOT="${ROOT}/react-ui"
 
 BASE_URL="${EVA_LIVE_BASE_URL:-https://127.0.0.1:5443}"
 CHANNEL_REF="${EVA_LIVE_CHANNEL_REF:-112}"
@@ -14,6 +16,7 @@ RUN_LIVE="${EVA_PREDEPLOY_RUN_LIVE:-false}"
 RUN_OPERATOR="${EVA_PREDEPLOY_RUN_OPERATOR:-false}"
 RUN_SEED="${EVA_PREDEPLOY_RUN_SEED:-false}"
 SKIP_FULL_TESTS="${EVA_PREDEPLOY_SKIP_FULL_TESTS:-false}"
+SKIP_REACT="${EVA_PREDEPLOY_SKIP_REACT:-false}"
 
 log() {
   printf '\n[predeploy] %s\n' "$*"
@@ -32,6 +35,7 @@ Runs deterministic predeploy gates by default:
   - git diff whitespace check
   - docs drift guard
   - full pytest suite
+  - React unit tests and production build
 
 Optional live smoke:
   EVA_PREDEPLOY_RUN_SEED=true       seed archive fixtures first
@@ -50,6 +54,7 @@ Useful env:
   EVA_LIVE_NEEDLE_QUERY="person lying on the ground at night"
   EVA_LIVE_PROBE_NAME="smoke: thumbs up gesture"
   EVA_PREDEPLOY_SKIP_FULL_TESTS=true
+  EVA_PREDEPLOY_SKIP_REACT=true
 USAGE
 }
 
@@ -78,6 +83,18 @@ if [[ "${SKIP_FULL_TESTS}" == "true" ]]; then
 else
   log "full pytest"
   "${PYTEST}" -q
+fi
+
+if [[ "${SKIP_REACT}" == "true" ]]; then
+  log "React tests/build skipped by EVA_PREDEPLOY_SKIP_REACT=true"
+else
+  command -v "${NPM}" >/dev/null 2>&1 || die "npm is required for the React release gate"
+  [[ -f "${REACT_ROOT}/package.json" ]] || die "React package is missing: ${REACT_ROOT}/package.json"
+  log "React tests"
+  "${NPM}" --prefix "${REACT_ROOT}" test -- --run
+  log "React production build"
+  "${NPM}" --prefix "${REACT_ROOT}" run build
+  [[ -f "${REACT_ROOT}/dist/index.html" ]] || die "React build did not produce dist/index.html"
 fi
 
 if [[ "${RUN_SEED}" == "true" ]]; then

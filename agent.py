@@ -1903,6 +1903,11 @@ _TOOL_SCHEMAS.extend(
                             "type": "boolean",
                             "description": "Resume the latest unfinished deployment. Default: true.",
                         },
+                        "deployment_profile": {
+                            "type": "string",
+                            "enum": ["general", "maritime"],
+                            "description": "Closed deployment workflow profile. Use maritime only when the operator requests port/coast monitoring.",
+                        },
                     },
                     "required": [],
                     "additionalProperties": False,
@@ -1945,6 +1950,34 @@ _TOOL_SCHEMAS.extend(
                                 "required": ["name", "channel_ids"],
                                 "additionalProperties": False,
                             },
+                        },
+                        "channel_roles": {
+                            "type": "array",
+                            "maxItems": 8,
+                            "description": "Operator-confirmed maritime role and optional location card for each selected channel.",
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "channel_id": {"type": "integer"},
+                                    "role": {
+                                        "type": "string",
+                                        "enum": [
+                                            "maritime_gate",
+                                            "maritime_coast",
+                                            "maritime_mixed_ptz",
+                                        ],
+                                    },
+                                    "label": {"type": "string"},
+                                    "location": {"type": "string"},
+                                },
+                                "required": ["channel_id", "role"],
+                                "additionalProperties": False,
+                            },
+                        },
+                        "starter_policy_mode": {
+                            "type": "string",
+                            "enum": ["none", "shadow"],
+                            "description": "Install no generic watches or add the operator-reviewed maritime starter set as non-regulatory shadow probes.",
                         },
                         "requirements": {
                             "type": "array",
@@ -5096,7 +5129,9 @@ class AgentTools:
                 ]
             resume_latest = bool(args.get("resume_latest", True))
             if resume_latest and allowed_channel_ids:
-                latest = self._deployment_store.latest_unfinished()
+                latest = self._deployment_store.latest_unfinished(
+                    str(args.get("deployment_profile") or "general")
+                )
                 if isinstance(latest, Mapping):
                     latest_scope = {
                         str(item)
@@ -5121,6 +5156,9 @@ class AgentTools:
                     min(8, int(args.get("target_channel_count") or 8)),
                 ),
                 resume_latest=resume_latest,
+                deployment_profile=str(
+                    args.get("deployment_profile") or "general"
+                ),
             )
         except DeploymentWorkflowError as exc:
             raise ToolError(str(exc)) from exc
@@ -5130,7 +5168,13 @@ class AgentTools:
             **compact_deployment_state(state),
             "instruction": (
                 "Ask the operator to choose up to 8 channels and optional groups. "
-                "Then call configure_deployment with IDs copied from this inventory."
+                + (
+                    "For every selected maritime channel also ask for role "
+                    "maritime_gate, maritime_coast, or maritime_mixed_ptz and an optional location label. "
+                    if str(state.get("deployment_profile") or "general") == "maritime"
+                    else ""
+                )
+                + "Then call configure_deployment with IDs copied from this inventory."
             ),
         }
 
@@ -5153,6 +5197,16 @@ class AgentTools:
                 quiet_window=(
                     args.get("quiet_window")
                     if "quiet_window" in args
+                    else None
+                ),
+                channel_roles=(
+                    args.get("channel_roles")
+                    if "channel_roles" in args
+                    else None
+                ),
+                starter_policy_mode=(
+                    args.get("starter_policy_mode")
+                    if "starter_policy_mode" in args
                     else None
                 ),
             )
@@ -5188,15 +5242,27 @@ class AgentTools:
         # Keep the vision task literal and shallow for Qwen3-VL-4B.  The
         # language agent receives compact receipts, while full survey text is
         # persisted in the durable deployment state.
-        survey_prompt = (
-            "Inspect only the supplied snapshots. Return four short lines: "
-            "SCENE: fixed physical area and camera viewpoint; "
-            "VISIBLE ROUTINE: repeated people/vehicles/objects only if visible; "
-            "CHANGES: observable motion or scene changes across snapshots; "
-            "CANDIDATE WATCHES: up to three concrete visible states worth asking "
-            "the operator about. Say UNKNOWN for ambiguity. Do not identify people, "
-            "infer intent, or choose alert severity."
-        )
+        if str(state.get("deployment_profile") or "general") == "maritime":
+            survey_prompt = (
+                "Inspect only the supplied maritime snapshots. Return five short lines: "
+                "VIEW: port gate, fairway, coastline, mixed, or UNKNOWN; "
+                "CAMERA: steady, probable PTZ movement/preset change, or UNKNOWN; "
+                "VISIBLE TRAFFIC: coarse vessel classes and directions only when visible; "
+                "COVERAGE: which water/shore areas are visible in these samples; "
+                "CANDIDATE WATCHES: up to three concrete visible states to confirm with the operator. "
+                "Camera movement is not vessel movement. Do not infer vessel identity, intent, distance, "
+                "collision risk, or absence outside the current view."
+            )
+        else:
+            survey_prompt = (
+                "Inspect only the supplied snapshots. Return four short lines: "
+                "SCENE: fixed physical area and camera viewpoint; "
+                "VISIBLE ROUTINE: repeated people/vehicles/objects only if visible; "
+                "CHANGES: observable motion or scene changes across snapshots; "
+                "CANDIDATE WATCHES: up to three concrete visible states worth asking "
+                "the operator about. Say UNKNOWN for ambiguity. Do not identify people, "
+                "infer intent, or choose alert severity."
+            )
         try:
             survey_result = self._survey_channels(
                 {
@@ -5233,7 +5299,9 @@ class AgentTools:
                 "Now ask the operator what is routine, which visible conditions "
                 "should alert on each channel/group, how severe unexpected activity "
                 "is, whether any state needs a counter/dwell metric, and the preferred "
-                "preemptible 9B consolidation window. Then call configure_deployment."
+                "preemptible 9B consolidation window. For a maritime profile, also ask "
+                "whether to include the role-specific starter policies as shadow probes. "
+                "Then call configure_deployment."
             ),
         }
 
@@ -5316,6 +5384,8 @@ class AgentTools:
             "bookmark_gate": None,
             "bookmark_gate_updated_at_ms": None,
             "origin": "agent",
+            "attention_only": bool(raw_probe.get("attention_only")),
+            "starter_policy": bool(raw_probe.get("starter_policy")),
             "deployment_id": raw_probe.get("deployment_id"),
             "metric_profile_id": raw_probe.get("metric_profile_id"),
         }
@@ -5352,6 +5422,8 @@ class AgentTools:
             else {}
         )
         diff = {
+            "deployment_profile": plan.get("deployment_profile") or "general",
+            "starter_policy_mode": plan.get("starter_policy_mode") or "none",
             "channel_ids": [
                 int(item.get("channel_id"))
                 for item in (plan.get("channels") or [])
@@ -5379,6 +5451,10 @@ class AgentTools:
                         "alert_policy_preview": str(
                             item.get("alert_policy_prompt") or ""
                         )[:1_200],
+                        "channel_role": item.get("channel_role"),
+                        "stream_prompt_preview": str(
+                            item.get("stream_system_prompt") or ""
+                        )[:800],
                     }
                     for item in (plan.get("channels") or [])
                     if isinstance(item, Mapping)
@@ -5457,9 +5533,40 @@ class AgentTools:
                     deployment_id,
                     str(channel_plan.get("alert_policy_prompt") or ""),
                 )
+                update_args: Dict[str, Any] = {
+                    "channel_id": channel_id,
+                    "alert_policy_prompt": merged_alert_prompt,
+                }
+                generated_stream_prompt = str(
+                    channel_plan.get("stream_system_prompt") or ""
+                ).strip()
+                if generated_stream_prompt:
+                    current_stream_prompt = str(
+                        (current_effective or {}).get("stream_system_prompt") or ""
+                    )
+                    update_args["stream_system_prompt"] = self._deployment_policy_prompt(
+                        current_stream_prompt,
+                        deployment_id,
+                        generated_stream_prompt,
+                    )
+                generated_rollups = channel_plan.get("rollup_prompts")
+                if isinstance(generated_rollups, Mapping):
+                    current_rollups = (
+                        (current_effective or {}).get("rollup_prompts")
+                        if isinstance((current_effective or {}).get("rollup_prompts"), Mapping)
+                        else {}
+                    )
+                    update_args["rollup_prompts"] = {
+                        level: self._deployment_policy_prompt(
+                            str(current_rollups.get(level) or ""),
+                            deployment_id,
+                            str(generated_rollups.get(level) or ""),
+                        )
+                        for level in ("L1", "L2", "L3")
+                        if str(generated_rollups.get(level) or "").strip()
+                    }
                 self._lxm.update_prompt_settings(
-                    channel_id=channel_id,
-                    alert_policy_prompt=merged_alert_prompt,
+                    **update_args,
                 )
                 applied["prompt_channels"].append(channel_id)
             except Exception as exc:

@@ -59,6 +59,11 @@ from attention_policy import (
 from local_video_source import LocalVideoSourceRegistry
 from alert_probe_lifecycle import derive_parent_alert_id
 from embedding_space import embedding_spaces_match
+try:
+    from camera_scene import PtzSceneTracker, scene_fingerprint
+except Exception:  # pragma: no cover - PTZ CV is optional in minimal installs
+    PtzSceneTracker = None  # type: ignore[assignment]
+    scene_fingerprint = None  # type: ignore[assignment]
 from rollup_deep_review import (
     DeepReviewClientConfig,
     OpenAICompatibleDeepReviewClient,
@@ -279,6 +284,9 @@ VECTOR_SIGNAL_PROMPT_PREFIX = (
     "- A CLIP signal with attention_authority=shadow is an unconfirmed follow-up cue. It may direct visual scrutiny, "
     "but it must not change the current state, create an alert, or confirm another cue without direct snapshot evidence.\n"
     "- Use it to decide which current snapshots deserve extra scrutiny; verify any candidate directly in the current images.\n"
+    "- camera_scene reports camera-global PTZ motion, a scene epoch, and recurring-view coverage. During pan, tilt, "
+    "zoom, preset_cut, settling, or an unconfirmed view, do not infer that an object/zone is absent and do not treat "
+    "camera-global motion as object motion. Report the relevant area as not observed when coverage is unavailable.\n"
     "- capture_attention marks snapshots whose motion is far above this channel's measured norm (activity_x = times above "
     "typical). Motion blur on burst snapshots is expected physics of fast events - describe the action itself; use sharper "
     "neighboring snapshots (or a provided sharper companion frame) for identity details.\n"
@@ -5300,6 +5308,7 @@ class LuxriotManager:
         self.road_scene_calibration_samples = max(4, min(64, road_scene_samples))
         self.road_scene_auto_samples: Dict[int, List[Any]] = {}
         self.road_scene_calibrations: Dict[int, Dict[str, Any]] = {}
+        self.camera_scene_trackers: Dict[int, Any] = {}
         self.road_episode_aggregators: Dict[int, Any] = {}
         # Measured per-channel motion homeostasis (capture decider baseline).
         self.capture_activity_baselines: Dict[int, Dict[str, Any]] = {}
@@ -10868,6 +10877,11 @@ class LuxriotManager:
                     "cue_score",
                     "active_ratio",
                     "global_motion",
+                    "global_dx",
+                    "global_dy",
+                    "global_motion_coherence",
+                    "global_zoom",
+                    "global_zoom_coherence",
                 ):
                     score = cls._finite_float(raw.get(score_key))
                     if score is not None:
@@ -10939,6 +10953,28 @@ class LuxriotManager:
                     scene_out[score_key] = round(float(number), 4)
             if scene_out:
                 out["road_cv_scene"] = scene_out
+
+        camera_scene = value.get("camera_scene")
+        if isinstance(camera_scene, Mapping):
+            camera_out: Dict[str, Any] = {
+                "version": int(_parse_optional_int(camera_scene.get("version")) or 1),
+                "camera_motion": str(camera_scene.get("camera_motion") or "steady").strip().lower()[:24],
+                "coverage_status": str(camera_scene.get("coverage_status") or "unknown_view").strip().lower()[:32],
+                "preset_status": str(camera_scene.get("preset_status") or "unavailable").strip().lower()[:32],
+                "spatial_probes_enabled": bool(camera_scene.get("spatial_probes_enabled")),
+                "coverage_semantics": "not_observed_when_view_unavailable",
+            }
+            preset_id = str(camera_scene.get("preset_id") or "").strip()
+            if preset_id:
+                camera_out["preset_id"] = preset_id[:80]
+            for int_key in ("channel_id", "scene_epoch", "known_preset_count"):
+                parsed = _parse_optional_int(camera_scene.get(int_key))
+                if parsed is not None:
+                    camera_out[int_key] = int(parsed)
+            similarity = cls._finite_float(camera_scene.get("preset_similarity"))
+            if similarity is not None:
+                camera_out["preset_similarity"] = round(float(similarity), 4)
+            out["camera_scene"] = camera_out
 
         attention = value.get("capture_attention")
         if isinstance(attention, Mapping):
@@ -11015,6 +11051,7 @@ class LuxriotManager:
                 "road_cv_frame_scores",
                 "road_episodes",
                 "road_cv_scene",
+                "camera_scene",
                 "capture_attention",
             )
         )
@@ -11198,7 +11235,7 @@ class LuxriotManager:
                 items = [dict(item) for item in raw_items[:limit] if isinstance(item, Mapping)]
                 if items:
                     out[key] = items
-        for key in ("road_cv_scene", "capture_attention"):
+        for key in ("road_cv_scene", "camera_scene", "capture_attention"):
             item = compact.get(key)
             if isinstance(item, Mapping):
                 out[key] = dict(item)
@@ -11214,6 +11251,10 @@ class LuxriotManager:
                 "road_cv_scene_status",
                 "road_cv_sampled_frame_count",
                 "road_cv_low_fps_suppressed_frames",
+                "camera_motion_state",
+                "camera_scene_epoch",
+                "camera_spatial_probes_enabled",
+                "clip_probe_status",
             )
             health_digest = {
                 key: health.get(key)
@@ -11296,9 +11337,18 @@ class LuxriotManager:
             attention = vector_signal.get("capture_attention")
             if isinstance(attention, Mapping):
                 history_signal["capture_attention"] = dict(attention)
+            camera_scene = vector_signal.get("camera_scene")
+            if isinstance(camera_scene, Mapping):
+                history_signal["camera_scene"] = dict(camera_scene)
             if any(
                 key in history_signal
-                for key in ("clip_probe_signals", "road_cv_cues", "road_episodes", "capture_attention")
+                for key in (
+                    "clip_probe_signals",
+                    "road_cv_cues",
+                    "road_episodes",
+                    "camera_scene",
+                    "capture_attention",
+                )
             ):
                 out["vector_signal"] = history_signal
             else:
@@ -11913,19 +11963,27 @@ class LuxriotManager:
         self,
         channel_id: int,
         frames: Sequence[Mapping[str, Any]],
-    ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], Dict[str, Any], Dict[str, Any]]:
+    ) -> Tuple[
+        List[Dict[str, Any]],
+        List[Dict[str, Any]],
+        Dict[str, Any],
+        Dict[str, Any],
+        Dict[str, Any],
+    ]:
         health: Dict[str, Any] = {}
         if not self.road_cv_batch_signals_enabled:
             health["road_cv_status"] = "disabled"
-            return [], [], {}, health
+            return [], [], {}, {}, health
         if (
             DecodedVideoFrame is None
             or AutoSceneCardConfig is None
             or infer_scene_card_from_frames is None
             or RoadMotionAnalyzer is None
+            or PtzSceneTracker is None
+            or scene_fingerprint is None
         ):
             health["road_cv_status"] = "unavailable"
-            return [], [], {}, health
+            return [], [], {}, {}, health
         decoded: List[Any] = []
         indexed_frames = list(enumerate(frames, start=1))
         sampled = indexed_frames[-self.road_cv_batch_max_frames :]
@@ -11949,7 +12007,7 @@ class LuxriotManager:
             )
         health["road_cv_decoded_frames"] = len(decoded)
         if len(decoded) < 3:
-            return [], [], {}, health
+            return [], [], {}, {}, health
         intervals = [
             int(decoded[idx].timestamp_ms) - int(decoded[idx - 1].timestamp_ms)
             for idx in range(1, len(decoded))
@@ -12035,6 +12093,17 @@ class LuxriotManager:
                     frame_score["cue_score"] = round(float(max_cue_score), 6)
                 if frame_global_motion is not None:
                     frame_score["global_motion"] = round(float(frame_global_motion), 6)
+                if sample.global_motion:
+                    for source_key, target_key in (
+                        ("dx", "global_dx"),
+                        ("dy", "global_dy"),
+                        ("coherence", "global_motion_coherence"),
+                        ("zoom", "global_zoom"),
+                        ("zoom_coherence", "global_zoom_coherence"),
+                    ):
+                        value = self._finite_float(sample.global_motion.get(source_key))
+                        if value is not None:
+                            frame_score[target_key] = round(float(value), 6)
                 if sample.warmup:
                     frame_score["unavailable_reason"] = "road_cv_warmup_frame"
                 elif sample.scene_cut:
@@ -12071,6 +12140,68 @@ class LuxriotManager:
                 health["road_cv_global_motion_max"] = round(max(global_motion_values), 4)
             if low_fps_suppressed:
                 health["road_cv_low_fps_suppressed_frames"] = int(low_fps_suppressed)
+            fingerprint = None
+            if decoded:
+                # Fingerprint the temporal median view so a passing vessel,
+                # vehicle, person, spray, or moving tree does not become a
+                # fake PTZ preset.  PTZ motion itself is already classified
+                # from global flow above.
+                same_shape = [
+                    item.image
+                    for item in decoded
+                    if getattr(item.image, "shape", None)
+                    == getattr(decoded[-1].image, "shape", None)
+                ]
+                if same_shape:
+                    try:
+                        import numpy as np
+
+                        median_view = np.median(
+                            np.stack(same_shape, axis=0),
+                            axis=0,
+                        ).astype("uint8")
+                        fingerprint = scene_fingerprint(median_view)
+                    except Exception:
+                        fingerprint = scene_fingerprint(decoded[-1].image)
+            with self.cache_lock:
+                tracker = self.camera_scene_trackers.get(int(channel_id))
+                if tracker is None:
+                    tracker = PtzSceneTracker(int(channel_id))
+                    self.camera_scene_trackers[int(channel_id)] = tracker
+                camera_scene = tracker.observe(
+                    frame_scores,
+                    fingerprint,
+                    timestamp_ms=int(decoded[-1].timestamp_ms),
+                )
+                self._summary_state_dirty = True
+            camera_motion = str(camera_scene.get("camera_motion") or "steady")
+            spatial_probes_enabled = bool(camera_scene.get("spatial_probes_enabled"))
+            health["camera_motion_state"] = camera_motion
+            health["camera_scene_epoch"] = int(camera_scene.get("scene_epoch") or 0)
+            health["camera_spatial_probes_enabled"] = spatial_probes_enabled
+            suppress_spatial_signals = camera_motion in {
+                "pan",
+                "tilt",
+                "zoom",
+                "preset_cut",
+                "settling",
+            } or (
+                str(camera_scene.get("coverage_status") or "") == "unknown_view"
+                and int(camera_scene.get("known_preset_count") or 0) > 0
+            )
+            if suppress_spatial_signals:
+                # Global camera motion and unconfirmed PTZ views are coverage
+                # facts, not object-motion evidence.  Preserve diagnostics but
+                # prevent them from becoming a CV burst or apex candidate.
+                cues = []
+                for frame_score in frame_scores:
+                    frame_score.pop("attention_score", None)
+                    frame_score.pop("cue_score", None)
+                    frame_score["unavailable_reason"] = (
+                        "camera_global_motion"
+                        if camera_motion in {"pan", "tilt", "zoom", "preset_cut"}
+                        else "camera_view_unconfirmed"
+                    )
             cues.sort(key=lambda item: float(item.get("score") or 0.0), reverse=True)
             scene = scene_result.as_dict()
             scene_compact = {
@@ -12089,10 +12220,10 @@ class LuxriotManager:
             for key in ("sample_count", "usable_zone_samples", "usable_flow_samples", "zone_agreement", "flow_agreement"):
                 if key in calibration_state:
                     scene_compact[key] = calibration_state.get(key)
-            return cues[:8], frame_scores, scene_compact, health
+            return cues[:8], frame_scores, scene_compact, camera_scene, health
         except Exception as exc:
             health["road_cv_error"] = str(exc)[:160] or exc.__class__.__name__
-            return [], [], {}, health
+            return [], [], {}, {}, health
 
     @staticmethod
     def _compact_count_breakdown(value: object) -> Dict[str, int]:
@@ -12808,6 +12939,11 @@ class LuxriotManager:
                 for channel_id, state in self.road_scene_calibrations.items()
                 if isinstance(state, Mapping)
             },
+            "camera_scene_trackers": {
+                str(channel_id): tracker.snapshot()
+                for channel_id, tracker in self.camera_scene_trackers.items()
+                if callable(getattr(tracker, "snapshot", None))
+            },
             "capture_baselines": {
                 str(channel_id): dict(state)
                 for channel_id, state in self.capture_activity_baselines.items()
@@ -12943,6 +13079,7 @@ class LuxriotManager:
         runs_raw = payload.get("summary_runs") if isinstance(payload, Mapping) else None
         routines_raw = payload.get("channel_routines") if isinstance(payload, Mapping) else None
         road_scene_raw = payload.get("road_scene_calibrations") if isinstance(payload, Mapping) else None
+        camera_scene_raw = payload.get("camera_scene_trackers") if isinstance(payload, Mapping) else None
         prompt_settings_raw = payload.get("prompt_settings") if isinstance(payload, Mapping) else None
         loaded_history: Dict[int, List[Dict[str, Any]]] = {}
         if isinstance(history_raw, Mapping):
@@ -13058,6 +13195,19 @@ class LuxriotManager:
                     },
                 }
                 loaded_road_scene_calibrations[int(channel_id)] = normalized_state
+        loaded_camera_scene_trackers: Dict[int, PtzSceneTracker] = {}
+        if isinstance(camera_scene_raw, Mapping) and PtzSceneTracker is not None:
+            for channel_key, state_value in camera_scene_raw.items():
+                channel_id = _parse_optional_int(channel_key)
+                if channel_id is None or channel_id <= 0 or not isinstance(state_value, Mapping):
+                    continue
+                try:
+                    loaded_camera_scene_trackers[int(channel_id)] = PtzSceneTracker(
+                        int(channel_id),
+                        state=state_value,
+                    )
+                except Exception:
+                    continue
         loaded_capture_baselines: Dict[int, Dict[str, Any]] = {}
         capture_baselines_raw = payload.get("capture_baselines") if isinstance(payload, Mapping) else None
         if isinstance(capture_baselines_raw, Mapping):
@@ -13197,6 +13347,7 @@ class LuxriotManager:
             self.summary_runs = loaded_runs
             self.channel_routine_context = loaded_routines
             self.road_scene_calibrations = loaded_road_scene_calibrations
+            self.camera_scene_trackers = loaded_camera_scene_trackers
             self.capture_activity_baselines = loaded_capture_baselines
             self.active_summary_runs = {}
             self.channel_prompt_overrides = loaded_channel_prompt_overrides
@@ -15443,18 +15594,35 @@ class LuxriotManager:
         if not self.vector_signals_enabled:
             return {}
         health: Dict[str, Any] = {"enabled": True}
-        clip_signals, clip_health = self._clip_probe_vector_signals(
-            int(channel_id),
-            frames,
-            batch_start_ms=batch_start_ms,
-            batch_end_ms=batch_end_ms,
-        )
-        health.update(clip_health)
-        road_cues, road_frame_scores, road_scene, road_health = self._road_cv_vector_signals(
-            int(channel_id),
-            frames,
-        )
+        (
+            road_cues,
+            road_frame_scores,
+            road_scene,
+            camera_scene,
+            road_health,
+        ) = self._road_cv_vector_signals(int(channel_id), frames)
         health.update(road_health)
+        suppress_spatial_signals = str(camera_scene.get("camera_motion") or "steady") in {
+            "pan",
+            "tilt",
+            "zoom",
+            "preset_cut",
+            "settling",
+        } or (
+            str(camera_scene.get("coverage_status") or "") == "unknown_view"
+            and int(camera_scene.get("known_preset_count") or 0) > 0
+        )
+        if suppress_spatial_signals:
+            clip_signals: List[Dict[str, Any]] = []
+            health["clip_probe_status"] = "suppressed_camera_scene"
+        else:
+            clip_signals, clip_health = self._clip_probe_vector_signals(
+                int(channel_id),
+                frames,
+                batch_start_ms=batch_start_ms,
+                batch_end_ms=batch_end_ms,
+            )
+            health.update(clip_health)
         road_episodes = self._road_episode_vector_signals(
             int(channel_id),
             road_cues,
@@ -15509,6 +15677,8 @@ class LuxriotManager:
             bundle["road_episodes"] = road_episodes
         if road_scene:
             bundle["road_cv_scene"] = road_scene
+        if camera_scene:
+            bundle["camera_scene"] = camera_scene
         return self._compact_vector_signal(bundle)
 
     def _capture_attention_signal(self, frames: Sequence[Mapping[str, Any]]) -> Dict[str, Any]:

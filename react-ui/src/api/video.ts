@@ -71,6 +71,15 @@ export interface SummaryEntry {
   cover_reason?: string
   cover_confidence?: string
   vector_signal?: {
+    camera_scene?: {
+      camera_motion?: 'steady' | 'pan' | 'tilt' | 'zoom' | 'preset_cut' | 'settling' | string
+      scene_epoch?: number
+      coverage_status?: string
+      preset_id?: string
+      preset_status?: string
+      spatial_probes_enabled?: boolean
+      [k: string]: any
+    }
     capture_attention?: {
       seconds?: Array<{
         snapshot?: number | string

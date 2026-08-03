@@ -78,8 +78,16 @@ class _GroupStore:
 class _Manager:
     def __init__(self):
         self.prompts = {
-            11: {"alert_policy_prompt": "KEEP EXISTING POLICY"},
-            12: {"alert_policy_prompt": ""},
+            11: {
+                "alert_policy_prompt": "KEEP EXISTING POLICY",
+                "stream_system_prompt": "KEEP STREAM CORE",
+                "rollup_prompts": {"L1": "", "L2": "", "L3": ""},
+            },
+            12: {
+                "alert_policy_prompt": "",
+                "stream_system_prompt": "",
+                "rollup_prompts": {"L1": "", "L2": "", "L3": ""},
+            },
         }
         self.sessions = {}
         self.schedule = None
@@ -93,8 +101,19 @@ class _Manager:
     def get_prompt_settings(self, channel_id=None):
         return {"current": copy.deepcopy(self.prompts[int(channel_id)])}
 
-    def update_prompt_settings(self, channel_id=None, alert_policy_prompt=None):
-        self.prompts[int(channel_id)]["alert_policy_prompt"] = alert_policy_prompt
+    def update_prompt_settings(
+        self,
+        channel_id=None,
+        alert_policy_prompt=None,
+        stream_system_prompt=None,
+        rollup_prompts=None,
+    ):
+        channel = self.prompts[int(channel_id)]
+        channel["alert_policy_prompt"] = alert_policy_prompt
+        if stream_system_prompt is not None:
+            channel["stream_system_prompt"] = stream_system_prompt
+        if rollup_prompts is not None:
+            channel["rollup_prompts"] = copy.deepcopy(dict(rollup_prompts))
         return {"status": "updated"}
 
     def start_session(self, channel_id):
@@ -258,6 +277,119 @@ def test_protocol_deploy_rejects_more_than_eight_channels_and_bad_duration_state
                 }
             ],
         )
+
+
+def test_maritime_deploy_builds_ptz_prompts_and_shadow_starter_probes():
+    store = ProtocolDeploymentStore()
+    state = store.start(
+        [
+            {"id": 41, "title": "Sea gate"},
+            {"id": 42, "title": "West beach"},
+        ],
+        deployment_profile="maritime",
+        resume_latest=False,
+    )
+    deployment_id = state["deployment_id"]
+    configured = store.configure(
+        deployment_id,
+        channel_ids=[41, 42],
+        channel_roles=[
+            {
+                "channel_id": 41,
+                "role": "maritime_gate",
+                "location": "Liepaja north gate",
+            },
+            {"channel_id": 42, "role": "maritime_coast"},
+        ],
+        starter_policy_mode="shadow",
+        quiet_window={
+            "enabled": True,
+            "timezone": "Europe/Riga",
+            "start_local": "01:00",
+            "end_local": "04:00",
+            "days": [0, 1, 2, 3, 4, 5, 6],
+        },
+    )
+
+    planned = store.build_plan(deployment_id)
+    plan = planned["plan"]
+
+    assert configured["deployment_profile"] == "maritime"
+    assert plan["deployment_profile"] == "maritime"
+    assert len(plan["channels"]) == 2
+    assert len(plan["probes"]) == 8
+    assert all(probe["attention_only"] for probe in plan["probes"])
+    gate = next(row for row in plan["channels"] if row["channel_id"] == 41)
+    assert gate["channel_role"] == "maritime_gate"
+    assert "Camera-global motion is not vessel motion" in gate["stream_system_prompt"]
+    assert "Liepaja north gate" in gate["stream_system_prompt"]
+    assert "not observed" in gate["rollup_prompts"]["L3"]
+    assert plan["quiet_window"]["timezone"] == "Europe/Riga"
+
+
+def test_maritime_deploy_requires_a_role_for_every_selected_channel():
+    store = ProtocolDeploymentStore()
+    state = store.start(
+        [{"id": 41, "title": "Sea gate"}, {"id": 42, "title": "Beach"}],
+        deployment_profile="maritime",
+        resume_latest=False,
+    )
+    store.configure(
+        state["deployment_id"],
+        channel_ids=[41, 42],
+        channel_roles=[{"channel_id": 41, "role": "maritime_gate"}],
+        starter_policy_mode="shadow",
+    )
+
+    with pytest.raises(DeploymentWorkflowError, match="assign a maritime role"):
+        store.build_plan(state["deployment_id"])
+
+
+def test_maritime_composite_apply_installs_prompt_layers_and_shadow_probes(monkeypatch):
+    store = ProtocolDeploymentStore()
+    state = store.start(
+        [{"id": 11, "title": "Sea gate"}],
+        deployment_profile="maritime",
+        resume_latest=False,
+    )
+    deployment_id = state["deployment_id"]
+    store.configure(
+        deployment_id,
+        channel_ids=[11],
+        channel_roles=[{
+            "channel_id": 11,
+            "role": "maritime_gate",
+            "location": "West coast gate",
+        }],
+        starter_policy_mode="shadow",
+    )
+    manager = _Manager()
+    probes = _ProbeStore()
+    tools = AgentTools(
+        detections_store=_DetectionStore(),
+        probes_store=probes,
+        luxriot_manager=manager,
+        embed_text_fn=lambda _text: None,
+        embed_image_fn=lambda _image: None,
+        call_lm_fn=lambda *_args, **_kwargs: "",
+        encode_jpeg_fn=lambda *_args, **_kwargs: "",
+        search_indexed_folder_fn=lambda **_kwargs: [],
+        search_detections_fn=lambda **_kwargs: [],
+        deployment_store=store,
+    )
+    monkeypatch.setattr(tools, "_schedule_deployment_commissioning", lambda _deployment_id: None)
+
+    applied = tools.execute(
+        "apply_deployment_plan",
+        {"deployment_id": deployment_id, "preview": False},
+    )
+
+    assert applied["status"] == "applied"
+    assert "KEEP STREAM CORE" in manager.prompts[11]["stream_system_prompt"]
+    assert "visual aggregation core" in manager.prompts[11]["stream_system_prompt"]
+    assert "eight-hour maritime consolidation" in manager.prompts[11]["rollup_prompts"]["L3"]
+    assert len(probes.rows) == 4
+    assert all(probe["attention_only"] for probe in probes.rows)
 
 
 def test_counted_metric_keeps_alert_delivery_and_unknown_time_out_of_count():

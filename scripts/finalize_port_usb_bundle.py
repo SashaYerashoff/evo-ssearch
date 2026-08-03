@@ -25,12 +25,28 @@ def main() -> int:
     args = parser.parse_args()
     root = args.bundle.resolve()
     version = (root / "repo" / "VERSION").read_text(encoding="utf-8").strip()
+    source_path = root / "SOURCE_REVISION.json"
+    if not source_path.is_file():
+        raise SystemExit("Missing critical payload: SOURCE_REVISION.json")
+    try:
+        source = json.loads(source_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise SystemExit(f"Invalid SOURCE_REVISION.json: {exc}") from exc
+    if source.get("working_tree_clean") is not True:
+        raise SystemExit("Refusing to finalize an uncommitted port client bundle.")
+    if str(source.get("release_flavor") or "") != "ventspils-maritime-client":
+        raise SystemExit("Unexpected release flavor in SOURCE_REVISION.json")
     version_match = re.search(r"\d+(?:\.\d+)+", version)
     if version_match is None:
         raise SystemExit(f"Cannot derive a Debian version from {version!r}")
     debian_version = version_match.group(0)
     critical_files = (
+        "SOURCE_REVISION.json",
         "repo/VERSION",
+        "repo/camera_scene.py",
+        "repo/maritime_profiles.py",
+        "repo/docs/maritime_port_profile.md",
+        "repo/react-ui/dist/index.html",
         "repo/migrations/versions/20260801_0011_incidents.py",
         "models/qwen3-vl-4b-awq/model.safetensors",
         "models/qwen3.5-9b-mtp/Qwen3.5-9B-Q4_K_M.gguf",
@@ -72,6 +88,8 @@ def main() -> int:
         "format": 1,
         "version": version,
         "schema_head": "20260801_0011",
+        "release_flavor": "ventspils-maritime-client",
+        "source": source,
         "created_at": datetime.now(timezone.utc).isoformat(),
         "target": {
             "os": "Ubuntu Server 24.04 amd64",

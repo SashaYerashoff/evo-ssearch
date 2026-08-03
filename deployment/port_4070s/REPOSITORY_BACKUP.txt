@@ -9,11 +9,13 @@ USB kit was built. Verify and restore it with:
   git bundle verify evo-ssearch-all-refs.bundle
   git clone evo-ssearch-all-refs.bundle evo-ssearch-restored
 
-The bundle cannot contain uncommitted working-tree changes. Those are preserved
-in the adjacent ../repo/ snapshot, together with untracked source files that are
-part of the deployment. Local virtual environments, model caches, runtime
-state, database dumps, .git internals, and large review PDFs are intentionally
-excluded from that source snapshot.
+The Ventspils client kit is built only from a clean committed working tree.
+The adjacent ../repo/ snapshot therefore matches the branch and commit recorded
+in ../SOURCE_REVISION.json; no uncommitted or untracked source is accepted into
+the release. Local virtual environments, model caches, runtime state, database
+dumps, .git internals, and large review PDFs are intentionally excluded from
+that source snapshot.
 
-For incident recovery, keep both the Git clone and the ../repo/ snapshot until
-the deployed tree has been compared and committed intentionally.
+For incident recovery, verify SOURCE_REVISION.json first and keep both the Git
+bundle and the ../repo/ snapshot until the deployed tree has been compared with
+that recorded revision.
