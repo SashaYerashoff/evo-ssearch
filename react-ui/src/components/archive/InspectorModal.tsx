@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from 'react'
+import { useEffect, useMemo, useState } from 'react'
 import {
   IconAlertTriangle,
   IconArrowsMaximize,
@@ -16,11 +16,11 @@ import {
 } from '@tabler/icons-react'
 import type { Channel, Detection } from '../../api/types'
 import {
+  archivePlaybackUrl,
   batchFrameNumber,
   describeFrame,
   detImageSrc,
   falsePositiveExportUrl,
-  fetchArchivePlayback,
   fullDetectionImageSrc,
   getAlertFeedback,
   loadDetectionBatchFrames,
@@ -118,12 +118,9 @@ export function InspectorModal({
   const [playback, setPlayback] = useState<{
     state: 'idle' | 'loading' | 'decoding' | 'playing' | 'error'
     url?: string
-    kind?: 'video' | 'mjpeg'
     detail?: string
   }>({ state: 'idle' })
   const [playbackElapsed, setPlaybackElapsed] = useState(0)
-  const playbackAbort = useRef<AbortController | null>(null)
-  const playbackUrl = useRef<string | null>(null)
 
   const active = frames[activeIndex] || d
   const previewSrc = detImageSrc(active)
@@ -150,17 +147,8 @@ export function InspectorModal({
   useEffect(() => {
     setSrc(fullSrc)
     setDesc(null)
-    playbackAbort.current?.abort()
-    playbackAbort.current = null
-    if (playbackUrl.current) URL.revokeObjectURL(playbackUrl.current)
-    playbackUrl.current = null
     setPlayback({ state: 'idle' })
   }, [active.key, fullSrc])
-
-  useEffect(() => () => {
-    playbackAbort.current?.abort()
-    if (playbackUrl.current) URL.revokeObjectURL(playbackUrl.current)
-  }, [])
 
   useEffect(() => {
     if (!['loading', 'decoding'].includes(playback.state)) {
@@ -176,10 +164,19 @@ export function InspectorModal({
   }, [playback.state])
 
   useEffect(() => {
+    if (playback.state !== 'loading') return
+    const timer = window.setTimeout(() => {
+      setPlayback({
+        state: 'error',
+        detail: 'The recorder did not begin the archive response within 120 seconds.',
+      })
+    }, 120_000)
+    return () => window.clearTimeout(timer)
+  }, [playback.state])
+
+  useEffect(() => {
     if (playback.state !== 'decoding') return
     const timer = window.setTimeout(() => {
-      if (playbackUrl.current) URL.revokeObjectURL(playbackUrl.current)
-      playbackUrl.current = null
       setPlayback({
         state: 'error',
         detail: 'The recorder segment arrived, but the browser did not make it playable within 12 seconds.',
@@ -275,46 +272,21 @@ export function InspectorModal({
   }
 
   function stopPlayback(detail?: string) {
-    playbackAbort.current?.abort()
-    playbackAbort.current = null
-    if (playbackUrl.current) URL.revokeObjectURL(playbackUrl.current)
-    playbackUrl.current = null
     setPlayback(detail ? { state: 'error', detail } : { state: 'idle' })
   }
 
-  async function playArchive() {
+  function playArchive() {
     if (playback.state === 'loading') return
-    stopPlayback()
-    const controller = new AbortController()
-    playbackAbort.current = controller
-    const timeout = window.setTimeout(() => controller.abort(), 120_000)
-    setPlayback({ state: 'loading', detail: 'Preparing recorder archive around the evidence frame…' })
-    try {
-      const media = await fetchArchivePlayback(active, controller.signal)
-      if (controller.signal.aborted || playbackAbort.current !== controller) return
-      const url = URL.createObjectURL(media.blob)
-      playbackUrl.current = url
-      const alignment = media.resolvedTimeMs && media.resolvedTimeMs !== active.tsMs
-        ? ` · recorder aligned ${fmtFull(media.resolvedTimeMs)}`
-        : ''
-      setPlayback({
-        state: 'decoding',
-        url,
-        kind: media.mediaKind,
-        detail: `Recorder segment received; opening video${alignment}`,
-      })
-    } catch (exception: any) {
-      if (playbackAbort.current !== controller) return
-      setPlayback({
-        state: 'error',
-        detail: controller.signal.aborted
-          ? 'Archive preparation timed out; the stored evidence frame remains available.'
-          : (exception?.message || 'Archive playback is unavailable.'),
-      })
-    } finally {
-      window.clearTimeout(timeout)
-      if (playbackAbort.current === controller) playbackAbort.current = null
+    const url = archivePlaybackUrl(active)
+    if (!url) {
+      setPlayback({ state: 'error', detail: 'This evidence has no recorder timestamp.' })
+      return
     }
+    setPlayback({
+      state: 'loading',
+      url,
+      detail: 'Preparing recorder archive around the evidence frame…',
+    })
   }
 
   const canPlayArchive = ['vlm_alert', 'vlm_summary'].includes(active.source)
@@ -338,7 +310,7 @@ export function InspectorModal({
         <div className="modal-body archive-review-body">
           <div className="archive-review-evidence">
             <div className="inspect-frame archive-review-frame">
-              {['decoding', 'playing'].includes(playback.state) && playback.url && playback.kind === 'video' ? (
+              {['loading', 'decoding', 'playing'].includes(playback.state) && playback.url ? (
                 <video
                   src={playback.url}
                   autoPlay
@@ -347,6 +319,11 @@ export function InspectorModal({
                   controls
                   playsInline
                   preload="auto"
+                  onLoadStart={() => setPlayback((current) => (
+                    current.url === playback.url
+                      ? { ...current, state: 'loading', detail: 'Preparing recorder archive around the evidence frame…' }
+                      : current
+                  ))}
                   onLoadedMetadata={() => setPlayback((current) => (
                     current.url === playback.url
                       ? { ...current, state: 'decoding', detail: 'Archive metadata loaded; buffering video…' }
@@ -362,19 +339,7 @@ export function InspectorModal({
                       ? { ...current, state: 'playing', detail: 'Archive playback' }
                       : current
                   ))}
-                  onError={() => stopPlayback('The browser could not decode the recorder archive segment.')}
-                />
-              ) : ['decoding', 'playing'].includes(playback.state) && playback.url && playback.kind === 'mjpeg' ? (
-                <img
-                  className="archive-review-playback-mjpeg"
-                  src={playback.url}
-                  alt="Luxriot archive playback"
-                  onLoad={() => setPlayback((current) => (
-                    current.url === playback.url
-                      ? { ...current, state: 'playing', detail: 'Archive playback' }
-                      : current
-                  ))}
-                  onError={() => stopPlayback('The browser could not decode the recorder archive stream.')}
+                  onError={() => stopPlayback('The browser could not load or decode the recorder archive segment.')}
                 />
               ) : src ? (
                 <>

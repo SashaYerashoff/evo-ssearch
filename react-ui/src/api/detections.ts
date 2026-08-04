@@ -285,47 +285,18 @@ export function archivePlaybackWindow(detection: Detection): ArchivePlaybackWind
   return { startMs, durationSec, evidenceMs, batchStartMs, batchEndMs }
 }
 
-export interface ArchivePlaybackMedia {
-  blob: Blob
-  mediaKind: 'video' | 'mjpeg'
-  resolvedTimeMs: number | null
-  frameAlignment: string
-}
-
-export async function fetchArchivePlayback(
-  detection: Detection,
-  signal: AbortSignal,
-): Promise<ArchivePlaybackMedia> {
+export function archivePlaybackUrl(detection: Detection): string | null {
   const window = archivePlaybackWindow(detection)
-  if (!window || detection.channelId == null) throw new Error('This evidence has no recorder timestamp.')
+  if (!window || detection.channelId == null) return null
   const params = new URLSearchParams({
     stream: 'mainStream',
     time_ms: String(window.startMs),
     duration_sec: String(window.durationSec),
   })
-  const response = await fetch(`/luxriot/media/archive/${detection.channelId}?${params.toString()}`, {
-    method: 'GET',
-    cache: 'no-store',
-    credentials: 'same-origin',
-    signal,
-  })
-  const mediaKind = String(response.headers.get('X-EVA-Media-Kind') || '').toLowerCase()
-  if (!response.ok || (mediaKind !== 'video' && mediaKind !== 'mjpeg')) {
-    let detail = ''
-    try {
-      const body = await response.json()
-      detail = String(body?.error || body?.error_code || '')
-    } catch { /* response may already be a recorder media body */ }
-    throw new Error(detail || 'Recorder archive playback is unavailable.')
-  }
-  const blob = await response.blob()
-  if (!blob.size) throw new Error('Recorder returned an empty archive segment.')
-  return {
-    blob,
-    mediaKind,
-    resolvedTimeMs: positiveMs(response.headers.get('X-EVA-Archive-Resolved-Time-Ms')),
-    frameAlignment: String(response.headers.get('X-EVA-Archive-Frame-Alignment') || ''),
-  }
+  // Feed recorder media straight to the browser. Chromium can reject a large
+  // fetch().blob() with an opaque `Failed to fetch` even when the same complete
+  // same-origin WebM response is accepted by its native media stack.
+  return `/luxriot/media/archive/${detection.channelId}?${params.toString()}`
 }
 
 export async function findParentAlert(

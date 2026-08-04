@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { archivePlaybackWindow } from '../../api/detections'
+import { archivePlaybackUrl, archivePlaybackWindow } from '../../api/detections'
 import type { Detection } from '../../api/types'
 
 function detection(payload: Record<string, unknown>, tsMs = 120_000): Detection {
@@ -41,5 +41,13 @@ describe('archivePlaybackWindow', () => {
 
   it('returns null without a channel or evidence timestamp', () => {
     expect(archivePlaybackWindow({ ...detection({}, 0), channelId: null })).toBeNull()
+  })
+
+  it('builds a same-origin media URL for the browser video stack', () => {
+    expect(archivePlaybackUrl(detection({
+      batch_start_ms: 100_000,
+      batch_end_ms: 160_000,
+      anchor_frame_timestamp_ms: 130_000,
+    }))).toBe('/luxriot/media/archive/112?stream=mainStream&time_ms=127000&duration_sec=8')
   })
 })
