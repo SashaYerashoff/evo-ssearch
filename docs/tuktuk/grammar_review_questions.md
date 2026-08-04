@@ -133,3 +133,16 @@ grammar and need Sasha-level review before the grammar or implementation moves.
   Apply remains operator-owned and may refresh the committed workspace after a
   trusted receipt. No tool schema, model argument, stable compact key, or
   d01–d15 correction path changes.
+
+- **Protocol Deploy cross-turn phase pinning** (resolved 2026-08-04,
+  Codex+Sasha). The durable deployment receipt is now rehydrated from trusted
+  tool history when the operator supplies channel/group scope in a later turn.
+  The harness intersects numeric selections with the immediately preceding
+  authorized inventory, then owns the closed
+  `start → configure scope → survey → TERM/requirements` transition. This
+  prevents a 4B head from routing a deployment selection into unrelated video
+  rollup reads. It creates no model-owned memory or temporary entity: full
+  deployment state remains in `ProtocolDeploymentStore`, chat carries only the
+  compact receipt, and Apply/devalidation authority is unchanged. Appliance
+  Doctor additionally checks the serving prerequisite (`auto tool choice` plus
+  a named parser); this is a deployment readiness gate, not a grammar layer.

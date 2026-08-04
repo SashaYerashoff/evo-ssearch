@@ -30,6 +30,27 @@ SERVICES = (
 )
 
 
+def _vllm_tool_calling_contract(unit_text: str) -> dict[str, Any]:
+    """Verify that the installed VLM unit accepts OpenAI native tool calls."""
+    exec_lines = [
+        line.strip()
+        for line in str(unit_text or "").splitlines()
+        if line.strip().startswith("ExecStart=") and "vllm" in line
+    ]
+    command = exec_lines[-1] if exec_lines else ""
+    auto_choice = "--enable-auto-tool-choice" in command
+    parser_match = command.split("--tool-call-parser", 1)
+    parser = ""
+    if len(parser_match) == 2:
+        parser = parser_match[1].strip().split(None, 1)[0] if parser_match[1].strip() else ""
+    return {
+        "ok": bool(command and auto_choice and parser),
+        "unit_exec_start_present": bool(command),
+        "auto_tool_choice": auto_choice,
+        "tool_call_parser": parser or None,
+    }
+
+
 def _command(argv: tuple[str, ...], timeout: int = 15) -> dict[str, Any]:
     try:
         result = subprocess.run(
@@ -115,6 +136,15 @@ def _service_status(service: str) -> dict[str, Any]:
         and result["properties"].get("ActiveState") == "active"
     )
     return result
+
+
+def _vllm_runtime_contract() -> dict[str, Any]:
+    result = _command(("systemctl", "cat", "eva-vllm.service", "--no-pager"))
+    contract = _vllm_tool_calling_contract(str(result.get("output") or ""))
+    if not result.get("ok"):
+        contract["unit_read_error"] = result.get("error") or result.get("returncode")
+        contract["ok"] = False
+    return contract
 
 
 def _safe_state(path: Path) -> dict[str, Any]:
@@ -249,6 +279,9 @@ def collect(env_file: Path, state_file: Path) -> dict[str, Any]:
         },
         "schema": schema,
         "services": {service: _service_status(service) for service in SERVICES},
+        "runtime_contracts": {
+            "vlm_native_tool_calling": _vllm_runtime_contract(),
+        },
         "endpoints": endpoints,
     }
 
@@ -269,6 +302,7 @@ def main(argv: list[str] | None = None) -> int:
     core_ready = bool(
         report["configuration"]["valid"]
         and report["endpoints"]["eva_ready"].get("ok")
+        and report["runtime_contracts"]["vlm_native_tool_calling"].get("ok")
     )
     return 0 if core_ready else 1
 

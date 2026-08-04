@@ -10243,6 +10243,15 @@ def _seed_turn_tool_context(user_text: Any) -> Dict[str, Any]:
         else:
             context["incident_operation"] = "get"
     if "deployment" in context["tool_intents"]:
+        context["deployment_profile"] = (
+            "maritime"
+            if re.search(
+                r"\b(?:maritime|port|coast|coastline|sea[ -]?gate|fairway)\b|"
+                r"порт|морск|берегов|побереж|фарватер",
+                normalized_unicode,
+            )
+            else "general"
+        )
         context["deployment_survey_only"] = bool(
             re.search(
                 r"\bsurvey[\s-]*only\b|только\s+обзор|только\s+осмотр",
@@ -10282,6 +10291,26 @@ def _inherit_followup_tool_context(
     history: Sequence[Mapping[str, Any]],
 ) -> Dict[str, Any]:
     """Carry the last operator intent into terse continuations and time choices."""
+
+    deployment = _latest_deployment_context(history)
+    if deployment and _looks_like_deployment_followup(user_text):
+        # Protocol Deploy is a durable, phase-bound workflow.  Keep its compact
+        # server-owned state authoritative across turns so a small local head
+        # cannot reinterpret a channel selection as generic video research.
+        context["tool_intents"] = ["deployment"]
+        context.update(deployment)
+        selected = _deployment_channel_selection(
+            user_text,
+            deployment.get("deployment_available_channel_ids") or (),
+        )
+        if selected:
+            context["deployment_selected_channel_ids"] = selected
+            context["deployment_groups"] = _deployment_groups_from_text(
+                user_text,
+                selected,
+            )
+        context["inherited_operator_intent"] = True
+        return context
 
     if context.get("tool_intents"):
         return context
@@ -10330,6 +10359,122 @@ def _inherit_followup_tool_context(
         if prior_user_messages >= 4:
             break
     return context
+
+
+_DEPLOYMENT_TOOL_NAMES = frozenset(
+    {
+        "start_deployment",
+        "configure_deployment",
+        "survey_deployment",
+        "apply_deployment_plan",
+        "get_deployment_status",
+    }
+)
+
+
+def _tool_result_payload(message: Mapping[str, Any]) -> Optional[Dict[str, Any]]:
+    raw = message.get("tool_result")
+    if raw in (None, ""):
+        raw = message.get("content")
+    if isinstance(raw, Mapping):
+        return dict(raw)
+    if not isinstance(raw, str) or not raw.strip():
+        return None
+    try:
+        payload = json.loads(raw)
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return None
+    return dict(payload) if isinstance(payload, Mapping) else None
+
+
+def _latest_deployment_context(
+    history: Sequence[Mapping[str, Any]],
+) -> Optional[Dict[str, Any]]:
+    for message in reversed(list(history)):
+        if not isinstance(message, Mapping):
+            continue
+        tool_name = str(message.get("tool_name") or message.get("name") or "")
+        if tool_name not in _DEPLOYMENT_TOOL_NAMES:
+            continue
+        payload = _tool_result_payload(message)
+        if not payload or payload.get("error"):
+            continue
+        deployment_id = str(payload.get("deployment_id") or "").strip()
+        stage = str(payload.get("stage") or "").strip()
+        if not deployment_id or stage in {"applied", "cancelled", "failed"}:
+            return None
+        available = [
+            int(item.get("id"))
+            for item in (payload.get("available_channels") or [])
+            if isinstance(item, Mapping) and _opt_int(item.get("id")) is not None
+        ]
+        selected = [
+            int(item)
+            for item in (payload.get("selected_channel_ids") or [])
+            if _opt_int(item) is not None
+        ]
+        return {
+            "deployment_id": deployment_id,
+            "deployment_stage": stage,
+            "deployment_available_channel_ids": available,
+            "deployment_selected_channel_ids": selected,
+            "deployment_groups": copy.deepcopy(payload.get("groups") or []),
+        }
+    return None
+
+
+def _looks_like_deployment_followup(user_text: Any) -> bool:
+    text = unicodedata.normalize("NFKC", str(user_text or "")).casefold()
+    return bool(
+        operator_requests_continuation(text)
+        or re.search(
+            r"\b(?:deploy(?:ment)?|select|choose|channel|group|survey|baseline|"
+            r"routine|alert|severity|novelty|quiet\s+window|start\s+live|preview|apply)\b|"
+            r"депло|выбер|канал|групп|обзор|сцен|рутин|алерт|тревог|тих\w*\s+окн|примен",
+            text,
+        )
+    )
+
+
+def _deployment_channel_selection(
+    user_text: Any,
+    available_channel_ids: Sequence[Any],
+) -> List[int]:
+    allowed = {
+        int(item)
+        for item in available_channel_ids
+        if _opt_int(item) is not None
+    }
+    if not allowed:
+        return []
+    mentioned = [
+        int(item)
+        for item in re.findall(r"(?<![\w.])#?(\d{1,9})(?![\w.])", str(user_text or ""))
+    ]
+    return list(dict.fromkeys(item for item in mentioned if item in allowed))[:8]
+
+
+def _deployment_groups_from_text(
+    user_text: Any,
+    selected_channel_ids: Sequence[int],
+) -> List[Dict[str, Any]]:
+    selected = {int(item) for item in selected_channel_ids}
+    grouped: Dict[str, List[int]] = {}
+    for match in re.finditer(
+        r"\bchannel\s*#?(\d{1,9})\s+(?:as|in|into)\s+([\w-]{1,80})",
+        str(user_text or ""),
+        flags=re.IGNORECASE,
+    ):
+        channel_id = int(match.group(1))
+        if channel_id not in selected:
+            continue
+        name = match.group(2).strip("_- ")
+        if name:
+            grouped.setdefault(name, []).append(channel_id)
+    return [
+        {"name": name, "channel_ids": list(dict.fromkeys(channel_ids))}
+        for name, channel_ids in grouped.items()
+    ][:8]
 
 
 def _tool_schema_names(schemas: Sequence[Mapping[str, Any]]) -> set[str]:
@@ -10477,6 +10622,52 @@ def _required_bounded_workflow_tool_call(
             },
         )
 
+    if "deployment" in intents:
+        deployment_id = str(context.get("deployment_id") or "").strip()
+        stage = str(context.get("deployment_stage") or "").strip()
+        selected_channel_ids = [
+            int(item)
+            for item in (context.get("deployment_selected_channel_ids") or [])
+            if _opt_int(item) is not None
+        ][:8]
+        if not deployment_id and "start_deployment" in available:
+            return _ToolCall(
+                id=f"required-deploy-start-{uuid.uuid4().hex[:12]}",
+                name="start_deployment",
+                args={
+                    "target_channel_count": 8,
+                    "resume_latest": True,
+                    "deployment_profile": str(
+                        context.get("deployment_profile") or "general"
+                    ),
+                },
+            )
+        if (
+            deployment_id
+            and stage in {"", "inventory"}
+            and selected_channel_ids
+            and "configure_deployment" in available
+        ):
+            return _ToolCall(
+                id=f"required-deploy-configure-{uuid.uuid4().hex[:12]}",
+                name="configure_deployment",
+                args={
+                    "deployment_id": deployment_id,
+                    "channel_ids": selected_channel_ids,
+                    "groups": copy.deepcopy(context.get("deployment_groups") or []),
+                },
+            )
+        if (
+            deployment_id
+            and stage == "scope_configured"
+            and "survey_deployment" in available
+        ):
+            return _ToolCall(
+                id=f"required-deploy-survey-{uuid.uuid4().hex[:12]}",
+                name="survey_deployment",
+                args={"deployment_id": deployment_id, "fast_mode": False},
+            )
+
     if (
         "deployment" in intents
         and context.get("deployment_survey_only")
@@ -10524,6 +10715,12 @@ def _bounded_workflow_plan_completed(context: Mapping[str, Any]) -> bool:
         context.get("incident_draft_completed")
         or context.get("counted_state_completed")
         or context.get("deployment_survey_completed")
+        or (
+            "deployment" in (context.get("tool_intents") or ())
+            and context.get("deployment_id")
+            and str(context.get("deployment_stage") or "") == "inventory"
+            and not context.get("deployment_selected_channel_ids")
+        )
         or (
             "archive_research" in (context.get("tool_intents") or ())
             and context.get("archive_search_completed")
@@ -10897,6 +11094,21 @@ def _remember_turn_tool_result(tool_name: str, result: Any, context: Dict[str, A
         stage = str(result.get("stage") or "").strip()
         if stage:
             context["deployment_stage"] = stage
+        available_channel_ids = [
+            int(item.get("id"))
+            for item in (result.get("available_channels") or [])
+            if isinstance(item, Mapping) and _opt_int(item.get("id")) is not None
+        ]
+        if available_channel_ids:
+            context["deployment_available_channel_ids"] = available_channel_ids
+        if result.get("selected_channel_ids") is not None:
+            context["deployment_selected_channel_ids"] = [
+                int(item)
+                for item in (result.get("selected_channel_ids") or [])
+                if _opt_int(item) is not None
+            ]
+        if result.get("groups") is not None:
+            context["deployment_groups"] = copy.deepcopy(result.get("groups") or [])
         if tool_name == "survey_deployment" and result.get("survey_count") is not None:
             context["deployment_survey_completed"] = True
         return

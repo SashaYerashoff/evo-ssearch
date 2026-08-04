@@ -398,6 +398,69 @@ class AgentToolLoopTests(unittest.TestCase):
         self.assertIn("video_research", continued["tool_intents"])
         self.assertEqual(continued["operator_relative_range"], "last 24 hours")
 
+    def test_protocol_deploy_rehydrates_scope_selection_from_tool_history(self):
+        start_result = {
+            "deployment_id": "deploy-home-1",
+            "stage": "inventory",
+            "available_channels": [
+                {"id": 106, "title": "pixel9a"},
+                {"id": 112, "title": "Zenbook webcam"},
+                {"id": 118, "title": "emu-1"},
+            ],
+            "selected_channel_ids": [],
+            "groups": [],
+        }
+        text = (
+            "Select channels 112 and 118. Group channel 112 as home_workspace "
+            "and channel 118 as traffic_simulation. This rehearses an 8-channel deployment."
+        )
+        context = agent._inherit_followup_tool_context(
+            _seed_turn_tool_context(text),
+            text,
+            [
+                {
+                    "role": "tool",
+                    "tool_name": "start_deployment",
+                    "tool_result": json.dumps(start_result),
+                }
+            ],
+        )
+
+        self.assertEqual(context["tool_intents"], ["deployment"])
+        self.assertEqual(context["deployment_id"], "deploy-home-1")
+        self.assertEqual(context["deployment_stage"], "inventory")
+        self.assertEqual(context["deployment_selected_channel_ids"], [112, 118])
+        self.assertEqual(
+            context["deployment_groups"],
+            [
+                {"name": "home_workspace", "channel_ids": [112]},
+                {"name": "traffic_simulation", "channel_ids": [118]},
+            ],
+        )
+
+        schemas = _select_relevant_tool_schemas(agent._TOOL_SCHEMAS, context)
+        call = agent._required_bounded_workflow_tool_call(context, schemas)
+        self.assertEqual(call.name, "configure_deployment")
+        self.assertEqual(call.args["channel_ids"], [112, 118])
+        self.assertEqual(call.args["groups"], context["deployment_groups"])
+
+        context["deployment_stage"] = "scope_configured"
+        call = agent._required_bounded_workflow_tool_call(context, schemas)
+        self.assertEqual(call.name, "survey_deployment")
+
+    def test_protocol_deploy_inventory_turn_stops_for_operator_scope(self):
+        context = _seed_turn_tool_context("Protocol Deploy, target 8 channels")
+        context.update(
+            {
+                "deployment_id": "deploy-home-1",
+                "deployment_stage": "inventory",
+                "deployment_available_channel_ids": [112, 118],
+                "deployment_selected_channel_ids": [],
+            }
+        )
+
+        self.assertTrue(agent._bounded_workflow_plan_completed(context))
+
     def test_video_period_research_executes_required_reads_before_model_narrative(self):
         class ResearchTools(_FakeTools):
             def execute(self, name, args, progress_cb=None):

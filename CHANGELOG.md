@@ -6,6 +6,12 @@ Format loosely follows Keep a Changelog.
 
 ## Unreleased
 
+- **Reliable Protocol Deploy on 4B heads:** active deployment drafts are now
+  rehydrated from compact trusted tool receipts across chat turns. Operator
+  channel/group selections deterministically advance through scope
+  configuration and the bounded scene survey instead of being misrouted into
+  generic L1/L2 research. Appliance Doctor also fails readiness when an
+  installed vLLM unit lacks native tool-choice/parser flags.
 - **Operator-mode boundary:** `Operator OFF` now suppresses all agent-chat
   console-driving effects server-side, with a React-side mixed-version guard.
   Read-only research and chat answers remain available; explicit operator Apply
