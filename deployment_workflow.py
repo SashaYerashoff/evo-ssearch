@@ -457,6 +457,7 @@ def _next_action(state: Mapping[str, Any]) -> str:
         "inventory": "configure_scope",
         "scope_configured": "survey",
         "surveyed": "collect_requirements",
+        "requirements_partial": "collect_requirements",
         "requirements_configured": "preview_plan",
         "plan_ready": "apply_in_ui",
         "applied": "wait_for_commissioning",
@@ -473,6 +474,20 @@ def compact_deployment_state(state: Mapping[str, Any]) -> Dict[str, Any]:
         if isinstance(state.get("commissioning"), Mapping)
         else {}
     )
+    selected_channel_ids = [
+        int(item) for item in (state.get("selected_channel_ids") or [])
+    ]
+    covered_requirement_ids = {
+        int(channel_id)
+        for pack in (state.get("requirements") or [])
+        if isinstance(pack, Mapping)
+        for channel_id in (pack.get("channel_ids") or [])
+    }
+    missing_requirement_ids = [
+        channel_id
+        for channel_id in selected_channel_ids
+        if channel_id not in covered_requirement_ids
+    ]
     return {
         "deployment_id": state.get("deployment_id"),
         "version": state.get("version"),
@@ -492,6 +507,7 @@ def compact_deployment_state(state: Mapping[str, Any]) -> Dict[str, Any]:
             if isinstance(row, Mapping) and row.get("channel_id") is not None
         ],
         "requirement_pack_count": len(state.get("requirements") or []),
+        "missing_requirement_channel_ids": missing_requirement_ids,
         "requirement_warnings": list(state.get("requirement_warnings") or [])[:8],
         "quiet_window": copy.deepcopy(state.get("quiet_window")),
         "plan_summary": {
@@ -755,16 +771,49 @@ class ProtocolDeploymentStore:
                 requirements,
                 selected_channel_ids=selected,
             )
-            (
-                state["requirements"],
-                state["requirement_warnings"],
-            ) = _dedupe_requirement_packs(normalized_requirements)
-            state["plan"] = None
-            state["stage"] = (
-                "requirements_configured"
-                if state["requirements"]
-                else "surveyed"
+            normalized_requirements, warnings = _dedupe_requirement_packs(
+                normalized_requirements
             )
+            if (
+                str(state.get("stage") or "") == "requirements_partial"
+                and state.get("requirements")
+            ):
+                touched_channel_ids = {
+                    int(channel_id)
+                    for pack in normalized_requirements
+                    for channel_id in (pack.get("channel_ids") or [])
+                }
+                retained_requirements = [
+                    copy.deepcopy(dict(pack))
+                    for pack in (state.get("requirements") or [])
+                    if isinstance(pack, Mapping)
+                    and not (
+                        touched_channel_ids
+                        & {
+                            int(channel_id)
+                            for channel_id in (pack.get("channel_ids") or [])
+                        }
+                    )
+                ]
+                normalized_requirements, merge_warnings = _dedupe_requirement_packs(
+                    retained_requirements + normalized_requirements
+                )
+                warnings = list(state.get("requirement_warnings") or []) + warnings + merge_warnings
+            state["requirements"] = normalized_requirements
+            state["requirement_warnings"] = list(dict.fromkeys(warnings))[:16]
+            state["plan"] = None
+            covered = {
+                int(channel_id)
+                for pack in state["requirements"]
+                for channel_id in (pack.get("channel_ids") or [])
+            }
+            missing = [channel_id for channel_id in selected if channel_id not in covered]
+            if state["requirements"] and not missing:
+                state["stage"] = "requirements_configured"
+            elif state["requirements"]:
+                state["stage"] = "requirements_partial"
+            else:
+                state["stage"] = "surveyed"
         if quiet_window is not None:
             state["quiet_window"] = _normalize_quiet_window(quiet_window)
             state["plan"] = None
@@ -845,6 +894,22 @@ class ProtocolDeploymentStore:
         if not requirements:
             raise DeploymentWorkflowError(
                 "collect operator alert/routine requirements before preview"
+            )
+        covered_requirement_ids = {
+            int(channel_id)
+            for pack in requirements
+            if isinstance(pack, Mapping)
+            for channel_id in (pack.get("channel_ids") or [])
+        }
+        missing_requirement_ids = [
+            channel_id
+            for channel_id in selected
+            if channel_id not in covered_requirement_ids
+        ]
+        if missing_requirement_ids:
+            raise DeploymentWorkflowError(
+                "collect requirements for every selected channel before preview: "
+                + ", ".join(str(item) for item in missing_requirement_ids)
             )
         requirement_by_channel: Dict[int, List[Dict[str, Any]]] = {
             channel_id: [] for channel_id in selected

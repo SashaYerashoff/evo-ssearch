@@ -5295,6 +5295,11 @@ class AgentTools:
                 "requirements_configured": (
                     "Call apply_deployment_plan with preview=true."
                 ),
+                "requirements_partial": (
+                    "Do not preview yet. Ask only for the channels listed in "
+                    "missing_requirement_channel_ids, then call configure_deployment "
+                    "again; saved channel requirements remain durable."
+                ),
             }.get(str(state.get("stage") or ""), "Continue from next_action."),
         }
 
@@ -10440,6 +10445,11 @@ def _deployment_context_from_payload(
         "deployment_available_channel_ids": available,
         "deployment_selected_channel_ids": selected,
         "deployment_groups": copy.deepcopy(payload.get("groups") or []),
+        "deployment_missing_requirement_channel_ids": [
+            int(item)
+            for item in (payload.get("missing_requirement_channel_ids") or [])
+            if _opt_int(item) is not None
+        ],
     }
 
 
@@ -10485,7 +10495,8 @@ def _trusted_deployment_state_message(state: Mapping[str, Any]) -> str:
         "Trusted Protocol Deploy durable state (server-owned; never invent or replace "
         "deployment_id, stage, channel IDs, groups, or survey evidence):\n"
         + json.dumps(receipt, ensure_ascii=False, separators=(",", ":"), default=str)
-        + "\nAt stage surveyed, do not repeat inventory, scope configuration, or survey. "
+        + "\nAt stage surveyed or requirements_partial, do not repeat inventory, "
+        "scope configuration, or survey. "
         + group_guard
         + " If the operator has not supplied policy requirements, ask for expected routine, "
         "visible alert conditions and severity, novelty response, optional counters/dwell "
@@ -10802,6 +10813,7 @@ def _bounded_workflow_plan_completed(context: Mapping[str, Any]) -> bool:
         or context.get("counted_state_completed")
         or context.get("deployment_survey_completed")
         or context.get("deployment_requirements_pending")
+        or context.get("deployment_requirements_partial")
         or context.get("deployment_preview_completed")
         or (
             "deployment" in (context.get("tool_intents") or ())
@@ -10984,7 +10996,12 @@ def _apply_turn_tool_context(tool_name: str, args: Dict[str, Any], context: Dict
         if (
             tool_name == "configure_deployment"
             and str(context.get("deployment_stage") or "")
-            in {"surveyed", "requirements_configured", "plan_ready"}
+            in {
+                "surveyed",
+                "requirements_partial",
+                "requirements_configured",
+                "plan_ready",
+            }
         ):
             # Resending channel_ids calls the workflow's scope-reset path and
             # clears completed surveys.  Requirements turns may only change
@@ -11220,6 +11237,12 @@ def _remember_turn_tool_result(tool_name: str, result: Any, context: Dict[str, A
             context["deployment_requirement_warnings"] = list(
                 result.get("requirement_warnings") or []
             )[:8]
+        if result.get("missing_requirement_channel_ids") is not None:
+            context["deployment_missing_requirement_channel_ids"] = [
+                int(item)
+                for item in (result.get("missing_requirement_channel_ids") or [])
+                if _opt_int(item) is not None
+            ]
         if tool_name == "survey_deployment" and result.get("survey_count") is not None:
             context["deployment_survey_completed"] = True
         if (
@@ -11228,9 +11251,22 @@ def _remember_turn_tool_result(tool_name: str, result: Any, context: Dict[str, A
         ):
             context.pop("deployment_requirements_supplied", None)
             context["deployment_preview_pending"] = True
+        elif (
+            tool_name == "configure_deployment"
+            and str(result.get("stage") or "") == "requirements_partial"
+        ):
+            context.pop("deployment_requirements_supplied", None)
+            context["deployment_requirements_partial"] = True
         if tool_name == "apply_deployment_plan" and result.get("status") == "preview":
             context.pop("deployment_preview_pending", None)
             context["deployment_preview_completed"] = True
+            context["deployment_preview_receipt"] = {
+                "status": "preview",
+                "deployment_id": result.get("deployment_id"),
+                "stage": result.get("stage"),
+                "diff": copy.deepcopy(result.get("diff") or {}),
+                "operator_action": result.get("operator_action"),
+            }
         return
 
     if tool_name == "normalize_time_window":
@@ -12345,6 +12381,49 @@ def _format_archive_research_fallback(
     return "\n".join(lines)
 
 
+def _format_deployment_preview_receipt(context: Mapping[str, Any]) -> str:
+    """Render the trusted preview result without asking the 4B head to restate it."""
+
+    receipt = (
+        context.get("deployment_preview_receipt")
+        if isinstance(context.get("deployment_preview_receipt"), Mapping)
+        else {}
+    )
+    diff = receipt.get("diff") if isinstance(receipt.get("diff"), Mapping) else {}
+    deployment_id = str(
+        receipt.get("deployment_id") or context.get("deployment_id") or "unknown"
+    )
+    channel_ids = [int(item) for item in (diff.get("channel_ids") or [])]
+    lines = [
+        "Protocol Deploy preview generated — not applied.",
+        f"- Deployment ID: `{deployment_id}`",
+        f"- Selected channels: {channel_ids}",
+        f"- Channel groups: {int(diff.get('channel_group_count') or 0)}",
+        f"- Channel policy documents: {int(diff.get('alert_policy_count') or 0)}",
+        f"- Attention probes: {int(diff.get('probe_count') or 0)}",
+        f"- Counted-state profiles: {int(diff.get('counted_state_count') or 0)}",
+        f"- Start live after Apply: {'yes' if diff.get('start_live') else 'no'}",
+    ]
+    quiet_window = diff.get("quiet_window")
+    if isinstance(quiet_window, Mapping) and quiet_window.get("enabled"):
+        lines.append(
+            "- Preemptible consolidation window: "
+            f"{quiet_window.get('start_local')}–{quiet_window.get('end_local')} "
+            f"({quiet_window.get('timezone')})"
+        )
+    warnings = list(context.get("deployment_requirement_warnings") or [])
+    if warnings:
+        lines.append("- Draft warnings:")
+        lines.extend(f"  - {str(item)}" for item in warnings[:8])
+    lines.extend(
+        [
+            "- Survey fingerprints are sparse samples, not proof of continuous coverage or absence of gaps.",
+            "Review the preview details, then use the trusted UI Apply action if the counts and per-channel policies are correct. Until Apply, live settings and commissioning are unchanged.",
+        ]
+    )
+    return "\n".join(lines)
+
+
 def _format_completion_fallback(
     ledger: Mapping[str, Any],
     *,
@@ -12813,7 +12892,8 @@ class AgentRunner:
                             selected,
                         )
                     if (
-                        str(durable_context.get("deployment_stage") or "") == "surveyed"
+                        str(durable_context.get("deployment_stage") or "")
+                        in {"surveyed", "requirements_partial"}
                         and _operator_supplies_deployment_requirements(user_text)
                     ):
                         turn_tool_context["deployment_requirements_supplied"] = True
@@ -12821,6 +12901,11 @@ class AgentRunner:
                         str(durable_context.get("deployment_stage") or "") == "surveyed"
                     ):
                         turn_tool_context["deployment_requirements_pending"] = True
+                    elif (
+                        str(durable_context.get("deployment_stage") or "")
+                        == "requirements_partial"
+                    ):
+                        turn_tool_context["deployment_requirements_partial"] = True
             else:
                 trusted_deployment_state = None
         else:
@@ -13067,6 +13152,21 @@ class AgentRunner:
                         "operator to recreate them. Use the exact trusted deployment_id; never "
                         "invent one. Treat survey fingerprints as sparse samples and do not "
                         "claim continuous coverage or absence of gaps."
+                    )
+                elif turn_tool_context.get("deployment_requirements_partial"):
+                    missing_ids = list(
+                        turn_tool_context.get(
+                            "deployment_missing_requirement_channel_ids"
+                        )
+                        or []
+                    )
+                    completion_instruction = (
+                        "Protocol Deploy saved a partial requirements draft and did NOT "
+                        "generate or apply a preview. State which channel requirements were "
+                        "saved, then ask only for the missing selected channel IDs: "
+                        + json.dumps(missing_ids)
+                        + ". Preserve existing groups and saved requirements. Do not claim "
+                        "coverage, readiness, preview completion, or live changes."
                     )
                 elif turn_tool_context.get("deployment_preview_completed"):
                     warnings = list(
@@ -13512,9 +13612,16 @@ class AgentRunner:
                 **final_compaction,
             })
 
-        full_text_parts: List[str] = []
+        deterministic_final_text = (
+            _format_deployment_preview_receipt(turn_tool_context)
+            if turn_tool_context.get("deployment_preview_completed")
+            else None
+        )
+        full_text_parts: List[str] = (
+            [deterministic_final_text] if deterministic_final_text else []
+        )
         final_transport_error: Optional[Exception] = None
-        for stream_attempt in range(2):
+        for stream_attempt in range(0 if deterministic_final_text else 2):
             stream_cancel_event = threading.Event()
             try:
                 for stream_kind, stream_value in _stream_items_with_heartbeats(

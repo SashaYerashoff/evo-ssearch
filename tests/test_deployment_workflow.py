@@ -7,6 +7,7 @@ from deployment_workflow import (
     DeploymentWorkflowError,
     ProtocolDeploymentStore,
     aggregate_counted_state_metric,
+    compact_deployment_state,
 )
 
 
@@ -328,6 +329,38 @@ def test_protocol_deploy_drops_overlapping_duplicate_requirement_pack():
     assert "quiet window is a separate field" in configured["requirement_warnings"][0]
 
 
+def test_protocol_deploy_merges_partial_channel_requirements_before_preview():
+    store = ProtocolDeploymentStore()
+    deployment_id = _configured_state(store)
+    partial = store.configure(
+        deployment_id,
+        requirements=[
+            {"name": "Gate", "channel_ids": [11], "alerts": []}
+        ],
+    )
+    compact_partial = compact_deployment_state(partial)
+    assert partial["stage"] == "requirements_partial"
+    assert compact_partial["missing_requirement_channel_ids"] == [12]
+    with pytest.raises(DeploymentWorkflowError, match="every selected channel"):
+        store.build_plan(deployment_id)
+
+    complete = store.configure(
+        deployment_id,
+        requirements=[
+            {"name": "Desk", "channel_ids": [12], "alerts": []}
+        ],
+    )
+    assert complete["stage"] == "requirements_configured"
+    assert [pack["channel_ids"] for pack in complete["requirements"]] == [
+        [11],
+        [12],
+    ]
+    assert complete["groups"] == [
+        {"name": "Perimeter", "channel_ids": [11]},
+        {"name": "Operations", "channel_ids": [12]},
+    ]
+
+
 def test_maritime_deploy_builds_ptz_prompts_and_shadow_starter_probes():
     store = ProtocolDeploymentStore()
     state = store.start(
@@ -485,8 +518,8 @@ def test_composite_apply_is_idempotent_and_preserves_existing_alert_policy(monke
     deployment_store.configure(
         deployment_id,
         requirements=[
-            {
-                "name": "Gate",
+                {
+                    "name": "Gate",
                 "channel_ids": [11],
                 "unexpected_severity": "normal",
                 "novelty_sensitivity": "balanced",
@@ -498,9 +531,15 @@ def test_composite_apply_is_idempotent_and_preserves_existing_alert_policy(monke
                         "positive_query": "person waiting at gate",
                         "contrast_query": "clear unattended gate",
                         "counter_mode": "count_transitions",
-                    }
-                ],
-            }
+                        }
+                    ],
+                },
+                {
+                    "name": "Workstation baseline",
+                    "channel_ids": [12],
+                    "expected_routine": "ordinary workstation activity",
+                    "alerts": [],
+                },
         ],
         quiet_window={
             "enabled": True,
@@ -575,8 +614,8 @@ def test_first_commissioning_pass_runs_l1_and_returns_proposals_only(monkeypatch
     deployment_store.configure(
         deployment_id,
         requirements=[
-            {
-                "name": "Gate",
+                {
+                    "name": "Gate",
                 "channel_ids": [11],
                 "alerts": [
                     {
@@ -585,9 +624,15 @@ def test_first_commissioning_pass_runs_l1_and_returns_proposals_only(monkeypatch
                         "severity": "low",
                         "positive_query": "person waiting at gate",
                         "contrast_query": "clear unattended gate",
-                    }
-                ],
-            }
+                        }
+                    ],
+                },
+                {
+                    "name": "Workstation baseline",
+                    "channel_ids": [12],
+                    "expected_routine": "ordinary workstation activity",
+                    "alerts": [],
+                },
         ],
     )
     deployment_store.build_plan(deployment_id)

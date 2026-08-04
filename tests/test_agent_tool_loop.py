@@ -592,6 +592,26 @@ class AgentToolLoopTests(unittest.TestCase):
             result_context,
         )
         self.assertTrue(result_context["deployment_preview_completed"])
+        receipt_text = agent._format_deployment_preview_receipt(
+            {
+                **result_context,
+                "deployment_preview_receipt": {
+                    "deployment_id": "deploy-home-1",
+                    "diff": {
+                        "channel_ids": [112, 118],
+                        "channel_group_count": 2,
+                        "alert_policy_count": 2,
+                        "probe_count": 4,
+                        "counted_state_count": 2,
+                        "start_live": False,
+                    },
+                },
+            }
+        )
+        self.assertIn("preview generated — not applied", receipt_text)
+        self.assertIn("Attention probes: 4", receipt_text)
+        self.assertIn("Counted-state profiles: 2", receipt_text)
+        self.assertIn("live settings and commissioning are unchanged", receipt_text)
 
     def test_protocol_deploy_runner_rehydrates_durable_state_when_history_omits_tools(self):
         state = {
