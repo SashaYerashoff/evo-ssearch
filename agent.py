@@ -10282,6 +10282,9 @@ def _seed_turn_tool_context(user_text: Any) -> Dict[str, Any]:
                 normalized_unicode,
             )
         )
+        explicit_alert_names = _deployment_explicit_alert_names(routing_text)
+        if explicit_alert_names:
+            context["deployment_explicit_alert_names"] = explicit_alert_names
     user_text_value = routing_text.strip()
     if context.get("vlm_alert_policy_request"):
         context["vlm_alert_criterion"] = _extract_vlm_alert_criterion(user_text_value)
@@ -10466,6 +10469,22 @@ def _operator_supplies_deployment_requirements(user_text: Any) -> bool:
         r"тих\w*\s+окн|консолидац|с\s+\d{1,2}(?::\d{2})?\s+до\s+\d{1,2}",
     )
     return sum(bool(re.search(pattern, text)) for pattern in categories) >= 2
+
+
+def _deployment_explicit_alert_names(user_text: Any) -> List[str]:
+    """Extract operator-authored quoted Rule/Alert names for an allowlist."""
+
+    text = unicodedata.normalize("NFKC", str(user_text or ""))
+    names: List[str] = []
+    for match in re.finditer(
+        r"\b(?:rule|alert)\s*(?:\d+\s*)?(?:named\s*)?[:=]?\s*[\"“]([^\"”]{1,100})[\"”]",
+        text,
+        flags=re.IGNORECASE,
+    ):
+        name = " ".join(str(match.group(1) or "").split())
+        if name and name.casefold() not in {item.casefold() for item in names}:
+            names.append(name)
+    return names[:16]
 
 
 def _trusted_deployment_state_message(state: Mapping[str, Any]) -> str:
@@ -11017,6 +11036,31 @@ def _apply_turn_tool_context(tool_name: str, args: Dict[str, Any], context: Dict
             # general-purpose heads sometimes invent them from traffic words.
             prepared.pop("channel_roles", None)
             prepared.pop("starter_policy_mode", None)
+        explicit_alert_names = {
+            str(item).strip().casefold()
+            for item in (context.get("deployment_explicit_alert_names") or [])
+            if str(item).strip()
+        }
+        if (
+            tool_name == "configure_deployment"
+            and explicit_alert_names
+            and isinstance(prepared.get("requirements"), list)
+        ):
+            filtered_requirements: List[Dict[str, Any]] = []
+            for raw_pack in prepared.get("requirements") or []:
+                if not isinstance(raw_pack, Mapping):
+                    continue
+                pack = copy.deepcopy(dict(raw_pack))
+                pack["alerts"] = [
+                    copy.deepcopy(dict(alert))
+                    for alert in (pack.get("alerts") or [])
+                    if isinstance(alert, Mapping)
+                    and str(alert.get("name") or "").strip().casefold()
+                    in explicit_alert_names
+                ]
+                if pack["alerts"]:
+                    filtered_requirements.append(pack)
+            prepared["requirements"] = filtered_requirements
         if tool_name == "apply_deployment_plan":
             prepared["preview"] = True
     operator_relative_range = str(context.get("operator_relative_range") or "").strip()

@@ -382,13 +382,26 @@ def _merge_requirement_corrections(
         update = copy.deepcopy(dict(raw_update))
         update_scope = tuple(sorted(int(item) for item in update.get("channel_ids") or []))
         update_name = str(update.get("name") or "").strip().casefold()
+        update_alert_names = {
+            str(alert.get("name") or "").strip().casefold()
+            for alert in (update.get("alerts") or [])
+            if isinstance(alert, Mapping)
+        }
         match_index: Optional[int] = None
         for index, current in enumerate(merged):
             current_scope = tuple(
                 sorted(int(item) for item in current.get("channel_ids") or [])
             )
             current_name = str(current.get("name") or "").strip().casefold()
-            if current_scope == update_scope and current_name == update_name:
+            current_alert_names = {
+                str(alert.get("name") or "").strip().casefold()
+                for alert in (current.get("alerts") or [])
+                if isinstance(alert, Mapping)
+            }
+            if current_scope == update_scope and (
+                current_name == update_name
+                or bool(current_alert_names & update_alert_names)
+            ):
                 match_index = index
                 break
         if match_index is None:

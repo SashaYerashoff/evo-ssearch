@@ -544,6 +544,42 @@ class AgentToolLoopTests(unittest.TestCase):
         self.assertNotIn("starter_policy_mode", general_prepared)
         self.assertEqual(general_prepared["deployment_id"], "deploy-home-1")
 
+        explicit_names = agent._deployment_explicit_alert_names(
+            'Alert 1 "Vehicle-person collision" and Alert named “Blocked intersection”'
+        )
+        self.assertEqual(
+            explicit_names,
+            ["Vehicle-person collision", "Blocked intersection"],
+        )
+        allowlisted = _apply_turn_tool_context(
+            "configure_deployment",
+            {
+                "deployment_id": "invented",
+                "requirements": [
+                    {
+                        "name": "traffic",
+                        "channel_ids": [118],
+                        "alerts": [
+                            {"name": "Blocked intersection"},
+                            {"name": "Pedestrian loitering"},
+                        ],
+                    }
+                ],
+            },
+            {
+                **context,
+                "deployment_profile": "general",
+                "deployment_explicit_alert_names": ["Blocked intersection"],
+            },
+        )
+        self.assertEqual(
+            [
+                alert["name"]
+                for alert in allowlisted["requirements"][0]["alerts"]
+            ],
+            ["Blocked intersection"],
+        )
+
         self.assertFalse(
             agent._operator_supplies_deployment_requirements("continue")
         )

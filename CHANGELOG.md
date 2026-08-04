@@ -27,7 +27,8 @@ Format loosely follows Keep a Changelog.
   prose, and general deployments discard model-invented maritime roles/starter
   policy fields. Operator corrections at `plan_ready` merge alerts by
   channel-pack and alert name, preserving sibling rules before regenerating the
-  preview. Appliance Doctor also
+  preview. Explicit quoted Rule/Alert names form a server-side allowlist, so
+  model-invented sibling policies cannot enter the durable draft. Appliance Doctor also
   fails readiness when an installed vLLM unit lacks native tool-choice/parser
   flags.
 - **Operator-mode boundary:** `Operator OFF` now suppresses all agent-chat
