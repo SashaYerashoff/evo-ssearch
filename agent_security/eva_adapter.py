@@ -7,7 +7,6 @@ from datetime import datetime, timezone
 from typing import Any
 
 from security import Permission
-
 from .audit import ToolAuditEvent
 from .context import ToolExecutionContext
 from .errors import (
@@ -23,6 +22,7 @@ from .policy import RateLimit, ToolPolicy, ToolRisk
 from .registry import ToolRegistry
 
 
+_DEPLOYMENT_SCOPE_GUARD_ONLY = "_eva_deployment_scope_guard_only"
 _TRUE_ARG_STRINGS = frozenset({"1", "true", "yes", "y", "on"})
 _FALSE_ARG_STRINGS = frozenset({"0", "false", "no", "n", "off"})
 
@@ -198,6 +198,12 @@ class EvaAgentToolAdapter:
                 # the model-visible schemas unless channel_ids is a real
                 # configure_deployment input.
                 allowed_arguments.add("channel_ids")
+            if name == "configure_deployment":
+                # Internal marker: channel_ids may be injected only so the
+                # gateway can authorize the durable scope.  The legacy
+                # workflow must not interpret that hidden copy as an operator
+                # request to reset scope and erase groups/surveys.
+                allowed_arguments.add(_DEPLOYMENT_SCOPE_GUARD_ONLY)
             if name == "query_counted_state_metric":
                 # Resolved server-side from the durable metric profile.
                 allowed_arguments.add("channel_id")
@@ -598,9 +604,18 @@ class EvaAgentToolAdapter:
             if callable(set_context):
                 set_context(context)
             try:
+                legacy_arguments = dict(arguments)
+                if (
+                    name == "configure_deployment"
+                    and legacy_arguments.pop(
+                        _DEPLOYMENT_SCOPE_GUARD_ONLY,
+                        False,
+                    )
+                ):
+                    legacy_arguments.pop("channel_ids", None)
                 result = self._legacy_tools.execute(
                     name,
-                    dict(arguments),
+                    legacy_arguments,
                     progress_cb=getattr(self._local, "progress_cb", None),
                 )
                 return self._filter_result(name, result, context)
@@ -725,6 +740,8 @@ class EvaAgentToolAdapter:
             "apply_deployment_plan",
             "get_deployment_status",
         }
+        # Never trust a caller-authored internal marker.
+        prepared.pop(_DEPLOYMENT_SCOPE_GUARD_ONLY, None)
         scoped_channels = self._scoped_channels(context)
         if name == "start_deployment":
             if scoped_channels is not None:
@@ -766,6 +783,8 @@ class EvaAgentToolAdapter:
             # Hidden channel_ids makes the generic gateway enforce every
             # selected channel against the authenticated actor grant.
             prepared["channel_ids"] = selected
+            if name == "configure_deployment" and requested is None:
+                prepared[_DEPLOYMENT_SCOPE_GUARD_ONLY] = True
 
             if name == "apply_deployment_plan":
                 required = {

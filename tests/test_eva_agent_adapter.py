@@ -484,6 +484,33 @@ class EvaAgentToolAdapterTests(unittest.TestCase):
                 self.context,
             )
 
+        scoped = self.legacy._deployment_store.start(
+            [{"id": 7, "title": "Door"}],
+            resume_latest=False,
+        )
+        self.legacy._deployment_store.configure(
+            scoped["deployment_id"],
+            channel_ids=[7],
+            groups=[{"name": "Door group", "channel_ids": [7]}],
+        )
+        self.adapter.execute(
+            "configure_deployment",
+            {
+                "deployment_id": scoped["deployment_id"],
+                "requirements": [
+                    {"name": "Door routine", "channel_ids": [7]}
+                ],
+            },
+            self.context,
+        )
+        _name, forwarded = self.legacy.calls[-1]
+        self.assertNotIn("channel_ids", forwarded)
+        self.assertNotIn("_eva_deployment_scope_guard_only", forwarded)
+        self.assertEqual(
+            forwarded["requirements"][0]["channel_ids"],
+            [7],
+        )
+
     def test_counted_metric_profile_is_channel_scoped(self):
         self.legacy._deployment_store.save_counted_profiles(
             [

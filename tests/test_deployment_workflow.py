@@ -233,6 +233,10 @@ def test_protocol_deploy_builds_bounded_durable_plan():
 
     assert planned["stage"] == "plan_ready"
     assert len(plan["channels"]) == 2
+    assert plan["groups"] == [
+        {"name": "Perimeter", "channel_ids": [11]},
+        {"name": "Operations", "channel_ids": [12]},
+    ]
     assert len(plan["probes"]) == 1
     assert len(plan["counted_states"]) == 1
     assert plan["probes"][0]["metric_profile_id"] == plan["counted_states"][0]["id"]
