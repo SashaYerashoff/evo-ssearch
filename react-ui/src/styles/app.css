@@ -977,6 +977,11 @@
 .ag-approval-status.ok { border-color: rgba(74,222,128,0.5); color: var(--success); }
 .ag-approval .ag-fields { padding: 0 12px 10px; }
 .ag-approval-foot { display: flex; justify-content: flex-end; padding: 0 12px 12px; }
+.ag-deployment-approval { margin: 8px 0; }
+.ag-deployment-channel { margin: 0 12px 8px; border: 1px solid var(--border); border-radius: 8px; background: rgba(0,0,0,.12); }
+.ag-deployment-channel > summary { cursor: pointer; padding: 8px 10px; color: var(--text); font-size: 12px; }
+.ag-deployment-channel > pre { margin: 0; padding: 0 10px 10px; max-height: 180px; overflow: auto; white-space: pre-wrap; overflow-wrap: anywhere; color: var(--text-dim); font: inherit; font-size: 11.5px; }
+.ag-approval-note { padding: 0 12px 10px; color: var(--text-dim); font-size: 11.5px; }
 .ag-tool-table {
   overflow: hidden; border: 1px solid var(--line); border-radius: 8px; background: var(--space-0);
 }

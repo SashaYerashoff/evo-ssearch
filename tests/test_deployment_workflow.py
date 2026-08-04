@@ -284,6 +284,30 @@ def test_protocol_deploy_rejects_more_than_eight_channels_and_bad_duration_state
         )
 
 
+def test_protocol_deploy_target_is_a_cap_and_mismatched_draft_is_not_resumed():
+    runtime = _RuntimeState()
+    store = ProtocolDeploymentStore(runtime)
+    two = store.start(
+        [{"id": index, "title": str(index)} for index in range(1, 6)],
+        target_channel_count=2,
+        resume_latest=False,
+    )
+    store.configure(two["deployment_id"], channel_ids=[1])
+
+    four = store.start(
+        [{"id": index, "title": str(index)} for index in range(1, 6)],
+        target_channel_count=4,
+        resume_latest=True,
+    )
+    assert four["deployment_id"] != two["deployment_id"]
+    assert four["target_channel_count"] == 4
+
+    configured = store.configure(four["deployment_id"], channel_ids=[1, 2])
+    assert configured["selected_channel_ids"] == [1, 2]
+    with pytest.raises(DeploymentWorkflowError, match="at most 4"):
+        store.configure(four["deployment_id"], channel_ids=[1, 2, 3, 4, 5])
+
+
 def test_protocol_deploy_drops_overlapping_duplicate_requirement_pack():
     store = ProtocolDeploymentStore()
     deployment_id = _configured_state(store)

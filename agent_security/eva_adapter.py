@@ -204,6 +204,11 @@ class EvaAgentToolAdapter:
                 # workflow must not interpret that hidden copy as an operator
                 # request to reset scope and erase groups/surveys.
                 allowed_arguments.add(_DEPLOYMENT_SCOPE_GUARD_ONLY)
+            if name == "apply_deployment_plan":
+                # Bound an approved write to the exact preview the operator
+                # inspected. This value is produced by the server, never the
+                # model-visible schema.
+                allowed_arguments.add("expected_plan_digest")
             if name == "query_counted_state_metric":
                 # Resolved server-side from the durable metric profile.
                 allowed_arguments.add("channel_id")
@@ -537,6 +542,13 @@ class EvaAgentToolAdapter:
                     "incident draft preview has no evidence digest"
                 )
             apply_arguments["expected_draft_digest"] = digest
+        if name == "apply_deployment_plan":
+            digest = str(result.get("plan_digest") or "").strip()
+            if not digest:
+                raise InvalidToolArgumentsError(
+                    "deployment preview has no plan digest"
+                )
+            apply_arguments["expected_plan_digest"] = digest
         plan = self.gateway.create_plan(name, apply_arguments, context)
         enriched = dict(result)
         enriched["approval"] = {

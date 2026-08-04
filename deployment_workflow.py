@@ -711,7 +711,15 @@ class ProtocolDeploymentStore:
         target = max(1, min(MAX_DEPLOYMENT_CHANNELS, int(target_channel_count or 8)))
         if resume_latest:
             existing = self.latest_unfinished(profile)
-            if existing is not None:
+            # A target supplied by the operator describes the new scope cap.
+            # Never silently resume a draft that was created for a different
+            # cap: this is especially confusing when a previous two-channel
+            # dry run is followed by a four/eight-channel commissioning run.
+            if (
+                existing is not None
+                and int(existing.get("target_channel_count") or MAX_DEPLOYMENT_CHANNELS)
+                == target
+            ):
                 return existing
         channels: List[Dict[str, Any]] = []
         seen = set()
@@ -772,7 +780,14 @@ class ProtocolDeploymentStore:
         state = self.load(deployment_id)
         selected = list(state.get("selected_channel_ids") or [])
         if channel_ids is not None:
-            selected = _normalize_channel_ids(channel_ids)
+            target = max(
+                1,
+                min(
+                    MAX_DEPLOYMENT_CHANNELS,
+                    int(state.get("target_channel_count") or MAX_DEPLOYMENT_CHANNELS),
+                ),
+            )
+            selected = _normalize_channel_ids(channel_ids, maximum=target)
             available = {
                 int(item.get("id"))
                 for item in (state.get("available_channels") or [])

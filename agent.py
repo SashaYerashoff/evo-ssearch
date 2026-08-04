@@ -15,6 +15,7 @@ from __future__ import annotations
 import base64
 import collections
 import copy
+import hashlib
 import json
 import os
 import queue
@@ -5237,7 +5238,9 @@ class AgentTools:
         return {
             **compact_deployment_state(state),
             "instruction": (
-                "Ask the operator to choose up to 8 channels and optional groups. "
+                "Ask the operator to choose one or more channels, up to the "
+                f"configured cap of {int(state.get('target_channel_count') or 8)}; "
+                "fewer than the cap is valid. Optional groups may be named now. "
                 + (
                     "For every selected maritime channel also ask for role "
                     "maritime_gate, maritime_coast, or maritime_mixed_ptz and an optional location label. "
@@ -5371,9 +5374,11 @@ class AgentTools:
             **compact_deployment_state(state),
             "surveys": surveys,
             "instruction": (
-                "Now ask the operator what is routine, which visible conditions "
-                "should alert on each channel/group, how severe unexpected activity "
-                "is, whether any state needs a counter/dwell metric, and the preferred "
+                "Now show the sampled scene fingerprint and ask the operator which "
+                "default visible alerts (or explicitly none) to install for every "
+                "selected channel/group. Give one compact alert-description example. "
+                "Also ask what is routine, how severe unexpected activity is, whether "
+                "any state needs a counter/dwell metric, and the preferred "
                 "preemptible 9B consolidation window. For a maritime profile, also ask "
                 "whether to include the role-specific starter policies as shadow probes. "
                 "Then call configure_deployment."
@@ -5477,18 +5482,45 @@ class AgentTools:
     def _apply_deployment_plan(self, args: Dict[str, Any]) -> Dict[str, Any]:
         deployment_id = str(args.get("deployment_id") or "").strip()
         preview = bool(args.get("preview", True))
+        expected_plan_digest = str(
+            args.get("expected_plan_digest") or ""
+        ).strip()
         try:
-            state = self._deployment_store.build_plan(
-                deployment_id,
-                start_live=bool(args.get("start_live", True)),
-                commissioning_after_minutes=max(
-                    1,
-                    min(
-                        120,
-                        int(args.get("commissioning_after_minutes") or 15),
+            if preview:
+                state = self._deployment_store.build_plan(
+                    deployment_id,
+                    start_live=bool(args.get("start_live", True)),
+                    commissioning_after_minutes=max(
+                        1,
+                        min(
+                            120,
+                            int(args.get("commissioning_after_minutes") or 15),
+                        ),
                     ),
-                ),
-            )
+                )
+            else:
+                # Apply the already-previewed immutable plan. Rebuilding here
+                # changes generated_at_ms and, worse, could apply corrections
+                # that the operator never reviewed.
+                state = self._deployment_store.load(deployment_id)
+                if not isinstance(state.get("plan"), Mapping):
+                    if expected_plan_digest:
+                        raise DeploymentWorkflowError(
+                            "deployment has no reviewed preview plan"
+                        )
+                    # Compatibility for trusted backend callers predating the
+                    # approval UI. Chat/UI applies always carry the digest.
+                    state = self._deployment_store.build_plan(
+                        deployment_id,
+                        start_live=bool(args.get("start_live", True)),
+                        commissioning_after_minutes=max(
+                            1,
+                            min(
+                                120,
+                                int(args.get("commissioning_after_minutes") or 15),
+                            ),
+                        ),
+                    )
         except DeploymentWorkflowError as exc:
             raise ToolError(str(exc)) from exc
         plan = (
@@ -5496,6 +5528,24 @@ class AgentTools:
             if isinstance(state.get("plan"), Mapping)
             else {}
         )
+        plan_digest = hashlib.blake2s(
+            json.dumps(
+                plan,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+                default=str,
+            ).encode("utf-8"),
+            digest_size=16,
+        ).hexdigest()
+        if (
+            not preview
+            and expected_plan_digest
+            and expected_plan_digest != plan_digest
+        ):
+            raise ToolError(
+                "Deployment draft changed after this preview. Generate and review a new approval card."
+            )
         diff = {
             "deployment_profile": plan.get("deployment_profile") or "general",
             "starter_policy_mode": plan.get("starter_policy_mode") or "none",
@@ -5519,6 +5569,7 @@ class AgentTools:
                 "status": "preview",
                 "deployment_id": deployment_id,
                 "stage": state.get("stage"),
+                "plan_digest": plan_digest,
                 "diff": diff,
                 "per_channel": [
                     {
@@ -5749,6 +5800,7 @@ class AgentTools:
 
         receipt = {
             "deployment_id": deployment_id,
+            "plan_digest": plan_digest,
             "status": "partial" if errors else "applied",
             "applied": applied,
             "errors": errors,
@@ -10261,6 +10313,12 @@ def _seed_turn_tool_context(user_text: Any) -> Dict[str, Any]:
         else:
             context["incident_operation"] = "get"
     if "deployment" in context["tool_intents"]:
+        target_channel_count = _deployment_target_channel_count(routing_text)
+        if target_channel_count is not None:
+            context["deployment_target_channel_count"] = target_channel_count
+        context["deployment_start_new"] = _operator_starts_fresh_deployment(
+            routing_text
+        )
         context["deployment_profile"] = (
             "maritime"
             if re.search(
@@ -10285,6 +10343,9 @@ def _seed_turn_tool_context(user_text: Any) -> Dict[str, Any]:
         explicit_alert_names = _deployment_explicit_alert_names(routing_text)
         if explicit_alert_names:
             context["deployment_explicit_alert_names"] = explicit_alert_names
+        no_alert_channel_ids = _deployment_no_alert_channel_ids(routing_text)
+        if no_alert_channel_ids:
+            context["deployment_no_alert_channel_ids"] = no_alert_channel_ids
     user_text_value = routing_text.strip()
     if context.get("vlm_alert_policy_request"):
         context["vlm_alert_criterion"] = _extract_vlm_alert_criterion(user_text_value)
@@ -10313,6 +10374,11 @@ def _inherit_followup_tool_context(
 ) -> Dict[str, Any]:
     """Carry the last operator intent into terse continuations and time choices."""
 
+    # "protocol: deploy, target N" is a fresh commissioning request, not a
+    # terse continuation of whichever draft happened to be newest in history.
+    if context.get("deployment_start_new"):
+        return context
+
     deployment = _latest_deployment_context(history)
     if deployment and _looks_like_deployment_followup(user_text):
         # Protocol Deploy is a durable, phase-bound workflow.  Keep its compact
@@ -10330,6 +10396,12 @@ def _inherit_followup_tool_context(
                 user_text,
                 selected,
             )
+        explicit_alert_names = _deployment_explicit_alert_names(user_text)
+        if explicit_alert_names:
+            context["deployment_explicit_alert_names"] = explicit_alert_names
+        no_alert_channel_ids = _deployment_no_alert_channel_ids(user_text)
+        if no_alert_channel_ids:
+            context["deployment_no_alert_channel_ids"] = no_alert_channel_ids
         context["inherited_operator_intent"] = True
         return context
 
@@ -10445,6 +10517,10 @@ def _deployment_context_from_payload(
         "deployment_id": deployment_id,
         "deployment_stage": stage,
         "deployment_profile": str(payload.get("deployment_profile") or "general"),
+        "deployment_target_channel_count": max(
+            1,
+            min(8, int(payload.get("target_channel_count") or 8)),
+        ),
         "deployment_available_channel_ids": available,
         "deployment_selected_channel_ids": selected,
         "deployment_groups": copy.deepcopy(payload.get("groups") or []),
@@ -10468,7 +10544,46 @@ def _operator_supplies_deployment_requirements(user_text: Any) -> bool:
         r"\b(?:quiet\s+window|consolidation|from\s+\d{1,2}(?::\d{2})?\s+to\s+\d{1,2})\b|"
         r"тих\w*\s+окн|консолидац|с\s+\d{1,2}(?::\d{2})?\s+до\s+\d{1,2}",
     )
-    return sum(bool(re.search(pattern, text)) for pattern in categories) >= 2
+    explicit_no_alerts = bool(
+        re.search(
+            r"\b(?:no|without)\s+(?:default\s+)?alerts?\b|"
+            r"без\s+(?:дефолтн\w*\s+)?алерт|алерт\w*\s+не\s+(?:нуж|став)",
+            text,
+        )
+    )
+    return (
+        sum(bool(re.search(pattern, text)) for pattern in categories) >= 2
+        or explicit_no_alerts
+    )
+
+
+def _deployment_target_channel_count(user_text: Any) -> Optional[int]:
+    """Read the operator's requested channel cap from a deploy invocation."""
+
+    text = unicodedata.normalize("NFKC", str(user_text or ""))
+    patterns = (
+        r"\btarget\s*(?:[-:=]|is)?\s*(\d{1,2})\s*(?:channels?)?\b",
+        r"\b(?:deploy(?:ment)?|protocol\s*:?\s*deploy)\b.{0,32}?\b(\d{1,2})\s+channels?\b",
+        r"\b(?:таргет|цель)\s*(?:[-:=]|это)?\s*(\d{1,2})\s*(?:канал\w*)?\b",
+    )
+    for pattern in patterns:
+        match = re.search(pattern, text, flags=re.IGNORECASE)
+        if match:
+            return max(1, min(8, int(match.group(1))))
+    return None
+
+
+def _operator_starts_fresh_deployment(user_text: Any) -> bool:
+    """Treat an explicit protocol invocation with a target as a new draft."""
+
+    text = unicodedata.normalize("NFKC", str(user_text or "")).casefold()
+    if _deployment_target_channel_count(text) is None:
+        return False
+    if re.search(r"\b(?:resume|continue)\b|продолж|возобнов", text):
+        return False
+    return bool(
+        re.search(r"\bprotocol\s*:?\s*deploy\b|\bdeploy(?:ment)?\b|протокол\s+депло", text)
+    )
 
 
 def _deployment_explicit_alert_names(user_text: Any) -> List[str]:
@@ -10485,6 +10600,28 @@ def _deployment_explicit_alert_names(user_text: Any) -> List[str]:
         if name and name.casefold() not in {item.casefold() for item in names}:
             names.append(name)
     return names[:16]
+
+
+def _deployment_no_alert_channel_ids(user_text: Any) -> List[int]:
+    """Extract channels for which the operator explicitly requested no defaults."""
+
+    text = unicodedata.normalize("NFKC", str(user_text or ""))
+    ids: List[int] = []
+    no_alert = (
+        r"(?:no|without)\s+(?:default\s+)?alerts?"
+        r"|без\s+(?:дефолтн\w*\s+)?алерт\w*"
+        r"|алерт\w*\s+не\s+(?:нуж\w*|став\w*)"
+    )
+    channel = r"(?:ch(?:annel)?|канал)\s*#?(\d{1,9})"
+    for pattern in (
+        channel + r".{0,100}?(?:" + no_alert + r")",
+        r"(?:" + no_alert + r").{0,100}?" + channel,
+    ):
+        for match in re.finditer(pattern, text, flags=re.IGNORECASE):
+            channel_id = int(match.group(1))
+            if channel_id not in ids:
+                ids.append(channel_id)
+    return ids[:8]
 
 
 def _trusted_deployment_state_message(state: Mapping[str, Any]) -> str:
@@ -10573,6 +10710,19 @@ def _deployment_groups_from_text(
         name = match.group(2).strip("_- ")
         if name:
             grouped.setdefault(name, []).append(channel_id)
+    for match in re.finditer(
+        r"\bgroup\s+([\w-]{1,80})\s*:\s*([#\d,\s]+)",
+        str(user_text or ""),
+        flags=re.IGNORECASE,
+    ):
+        name = match.group(1).strip("_- ")
+        channel_ids = [
+            int(item)
+            for item in re.findall(r"\d{1,9}", match.group(2))
+            if int(item) in selected
+        ]
+        if name and channel_ids:
+            grouped.setdefault(name, []).extend(channel_ids)
     return [
         {"name": name, "channel_ids": list(dict.fromkeys(channel_ids))}
         for name, channel_ids in grouped.items()
@@ -10737,8 +10887,12 @@ def _required_bounded_workflow_tool_call(
                 id=f"required-deploy-start-{uuid.uuid4().hex[:12]}",
                 name="start_deployment",
                 args={
-                    "target_channel_count": 8,
-                    "resume_latest": True,
+                    "target_channel_count": int(
+                        context.get("deployment_target_channel_count") or 8
+                    ),
+                    "resume_latest": not bool(
+                        context.get("deployment_start_new")
+                    ),
                     "deployment_profile": str(
                         context.get("deployment_profile") or "general"
                     ),
@@ -10780,7 +10934,7 @@ def _required_bounded_workflow_tool_call(
                 args={
                     "deployment_id": deployment_id,
                     "preview": True,
-                    "start_live": False,
+                    "start_live": True,
                 },
             )
 
@@ -11041,9 +11195,14 @@ def _apply_turn_tool_context(tool_name: str, args: Dict[str, Any], context: Dict
             for item in (context.get("deployment_explicit_alert_names") or [])
             if str(item).strip()
         }
+        no_alert_channel_ids = {
+            int(item)
+            for item in (context.get("deployment_no_alert_channel_ids") or [])
+            if _opt_int(item) is not None
+        }
         if (
             tool_name == "configure_deployment"
-            and explicit_alert_names
+            and (explicit_alert_names or no_alert_channel_ids)
             and isinstance(prepared.get("requirements"), list)
         ):
             filtered_requirements: List[Dict[str, Any]] = []
@@ -11051,14 +11210,30 @@ def _apply_turn_tool_context(tool_name: str, args: Dict[str, Any], context: Dict
                 if not isinstance(raw_pack, Mapping):
                     continue
                 pack = copy.deepcopy(dict(raw_pack))
-                pack["alerts"] = [
-                    copy.deepcopy(dict(alert))
-                    for alert in (pack.get("alerts") or [])
-                    if isinstance(alert, Mapping)
-                    and str(alert.get("name") or "").strip().casefold()
-                    in explicit_alert_names
-                ]
-                if pack["alerts"]:
+                pack_channel_ids = {
+                    int(item)
+                    for item in (pack.get("channel_ids") or [])
+                    if _opt_int(item) is not None
+                }
+                explicit_none = pack_channel_ids.intersection(
+                    no_alert_channel_ids
+                )
+                remaining = pack_channel_ids - explicit_none
+                for channel_id in sorted(explicit_none):
+                    none_pack = copy.deepcopy(pack)
+                    none_pack["channel_ids"] = [channel_id]
+                    none_pack["alerts"] = []
+                    filtered_requirements.append(none_pack)
+                if remaining:
+                    pack["channel_ids"] = sorted(remaining)
+                    if explicit_alert_names:
+                        pack["alerts"] = [
+                            copy.deepcopy(dict(alert))
+                            for alert in (pack.get("alerts") or [])
+                            if isinstance(alert, Mapping)
+                            and str(alert.get("name") or "").strip().casefold()
+                            in explicit_alert_names
+                        ]
                     filtered_requirements.append(pack)
             prepared["requirements"] = filtered_requirements
         if tool_name == "apply_deployment_plan":
@@ -11298,6 +11473,25 @@ def _remember_turn_tool_result(tool_name: str, result: Any, context: Dict[str, A
             ]
         if tool_name == "survey_deployment" and result.get("survey_count") is not None:
             context["deployment_survey_completed"] = True
+            context["deployment_requirements_pending"] = True
+            context["deployment_requirements_receipt"] = {
+                "deployment_id": result.get("deployment_id"),
+                "selected_channel_ids": list(
+                    result.get("selected_channel_ids") or []
+                ),
+                "groups": copy.deepcopy(result.get("groups") or []),
+                "surveys": copy.deepcopy(result.get("surveys") or []),
+                "deployment_profile": result.get("deployment_profile"),
+            }
+        if tool_name == "start_deployment" and str(result.get("stage") or "") == "inventory":
+            context["deployment_inventory_receipt"] = {
+                "deployment_id": result.get("deployment_id"),
+                "target_channel_count": result.get("target_channel_count"),
+                "available_channels": copy.deepcopy(
+                    result.get("available_channels") or []
+                ),
+                "deployment_profile": result.get("deployment_profile"),
+            }
         if (
             tool_name == "configure_deployment"
             and str(result.get("stage") or "") == "requirements_configured"
@@ -11333,6 +11527,8 @@ def _remember_turn_tool_result(tool_name: str, result: Any, context: Dict[str, A
                 "stage": result.get("stage"),
                 "diff": copy.deepcopy(result.get("diff") or {}),
                 "operator_action": result.get("operator_action"),
+                "approval": copy.deepcopy(result.get("approval") or {}),
+                "per_channel": copy.deepcopy(result.get("per_channel") or []),
             }
         return
 
@@ -12448,6 +12644,83 @@ def _format_archive_research_fallback(
     return "\n".join(lines)
 
 
+def _format_deployment_inventory_receipt(context: Mapping[str, Any]) -> str:
+    """Render the first operator choice without exposing internal tool names."""
+
+    receipt = (
+        context.get("deployment_inventory_receipt")
+        if isinstance(context.get("deployment_inventory_receipt"), Mapping)
+        else {}
+    )
+    cap = max(1, min(8, int(receipt.get("target_channel_count") or 8)))
+    channels = [
+        row
+        for row in (receipt.get("available_channels") or [])
+        if isinstance(row, Mapping) and _opt_int(row.get("id")) is not None
+    ]
+    lines = [
+        "Protocol Deploy started — no live settings changed.",
+        f"- Deployment ID: `{receipt.get('deployment_id') or context.get('deployment_id') or 'unknown'}`",
+        f"- Selection cap: up to {cap} channel(s). Fewer than {cap} is valid.",
+        "- Available channels:",
+    ]
+    lines.extend(
+        f"  - `{int(row.get('id'))}` — {str(row.get('title') or 'Untitled channel')}"
+        for row in channels
+    )
+    lines.extend(
+        [
+            "Reply with one or more channel IDs. You may also name groups in the same message; groups are optional.",
+            "Example: `112, 118; group home_workspace: 112; group traffic_simulation: 118`.",
+        ]
+    )
+    return "\n".join(lines)
+
+
+def _format_deployment_requirements_receipt(context: Mapping[str, Any]) -> str:
+    """Show the survey and ask for explicit per-channel policy requirements."""
+
+    receipt = (
+        context.get("deployment_requirements_receipt")
+        if isinstance(context.get("deployment_requirements_receipt"), Mapping)
+        else {}
+    )
+    selected = [int(item) for item in (receipt.get("selected_channel_ids") or [])]
+    lines = [
+        "Protocol Deploy survey saved — no alerts or live settings changed.",
+        f"- Deployment ID: `{receipt.get('deployment_id') or context.get('deployment_id') or 'unknown'}`",
+        f"- Selected channels: {selected}",
+    ]
+    groups = [
+        str(row.get("name"))
+        for row in (receipt.get("groups") or [])
+        if isinstance(row, Mapping) and row.get("name")
+    ]
+    if groups:
+        lines.append(f"- Groups: {groups}")
+    lines.append("- Sampled scene fingerprints (sparse observations, not continuous coverage):")
+    for row in (receipt.get("surveys") or []):
+        if not isinstance(row, Mapping):
+            continue
+        summary = str(
+            row.get("scene_fingerprint")
+            or row.get("survey")
+            or row.get("error")
+            or "No usable sample"
+        )
+        lines.append(
+            f"  - CH {row.get('channel_id')} {str(row.get('title') or '').strip()}: {summary[:700]}"
+        )
+    lines.extend(
+        [
+            "For every selected channel, reply with the normal routine and the default visible alerts you want. Explicitly say `no default alerts` for a channel if that is intentional. Also give the unexpected-event severity, novelty sensitivity, optional counter/duration, and the preemptible consolidation quiet window.",
+            "Good alert example: `CH 112 — Alert \"Person collapse\": trigger when a person visibly falls and remains down for 10 s; severity high; deduplicate one continuing episode for 2 min; count incidents, do not measure routine sitting.`",
+            "You can answer channel by channel; saved answers remain in the draft until every selected channel is covered.",
+        ]
+    )
+    return "\n".join(lines)
+
+
 def _format_deployment_partial_receipt(context: Mapping[str, Any]) -> str:
     """Render a truthful per-channel requirements continuation."""
 
@@ -12496,6 +12769,11 @@ def _format_deployment_preview_receipt(context: Mapping[str, Any]) -> str:
         receipt.get("deployment_id") or context.get("deployment_id") or "unknown"
     )
     channel_ids = [int(item) for item in (diff.get("channel_ids") or [])]
+    approval = (
+        receipt.get("approval")
+        if isinstance(receipt.get("approval"), Mapping)
+        else {}
+    )
     lines = [
         "Protocol Deploy preview generated — not applied.",
         f"- Deployment ID: `{deployment_id}`",
@@ -12520,7 +12798,12 @@ def _format_deployment_preview_receipt(context: Mapping[str, Any]) -> str:
     lines.extend(
         [
             "- Survey fingerprints are sparse samples, not proof of continuous coverage or absence of gaps.",
-            "Review the preview details, then use the trusted UI Apply action if the counts and per-channel policies are correct. Until Apply, live settings and commissioning are unchanged.",
+            (
+                "A deployment approval card is shown with this response. Expand each channel policy there, then press Apply deployment if it is correct; otherwise describe the correction in chat."
+                if approval.get("plan_id")
+                else "The approval card could not be created; do not assume the preview was applied. Ask an administrator to regenerate the preview."
+            ),
+            "Until the approval action succeeds, live settings and commissioning are unchanged.",
         ]
     )
     return "\n".join(lines)
@@ -12968,12 +13251,17 @@ class AgentRunner:
             user_text,
             history_prefix,
         )
-        if "deployment" in (turn_tool_context.get("tool_intents") or ()):
+        if (
+            "deployment" in (turn_tool_context.get("tool_intents") or ())
+            and not turn_tool_context.get("deployment_start_new")
+        ):
             # PostgreSQL chat history intentionally omits raw tool messages.
             # Rehydrate only the compact deployment receipt from its durable
             # workflow store; never ask the model to reconstruct phase state.
             try:
-                active_deployment = self._tools._deployment_store.latest_unfinished()
+                active_deployment = self._tools._deployment_store.latest_unfinished(
+                    str(turn_tool_context.get("deployment_profile") or "general")
+                )
             except Exception:
                 active_deployment = None
             if isinstance(active_deployment, Mapping):
@@ -13008,11 +13296,57 @@ class AgentRunner:
                         str(durable_context.get("deployment_stage") or "") == "surveyed"
                     ):
                         turn_tool_context["deployment_requirements_pending"] = True
+                        turn_tool_context["deployment_requirements_receipt"] = {
+                            "deployment_id": active_deployment.get("deployment_id"),
+                            "selected_channel_ids": list(
+                                active_deployment.get("selected_channel_ids") or []
+                            ),
+                            "groups": copy.deepcopy(
+                                active_deployment.get("groups") or []
+                            ),
+                            "surveys": [
+                                {
+                                    "channel_id": row.get("channel_id"),
+                                    "title": row.get("title"),
+                                    "sample_count": row.get("sample_count"),
+                                    "scene_fingerprint": str(
+                                        row.get("survey") or ""
+                                    )[:700],
+                                    "error": row.get("error"),
+                                }
+                                for row in (active_deployment.get("surveys") or [])
+                                if isinstance(row, Mapping)
+                            ],
+                            "deployment_profile": active_deployment.get(
+                                "deployment_profile"
+                            ),
+                        }
                     elif (
                         str(durable_context.get("deployment_stage") or "")
                         == "requirements_partial"
                     ):
                         turn_tool_context["deployment_requirements_partial"] = True
+                        turn_tool_context["deployment_partial_receipt"] = {
+                            "deployment_id": active_deployment.get("deployment_id"),
+                            "selected_channel_ids": list(
+                                active_deployment.get("selected_channel_ids") or []
+                            ),
+                            "groups": copy.deepcopy(
+                                active_deployment.get("groups") or []
+                            ),
+                            "requirement_pack_count": len(
+                                active_deployment.get("requirements") or []
+                            ),
+                            "missing_requirement_channel_ids": list(
+                                durable_context.get(
+                                    "deployment_missing_requirement_channel_ids"
+                                )
+                                or []
+                            ),
+                            "requirement_warnings": list(
+                                active_deployment.get("requirement_warnings") or []
+                            ),
+                        }
             else:
                 trusted_deployment_state = None
         else:
@@ -13725,7 +14059,16 @@ class AgentRunner:
             else (
                 _format_deployment_partial_receipt(turn_tool_context)
                 if turn_tool_context.get("deployment_requirements_partial")
-                else None
+                else (
+                    _format_deployment_requirements_receipt(turn_tool_context)
+                    if turn_tool_context.get("deployment_requirements_pending")
+                    and turn_tool_context.get("deployment_requirements_receipt")
+                    else (
+                        _format_deployment_inventory_receipt(turn_tool_context)
+                        if turn_tool_context.get("deployment_inventory_receipt")
+                        else None
+                    )
+                )
             )
         )
         full_text_parts: List[str] = (
@@ -17264,6 +17607,7 @@ def _compact_tool_result_for_model(tool_name: str, result: Any) -> Any:
         return _attach_action_plan_hint({
             "status": result.get("status"),
             "deployment_id": result.get("deployment_id"),
+            "plan_digest": result.get("plan_digest"),
             "stage": result.get("stage"),
             "diff": result.get("diff"),
             "per_channel": [

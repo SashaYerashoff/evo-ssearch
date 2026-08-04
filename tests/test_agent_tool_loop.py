@@ -359,6 +359,15 @@ class AgentToolLoopTests(unittest.TestCase):
         call = agent._required_bounded_workflow_tool_call(deploy, schemas)
         self.assertEqual(call.name, "survey_deployment")
 
+        fresh = _seed_turn_tool_context("protocol: deploy, target - 4 channels")
+        self.assertEqual(fresh["deployment_target_channel_count"], 4)
+        self.assertTrue(fresh["deployment_start_new"])
+        schemas = _select_relevant_tool_schemas(agent._TOOL_SCHEMAS, fresh)
+        call = agent._required_bounded_workflow_tool_call(fresh, schemas)
+        self.assertEqual(call.name, "start_deployment")
+        self.assertEqual(call.args["target_channel_count"], 4)
+        self.assertFalse(call.args["resume_latest"])
+
     def test_routing_repairs_common_operator_typos_and_inherits_followup_intent(self):
         initial = _seed_turn_tool_context(
             "Hi! Tell me about what happend this night"
@@ -432,6 +441,32 @@ class AgentToolLoopTests(unittest.TestCase):
         self.assertEqual(context["deployment_selected_channel_ids"], [112, 118])
         self.assertEqual(
             context["deployment_groups"],
+            [
+                {"name": "home_workspace", "channel_ids": [112]},
+                {"name": "traffic_simulation", "channel_ids": [118]},
+            ],
+        )
+
+        fresh = agent._inherit_followup_tool_context(
+            _seed_turn_tool_context("protocol: deploy, target - 4 channels"),
+            "protocol: deploy, target - 4 channels",
+            [
+                {
+                    "role": "tool",
+                    "tool_name": "start_deployment",
+                    "tool_result": json.dumps(start_result),
+                }
+            ],
+        )
+        self.assertNotIn("deployment_id", fresh)
+        self.assertEqual(fresh["deployment_target_channel_count"], 4)
+
+        grouped = agent._deployment_groups_from_text(
+            "112, 118; group home_workspace: 112; group traffic_simulation: 118",
+            [112, 118],
+        )
+        self.assertEqual(
+            grouped,
             [
                 {"name": "home_workspace", "channel_ids": [112]},
                 {"name": "traffic_simulation", "channel_ids": [118]},
@@ -589,6 +624,31 @@ class AgentToolLoopTests(unittest.TestCase):
                 "severity, and use a quiet window from 01:00 to 04:00."
             )
         )
+        self.assertEqual(
+            agent._deployment_no_alert_channel_ids(
+                "CH 112: no default alerts; канал 118 — без дефолтных алертов"
+            ),
+            [112, 118],
+        )
+        no_alerts = _apply_turn_tool_context(
+            "configure_deployment",
+            {
+                "deployment_id": "invented",
+                "requirements": [
+                    {
+                        "name": "quiet channel",
+                        "channel_ids": [112],
+                        "alerts": [{"name": "Invented watch"}],
+                    }
+                ],
+            },
+            {
+                **context,
+                "deployment_profile": "general",
+                "deployment_no_alert_channel_ids": [112],
+            },
+        )
+        self.assertEqual(no_alerts["requirements"][0]["alerts"], [])
 
         requirements_context = {
             **context,
@@ -620,7 +680,7 @@ class AgentToolLoopTests(unittest.TestCase):
         )
         self.assertEqual(call.name, "apply_deployment_plan")
         self.assertIs(call.args["preview"], True)
-        self.assertIs(call.args["start_live"], False)
+        self.assertIs(call.args["start_live"], True)
 
         result_context = dict(requirements_context)
         agent._remember_turn_tool_result(
@@ -711,7 +771,7 @@ class AgentToolLoopTests(unittest.TestCase):
         }
 
         class DeploymentStore:
-            def latest_unfinished(self):
+            def latest_unfinished(self, _profile=None):
                 return dict(state)
 
         class DeploymentTools(_FakeTools):

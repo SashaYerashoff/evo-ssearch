@@ -68,22 +68,31 @@ function ResearchTrace({
   // a trace open or closed after the user has touched it.
   const [traceOpen, setTraceOpen] = useState(true)
   const stepCount = (message.actions?.length ?? 0) + (message.notes?.length ?? 0)
+  const approvalActions = (message.actions || []).filter((action) => (
+    Boolean(action.planId) || action.applied || action.result?.status === 'preview'
+  ))
+  const traceActions = (message.actions || []).filter((action) => !approvalActions.includes(action))
   return (
-    <details
-      className="ag-trace"
-      open={traceOpen}
-      onToggle={(event) => setTraceOpen(event.currentTarget.open)}
-    >
-      <summary>Research trace · {stepCount} step{stepCount === 1 ? '' : 's'}</summary>
-      <div className="ag-trace-body">
-        {message.notes?.map((note) => (
-          <div key={note.id} className="ag-note"><span className="ag-note-badge">In progress</span>{note.message}</div>
-        ))}
-        {message.actions?.map((action) => (
-          <ActionCard key={action.id} action={action} onThumb={onThumb} onApply={onApply} />
-        ))}
-      </div>
-    </details>
+    <>
+      {approvalActions.map((action) => (
+        <ActionCard key={action.id} action={action} onThumb={onThumb} onApply={onApply} />
+      ))}
+      {(traceActions.length > 0 || (message.notes?.length ?? 0) > 0) && <details
+        className="ag-trace"
+        open={traceOpen}
+        onToggle={(event) => setTraceOpen(event.currentTarget.open)}
+      >
+        <summary>Research trace · {stepCount} step{stepCount === 1 ? '' : 's'}</summary>
+        <div className="ag-trace-body">
+          {message.notes?.map((note) => (
+            <div key={note.id} className="ag-note"><span className="ag-note-badge">In progress</span>{note.message}</div>
+          ))}
+          {traceActions.map((action) => (
+            <ActionCard key={action.id} action={action} onThumb={onThumb} onApply={onApply} />
+          ))}
+        </div>
+      </details>}
+    </>
   )
 }
 

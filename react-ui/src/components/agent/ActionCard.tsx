@@ -20,6 +20,8 @@ const LABELS: Record<string, string> = {
   track_visual_state_transitions: 'State transitions', create_bookmark: 'Bookmark', generate_report: 'Report',
   normalize_time_window: 'Time window', build_research_batch: 'Research batch',
   get_prompt_settings: 'VLM prompt layers', update_prompt_settings: 'Update VLM prompts',
+  start_deployment: 'Protocol Deploy inventory', configure_deployment: 'Protocol Deploy draft',
+  survey_deployment: 'Protocol Deploy survey', apply_deployment_plan: 'Protocol Deploy approval',
 }
 
 function label(name: string) { return (LABELS[name] || name.replace(/_/g, ' ')).toUpperCase() }
@@ -217,6 +219,42 @@ export function ActionCard({ action, onThumb, onApply }: {
   const tables = actionTables(name, result)
 
   if (isApproval) {
+    if (name === 'apply_deployment_plan' && result?.status === 'preview') {
+      const diff = result?.diff || {}
+      const channels = Array.isArray(result?.per_channel) ? result.per_channel : []
+      return (
+        <div className="ag-approval ag-deployment-approval">
+          <div className="ag-approval-head">
+            <div>
+              <div className="ag-approval-kick">Operator approval required</div>
+              <div className="ag-approval-title">PROTOCOL DEPLOY · {result?.deployment_id || 'draft'}</div>
+            </div>
+            <span className={`ag-approval-status ${action.applied ? 'ok' : ''}`}>{action.applied ? 'Applied' : 'Preview only'}</span>
+          </div>
+          <div className="ag-fields">
+            <div className="ag-field"><span className="ag-field-k">Channels</span><span className="ag-field-v">{textValue(diff.channel_ids)}</span></div>
+            <div className="ag-field"><span className="ag-field-k">Policies</span><span className="ag-field-v">{textValue(diff.alert_policy_count)}</span></div>
+            <div className="ag-field"><span className="ag-field-k">Attention probes</span><span className="ag-field-v">{textValue(diff.probe_count)}</span></div>
+            <div className="ag-field"><span className="ag-field-k">Counters</span><span className="ag-field-v">{textValue(diff.counted_state_count)}</span></div>
+          </div>
+          {channels.map((channel: any) => (
+            <details className="ag-deployment-channel" key={String(channel?.channel_id)}>
+              <summary>CH {channel?.channel_id} · review proposed alert policy</summary>
+              <pre>{String(channel?.alert_policy_preview || 'No default alert policy proposed.')}</pre>
+            </details>
+          ))}
+          <div className="ag-approval-note">Nothing changes until Apply succeeds. To revise the draft, describe the channel and correction in chat.</div>
+          {error && <div className="ag-card-err">{error}</div>}
+          {!action.applied && action.planId && (
+            <div className="ag-approval-foot">
+              <button className="ag-apply" disabled={action.applying} onClick={() => onApply(action)}>
+                {action.applying ? 'Applying deployment…' : 'Apply deployment'}
+              </button>
+            </div>
+          )}
+        </div>
+      )
+    }
     const fields = entriesOf(result?.approval || result?.preview || result)
     return (
       <div className="ag-approval">
