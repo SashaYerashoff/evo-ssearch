@@ -19,7 +19,9 @@ Format loosely follows Keep a Changelog.
   only their single valid tool, so a small head cannot merely narrate an update
   without persisting it or skip the operator-review preview. Duplicate overlapping
   policy packs (including a hallucinated `quiet_window` pack) are discarded with
-  a draft warning, while mixed count-and-duration intent is preserved. Appliance Doctor also
+  a draft warning, while mixed count-and-duration intent is preserved. Final
+  receipts distinguish a generated preview from an applied plan and prohibit
+  coverage claims from the sparse survey. Appliance Doctor also
   fails readiness when an installed vLLM unit lacks native tool-choice/parser
   flags.
 - **Operator-mode boundary:** `Operator OFF` now suppresses all agent-chat

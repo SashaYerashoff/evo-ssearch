@@ -568,6 +568,31 @@ class AgentToolLoopTests(unittest.TestCase):
         self.assertIs(call.args["preview"], True)
         self.assertIs(call.args["start_live"], False)
 
+        result_context = dict(requirements_context)
+        agent._remember_turn_tool_result(
+            "configure_deployment",
+            {
+                "deployment_id": "deploy-home-1",
+                "stage": "requirements_configured",
+                "requirement_warnings": ["ignored duplicate pack"],
+            },
+            result_context,
+        )
+        self.assertEqual(
+            result_context["deployment_requirement_warnings"],
+            ["ignored duplicate pack"],
+        )
+        agent._remember_turn_tool_result(
+            "apply_deployment_plan",
+            {
+                "status": "preview",
+                "deployment_id": "deploy-home-1",
+                "stage": "plan_ready",
+            },
+            result_context,
+        )
+        self.assertTrue(result_context["deployment_preview_completed"])
+
     def test_protocol_deploy_runner_rehydrates_durable_state_when_history_omits_tools(self):
         state = {
             "deployment_id": "deploy-home-1",

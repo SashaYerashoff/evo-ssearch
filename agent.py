@@ -11216,6 +11216,10 @@ def _remember_turn_tool_result(tool_name: str, result: Any, context: Dict[str, A
             ]
         if result.get("groups") is not None:
             context["deployment_groups"] = copy.deepcopy(result.get("groups") or [])
+        if result.get("requirement_warnings") is not None:
+            context["deployment_requirement_warnings"] = list(
+                result.get("requirement_warnings") or []
+            )[:8]
         if tool_name == "survey_deployment" and result.get("survey_count") is not None:
             context["deployment_survey_completed"] = True
         if (
@@ -11749,6 +11753,7 @@ def _record_turn_signal_ledger(
         "start_deployment",
         "configure_deployment",
         "survey_deployment",
+        "apply_deployment_plan",
         "get_deployment_status",
     }:
         _signal_ledger_append(
@@ -11761,6 +11766,8 @@ def _record_turn_signal_ledger(
                 "next_action": result.get("next_action"),
                 "selected_channel_ids": result.get("selected_channel_ids"),
                 "survey_count": result.get("survey_count"),
+                "requirement_warnings": result.get("requirement_warnings"),
+                "preview_diff": result.get("diff"),
             },
             limit=8,
         )
@@ -13060,6 +13067,27 @@ class AgentRunner:
                         "operator to recreate them. Use the exact trusted deployment_id; never "
                         "invent one. Treat survey fingerprints as sparse samples and do not "
                         "claim continuous coverage or absence of gaps."
+                    )
+                elif turn_tool_context.get("deployment_preview_completed"):
+                    warnings = list(
+                        turn_tool_context.get("deployment_requirement_warnings")
+                        or []
+                    )
+                    warning_instruction = (
+                        " Report these draft warnings explicitly: "
+                        + json.dumps(warnings, ensure_ascii=False, default=str)
+                        + "."
+                        if warnings
+                        else ""
+                    )
+                    completion_instruction = (
+                        "The Protocol Deploy preview was generated but NOT applied. Do not "
+                        "say applied, active, commissioned, scheduled, fully aligned, no "
+                        "errors, full coverage, or no gaps. Report exact preview diff counts "
+                        "as channel policies, probes, counted states, and groups; then tell "
+                        "the operator that only the trusted UI Apply action can change live "
+                        "settings. Survey fingerprints are sparse samples, not coverage proof."
+                        + warning_instruction
                     )
                 else:
                     completion_instruction = (
