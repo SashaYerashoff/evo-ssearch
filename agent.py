@@ -10489,7 +10489,9 @@ def _trusted_deployment_state_message(state: Mapping[str, Any]) -> str:
         + group_guard
         + " If the operator has not supplied policy requirements, ask for expected routine, "
         "visible alert conditions and severity, novelty response, optional counters/dwell "
-        "metrics, and a preemptible consolidation quiet window."
+        "metrics, and a preemptible consolidation quiet window. Survey fingerprints are "
+        "sparse sampled evidence, not proof of continuous coverage; never claim 100% "
+        "coverage or no gaps from this receipt."
     )
 
 
@@ -13056,7 +13058,8 @@ class AgentRunner:
                         "response, optional counter/dwell metrics, and the consolidation quiet "
                         "window. Preserve and list any existing groups exactly; do not ask the "
                         "operator to recreate them. Use the exact trusted deployment_id; never "
-                        "invent one."
+                        "invent one. Treat survey fingerprints as sparse samples and do not "
+                        "claim continuous coverage or absence of gaps."
                     )
                 else:
                     completion_instruction = (

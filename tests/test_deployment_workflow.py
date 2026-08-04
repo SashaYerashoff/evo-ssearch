@@ -283,6 +283,51 @@ def test_protocol_deploy_rejects_more_than_eight_channels_and_bad_duration_state
         )
 
 
+def test_protocol_deploy_drops_overlapping_duplicate_requirement_pack():
+    store = ProtocolDeploymentStore()
+    deployment_id = _configured_state(store)
+    configured = store.configure(
+        deployment_id,
+        requirements=[
+            {
+                "name": "Operations",
+                "channel_ids": [12],
+                "alerts": [
+                    {
+                        "name": "Occupancy",
+                        "description": "Visible workstation occupancy",
+                        "severity": "log",
+                        "positive_query": "person at workstation",
+                        "contrast_query": "empty workstation",
+                        "counter_mode": "count_transitions",
+                        "duration_state": "positive",
+                    }
+                ],
+            },
+            {
+                "name": "quiet_window",
+                "channel_ids": [11, 12],
+                "alerts": [
+                    {
+                        "name": "Occupancy",
+                        "description": "Visible workstation occupancy",
+                        "severity": "log",
+                        "positive_query": "person at workstation",
+                        "contrast_query": "empty workstation",
+                        "counter_mode": "count_transitions",
+                        "duration_state": "positive",
+                    }
+                ],
+            },
+        ],
+    )
+
+    assert len(configured["requirements"]) == 1
+    assert configured["requirements"][0]["alerts"][0]["counter_mode"] == "count_and_duration"
+    assert configured["requirement_warnings"]
+    assert "quiet window is a separate field" in configured["requirement_warnings"][0]
+
+
 def test_maritime_deploy_builds_ptz_prompts_and_shadow_starter_probes():
     store = ProtocolDeploymentStore()
     state = store.start(

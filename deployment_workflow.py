@@ -185,6 +185,14 @@ def _normalize_alert(raw: Mapping[str, Any], index: int) -> Dict[str, Any]:
     counter_mode = str(raw.get("counter_mode") or "none").strip().lower()
     if counter_mode not in _COUNTER_MODES:
         raise DeploymentWorkflowError(f"unsupported counter_mode: {counter_mode}")
+    if (
+        counter_mode == "count_transitions"
+        and raw.get("duration_state") is not None
+    ):
+        # Small heads often encode “count transitions and duration” as a
+        # transition counter plus an explicit duration_state.  Preserve both
+        # operator intents instead of silently discarding dwell time.
+        counter_mode = "count_and_duration"
     count_transition = str(
         raw.get("count_transition") or "positive_to_negative"
     ).strip().lower()
@@ -317,6 +325,52 @@ def _normalize_requirements(
     return normalized
 
 
+def _dedupe_requirement_packs(
+    requirements: Sequence[Mapping[str, Any]],
+) -> tuple[List[Dict[str, Any]], List[str]]:
+    """Drop model-duplicated policy packs without merging channel scopes."""
+
+    accepted: List[Dict[str, Any]] = []
+    seen: List[tuple[tuple[tuple[str, str, str], ...], frozenset[int]]] = []
+    warnings: List[str] = []
+    for raw in requirements:
+        pack = copy.deepcopy(dict(raw))
+        name_key = str(pack.get("name") or "").strip().casefold().replace("_", " ")
+        if name_key in {"quiet window", "consolidation window"}:
+            warnings.append(
+                f"ignored requirement pack {pack.get('name')!r}: quiet window is a separate field"
+            )
+            continue
+        signature = tuple(
+            sorted(
+                (
+                    str(alert.get("name") or "").strip().casefold(),
+                    str(alert.get("positive_query") or "").strip().casefold(),
+                    str(alert.get("contrast_query") or "").strip().casefold(),
+                )
+                for alert in (pack.get("alerts") or [])
+                if isinstance(alert, Mapping)
+            )
+        )
+        scope = frozenset(int(item) for item in (pack.get("channel_ids") or []))
+        duplicate = bool(
+            signature
+            and any(
+                signature == prior_signature and bool(scope & prior_scope)
+                for prior_signature, prior_scope in seen
+            )
+        )
+        if duplicate:
+            warnings.append(
+                f"ignored duplicated requirement pack {pack.get('name')!r} with overlapping channel scope"
+            )
+            continue
+        accepted.append(pack)
+        if signature:
+            seen.append((signature, scope))
+    return accepted, warnings
+
+
 def _normalize_quiet_window(value: Any) -> Optional[Dict[str, Any]]:
     if value in (None, {}):
         return None
@@ -438,6 +492,7 @@ def compact_deployment_state(state: Mapping[str, Any]) -> Dict[str, Any]:
             if isinstance(row, Mapping) and row.get("channel_id") is not None
         ],
         "requirement_pack_count": len(state.get("requirements") or []),
+        "requirement_warnings": list(state.get("requirement_warnings") or [])[:8],
         "quiet_window": copy.deepcopy(state.get("quiet_window")),
         "plan_summary": {
             "channel_count": len(plan.get("channels") or []),
@@ -615,6 +670,7 @@ class ProtocolDeploymentStore:
             "channel_roles": [],
             "surveys": [],
             "requirements": [],
+            "requirement_warnings": [],
             "quiet_window": None,
             "plan": None,
             "commissioning": {"status": "not_scheduled"},
@@ -659,6 +715,7 @@ class ProtocolDeploymentStore:
                 and int(row.get("channel_id") or 0) in set(selected)
             ]
             state["requirements"] = []
+            state["requirement_warnings"] = []
             state["channel_roles"] = []
             state["plan"] = None
             state["stage"] = "scope_configured"
@@ -694,10 +751,14 @@ class ProtocolDeploymentStore:
         if requirements is not None:
             if not selected:
                 raise DeploymentWorkflowError("configure channel scope first")
-            state["requirements"] = _normalize_requirements(
+            normalized_requirements = _normalize_requirements(
                 requirements,
                 selected_channel_ids=selected,
             )
+            (
+                state["requirements"],
+                state["requirement_warnings"],
+            ) = _dedupe_requirement_packs(normalized_requirements)
             state["plan"] = None
             state["stage"] = (
                 "requirements_configured"
