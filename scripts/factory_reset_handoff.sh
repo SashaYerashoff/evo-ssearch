@@ -4,11 +4,12 @@ set -Eeuo pipefail
 # Destructive, operator-authorized appliance handoff reset.
 # Keeps schema, users, roles and model/runtime configuration; removes all
 # collected evidence, summaries, probes, incidents, chats and home-site data.
+# No database or runtime backup is retained on the appliance.
 
 APP_DIR="/opt/eva-ai"
 SYSTEM_ENV="/etc/eva-ai/eva-ai.env"
 PROJECT_ENV="${APP_DIR}/.env"
-BACKUP_OWNER="admins"
+SERVICE_USER="admins"
 CONFIRMATION="--yes-clean-operational-data"
 
 die() {
@@ -28,13 +29,11 @@ fi
 if [[ ! -f "${SYSTEM_ENV}" ]]; then
   die "missing ${SYSTEM_ENV}"
 fi
-if ! id "${BACKUP_OWNER}" >/dev/null 2>&1; then
-  die "backup owner ${BACKUP_OWNER} does not exist"
+if ! id "${SERVICE_USER}" >/dev/null 2>&1; then
+  die "service user ${SERVICE_USER} does not exist"
 fi
 
 stamp="$(date -u +%Y%m%dT%H%M%SZ)"
-backup_dir="/home/${BACKUP_OWNER}/eva-handoff-private-${stamp}"
-install -d -m 0700 -o "${BACKUP_OWNER}" -g "${BACKUP_OWNER}" "${backup_dir}"
 
 set -a
 # This is a root-managed installation file produced by the EVA installer.
@@ -47,25 +46,32 @@ if [[ -z "${database_dsn}" ]]; then
   die "no PostgreSQL DSN was found in ${SYSTEM_ENV}"
 fi
 
-printf 'Creating final private backup in %s\n' "${backup_dir}"
-pg_dump --format=custom --file="${backup_dir}/eva.pgcustom" "${database_dsn}"
-cp --preserve=mode,timestamps "${SYSTEM_ENV}" "${backup_dir}/system.env"
-if [[ -f "${PROJECT_ENV}" ]]; then
-  cp --preserve=mode,timestamps "${PROJECT_ENV}" "${backup_dir}/application.env"
-fi
-if [[ -d "/home/${BACKUP_OWNER}/Pictures/Screenshots" ]]; then
-  tar -C "/home/${BACKUP_OWNER}/Pictures" -czf "${backup_dir}/server-screenshots.tar.gz" Screenshots
-fi
-git -C "${APP_DIR}" bundle create "${backup_dir}/source.bundle" HEAD
-sha256sum "${backup_dir}"/* > "${backup_dir}/SHA256SUMS"
-chown -R "${BACKUP_OWNER}:${BACKUP_OWNER}" "${backup_dir}"
-chmod -R go-rwx "${backup_dir}"
+database_name="$(DATABASE_DSN="${database_dsn}" python3 <<'PY'
+import os
+import shlex
+from urllib.parse import unquote, urlsplit
+
+dsn = os.environ["DATABASE_DSN"].strip()
+if "://" in dsn:
+    name = unquote(urlsplit(dsn).path.lstrip("/").split("/", 1)[0])
+else:
+    values = {}
+    for token in shlex.split(dsn):
+        if "=" in token:
+            key, value = token.split("=", 1)
+            values[key.strip()] = value.strip()
+    name = values.get("dbname") or values.get("database") or ""
+if not name or any(character not in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-" for character in name):
+    raise SystemExit("could not safely determine the PostgreSQL database name")
+print(name)
+PY
+)"
 
 printf 'Stopping writers...\n'
 systemctl stop eva-deep-review.service eva-ai.service
 
 printf 'Removing operational PostgreSQL data while preserving IAM principals and schema...\n'
-psql "${database_dsn}" -v ON_ERROR_STOP=1 <<'SQL'
+runuser -u postgres -- psql --dbname="${database_name}" -v ON_ERROR_STOP=1 <<'SQL'
 DO $handoff$
 DECLARE
     targets text;
@@ -96,7 +102,7 @@ safe_empty_dir() {
   fi
   resolved="$(realpath -m -- "${raw_path}")"
   case "${resolved}" in
-    "${APP_DIR}"/*|/var/lib/eva-ai/*|"/home/${BACKUP_OWNER}/.local/share/eva-ai"/*)
+    "${APP_DIR}"/*|/var/lib/eva-ai/*|"/home/${SERVICE_USER}/.local/share/eva-ai"/*)
       if [[ -d "${resolved}" ]]; then
         find "${resolved}" -mindepth 1 -delete
       fi
@@ -116,7 +122,7 @@ safe_remove_file() {
   fi
   resolved="$(realpath -m -- "${raw_path}")"
   case "${resolved}" in
-    "${APP_DIR}"/*|/var/lib/eva-ai/*|"/home/${BACKUP_OWNER}/.local/share/eva-ai"/*)
+    "${APP_DIR}"/*|/var/lib/eva-ai/*|"/home/${SERVICE_USER}/.local/share/eva-ai"/*)
       rm -f -- "${resolved}"
       ;;
     *)
@@ -167,7 +173,7 @@ for key, value in updates.items():
         rendered.append(f'{key}="{value}"')
 target.write_text("\n".join(rendered) + "\n", encoding="utf-8")
 PY
-chown "${BACKUP_OWNER}:${BACKUP_OWNER}" "${PROJECT_ENV}"
+chown "${SERVICE_USER}:${SERVICE_USER}" "${PROJECT_ENV}"
 chmod 0600 "${PROJECT_ENV}"
 
 # Make the same sanitized values visible in the retained root copy so an old
@@ -186,50 +192,86 @@ chmod 0644 "${dropin_dir}/10-ui-managed-env.conf"
 systemctl daemon-reload
 
 printf 'Removing private, superseded server-side copies...\n'
-rm -rf -- "/home/${BACKUP_OWNER}/eva-backups"
-rm -rf -- "/home/${BACKUP_OWNER}/eva-release-a49b71b"
-if [[ -d "/home/${BACKUP_OWNER}/Pictures/Screenshots" ]]; then
-  find "/home/${BACKUP_OWNER}/Pictures/Screenshots" -mindepth 1 -delete
+rm -rf -- "/home/${SERVICE_USER}/eva-backups"
+rm -rf -- "/home/${SERVICE_USER}/eva-release-a49b71b"
+find "/home/${SERVICE_USER}" -maxdepth 1 -type d -name 'eva-handoff-private-*' -exec rm -rf -- {} +
+if [[ -d "/home/${SERVICE_USER}/Pictures/Screenshots" ]]; then
+  find "/home/${SERVICE_USER}/Pictures/Screenshots" -mindepth 1 -delete
 fi
 find /tmp -maxdepth 1 -type f \( -name 'eva*.pgcustom' -o -name 'eva*.dump' \) -delete
 find /tmp -maxdepth 1 -type d -name 'eva-upgrade.*' -exec rm -rf -- {} +
 
-desktop_dir="/home/${BACKUP_OWNER}/Desktop"
-install -d -m 0755 -o "${BACKUP_OWNER}" -g "${BACKUP_OWNER}" "${desktop_dir}"
-install -m 0644 -o "${BACKUP_OWNER}" -g "${BACKUP_OWNER}" \
+# This workstation was used only for appliance development and testing. Clear
+# cached EVA frames, browser histories and localStorage so a handed-over GUI
+# cannot resurrect private thumbnails, chat/session selectors or channel IDs.
+for browser_path in \
+  "/home/${SERVICE_USER}/.cache/chromium" \
+  "/home/${SERVICE_USER}/.cache/google-chrome" \
+  "/home/${SERVICE_USER}/.cache/mozilla"; do
+  if [[ -d "${browser_path}" ]]; then
+    find "${browser_path}" -mindepth 1 -delete
+  fi
+done
+for chromium_profile in \
+  "/home/${SERVICE_USER}/.config/chromium/Default" \
+  "/home/${SERVICE_USER}/.config/google-chrome/Default"; do
+  if [[ -d "${chromium_profile}" ]]; then
+    rm -rf -- \
+      "${chromium_profile}/Cache" \
+      "${chromium_profile}/Code Cache" \
+      "${chromium_profile}/Service Worker" \
+      "${chromium_profile}/IndexedDB" \
+      "${chromium_profile}/Local Storage" \
+      "${chromium_profile}/Session Storage" \
+      "${chromium_profile}/History" \
+      "${chromium_profile}/History-journal"
+  fi
+done
+rm -f -- \
+  "/home/${SERVICE_USER}/.bash_history" \
+  "/home/${SERVICE_USER}/.local/share/recently-used.xbel"
+
+desktop_dir="/home/${SERVICE_USER}/Desktop"
+install -d -m 0755 -o "${SERVICE_USER}" -g "${SERVICE_USER}" "${desktop_dir}"
+install -m 0644 -o "${SERVICE_USER}" -g "${SERVICE_USER}" \
   "${APP_DIR}/react-ui/dist/quick-start.html" \
   "${desktop_dir}/EVA AI Operator Quick Start.html"
+rm -f -- "${desktop_dir}/RUN EVA CLEAN HANDOFF.txt"
 
 printf 'Starting EVA services...\n'
 systemctl start eva-ai.service eva-deep-review.service
 
 for _attempt in $(seq 1 45); do
-  if curl -fsS --max-time 2 http://127.0.0.1:5000/health >/dev/null; then
+  if python3 - <<'PY' >/dev/null 2>&1
+import urllib.request
+urllib.request.urlopen("http://127.0.0.1:5000/health", timeout=2).read()
+PY
+  then
     break
   fi
   sleep 1
 done
-curl -fsS --max-time 5 http://127.0.0.1:5000/health >/dev/null \
-  || die "EVA health endpoint did not recover"
+python3 - <<'PY' >/dev/null || die "EVA health endpoint did not recover"
+import urllib.request
+urllib.request.urlopen("http://127.0.0.1:5000/health", timeout=5).read()
+PY
 
-report="/home/${BACKUP_OWNER}/eva-handoff-report.txt"
+report="/home/${SERVICE_USER}/eva-handoff-report.txt"
 {
   printf 'EVA AI handoff reset: %s\n' "${stamp}"
   printf 'Source revision: %s\n' "$(git -C "${APP_DIR}" rev-parse --short HEAD)"
   printf 'Database migration: '
-  psql "${database_dsn}" -Atqc 'SELECT version_num FROM alembic_version LIMIT 1'
+  runuser -u postgres -- psql --dbname="${database_name}" -Atqc 'SELECT version_num FROM alembic_version LIMIT 1'
   printf 'Preserved users: '
-  psql "${database_dsn}" -Atqc 'SELECT count(*) FROM iam.users'
+  runuser -u postgres -- psql --dbname="${database_name}" -Atqc 'SELECT count(*) FROM iam.users'
   printf 'Operational rows remaining: '
-  psql "${database_dsn}" -Atqc "SELECT sum(n_live_tup)::bigint FROM pg_stat_user_tables WHERE schemaname IN ('archive','agent','jobs')"
+  runuser -u postgres -- psql --dbname="${database_name}" -Atqc "SELECT coalesce(sum(n_live_tup), 0)::bigint FROM pg_stat_user_tables WHERE schemaname IN ('archive','agent','jobs')"
   printf 'Health: OK\n'
-  printf 'Private backup awaiting off-machine copy: %s\n' "${backup_dir}"
-  printf 'Quick start: /home/%s/Desktop/EVA AI Operator Quick Start.html\n' "${BACKUP_OWNER}"
+  printf 'Server-side private backups: none\n'
+  printf 'Quick start: /home/%s/Desktop/EVA AI Operator Quick Start.html\n' "${SERVICE_USER}"
 } > "${report}"
-chown "${BACKUP_OWNER}:${BACKUP_OWNER}" "${report}"
+chown "${SERVICE_USER}:${SERVICE_USER}" "${report}"
 chmod 0644 "${report}"
 
 printf '\nHandoff reset completed.\n'
-printf 'PRIVATE_BACKUP=%s\n' "${backup_dir}"
-printf 'Copy that directory off the appliance, verify its SHA256SUMS, then remove it.\n'
 cat "${report}"
