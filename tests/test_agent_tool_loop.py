@@ -613,6 +613,32 @@ class AgentToolLoopTests(unittest.TestCase):
         self.assertIn("Counted-state profiles: 2", receipt_text)
         self.assertIn("live settings and commissioning are unchanged", receipt_text)
 
+        partial_context = {
+            "deployment_id": "deploy-home-1",
+            "deployment_stage": "surveyed",
+        }
+        agent._remember_turn_tool_result(
+            "configure_deployment",
+            {
+                "deployment_id": "deploy-home-1",
+                "stage": "requirements_partial",
+                "selected_channel_ids": [112, 118],
+                "groups": [
+                    {"name": "home_workspace", "channel_ids": [112]},
+                    {"name": "traffic_simulation", "channel_ids": [118]},
+                ],
+                "requirement_pack_count": 2,
+                "missing_requirement_channel_ids": [118],
+                "requirement_warnings": [],
+            },
+            partial_context,
+        )
+        partial_text = agent._format_deployment_partial_receipt(partial_context)
+        self.assertTrue(partial_context["deployment_requirements_partial"])
+        self.assertIn("Selected scope remains unchanged: [112, 118]", partial_text)
+        self.assertIn("Requirements still needed only for: [118]", partial_text)
+        self.assertIn("Do not select additional channels", partial_text)
+
     def test_protocol_deploy_runner_rehydrates_durable_state_when_history_omits_tools(self):
         state = {
             "deployment_id": "deploy-home-1",

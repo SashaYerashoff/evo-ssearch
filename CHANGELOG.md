@@ -23,7 +23,8 @@ Format loosely follows Keep a Changelog.
   receipts distinguish a generated preview from an applied plan and prohibit
   coverage claims from the sparse survey. Partial requirements are durable and
   preview is blocked until every selected channel has a policy pack; the final
-  preview receipt is rendered from server truth instead of model prose. Appliance Doctor also
+  partial and preview receipts are rendered from server truth instead of model
+  prose. Appliance Doctor also
   fails readiness when an installed vLLM unit lacks native tool-choice/parser
   flags.
 - **Operator-mode boundary:** `Operator OFF` now suppresses all agent-chat

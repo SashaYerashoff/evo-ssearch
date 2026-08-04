@@ -11257,6 +11257,20 @@ def _remember_turn_tool_result(tool_name: str, result: Any, context: Dict[str, A
         ):
             context.pop("deployment_requirements_supplied", None)
             context["deployment_requirements_partial"] = True
+            context["deployment_partial_receipt"] = {
+                "deployment_id": result.get("deployment_id"),
+                "selected_channel_ids": list(
+                    result.get("selected_channel_ids") or []
+                ),
+                "groups": copy.deepcopy(result.get("groups") or []),
+                "requirement_pack_count": result.get("requirement_pack_count"),
+                "missing_requirement_channel_ids": list(
+                    result.get("missing_requirement_channel_ids") or []
+                ),
+                "requirement_warnings": list(
+                    result.get("requirement_warnings") or []
+                ),
+            }
         if tool_name == "apply_deployment_plan" and result.get("status") == "preview":
             context.pop("deployment_preview_pending", None)
             context["deployment_preview_completed"] = True
@@ -12378,6 +12392,41 @@ def _format_archive_research_fallback(
             else "This conclusion covers only the bounded vision batch of top candidates; it is not proof of absence across the whole archive."
         )
     )
+    return "\n".join(lines)
+
+
+def _format_deployment_partial_receipt(context: Mapping[str, Any]) -> str:
+    """Render a truthful per-channel requirements continuation."""
+
+    receipt = (
+        context.get("deployment_partial_receipt")
+        if isinstance(context.get("deployment_partial_receipt"), Mapping)
+        else {}
+    )
+    selected = [int(item) for item in (receipt.get("selected_channel_ids") or [])]
+    missing = [
+        int(item)
+        for item in (receipt.get("missing_requirement_channel_ids") or [])
+    ]
+    saved = [item for item in selected if item not in set(missing)]
+    group_names = [
+        str(item.get("name"))
+        for item in (receipt.get("groups") or [])
+        if isinstance(item, Mapping) and item.get("name")
+    ]
+    lines = [
+        "Protocol Deploy requirements saved partially — no preview generated or applied.",
+        f"- Deployment ID: `{receipt.get('deployment_id') or context.get('deployment_id') or 'unknown'}`",
+        f"- Selected scope remains unchanged: {selected}",
+        f"- Existing groups remain unchanged: {group_names}",
+        f"- Requirements saved for: {saved}",
+        f"- Requirements still needed only for: {missing}",
+        "Provide the routine, visible alert conditions and severity, novelty response, and optional counters for only the missing channels. Do not select additional channels or repeat the survey.",
+    ]
+    warnings = list(receipt.get("requirement_warnings") or [])
+    if warnings:
+        lines.append("- Draft warnings:")
+        lines.extend(f"  - {str(item)}" for item in warnings[:8])
     return "\n".join(lines)
 
 
@@ -13615,7 +13664,11 @@ class AgentRunner:
         deterministic_final_text = (
             _format_deployment_preview_receipt(turn_tool_context)
             if turn_tool_context.get("deployment_preview_completed")
-            else None
+            else (
+                _format_deployment_partial_receipt(turn_tool_context)
+                if turn_tool_context.get("deployment_requirements_partial")
+                else None
+            )
         )
         full_text_parts: List[str] = (
             [deterministic_final_text] if deterministic_final_text else []
