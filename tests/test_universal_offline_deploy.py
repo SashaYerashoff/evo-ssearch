@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib.util
+import hashlib
 import json
 import sys
 from pathlib import Path
@@ -52,6 +53,46 @@ def test_auto_detection_prefers_systemd_working_directory_and_environment(tmp_pa
 def test_auto_detection_returns_fresh_when_no_unit_or_install():
     with patch.object(deploy, "_systemd_property", return_value=""):
         assert deploy.detect_existing() is None
+
+
+def test_common_bundle_verification_catches_corruption_before_either_path(tmp_path):
+    bundle = tmp_path / "bundle"
+    critical_file = bundle / "repo" / "VERSION"
+    required_files = (
+        bundle / "SOURCE_REVISION.json",
+        bundle / "START_EVA_AI.sh",
+        bundle / "eva_offline_deploy.py",
+        bundle / "install_port_appliance.py",
+        bundle / "migration-plans" / "0006-to-0011.sql",
+        bundle / "apt" / "Packages.gz",
+        bundle / "repo" / "react-ui" / "dist" / "index.html",
+        bundle / "repo" / "migrations" / "versions" / "20260801_0011_incidents.py",
+    )
+    for path in (*required_files, critical_file):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("payload\n", encoding="utf-8")
+    (bundle / "wheelhouse").mkdir()
+    digest = hashlib.sha256(critical_file.read_bytes()).hexdigest()
+    (bundle / "manifest.json").write_text(
+        json.dumps(
+            {
+                "release_flavor": deploy.EXPECTED_FLAVOR,
+                "schema_head": deploy.EXPECTED_SCHEMA,
+                "critical_sha256": {"repo/VERSION": digest},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    deploy._verify_bundle(bundle)
+    critical_file.write_text("corrupted\n", encoding="utf-8")
+
+    try:
+        deploy._verify_bundle(bundle)
+    except deploy.DeployError as exc:
+        assert "Checksum mismatch" in str(exc)
+    else:
+        raise AssertionError("corrupted critical file was accepted")
 
 
 def test_report_evaluation_requires_react_schema_evo_and_inference():

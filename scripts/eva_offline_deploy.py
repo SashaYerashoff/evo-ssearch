@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import argparse
 import getpass
+import hashlib
 import json
 import os
 import pwd
@@ -31,6 +32,8 @@ from typing import Mapping, Sequence
 DEFAULT_BACKUP_ROOT = Path("/var/backups/eva-ai")
 DEFAULT_REPORT_ROOT = Path("/var/lib/eva-ai-installer")
 DEFAULT_SERVICE = "eva-ai"
+EXPECTED_SCHEMA = "20260801_0011"
+EXPECTED_FLAVOR = "universal-offline"
 
 
 class DeployError(RuntimeError):
@@ -94,6 +97,62 @@ def _bundle_root(explicit: Path | None) -> Path:
     if not (root / "repo").is_dir():
         raise DeployError(f"Offline bundle repo/ is missing under {root}")
     return root
+
+
+def _verify_bundle(root: Path) -> None:
+    """Reject an incomplete, mismatched or corrupted universal payload.
+
+    Fresh installs perform their own payload validation as well, but updates used
+    to trust the copied source tree.  Keeping this check in the common entry point
+    gives both paths the same fail-before-mutation boundary.
+    """
+
+    manifest_path = root / "manifest.json"
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except FileNotFoundError as exc:
+        raise DeployError(f"Offline bundle manifest is missing: {manifest_path}") from exc
+    except (OSError, json.JSONDecodeError) as exc:
+        raise DeployError(f"Offline bundle manifest is invalid: {exc}") from exc
+    if str(manifest.get("release_flavor") or "") != EXPECTED_FLAVOR:
+        raise DeployError(
+            "This entry point requires an EVA AI universal-offline bundle; "
+            f"found {manifest.get('release_flavor') or 'unknown'}"
+        )
+    if str(manifest.get("schema_head") or "") != EXPECTED_SCHEMA:
+        raise DeployError(
+            f"Bundle schema head is {manifest.get('schema_head') or 'unknown'}, "
+            f"expected {EXPECTED_SCHEMA}"
+        )
+    required = (
+        "SOURCE_REVISION.json",
+        "START_EVA_AI.sh",
+        "eva_offline_deploy.py",
+        "install_port_appliance.py",
+        "migration-plans/0006-to-0011.sql",
+        "apt/Packages.gz",
+        "wheelhouse",
+        "repo/VERSION",
+        "repo/react-ui/dist/index.html",
+        "repo/migrations/versions/20260801_0011_incidents.py",
+    )
+    missing = [relative for relative in required if not (root / relative).exists()]
+    if missing:
+        raise DeployError("Offline payload is incomplete: " + ", ".join(missing))
+    critical = manifest.get("critical_sha256")
+    if not isinstance(critical, dict) or not critical:
+        raise DeployError("Bundle manifest has no critical checksums")
+    resolved_root = root.resolve()
+    for relative, expected in critical.items():
+        candidate = (root / str(relative)).resolve()
+        if not candidate.is_relative_to(resolved_root) or not candidate.is_file():
+            raise DeployError(f"Invalid critical payload path: {relative}")
+        digest = hashlib.sha256()
+        with candidate.open("rb") as handle:
+            for block in iter(lambda: handle.read(8 * 1024 * 1024), b""):
+                digest.update(block)
+        if digest.hexdigest() != str(expected):
+            raise DeployError(f"Checksum mismatch: {relative}")
 
 
 def _parse_env(path: Path) -> dict[str, str]:
@@ -377,6 +436,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     args, passthrough = parser.parse_known_args(argv)
     try:
         bundle_root = _bundle_root(args.bundle_root)
+        _verify_bundle(bundle_root)
         existing = detect_existing(args.service)
         selected_mode = args.mode
         if selected_mode == "auto":
