@@ -12698,6 +12698,13 @@ def _format_deployment_requirements_receipt(context: Mapping[str, Any]) -> str:
     ]
     if groups:
         lines.append(f"- Groups: {groups}")
+    if str(receipt.get("deployment_profile") or "general") == "maritime":
+        lines.extend(
+            [
+                "- Maritime operating card required for every channel: choose `maritime_gate`, `maritime_coast`, or `maritime_mixed_ptz`, and give a short location/view label.",
+                "- Choose whether to add the role-specific starter watches as non-bookmarking shadow probes (`shadow`) or install none (`none`).",
+            ]
+        )
     lines.append("- Sampled scene fingerprints (sparse observations, not continuous coverage):")
     for row in (receipt.get("surveys") or []):
         if not isinstance(row, Mapping):

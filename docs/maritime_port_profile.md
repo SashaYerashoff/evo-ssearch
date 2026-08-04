@@ -48,13 +48,15 @@ eight-channel target is valid. EVA then:
 1. lists only the currently visible channel inventory and asks for one or more
    IDs plus optional groups;
 2. samples every selected channel and shows the sparse scene fingerprints;
-3. asks, channel by channel, for normal routine, default visible alerts (or an
+3. asks for each channel's maritime role/location card and whether conservative
+   role starter watches should run as non-bookmarking shadow probes;
+4. asks, channel by channel, for normal routine, default visible alerts (or an
    explicit `no default alerts`), unexpected-event severity, novelty
    sensitivity, optional count/duration behavior, and the preemptible deep
    consolidation window;
-4. renders a Protocol Deploy approval card with the selected channels,
+5. renders a Protocol Deploy approval card with the selected channels,
    policy/probe/counter counts, and an expandable policy for each channel;
-5. changes live settings only after `Apply deployment` succeeds.
+6. changes live settings only after `Apply deployment` succeeds.
 
 A useful alert answer names visible evidence and temporal behavior, not intent:
 
