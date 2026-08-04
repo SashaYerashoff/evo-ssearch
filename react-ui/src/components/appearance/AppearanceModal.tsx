@@ -28,7 +28,7 @@ const COLOR_FIELDS: ReadonlyArray<{ key: CustomColorKey; label: string; help: st
   { key: 'accent', label: 'Accent', help: 'Primary actions and focus' },
 ]
 
-export function AppearanceModal({ onClose }: { onClose: () => void }) {
+export function AppearanceModal({ onClose, embedded = false }: { onClose: () => void; embedded?: boolean }) {
   const {
     savedPreferences,
     previewPreferences,
@@ -53,12 +53,15 @@ export function AppearanceModal({ onClose }: { onClose: () => void }) {
     const onKey = (event: KeyboardEvent) => {
       if (event.key === 'Escape') {
         cancelPreview()
-        onClose()
+        setDraft({ ...savedPreferences, overrides: { ...savedPreferences.overrides } })
+        if (!embedded) onClose()
       }
     }
     window.addEventListener('keydown', onKey)
     return () => window.removeEventListener('keydown', onKey)
-  }, [cancelPreview, onClose])
+  }, [cancelPreview, embedded, onClose, savedPreferences])
+
+  useEffect(() => () => cancelPreview(), [cancelPreview])
 
   function update(next: AppearancePreferences) {
     setDraft(next)
@@ -67,12 +70,13 @@ export function AppearanceModal({ onClose }: { onClose: () => void }) {
 
   function closeWithoutSaving() {
     cancelPreview()
-    onClose()
+    setDraft({ ...savedPreferences, overrides: { ...savedPreferences.overrides } })
+    if (!embedded) onClose()
   }
 
   function apply() {
     commitPreferences(draft)
-    onClose()
+    if (!embedded) onClose()
   }
 
   function choosePreset(preset: AppearancePreferences['preset']) {
@@ -90,15 +94,18 @@ export function AppearanceModal({ onClose }: { onClose: () => void }) {
   }
 
   return (
-    <div className="scrim appearance-scrim" onClick={closeWithoutSaving}>
+    <div
+      className={embedded ? 'appearance-settings-embedded' : 'scrim appearance-scrim'}
+      onClick={embedded ? undefined : closeWithoutSaving}
+    >
       <div
-        className="modal appearance-modal"
-        role="dialog"
-        aria-modal="true"
-        aria-labelledby="appearance-title"
+        className={embedded ? 'appearance-settings-inline' : 'modal appearance-modal'}
+        role={embedded ? undefined : 'dialog'}
+        aria-modal={embedded ? undefined : true}
+        aria-labelledby={embedded ? undefined : 'appearance-title'}
         onClick={(event) => event.stopPropagation()}
       >
-        <div className="modal-head appearance-head">
+        {!embedded && <div className="modal-head appearance-head">
           <div>
             <div className="modal-title" id="appearance-title">Appearance</div>
             <div className="brand-sub">Choose a balanced preset, then tune its operational palette.</div>
@@ -106,7 +113,7 @@ export function AppearanceModal({ onClose }: { onClose: () => void }) {
           <button className="modal-close" onClick={closeWithoutSaving} aria-label="Close appearance settings">
             <IconX size={18} />
           </button>
-        </div>
+        </div>}
 
         <div className="appearance-body">
           <section className="appearance-section">

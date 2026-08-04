@@ -300,6 +300,33 @@
 }
 .menu-ear:hover, .menu-shell.open .menu-ear { filter: brightness(1.08); box-shadow: 0 0 26px -2px color-mix(in srgb, var(--accent) 82%, transparent); }
 .menu-ear .txt { writing-mode: vertical-rl; transform: rotate(180deg); font-size: 11px; font-weight: 700; letter-spacing: .18em; }
+.menu-header-button {
+  width: 100%; height: 56px; min-height: 56px;
+  display: flex; align-items: center;
+  flex-direction: row; justify-content: center; gap: 10px; padding: 0 14px;
+  color: var(--text-2);
+  background: color-mix(in srgb, var(--surface-raised) 88%, transparent);
+  border-radius: 0 11px 11px 0; border: 1px solid var(--line-2); border-left: 0;
+  box-shadow: var(--elev);
+  transition: opacity .14s ease, transform .16s ease, visibility 0s linear 0s,
+    border-color .14s ease, background .14s ease;
+}
+.menu-header-button svg {
+  width: 32px; height: 32px; flex: 0 0 32px; padding: 6px; border-radius: 9px;
+  color: var(--accent); background: var(--accent-bg); border: 0;
+}
+.menu-header-button span {
+  color: var(--text-2); font-family: var(--mono); white-space: nowrap;
+  font-size: 10.5px; font-weight: 750; line-height: 1; letter-spacing: .12em; text-align: center;
+}
+.menu-header-button:hover {
+  color: var(--text); border-color: var(--accent-line);
+  background: var(--control-hover); box-shadow: inset 3px 0 var(--accent);
+}
+.home-menu-slot {
+  position: absolute; top: 41px; left: 0; z-index: 61;
+  width: 108px; display: flex;
+}
 .menu-drawer {
   position: absolute; left: 0; top: 10px; bottom: 10px; z-index: 2;
   width: min(248px, calc(100vw - 32px)); padding: 16px 14px 16px 42px;
@@ -342,6 +369,12 @@
 /* ---- center ---- */
 .center { flex: 1; min-width: 0; display: flex; flex-direction: column; min-height: 0; }
 .center-scroll { flex: 1; overflow-y: auto; padding: 14px 16px 20px; display: flex; flex-direction: column; gap: 14px; }
+.archive-screen { overflow: hidden; padding-bottom: 0; }
+.archive-results-scroll {
+  flex: 1 1 auto; min-height: 0; overflow-y: auto; overflow-x: hidden;
+  display: flex; flex-direction: column; gap: 14px; padding-bottom: 20px;
+  scrollbar-gutter: stable;
+}
 /* single full-width toolbar: filters | text query | search controls | image query */
 .archive-toolbar { display: flex; align-items: stretch; gap: 16px; flex-wrap: wrap; padding: 12px 14px; border: 1px solid var(--line); border-radius: 12px; background: var(--panel); }
 .archive-toolbar .filter-block { align-self: stretch; }
@@ -351,12 +384,21 @@
    grid without later card rows painting through it. */
 .archive-screen > .tool-tabs { position: relative; z-index: 10; }
 
-/* folder-style tool tabs (Archive / Video / Monitoring): tab headers on top,
-   the active tab's content opens in a panel below */
+/* Tool tabs and their active controls live inside one shared panel. */
 .tool-tabs { display: flex; flex-direction: column; }
+.tool-tabs.with-leading {
+  display: grid; grid-template-columns: 92px minmax(0, 1fr); column-gap: 16px; align-items: stretch;
+}
+.tool-tabs-leading {
+  position: relative; width: 108px; margin-left: -16px;
+  display: flex; align-items: flex-start; padding-top: 27px;
+}
 /* tool tabs scroll away with the content — no sticky pin, no frosted backdrop band.
    Same plain header across Archive / Video / Monitoring. */
-.atp-tabrow { display: flex; gap: 4px; padding: 0 10px; min-width: 0; overflow: hidden; }
+.atp-tabrow {
+  display: flex; gap: 4px; padding: 0 10px; min-width: 0; overflow: hidden;
+  background: transparent;
+}
 .atp-tab {
   position: relative; top: 1px; z-index: 2;
   display: flex; align-items: center; gap: 7px; padding: 6px 11px 7px;
@@ -367,8 +409,8 @@
   border-radius: 11px 11px 0 0;
   transition: background .15s;
 }
-.atp-tab:hover { background: var(--control-hover); }
-.atp-tab.on { background: var(--surface-raised); border-color: var(--line-2); }
+.atp-tab:hover { background: var(--control-hover); border-color: var(--accent-line); }
+.atp-tab.on { background: var(--surface-raised); border-color: var(--line-2); box-shadow: inset 0 -2px var(--accent); }
 .atp-tab b { display: inline-flex; align-items: center; gap: 6px; flex: 0 0 auto; color: var(--text-mut); font-size: 10.5px; font-weight: 700; text-transform: uppercase; letter-spacing: .06em; white-space: nowrap; }
 .atp-tab.on b { color: var(--accent); }
 .atp-tab-sep { width: 1px; height: 12px; flex: 0 0 auto; background: var(--line-2); }
@@ -377,14 +419,18 @@
 
 .atp-tabpanel {
   position: relative; z-index: 1;
-  display: flex; align-items: center; min-width: 0;
+  display: flex; flex-direction: column; align-items: stretch; min-width: 0;
   min-height: 80px;   /* uniform height across tabs; grows gracefully if a squeezed row wraps */
+  background: transparent; border: 0; border-radius: 0;
+  padding: 0; overflow: visible;
+}
+.atp-tabpanel-content {
+  flex: 1 1 auto; min-width: 0; min-height: 80px;
+  display: flex; align-items: center; padding: 12px 14px;
   background: var(--panel); border: 1px solid var(--line-2); border-radius: 12px;
   backdrop-filter: blur(14px); -webkit-backdrop-filter: blur(14px);
   box-shadow: var(--elev);
-  padding: 12px 14px; animation: atp-in .18s ease;
 }
-@keyframes atp-in { from { opacity: 0; transform: translateY(-5px) } }
 .atp-open { flex: 0 1 auto; min-width: 0; }
 /* the tab already names the section — don't repeat the label inside the panel */
 .atp-tabpanel .atp-glabel { display: none; }
@@ -789,6 +835,32 @@
 .gate-card input { padding: 10px 12px; border-radius: 10px; background: var(--void-tile); border: 1px solid var(--line-2); color: var(--text); outline: none; }
 .gate-card input:focus { border-color: var(--accent-line); }
 .gate-err { color: var(--danger); font-size: 13px; min-height: 16px; }
+
+/* password field with a show/hide eye pinned inside it */
+.gate-pw { position: relative; display: flex; }
+.gate-pw input { flex: 1; padding-right: 42px; }
+.gate-pw-eye {
+  position: absolute; right: 6px; top: 50%; transform: translateY(-50%);
+  display: grid; place-items: center; width: 30px; height: 30px;
+  background: transparent; border: none; border-radius: 8px;
+  color: var(--text-mut); transition: color .15s, background .15s;
+}
+.gate-pw-eye:hover { color: var(--accent); background: var(--accent-soft); }
+
+/* remember-me row */
+.gate-remember { display: flex; align-items: center; gap: 8px; font-size: 13px; color: var(--text-2); cursor: pointer; user-select: none; }
+.gate-remember input { width: 15px; height: 15px; accent-color: var(--accent); cursor: pointer; }
+
+/* keep the sign-in CTA muted until hovered, so it doesn't shout on the login card */
+.gate-card .btn.primary {
+  color: var(--accent); background: var(--accent-bg);
+  border: 1px solid var(--accent-line); box-shadow: none;
+  transition: color .16s, background .16s, box-shadow .16s;
+}
+.gate-card .btn.primary:hover:not(:disabled) {
+  color: var(--primary-text); background: linear-gradient(135deg, var(--accent), var(--accent-2));
+  border-color: transparent; box-shadow: var(--glow);
+}
 
 /* ---- agent half-screen dock (in-flow, toggled) ---- */
 .agent-ear.on { box-shadow: 0 0 26px -2px rgba(56,224,212,0.75); filter: brightness(1.08); }
@@ -1295,6 +1367,17 @@
   gap: 14px; padding: 14px 16px; overflow-y: auto;
 }
 
+/* Workspace navigation, section tabs and filters are one pinned header. The large
+   MENU column deliberately takes width from the filters instead of overlaying them. */
+.archive-screen > .tool-tabs.with-leading,
+.mon-cols > .tool-tabs.with-leading,
+.vid-cols > .tool-tabs.with-leading {
+  position: sticky; top: 0; z-index: 45;
+  margin: -14px -16px 0; padding: 14px 16px 10px;
+  background: transparent;
+  border-bottom: 0;
+}
+
 /* video tool-tab content rows (Stream review / Stream settings) */
 .vid-tb-row { display: flex; align-items: flex-end; gap: 12px; flex-wrap: wrap; flex: 1 1 auto; min-width: 0; }
 .vid-tb-actions { display: flex; align-items: flex-end; gap: 8px; flex-wrap: wrap; }  /* buttons sit right after the fields, not shoved to the far right */
@@ -1329,10 +1412,7 @@
 }
 .vid-control-group {
   min-width: 0; display: flex; flex-direction: column; justify-content: flex-end; gap: 7px;
-  padding: 9px 10px; border: 1px solid var(--line); border-radius: 10px; background: var(--void-tile);
-}
-.vid-control-group-title {
-  color: var(--text-mut); font-size: 9.5px; font-weight: 800; letter-spacing: .065em; text-transform: uppercase;
+  padding: 0; border: 0; border-radius: 0; background: transparent;
 }
 .vid-control-fields { display: flex; align-items: flex-end; gap: 9px; }
 .vid-control-group .wfield { gap: 5px; min-width: 0; }

@@ -332,6 +332,16 @@ class Config:
     except (TypeError, ValueError):
         AUTH_SESSION_TTL_HOURS = 12
     AUTH_SESSION_TTL_HOURS = min(24 * 30, max(1, AUTH_SESSION_TTL_HOURS))
+    # "Remember me" session lifetime — used when the login request opts in.
+    try:
+        AUTH_SESSION_REMEMBER_TTL_HOURS = int(
+            os.getenv('EVOSSEARCH_AUTH_SESSION_REMEMBER_TTL_HOURS', str(24 * 30))
+        )
+    except (TypeError, ValueError):
+        AUTH_SESSION_REMEMBER_TTL_HOURS = 24 * 30
+    AUTH_SESSION_REMEMBER_TTL_HOURS = min(
+        24 * 30, max(AUTH_SESSION_TTL_HOURS, AUTH_SESSION_REMEMBER_TTL_HOURS)
+    )
     DB_STRICT_RUNTIME_ROLES = _get_bool_env(
         'EVOSSEARCH_DB_STRICT_RUNTIME_ROLES',
         os.getenv('EVA_DB_STRICT_RUNTIME_ROLES', 'False'),

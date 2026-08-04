@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from 'react'
 import {
   IconAlertTriangle,
   IconBookmark,
@@ -326,6 +326,7 @@ function SummaryCard({
 }
 
 export function VideoScreen({
+  navigation,
   channels,
   drive,
   reviewOverlayOpen = false,
@@ -337,6 +338,7 @@ export function VideoScreen({
   canExport,
   onReviewSummary,
 }: {
+  navigation?: ReactNode
   channels: Channel[]
   drive?: ConsoleDrive | null
   reviewOverlayOpen?: boolean
@@ -895,6 +897,7 @@ export function VideoScreen({
   return (
     <div className="vid-cols">
       <StreamControl
+        navigation={navigation}
         channels={channels}
         activeTab={activeTab} onTab={selectWorkspaceTab}
         settingsChannelId={settingsChannelId} onSettingsChannel={(channelId) => requestSettingsChannel(channelId)}

@@ -1,4 +1,4 @@
-import { useEffect, useState, useCallback, useMemo, useRef } from 'react'
+import { useEffect, useState, useCallback, useMemo, useRef, type ReactNode } from 'react'
 import {
   IconAdjustmentsHorizontal,
   IconAlertTriangle,
@@ -75,9 +75,10 @@ function agentHoursFromArgs(args: any): string | null {
 const DEFAULT_FILTERS: ArchiveFilters = { source: '', hours: '24', sortBy: 'similarity', rows: '24' }
 
 export function ArchiveScreen({
-  channels, drive, similarDrive, noAnim, canReportFeedback, canReportIncidents, canExport, onFilters, onRefreshChannels,
+  navigation, channels, drive, similarDrive, noAnim, canReportFeedback, canReportIncidents, canExport, onFilters, onRefreshChannels,
   onSimilarDriveHandled,
 }: {
+  navigation?: ReactNode
   channels: Channel[]
   drive?: AgentDrive | null
   similarDrive?: { detection: Detection; seq: number } | null
@@ -116,7 +117,11 @@ export function ArchiveScreen({
   const probeRequestSeq = useRef(0)
   const loadingRef = useRef(false)
   const loadMoreRef = useRef<HTMLDivElement>(null)
+  const resultsScrollRef = useRef<HTMLDivElement>(null)
   const nextOffsetRef = useRef(0)   // read by the observer without re-creating it each load
+  // Distinguishes a live agent run from re-playing a finished drive on (re)mount:
+  // only true once we've actually seen an in-progress action this mount.
+  const sawAgentProgress = useRef(false)
 
   const patch = useCallback((p: Partial<ArchiveFilters>) => {
     requestSeq.current++
@@ -339,6 +344,7 @@ export function ArchiveScreen({
       }
     }
     if (!done) {
+      sawAgentProgress.current = true
       setAgentStep(prettyTool(name))
       if (VIEW_TOOLS.has(name)) {
         // agent drives the console controls: channel / source / time / sort / rows visibly change
@@ -372,6 +378,10 @@ export function ArchiveScreen({
         }
       }
     }
+    // A finished drive replayed on (re)mount — with no in-progress step seen — is stale:
+    // load its frames but don't flash the "Agent is searching…" banner when nothing is running.
+    if (!sawAgentProgress.current) { setAgentStep(null); return }
+    sawAgentProgress.current = false
     setAgentStep(error ? `${prettyTool(name)} — failed` : prettyTool(name))
     const t = setTimeout(() => setAgentStep(null), error ? 2600 : 700)
     return () => clearTimeout(t)
@@ -398,7 +408,7 @@ export function ArchiveScreen({
     // into a runaway that loads (and re-renders) the entire archive at once
     const observer = new IntersectionObserver((entries) => {
       if (entries[0]?.isIntersecting && !loadingRef.current) void runLoad(nextOffsetRef.current, true)
-    }, { rootMargin: '400px 0px' })
+    }, { root: resultsScrollRef.current, rootMargin: '400px 0px' })
     observer.observe(sentinel)
     return () => observer.disconnect()
   }, [filtersDirty, hasMore, resultMode, runLoad])
@@ -516,6 +526,7 @@ export function ArchiveScreen({
         })}
         active={openTool}
         onSelect={(id) => setOpenTool(id as typeof openTool)}
+        leading={navigation}
       >
         {expanded()}
       </ToolTabs>
@@ -533,38 +544,40 @@ export function ArchiveScreen({
         </div>
       </div>
 
-      {coverageMessages.length > 0 && (
-        <div className="archive-coverage-notice" role="status" aria-live="polite">
-          <IconAlertTriangle size={16} />
-          <div>{coverageMessages.map((message) => <div key={message}>{message}</div>)}</div>
-        </div>
-      )}
+      <div ref={resultsScrollRef} className="archive-results-scroll">
+        {coverageMessages.length > 0 && (
+          <div className="archive-coverage-notice" role="status" aria-live="polite">
+            <IconAlertTriangle size={16} />
+            <div>{coverageMessages.map((message) => <div key={message}>{message}</div>)}</div>
+          </div>
+        )}
 
-      {error && <div className="empty-state" style={{ color: 'var(--danger)', padding: 30 }}>{error}</div>}
-      {loading && items.length === 0 && (
-        <div className="loading-state">
-          <div className="spinner" />
-          <div>{textSearchPending ? 'Searching semantic archive…' : 'Loading archive…'}</div>
-        </div>
-      )}
-      {!loading && !error && displayed.length === 0 && <div className="empty-state">No archived frames for these filters.</div>}
+        {error && <div className="empty-state" style={{ color: 'var(--danger)', padding: 30 }}>{error}</div>}
+        {loading && items.length === 0 && (
+          <div className="loading-state">
+            <div className="spinner" />
+            <div>{textSearchPending ? 'Searching semantic archive…' : 'Loading archive…'}</div>
+          </div>
+        )}
+        {!loading && !error && displayed.length === 0 && <div className="empty-state">No archived frames for these filters.</div>}
 
-      {displayed.length > 0 && (
-        <div className="card-grid">
-          {displayed.map((d) => <DetectionCard key={d.key} d={d} onClick={() => setSelected(d)} />)}
-        </div>
-      )}
+        {displayed.length > 0 && (
+          <div className="card-grid">
+            {displayed.map((d) => <DetectionCard key={d.key} d={d} onClick={() => setSelected(d)} />)}
+          </div>
+        )}
 
-      {resultMode === 'list' && !filtersDirty && (
-        <div ref={loadMoreRef} className="archive-load-more">
-          {loading && items.length > 0 && <><div className="spinner" /><span>Loading more matches…</span></>}
-          {!loading && hasMore && <span>Scroll for more</span>}
-          {!loading && !hasMore && items.length > 0 && !error && <span>All archive matches loaded</span>}
-          {!loading && error && items.length > 0 && (
-            <button type="button" className="btn" onClick={() => runLoad(nextOffset, true)}>Retry loading more</button>
-          )}
-        </div>
-      )}
+        {resultMode === 'list' && !filtersDirty && (
+          <div ref={loadMoreRef} className="archive-load-more">
+            {loading && items.length > 0 && <><div className="spinner" /><span>Loading more matches…</span></>}
+            {!loading && hasMore && <span>Scroll for more</span>}
+            {!loading && !hasMore && items.length > 0 && !error && <span>All archive matches loaded</span>}
+            {!loading && error && items.length > 0 && (
+              <button type="button" className="btn" onClick={() => runLoad(nextOffset, true)}>Retry loading more</button>
+            )}
+          </div>
+        )}
+      </div>
 
       {selected && (
         <InspectorModal

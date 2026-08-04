@@ -9,6 +9,7 @@ import { AuditTab } from './AuditTab'
 import { UsersTab } from './UsersTab'
 import { DiagnosticsTab } from './DiagnosticsTab'
 import { Dropdown } from '../shell/Dropdown'
+import { AppearanceModal } from '../appearance/AppearanceModal'
 
 const DEFAULTS: Settings = {
   host: '0.0.0.0', port: 5000, debug: false,
@@ -169,7 +170,9 @@ export function SettingsModal({
         : custom === 'diagnostics'
           ? 'diagnostics'
           : 'settings'
-  const permittedTabs = TABS.filter((candidate) => canViewSettingsTab(user, tabKind(candidate.custom)))
+  const permittedTabs = TABS.filter((candidate) => (
+    candidate.custom === 'appearance' || canViewSettingsTab(user, tabKind(candidate.custom))
+  ))
   const visibleTabs = permittedTabs.filter(tabHasMatch)
   const activeId = visibleTabs.some((t) => t.id === tab) ? tab : (visibleTabs[0]?.id ?? tab)
   const activeTab = permittedTabs.find((t) => t.id === activeId) ?? permittedTabs[0]
@@ -181,7 +184,7 @@ export function SettingsModal({
         <div className="modal-head">
           <div>
             <div className="modal-title">Settings</div>
-            <div className="brand-sub">Tune runtime, ranking, Luxriot integration, and environment.</div>
+            <div className="brand-sub">Tune appearance, runtime, ranking, Luxriot integration, and environment.</div>
           </div>
           <button className="modal-close" onClick={onClose}><IconX size={18} /></button>
         </div>
@@ -221,6 +224,7 @@ export function SettingsModal({
             {!loading && activeTab?.custom === 'env' && <EnvTab />}
             {!loading && activeTab?.custom === 'audit' && <AuditTab />}
             {!loading && activeTab?.custom === 'diagnostics' && <DiagnosticsTab />}
+            {!loading && activeTab?.custom === 'appearance' && <AppearanceModal embedded onClose={() => {}} />}
             {!loading && activeTab?.custom === 'users' && (
               <UsersTab
                 currentUserId={user.id}

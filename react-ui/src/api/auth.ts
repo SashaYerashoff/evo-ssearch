@@ -15,8 +15,8 @@ export function mapUser(u: any): AuthUser {
   }
 }
 
-export async function login(username: string, password: string): Promise<AuthUser> {
-  const res = await api.postJson('/auth/login', { username, password })
+export async function login(username: string, password: string, remember = false): Promise<AuthUser> {
+  const res = await api.postJson('/auth/login', { username, password, remember })
   return mapUser({ ...res.user, currentSessionId: res.sessionId })
 }
 

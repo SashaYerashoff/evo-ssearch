@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState, useCallback } from 'react'
+import { IconEye, IconEyeOff } from '@tabler/icons-react'
 import type { AuthUser, Channel, ArchiveFilters, Detection } from './api/types'
 import { login as apiLogin, me as apiMe, logout as apiLogout } from './api/auth'
 import {
@@ -14,7 +15,7 @@ import type { Probe } from './api/probes'
 import { api, API_FORBIDDEN_EVENT, AUTH_EXPIRED_EVENT } from './api/client'
 import { TopBar } from './components/shell/TopBar'
 import { StatusConsole } from './components/shell/StatusConsole'
-import { LeftRail, SECTION_LABELS, type SectionId } from './components/shell/LeftRail'
+import { LeftRail, MainMenuButton, SECTION_LABELS, type SectionId } from './components/shell/LeftRail'
 import { AgentEar } from './components/shell/AgentEar'
 import { AgentPanel, type AgentAction } from './components/shell/AgentPanel'
 import { ArchiveScreen } from './components/archive/ArchiveScreen'
@@ -25,7 +26,6 @@ import { videoApi, type SummaryEntry } from './api/video'
 import { SettingsModal } from './components/settings/SettingsModal'
 import { HomeScreen } from './components/home/HomeScreen'
 import { NeuralBackground } from './components/shell/NeuralBackground'
-import { AppearanceModal } from './components/appearance/AppearanceModal'
 import { useAppearance } from './appearance/AppearanceProvider'
 import type { ConsoleUiEffect } from './ui-effects/consoleEffects'
 
@@ -44,15 +44,31 @@ export interface StatusData {
   agent: 'idle' | 'working'
 }
 
+const REMEMBER_KEY = 'eva.auth.remember'
+const REMEMBER_USER_KEY = 'eva.auth.user'
+const readRemember = (): boolean => { try { return localStorage.getItem(REMEMBER_KEY) === '1' } catch { return false } }
+const readRememberedUser = (): string => { try { return localStorage.getItem(REMEMBER_USER_KEY) || '' } catch { return '' } }
+
 function LoginGate({ onDone }: { onDone: (u: AuthUser) => void }) {
-  const [u, setU] = useState('admin')
+  const [u, setU] = useState(() => readRememberedUser() || 'admin')
   const [p, setP] = useState('')
+  const [showPw, setShowPw] = useState(false)
+  const [remember, setRemember] = useState(readRemember)
   const [err, setErr] = useState('')
   const [busy, setBusy] = useState(false)
   async function submit(e: React.FormEvent) {
     e.preventDefault()
     setBusy(true); setErr('')
-    try { onDone(await apiLogin(u, p)) }
+    try {
+      const user = await apiLogin(u, p, remember)
+      // Remember only keeps a long-lived session + the username for pre-fill.
+      // The password is never stored — the server session cookie is what persists.
+      try {
+        if (remember) { localStorage.setItem(REMEMBER_KEY, '1'); localStorage.setItem(REMEMBER_USER_KEY, u) }
+        else { localStorage.removeItem(REMEMBER_KEY); localStorage.removeItem(REMEMBER_USER_KEY) }
+      } catch { /* storage blocked */ }
+      onDone(user)
+    }
     catch (ex: any) { setErr(ex?.message || 'Sign in failed') }
     finally { setBusy(false) }
   }
@@ -63,7 +79,17 @@ function LoginGate({ onDone }: { onDone: (u: AuthUser) => void }) {
         <h1>EVA AI</h1>
         <div className="brand-sub">Command console · sign in</div>
         <input placeholder="Username" value={u} onChange={(e) => setU(e.target.value)} autoFocus />
-        <input placeholder="Password" type="password" value={p} onChange={(e) => setP(e.target.value)} />
+        <div className="gate-pw">
+          <input placeholder="Password" type={showPw ? 'text' : 'password'} value={p} onChange={(e) => setP(e.target.value)} />
+          <button type="button" className="gate-pw-eye" onClick={() => setShowPw((v) => !v)}
+            title={showPw ? 'Hide password' : 'Show password'} aria-label={showPw ? 'Hide password' : 'Show password'}>
+            {showPw ? <IconEyeOff size={18} /> : <IconEye size={18} />}
+          </button>
+        </div>
+        <label className="gate-remember">
+          <input type="checkbox" checked={remember} onChange={(e) => setRemember(e.target.checked)} />
+          <span>Remember me on this device</span>
+        </label>
         <div className="gate-err">{err}</div>
         <button className="btn primary" disabled={busy} style={{ justifyContent: 'center' }}>
           {busy ? 'Signing in…' : 'Sign in'}
@@ -88,10 +114,10 @@ export default function App() {
   const [section, setSection] = useState<SectionId>('home')
   const [agentOpen, setAgentOpen] = useState(false)
   const [agentFull, setAgentFull] = useState(false)
+  const [menuOpen, setMenuOpen] = useState(false)
   const [agentArchiveColumns, setAgentArchiveColumns] = useState(4)
   const [agentCommittedArchiveColumns, setAgentCommittedArchiveColumns] = useState(4)
   const [settingsOpen, setSettingsOpen] = useState(false)
-  const [appearanceOpen, setAppearanceOpen] = useState(false)
   const [drive, setDrive] = useState<AgentDrive | null>(null)
   const [summaryReview, setSummaryReview] = useState<Detection | null>(null)
   const [similarDrive, setSimilarDrive] = useState<{ detection: Detection; seq: number } | null>(null)
@@ -346,9 +372,12 @@ export default function App() {
   if (!ready) return <div className="loading-state"><div className="spinner" /></div>
   if (!user) return <LoginGate onDone={setUser} />
 
-  async function handleLogout() { await apiLogout(); setUser(null) }
+  async function handleLogout() { await apiLogout(); setMenuOpen(false); setUser(null) }
   const agentPresetGrid = agentOpen && !agentFull
   const noAnim = isMotionReduced
+  const navigation = () => (
+    <MainMenuButton open={menuOpen} onToggle={() => setMenuOpen(true)} />
+  )
 
   return (
     <div className={`shell ${noAnim ? 'no-anim' : ''}`}>
@@ -356,7 +385,6 @@ export default function App() {
       <TopBar
         appVersion={appVersion}
         section={SECTION_LABELS[section]}
-        onAppearance={() => setAppearanceOpen(true)}
         onBrand={() => setSection('home')}
       />
       {forbiddenNotice && <div className="global-notice" role="alert">{forbiddenNotice}</div>}
@@ -373,14 +401,19 @@ export default function App() {
           active={section}
           visibleSections={visibleSections}
           showSettings={settingsAllowed}
+          open={menuOpen}
+          showTrigger={false}
+          onOpenChange={setMenuOpen}
           onNavigate={setSection}
           onSettings={() => setSettingsOpen(true)}
           onLogout={handleLogout}
         />
         <div className="center">
+          {section === 'home' && <div className="home-menu-slot">{navigation()}</div>}
           <HomeScreen active={section === 'home'} serverStartedAtMs={serverStartedAtMs} />
           {section === 'archive' && (
             <ArchiveScreen
+              navigation={navigation()}
               channels={channels}
               drive={drive}
               similarDrive={similarDrive}
@@ -395,6 +428,7 @@ export default function App() {
           )}
           {section === 'monitoring' && (
             <MonitoringScreen
+              navigation={navigation()}
               channels={channels}
               drive={probeDrive}
               canOperate={hasPermission(user, PERMISSION.probesRun) && hasPermission(user, PERMISSION.captureManage)}
@@ -405,6 +439,7 @@ export default function App() {
           )}
           {section === 'video' && (
             <VideoScreen
+              navigation={navigation()}
               channels={channels}
               drive={videoDrive}
               reviewOverlayOpen={!!summaryReview}
@@ -432,7 +467,6 @@ export default function App() {
             onClose={() => setSettingsOpen(false)}
           />
         )}
-        {appearanceOpen && <AppearanceModal onClose={() => setAppearanceOpen(false)} />}
         {summaryReview && (
           <InspectorModal
             d={summaryReview}

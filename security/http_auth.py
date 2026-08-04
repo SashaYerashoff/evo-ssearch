@@ -124,6 +124,7 @@ class AuthenticationService:
         password: str,
         client_ip: str,
         user_agent: str | None = None,
+        session_ttl: timedelta | None = None,
     ) -> LoginSession:
         normalized_username = username.strip()
         throttle_key = self._throttle_key(normalized_username, client_ip)
@@ -145,7 +146,8 @@ class AuthenticationService:
         self._throttle.record_success(throttle_key)
         session_token = generate_session_token()
         csrf_token = generate_csrf_token()
-        expires_at = datetime.now(timezone.utc) + self._session_ttl
+        ttl = session_ttl if session_ttl and session_ttl > timedelta(0) else self._session_ttl
+        expires_at = datetime.now(timezone.utc) + ttl
         session_id = self._repository.create_session(
             identity,
             session_token,
