@@ -263,7 +263,7 @@ function positiveMs(value: unknown): number | null {
   return Number.isSafeInteger(parsed) && parsed > 0 ? parsed : null
 }
 
-/** A bounded recorder window around the exact evidence frame, not inference completion. */
+/** A compact recorder window around the exact evidence frame, not inference completion. */
 export function archivePlaybackWindow(detection: Detection): ArchivePlaybackWindow | null {
   const payload = detection.raw?.payload || {}
   const evidenceMs = positiveMs(payload.anchor_frame_timestamp_ms)
@@ -275,11 +275,13 @@ export function archivePlaybackWindow(detection: Detection): ArchivePlaybackWind
   const rawEnd = positiveMs(payload.batch_end_ms ?? detection.raw?.batch_end_ms)
   const batchStartMs = rawStart != null && rawEnd != null ? Math.min(rawStart, rawEnd) : rawStart
   const batchEndMs = rawStart != null && rawEnd != null ? Math.max(rawStart, rawEnd) : rawEnd
-  const desiredStart = evidenceMs - 5_000
-  const desiredEnd = evidenceMs + 10_000
+  // Eight seconds retains useful before/after context while avoiding the very
+  // expensive 15-second WebM assembly observed on low-power Evo recorders.
+  const desiredStart = evidenceMs - 3_000
+  const desiredEnd = evidenceMs + 5_000
   const startMs = Math.max(batchStartMs ?? desiredStart, desiredStart)
   const boundedEnd = Math.min(batchEndMs != null ? batchEndMs + 1_000 : desiredEnd, desiredEnd)
-  const durationSec = Math.max(1, Math.min(15, Math.ceil(Math.max(1_000, boundedEnd - startMs) / 1_000)))
+  const durationSec = Math.max(1, Math.min(8, Math.ceil(Math.max(1_000, boundedEnd - startMs) / 1_000)))
   return { startMs, durationSec, evidenceMs, batchStartMs, batchEndMs }
 }
 

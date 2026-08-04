@@ -116,11 +116,12 @@ export function InspectorModal({
   const [hasFeedback, setHasFeedback] = useState(false)
   const [incidentDraft, setIncidentDraft] = useState<IncidentDraftInput | null>(null)
   const [playback, setPlayback] = useState<{
-    state: 'idle' | 'loading' | 'playing' | 'error'
+    state: 'idle' | 'loading' | 'decoding' | 'playing' | 'error'
     url?: string
     kind?: 'video' | 'mjpeg'
     detail?: string
   }>({ state: 'idle' })
+  const [playbackElapsed, setPlaybackElapsed] = useState(0)
   const playbackAbort = useRef<AbortController | null>(null)
   const playbackUrl = useRef<string | null>(null)
 
@@ -160,6 +161,32 @@ export function InspectorModal({
     playbackAbort.current?.abort()
     if (playbackUrl.current) URL.revokeObjectURL(playbackUrl.current)
   }, [])
+
+  useEffect(() => {
+    if (!['loading', 'decoding'].includes(playback.state)) {
+      setPlaybackElapsed(0)
+      return
+    }
+    const startedAt = Date.now()
+    setPlaybackElapsed(0)
+    const timer = window.setInterval(() => {
+      setPlaybackElapsed(Math.max(0, Math.floor((Date.now() - startedAt) / 1_000)))
+    }, 1_000)
+    return () => window.clearInterval(timer)
+  }, [playback.state])
+
+  useEffect(() => {
+    if (playback.state !== 'decoding') return
+    const timer = window.setTimeout(() => {
+      if (playbackUrl.current) URL.revokeObjectURL(playbackUrl.current)
+      playbackUrl.current = null
+      setPlayback({
+        state: 'error',
+        detail: 'The recorder segment arrived, but the browser did not make it playable within 12 seconds.',
+      })
+    }, 12_000)
+    return () => window.clearTimeout(timer)
+  }, [playback.state])
 
   useEffect(() => {
     let alive = true
@@ -271,10 +298,10 @@ export function InspectorModal({
         ? ` · recorder aligned ${fmtFull(media.resolvedTimeMs)}`
         : ''
       setPlayback({
-        state: 'playing',
+        state: 'decoding',
         url,
         kind: media.mediaKind,
-        detail: `Archive playback${alignment}`,
+        detail: `Recorder segment received; opening video${alignment}`,
       })
     } catch (exception: any) {
       if (playbackAbort.current !== controller) return
@@ -311,7 +338,7 @@ export function InspectorModal({
         <div className="modal-body archive-review-body">
           <div className="archive-review-evidence">
             <div className="inspect-frame archive-review-frame">
-              {playback.state === 'playing' && playback.url && playback.kind === 'video' ? (
+              {['decoding', 'playing'].includes(playback.state) && playback.url && playback.kind === 'video' ? (
                 <video
                   src={playback.url}
                   autoPlay
@@ -319,13 +346,34 @@ export function InspectorModal({
                   loop
                   controls
                   playsInline
+                  preload="auto"
+                  onLoadedMetadata={() => setPlayback((current) => (
+                    current.url === playback.url
+                      ? { ...current, state: 'decoding', detail: 'Archive metadata loaded; buffering video…' }
+                      : current
+                  ))}
+                  onCanPlay={() => setPlayback((current) => (
+                    current.url === playback.url
+                      ? { ...current, state: 'playing', detail: 'Archive playback ready' }
+                      : current
+                  ))}
+                  onPlaying={() => setPlayback((current) => (
+                    current.url === playback.url
+                      ? { ...current, state: 'playing', detail: 'Archive playback' }
+                      : current
+                  ))}
                   onError={() => stopPlayback('The browser could not decode the recorder archive segment.')}
                 />
-              ) : playback.state === 'playing' && playback.url && playback.kind === 'mjpeg' ? (
+              ) : ['decoding', 'playing'].includes(playback.state) && playback.url && playback.kind === 'mjpeg' ? (
                 <img
                   className="archive-review-playback-mjpeg"
                   src={playback.url}
                   alt="Luxriot archive playback"
+                  onLoad={() => setPlayback((current) => (
+                    current.url === playback.url
+                      ? { ...current, state: 'playing', detail: 'Archive playback' }
+                      : current
+                  ))}
                   onError={() => stopPlayback('The browser could not decode the recorder archive stream.')}
                 />
               ) : src ? (
@@ -347,7 +395,10 @@ export function InspectorModal({
                 <div className="inspect-noimg"><IconPhoto size={30} /> No frame</div>
               )}
               {playback.state !== 'idle' && playback.detail && (
-                <div className={`archive-playback-status ${playback.state}`}>{playback.detail}</div>
+                <div className={`archive-playback-status ${playback.state}`}>
+                  {playback.detail}
+                  {['loading', 'decoding'].includes(playback.state) ? ` · ${playbackElapsed}s` : ''}
+                </div>
               )}
             </div>
 
@@ -422,15 +473,15 @@ export function InspectorModal({
 
             <div className="modal-actions">
               {canPlayArchive && (
-                playback.state === 'playing'
+                ['loading', 'decoding', 'playing'].includes(playback.state)
                   ? (
                     <button className="btn" onClick={() => stopPlayback()}>
-                      <IconPlayerStop size={15} /> Stop playback
+                      <IconPlayerStop size={15} /> {playback.state === 'playing' ? 'Stop playback' : 'Cancel archive'}
                     </button>
                   )
                   : (
-                    <button className="btn primary" onClick={playArchive} disabled={playback.state === 'loading'}>
-                      <IconPlayerPlay size={15} /> {playback.state === 'loading' ? 'Preparing archive…' : 'Play archive video'}
+                    <button className="btn primary" onClick={playArchive}>
+                      <IconPlayerPlay size={15} /> {playback.state === 'error' ? 'Retry archive video' : 'Play archive video'}
                     </button>
                   )
               )}

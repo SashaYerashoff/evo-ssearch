@@ -23,8 +23,8 @@ describe('archivePlaybackWindow', () => {
       batch_end_ms: 160_000,
       anchor_frame_timestamp_ms: 130_000,
     }))).toEqual({
-      startMs: 125_000,
-      durationSec: 15,
+      startMs: 127_000,
+      durationSec: 8,
       evidenceMs: 130_000,
       batchStartMs: 100_000,
       batchEndMs: 160_000,
@@ -36,7 +36,7 @@ describe('archivePlaybackWindow', () => {
       batch_start_ms: 100_000,
       batch_end_ms: 108_000,
       anchor_frame_timestamp_ms: 101_000,
-    }))).toMatchObject({ startMs: 100_000, durationSec: 9, evidenceMs: 101_000 })
+    }))).toMatchObject({ startMs: 100_000, durationSec: 6, evidenceMs: 101_000 })
   })
 
   it('returns null without a channel or evidence timestamp', () => {
