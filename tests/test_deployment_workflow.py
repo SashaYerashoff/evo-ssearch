@@ -360,6 +360,41 @@ def test_protocol_deploy_merges_partial_channel_requirements_before_preview():
         {"name": "Operations", "channel_ids": [12]},
     ]
 
+    corrected = store.configure(
+        deployment_id,
+        requirements=[
+            {
+                "name": "Gate",
+                "channel_ids": [11],
+                "alerts": [
+                    {
+                        "name": "Gate occupied",
+                        "description": "person at gate",
+                        "severity": "low",
+                        "positive_query": "person at gate",
+                        "contrast_query": "clear gate",
+                    },
+                    {
+                        "name": "Gate blocked",
+                        "description": "vehicle blocking gate",
+                        "severity": "high",
+                        "positive_query": "vehicle blocking gate",
+                        "contrast_query": "clear vehicle lane",
+                    },
+                ],
+            }
+        ],
+    )
+    gate_pack = next(
+        pack for pack in corrected["requirements"] if pack["channel_ids"] == [11]
+    )
+    assert [alert["name"] for alert in gate_pack["alerts"]] == [
+        "Gate occupied",
+        "Gate blocked",
+    ]
+    assert any(pack["channel_ids"] == [12] for pack in corrected["requirements"])
+    assert corrected["stage"] == "requirements_configured"
+
 
 def test_maritime_deploy_builds_ptz_prompts_and_shadow_starter_probes():
     store = ProtocolDeploymentStore()

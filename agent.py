@@ -12951,7 +12951,12 @@ class AgentRunner:
                         )
                     if (
                         str(durable_context.get("deployment_stage") or "")
-                        in {"surveyed", "requirements_partial"}
+                        in {
+                            "surveyed",
+                            "requirements_partial",
+                            "requirements_configured",
+                            "plan_ready",
+                        }
                         and _operator_supplies_deployment_requirements(user_text)
                     ):
                         turn_tool_context["deployment_requirements_supplied"] = True

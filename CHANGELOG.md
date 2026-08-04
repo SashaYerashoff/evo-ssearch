@@ -25,7 +25,9 @@ Format loosely follows Keep a Changelog.
   preview is blocked until every selected channel has a policy pack; the final
   partial and preview receipts are rendered from server truth instead of model
   prose, and general deployments discard model-invented maritime roles/starter
-  policy fields. Appliance Doctor also
+  policy fields. Operator corrections at `plan_ready` merge alerts by
+  channel-pack and alert name, preserving sibling rules before regenerating the
+  preview. Appliance Doctor also
   fails readiness when an installed vLLM unit lacks native tool-choice/parser
   flags.
 - **Operator-mode boundary:** `Operator OFF` now suppresses all agent-chat

@@ -371,6 +371,56 @@ def _dedupe_requirement_packs(
     return accepted, warnings
 
 
+def _merge_requirement_corrections(
+    existing: Sequence[Mapping[str, Any]],
+    updates: Sequence[Mapping[str, Any]],
+) -> List[Dict[str, Any]]:
+    """Merge corrections by pack scope/name and alert name, preserving siblings."""
+
+    merged = [copy.deepcopy(dict(pack)) for pack in existing]
+    for raw_update in updates:
+        update = copy.deepcopy(dict(raw_update))
+        update_scope = tuple(sorted(int(item) for item in update.get("channel_ids") or []))
+        update_name = str(update.get("name") or "").strip().casefold()
+        match_index: Optional[int] = None
+        for index, current in enumerate(merged):
+            current_scope = tuple(
+                sorted(int(item) for item in current.get("channel_ids") or [])
+            )
+            current_name = str(current.get("name") or "").strip().casefold()
+            if current_scope == update_scope and current_name == update_name:
+                match_index = index
+                break
+        if match_index is None:
+            merged.append(update)
+            continue
+        current = merged[match_index]
+        alerts_by_name = {
+            str(alert.get("name") or "").strip().casefold(): copy.deepcopy(dict(alert))
+            for alert in (current.get("alerts") or [])
+            if isinstance(alert, Mapping)
+        }
+        for alert in (update.get("alerts") or []):
+            if not isinstance(alert, Mapping):
+                continue
+            alerts_by_name[str(alert.get("name") or "").strip().casefold()] = (
+                copy.deepcopy(dict(alert))
+            )
+        combined = copy.deepcopy(current)
+        for key in (
+            "name",
+            "channel_ids",
+            "expected_routine",
+            "unexpected_severity",
+            "novelty_sensitivity",
+        ):
+            if update.get(key) not in (None, "", []):
+                combined[key] = copy.deepcopy(update.get(key))
+        combined["alerts"] = list(alerts_by_name.values())
+        merged[match_index] = combined
+    return merged
+
+
 def _normalize_quiet_window(value: Any) -> Optional[Dict[str, Any]]:
     if value in (None, {}):
         return None
@@ -775,28 +825,24 @@ class ProtocolDeploymentStore:
                 normalized_requirements
             )
             if (
-                str(state.get("stage") or "") == "requirements_partial"
+                str(state.get("stage") or "")
+                in {
+                    "requirements_partial",
+                    "requirements_configured",
+                    "plan_ready",
+                }
                 and state.get("requirements")
             ):
-                touched_channel_ids = {
-                    int(channel_id)
-                    for pack in normalized_requirements
-                    for channel_id in (pack.get("channel_ids") or [])
-                }
-                retained_requirements = [
-                    copy.deepcopy(dict(pack))
-                    for pack in (state.get("requirements") or [])
-                    if isinstance(pack, Mapping)
-                    and not (
-                        touched_channel_ids
-                        & {
-                            int(channel_id)
-                            for channel_id in (pack.get("channel_ids") or [])
-                        }
-                    )
-                ]
+                merged_requirements = _merge_requirement_corrections(
+                    [
+                        pack
+                        for pack in (state.get("requirements") or [])
+                        if isinstance(pack, Mapping)
+                    ],
+                    normalized_requirements,
+                )
                 normalized_requirements, merge_warnings = _dedupe_requirement_packs(
-                    retained_requirements + normalized_requirements
+                    merged_requirements
                 )
                 warnings = list(state.get("requirement_warnings") or []) + warnings + merge_warnings
             state["requirements"] = normalized_requirements
