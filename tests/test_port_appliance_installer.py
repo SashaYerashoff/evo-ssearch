@@ -22,6 +22,29 @@ sys.modules[SPEC.name] = installer
 SPEC.loader.exec_module(installer)
 
 
+def test_fresh_entrypoint_reads_manifest_before_rendering_target(tmp_path, capsys):
+    manifest = {
+        "target": {
+            "gpu": "RTX 5070 Ti",
+            "os": "Ubuntu 24.04 LTS amd64",
+        }
+    }
+    with (
+        patch.object(installer, "read_manifest", return_value=manifest),
+        patch.object(
+            installer,
+            "validate_target_host",
+            side_effect=installer.InstallError("stop after entrypoint contract"),
+        ),
+    ):
+        result = installer.main(("--bundle-root", str(tmp_path)))
+
+    assert result == 1
+    output = capsys.readouterr()
+    assert "RTX 5070 Ti" in output.out
+    assert "stop after entrypoint contract" in output.err
+
+
 def test_usb_builder_builds_react_for_node_free_runtime():
     builder = (ROOT / "scripts" / "build_port_usb_bundle.sh").read_text(
         encoding="utf-8"

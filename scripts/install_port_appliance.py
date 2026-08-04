@@ -2172,6 +2172,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
     bundle_root = args.bundle_root.resolve() if args.bundle_root else default_bundle_root
     try:
+        manifest = read_manifest(bundle_root)
         print(f"EVA AI {VERSION} universal offline appliance installer")
         target = manifest.get("target") if isinstance(manifest.get("target"), Mapping) else {}
         print(
@@ -2183,7 +2184,6 @@ def main(argv: Sequence[str] | None = None) -> int:
             )
         )
         validate_target_host()
-        manifest = read_manifest(bundle_root)
         verify_critical_payload(bundle_root, manifest)
         answers = gather_answers(args.non_interactive, args)
         required_gib = max(
