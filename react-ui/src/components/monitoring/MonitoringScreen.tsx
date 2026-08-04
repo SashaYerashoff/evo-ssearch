@@ -24,6 +24,7 @@ import {
 } from '../../api/probes'
 import type { Channel } from '../../api/types'
 import { videoApi } from '../../api/video'
+import { ToolbarActionMenu } from '../shell/ToolbarActionMenu'
 import { ToolTabs } from '../shell/ToolTabs'
 import {
   ProbeCard,
@@ -461,28 +462,36 @@ export function MonitoringScreen({
               </button>
             ))}
           </div>
-          <div className="probe-view-toggle">
-            <button className={view === 'grid' ? 'on' : ''} onClick={() => persistView('grid')} title="Card view"><IconLayoutGrid size={15} /></button>
-            <button className={view === 'list' ? 'on' : ''} onClick={() => persistView('list')} title="List view"><IconList size={15} /></button>
-          </div>
-          {filtersActive && (
-            <button className="mon-btn sm" onClick={() => { setOrigins(new Set()); setStates(new Set()); setQuery('') }}>
-              Reset
-            </button>
-          )}
-          <button className="mon-btn sm" onClick={refresh} disabled={loading}>
-            <IconRefresh className={loading ? 'spin' : ''} size={15} /> Refresh
-          </button>
-          {canManage && (
-            <>
-              <button className="mon-btn sm" onClick={() => { setGroupError(null); setGroupEditor(null) }}>
-                <IconSettings size={15} /> Groups
-              </button>
+          <div className="mon-toolbar-primary-actions">
+            <ToolbarActionMenu actions={[
+              {
+                id: 'refresh', label: 'Refresh probes',
+                icon: <IconRefresh className={loading ? 'spin' : ''} size={15} />,
+                onSelect: refresh, disabled: loading,
+              },
+              {
+                id: 'grid', label: 'Card view', icon: <IconLayoutGrid size={15} />,
+                onSelect: () => persistView('grid'), active: view === 'grid',
+              },
+              {
+                id: 'list', label: 'List view', icon: <IconList size={15} />,
+                onSelect: () => persistView('list'), active: view === 'list',
+              },
+              ...(filtersActive ? [{
+                id: 'reset', label: 'Reset filters', icon: <IconX size={15} />,
+                onSelect: () => { setOrigins(new Set()); setStates(new Set()); setQuery('') },
+              }] : []),
+              ...(canManage ? [{
+                id: 'groups', label: 'Manage probe groups', icon: <IconSettings size={15} />,
+                onSelect: () => { setGroupError(null); setGroupEditor(null) },
+              }] : []),
+            ]} />
+            {canManage && (
               <button className="mon-btn accent" onClick={() => setEditing({ probe: null })}>
                 <IconPlus size={16} /> New probe
               </button>
-            </>
-          )}
+            )}
+          </div>
         </div>
       </ToolTabs>
 

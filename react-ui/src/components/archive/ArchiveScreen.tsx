@@ -392,6 +392,7 @@ export function ArchiveScreen({
   const displayed = items.filter((d) => passesArchiveScoreThreshold(d, scoreThreshold))
   const filtersDirty = !!appliedFilters && JSON.stringify(appliedFilters) !== JSON.stringify(filters)
   const archiveMatchCount = resultMode === 'list' ? total : items.length
+  const showArchiveNote = !!note && !/^\d+\s+loaded$/i.test(note.trim())
   const coverageMessages = useMemo(
     () => archiveCoverageMessages(searchCoverage, channels),
     [searchCoverage, channels],
@@ -502,7 +503,7 @@ export function ArchiveScreen({
     return (
       <div className="atp-open atp-group" key="image">
         <span className="atp-glabel"><IconPhoto size={13} /> Image query</span>
-        <label className="btn atp-image" title="Upload a reference image — visual similarity search">
+        <label className="btn primary atp-image" title="Upload a reference image — visual similarity search">
           <IconPhoto size={15} /> Choose image
           <input type="file" accept="image/*" style={{ display: 'none' }}
             onChange={(e) => { const file = e.target.files?.[0]; if (file) runImageSearch(file, file.name); e.currentTarget.value = '' }} />
@@ -532,15 +533,24 @@ export function ArchiveScreen({
       </ToolTabs>
 
       <div className="archive-results-head" role="status" aria-live="polite">
-        <div className="archive-results-count">
-          <strong>{archiveMatchCount.toLocaleString()}</strong>
-          <span>{archiveMatchCount === 1 ? 'archive match' : 'archive matches'}</span>
-        </div>
-        <div className="archive-results-context">
-          {textSearchPending
-            ? `Searching archive for “${q}” · current results remain visible`
-            : (note || `${items.length} loaded`)}
-          {filtersDirty ? ' · Filters changed — load to apply' : ''}
+        <div className="archive-results-summary">
+          <div className="archive-results-count">
+            <strong>{archiveMatchCount.toLocaleString()}</strong>
+            <span>{archiveMatchCount === 1 ? 'archive match' : 'archive matches'}</span>
+          </div>
+          <span className="archive-results-separator" aria-hidden="true">·</span>
+          <div className="archive-results-count">
+            <strong>{items.length.toLocaleString()}</strong>
+            <span>loaded</span>
+          </div>
+          {(textSearchPending || showArchiveNote || filtersDirty) && (
+            <div className="archive-results-context">
+              {textSearchPending
+                ? `· Searching archive for “${q}” · current results remain visible`
+                : (showArchiveNote ? `· ${note}` : '')}
+              {filtersDirty ? ' · Filters changed — load to apply' : ''}
+            </div>
+          )}
         </div>
       </div>
 

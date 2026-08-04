@@ -14,7 +14,6 @@ import {
   THEME_PRESETS,
   contrastRatio,
   contrastText,
-  getThemePreset,
   hasCustomColors,
   normalizeHex,
   normalizeSavedAppearancePresets,
@@ -162,6 +161,24 @@ export function AppearanceModal({ onClose, embedded = false }: { onClose: () => 
         </div>}
 
         <div className="appearance-body">
+          <section className="appearance-section appearance-interface-section">
+            <div className="appearance-section-head">
+              <div>
+                <h3>Interface</h3>
+                <p>Use the standard workspace or enlarge the entire operator interface to 150%.</p>
+              </div>
+            </div>
+            <OptionGroup
+              label="Scale"
+              value={draft.scale}
+              options={[
+                { value: 'normal', label: 'Normal' },
+                { value: 'large', label: 'Big 150%' },
+              ]}
+              onChange={(scale) => update({ ...draft, scale: scale as AppearancePreferences['scale'] })}
+            />
+          </section>
+
           <section className="appearance-section">
             <div className="appearance-section-head">
               <div>
@@ -184,7 +201,7 @@ export function AppearanceModal({ onClose, embedded = false }: { onClose: () => 
             <div className="appearance-section-head">
               <div>
                 <h3><IconColorSwatch size={16} /> Theme preset</h3>
-                <p>Changing preset clears color overrides but keeps density and motion preferences.</p>
+                <p>Changing preset clears color overrides but keeps density, interface scale, and motion preferences.</p>
               </div>
               {hasCustomColors(draft) && <span className="appearance-custom-badge">customized</span>}
             </div>
@@ -274,7 +291,7 @@ export function AppearanceModal({ onClose, embedded = false }: { onClose: () => 
               <div className="appearance-section-head">
                 <div>
                   <h3>Controls</h3>
-                  <p>Geometry may adapt to an operator station; typography remains fixed.</p>
+                  <p>Tune control geometry, density, and motion for the operator station.</p>
                 </div>
               </div>
               <OptionGroup
@@ -307,42 +324,8 @@ export function AppearanceModal({ onClose, embedded = false }: { onClose: () => 
                 onChange={(motion) => update({ ...draft, motion: motion as AppearancePreferences['motion'] })}
               />
 
-              <div className="typography-lock">
-                <div className="typography-lock-icon"><IconTypography size={19} /></div>
-                <div>
-                  <b>Fixed EVA typography</b>
-                  <span>Noto Sans for reading · Noto Sans Mono for telemetry and identifiers</span>
-                  <div className="type-sample">
-                    <strong>Scene activity</strong>
-                    <code>CH 900001 · P 0.82 · 21:34:09</code>
-                  </div>
-                </div>
-              </div>
             </section>
           </div>
-
-          <section className="appearance-preview" style={{
-            '--preview-canvas': palette.canvas,
-            '--preview-surface': palette.surface,
-            '--preview-control': palette.control,
-            '--preview-text': palette.text,
-            '--preview-accent': palette.accent,
-          } as React.CSSProperties}>
-            <div className="appearance-preview-title">Live preview · {getThemePreset(draft.preset).label}</div>
-            <div className="appearance-preview-shell">
-              <span className="appearance-preview-rail" />
-              <div className="appearance-preview-panel">
-                <span>VLM attention</span>
-                <b>8 channels · regulated</b>
-                <button>Open live feed</button>
-              </div>
-              <div className="appearance-preview-panel muted">
-                <span>Agent</span>
-                <b>Ready for operator request</b>
-                <div className="appearance-preview-input">Ask EVA AI…</div>
-              </div>
-            </div>
-          </section>
         </div>
 
         <div className="appearance-footer">

@@ -14,6 +14,7 @@ import {
 import type { Channel } from '../../api/types'
 import type { ReactNode } from 'react'
 import { Dropdown } from '../shell/Dropdown'
+import { ToolbarActionMenu } from '../shell/ToolbarActionMenu'
 import { ToolTabs } from '../shell/ToolTabs'
 import type { SummaryPeriod, SummaryResolution } from './summaryView'
 import type { IncidentPeriod } from '../incidents/IncidentReview'
@@ -84,10 +85,9 @@ export function StreamControl(p: {
   onRefreshFeed: () => void
   live: boolean; onToggleLive: () => void
   summaryCount: number
-  onCollapseAll: () => void
-  onExpandAll: () => void
+  allSummariesCollapsed: boolean
+  onToggleAllSummaries: () => void
   onOpenPreview: () => void
-  onEditReviewStream: () => void
   settingsDirty: boolean
   onDiscardSettings: () => void
   incidentChannelId: string
@@ -136,7 +136,6 @@ export function StreamControl(p: {
               <div className="vid-row">
                 <Dropdown value={String(p.settingsChannelId ?? '')} onChange={(v) => p.onSettingsChannel(Number(v))}
                   options={p.channels.map((c) => ({ value: String(c.id), label: c.title }))} />
-                <button className="mon-icobtn" title="Reload channels" onClick={p.onReload}><IconReload size={15} /></button>
               </div>
             </div>
           </section>
@@ -154,15 +153,31 @@ export function StreamControl(p: {
           <section className="vid-control-group actions">
             <div className="vid-control-group-title">{t('video.runtime')}</div>
             <div className="vid-tb-actions">
+              <ToolbarActionMenu actions={[
+                {
+                  id: 'reload-channels', label: 'Reload channels', icon: <IconReload size={15} />,
+                  onSelect: p.onReload,
+                },
+                ...(p.canCapture && p.capturing ? [{
+                  id: 'stop', label: 'Stop summaries', icon: <IconPlayerStop size={15} />,
+                  onSelect: p.onStop, disabled: p.busy, danger: true,
+                }] : []),
+                ...(p.canCapture ? [{
+                  id: 'flush', label: 'Flush pending summaries', icon: <IconDroplet size={15} />,
+                  onSelect: p.onFlush, disabled: p.busy || !p.capturing,
+                }] : []),
+                ...(p.canManagePrompts ? [{
+                  id: 'prompts', label: 'Prompts and alerts', icon: <IconSettings size={15} />,
+                  onSelect: p.onPromptSettings,
+                }] : []),
+                ...(p.settingsDirty ? [{
+                  id: 'discard', label: 'Discard draft', icon: <IconReload size={15} />,
+                  onSelect: p.onDiscardSettings, disabled: p.busy,
+                }] : []),
+              ]} />
               {p.canCapture && (p.capturing
-                ? <>
-                    <button className="mon-btn accent vid-toggle" disabled={p.busy || !p.settingsDirty} onClick={p.onStart} title="Restart this stream with the edited sampling and inference settings"><IconPlayerPlay size={15} /> {t('video.applyChanges')}</button>
-                    <button className="mon-btn danger" disabled={p.busy} onClick={p.onStop}><IconPlayerStop size={15} /> {t('video.stop')}</button>
-                  </>
+                ? <button className="mon-btn accent vid-toggle" disabled={p.busy || !p.settingsDirty} onClick={p.onStart} title="Restart this stream with the edited sampling and inference settings"><IconPlayerPlay size={15} /> {t('video.applyChanges')}</button>
                 : <button className="mon-btn accent vid-toggle" disabled={p.busy} onClick={p.onStart}><IconPlayerPlay size={15} /> {t('video.start')}</button>)}
-              {p.canCapture && <button className="mon-btn" disabled={p.busy || !p.capturing} onClick={p.onFlush}><IconDroplet size={15} /> {t('video.flush')}</button>}
-              {p.canManagePrompts && <button className="mon-btn" onClick={p.onPromptSettings} title="System prompt and alert settings"><IconSettings size={15} /> {t('video.prompts')}</button>}
-              {p.settingsDirty && <button className="mon-btn" disabled={p.busy} onClick={p.onDiscardSettings}>{t('video.discard')}</button>}
             </div>
           </section>
         </div>
@@ -207,7 +222,6 @@ export function StreamControl(p: {
               <div className="vid-row">
                 <Dropdown value={String(p.reviewChannelId ?? '')} onChange={(v) => p.onReviewChannel(Number(v))}
                   options={p.channels.map((c) => ({ value: String(c.id), label: c.title }))} />
-                <button className="mon-icobtn" title="Reload channels" onClick={p.onReload}><IconReload size={15} /></button>
               </div>
             </div>
             <div className="wfield hist"><label>{t('video.period')}</label>
@@ -225,20 +239,26 @@ export function StreamControl(p: {
               />
             </div>
             <div className="vid-tb-actions">
-              <button className="mon-btn" onClick={p.onRefreshFeed}><IconReload size={14} /> {t('video.refresh')}</button>
-              <button className={`mon-btn ${p.live ? 'accent' : ''}`} onClick={p.onToggleLive}><IconPlayerPlay size={14} /> {p.live ? t('video.liveOn') : t('video.liveOff')}</button>
-              <button className="mon-btn" disabled={!p.summaryCount} onClick={p.onCollapseAll}>
-                <IconChevronsUp size={14} /> {t('video.collapseAll')}
-              </button>
-              <button className="mon-btn" disabled={!p.summaryCount} onClick={p.onExpandAll}>
-                <IconChevronsDown size={14} /> {t('video.expandAll')}
-              </button>
-              <button className="mon-btn" disabled={p.reviewChannelId == null} onClick={p.onOpenPreview}>
-                <IconEye size={14} /> {t('video.openPreview')}
-              </button>
-              <button className="mon-btn" disabled={p.reviewChannelId == null} onClick={p.onEditReviewStream}>
-                <IconSettings size={14} /> {t('video.editSettings')}
-              </button>
+              <ToolbarActionMenu actions={[
+                { id: 'reload-channels', label: 'Reload channels', icon: <IconReload size={15} />, onSelect: p.onReload },
+                { id: 'refresh', label: t('video.refresh'), icon: <IconReload size={15} />, onSelect: p.onRefreshFeed },
+                {
+                  id: 'collapse',
+                  label: p.allSummariesCollapsed ? t('video.expandAll') : t('video.collapseAll'),
+                  icon: p.allSummariesCollapsed ? <IconChevronsDown size={15} /> : <IconChevronsUp size={15} />,
+                  onSelect: p.onToggleAllSummaries,
+                  disabled: !p.summaryCount,
+                },
+                {
+                  id: 'preview', label: t('video.openPreview'), icon: <IconEye size={15} />,
+                  onSelect: p.onOpenPreview, disabled: p.reviewChannelId == null,
+                },
+                ...(p.period === 'custom' ? [{
+                  id: 'apply-range', label: t('video.applyChanges'), icon: <IconReload size={15} />,
+                  onSelect: p.onApplyCustom, disabled: !p.customFrom || !p.customTo,
+                }] : []),
+              ]} />
+              <button className="mon-btn accent vid-toggle" onClick={p.onToggleLive}><IconPlayerPlay size={14} /> {p.live ? t('video.liveOn') : t('video.liveOff')}</button>
             </div>
           </div>
           {p.period === 'custom' && (
@@ -249,7 +269,6 @@ export function StreamControl(p: {
               <div className="wfield"><label>{t('video.to')}</label>
                 <input type="datetime-local" value={p.customTo} onChange={(event) => p.onCustomTo(event.target.value)} />
               </div>
-              <button className="mon-btn" onClick={p.onApplyCustom}><IconReload size={14} /> {t('video.applyChanges')}</button>
             </div>
           )}
         </div>

@@ -13,6 +13,7 @@ import {
 } from '@tabler/icons-react'
 import type { Channel, ArchiveFilters } from '../../api/types'
 import { Dropdown } from '../shell/Dropdown'
+import { ToolbarActionMenu } from '../shell/ToolbarActionMenu'
 import { DateRangeModal } from './DateRangeModal'
 import type { ArchiveProbeOption } from '../../api/detections'
 
@@ -232,13 +233,19 @@ export function FilterBar({
       <Dropdown variant="chip" icon={<IconArrowsSort size={15} />} value={filters.sortBy || 'similarity'} onChange={(v) => onChange({ sortBy: v })}
         options={[{ value: 'similarity', label: 'Similarity' }, { value: 'time', label: 'Newest' }]} />
 
-      <button className="btn" type="button" onClick={onRefresh} disabled={loading || probesLoading} title="Reload channel and archive probe filters">
-        <IconRefresh size={15} /> Refresh filters
-      </button>
-      <button className="btn primary" type="button" onClick={() => onLoad()} disabled={loading}>
-        {loading ? <IconRefresh size={15} className="spin" /> : <IconDownload size={15} />}
-        Load archive
-      </button>
+      <div className="filter-bar-actions">
+        <ToolbarActionMenu actions={[{
+          id: 'refresh',
+          label: 'Refresh filters',
+          icon: <IconRefresh className={loading || probesLoading ? 'spin' : ''} size={15} />,
+          onSelect: onRefresh,
+          disabled: loading || probesLoading,
+        }]} />
+        <button className="btn primary" type="button" onClick={() => onLoad()} disabled={loading}>
+          {loading ? <IconRefresh size={15} className="spin" /> : <IconDownload size={15} />}
+          Load archive
+        </button>
+      </div>
       </div>
     </div>
   )

@@ -114,6 +114,20 @@
 * { box-sizing: border-box; }
 html, body, #root { height: 100%; margin: 0; }
 
+#root {
+  width: 100%;
+  container-type: size;
+}
+
+/* Big interface reproduces a 150% browser zoom while preserving a full-screen
+   application viewport for fixed panels, drawers, and modal overlays. */
+html[data-interface-scale="large"] #root {
+  width: 66.666667%;
+  height: 66.666667%;
+  transform: scale(1.5);
+  transform-origin: top left;
+}
+
 html {
   font-synthesis: none;
   text-rendering: optimizeLegibility;

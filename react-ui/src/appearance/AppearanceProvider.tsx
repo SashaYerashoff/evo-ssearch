@@ -61,6 +61,7 @@ export function AppearanceProvider({ children }: { children: ReactNode }) {
     root.dataset.themePreset = activePreferences.preset
     root.dataset.colorScheme = preset.palette.scheme
     root.dataset.density = activePreferences.density
+    root.dataset.interfaceScale = activePreferences.scale
     root.dataset.controlShape = activePreferences.shape
     root.style.colorScheme = preset.palette.scheme
     root.classList.toggle('anim-off', isMotionReduced)
