@@ -948,6 +948,21 @@ class VlmAlertPromptContractTests(unittest.TestCase):
                 result.alert_events[0]["id"],
             )
 
+    def test_alert_parser_uses_first_evidence_snapshot_unless_anchor_is_explicit(self):
+        parser = load_lm_alert_parser()
+        summary = (
+            "BATCH_STATE_JSON:\n"
+            '{"version":1,"cover":{"snapshot_index":3},"events":[],'
+            '"observed_states":[],"routines":[],"memory_pass":[],'
+            '"alerts":[{"title":"Vessel convergence","severity":"high",'
+            '"snapshot_indices":[2,3]}]}'
+        )
+
+        parsed = parser(summary, 7, 1_781_700_060_000)
+
+        self.assertEqual(parsed[0]["snapshot_indices"], [2, 3])
+        self.assertEqual(parsed[0]["anchor_snapshot"], 2)
+
 
 if __name__ == "__main__":
     unittest.main()

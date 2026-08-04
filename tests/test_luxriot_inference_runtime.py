@@ -4265,6 +4265,48 @@ class LuxriotCaptureDispatchTests(unittest.TestCase):
                 event["bookmark_ack_at_ms"],
             )
 
+    def test_process_summary_alerts_anchors_bookmark_to_first_evidence_snapshot(self):
+        with tempfile.TemporaryDirectory() as temp:
+            manager = build_manager(
+                Path(temp),
+                alert_parser=load_lm_alert_parser(),
+            )
+            manager.default_bookmark_enabled = True
+            sent: List[Dict[str, Any]] = []
+            summary = (
+                "Two vessel tracks visibly converge.\n"
+                "BATCH_STATE_JSON:\n"
+                '{"version":1,"cover":{"snapshot_index":3},"events":[],'
+                '"observed_states":[],"routines":[],"memory_pass":[],'
+                '"alerts":[{"title":"Vessel convergence",'
+                '"description":"Two vessel tracks visibly converge",'
+                '"severity":"high","timestamp_ms":1781700060000,'
+                '"snapshot_indices":[2,3]}]}'
+            )
+
+            with patch.object(
+                manager,
+                "send_bookmark_event",
+                side_effect=lambda **kwargs: sent.append(kwargs) or {"success": True},
+            ):
+                result = manager.process_summary_alerts(
+                    7,
+                    summary,
+                    default_ts_ms=1_781_700_060_000,
+                    min_ts_ms=1_781_700_000_000,
+                    max_ts_ms=1_781_700_060_000,
+                    snapshot_timestamps_ms={
+                        1: 1_781_700_005_000,
+                        2: 1_781_700_018_000,
+                        3: 1_781_700_031_000,
+                    },
+                )
+
+            self.assertEqual(sent[0]["timestamp_ms"], 1_781_700_018_000)
+            self.assertEqual(result.alert_events[0]["timestamp_ms"], 1_781_700_018_000)
+            self.assertEqual(result.alert_events[0]["anchor_snapshot"], 2)
+            self.assertEqual(result.alert_events[0]["timestamp_source"], "snapshot_index")
+
     def test_summary_batch_preserves_capture_queue_and_inference_latency_trace(self):
         with tempfile.TemporaryDirectory() as temp:
             manager = build_manager(

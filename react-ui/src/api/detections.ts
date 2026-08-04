@@ -250,6 +250,82 @@ export function falsePositiveExportUrl(
   return `/reports/false-positives/export?${params.toString()}`
 }
 
+export interface ArchivePlaybackWindow {
+  startMs: number
+  durationSec: number
+  evidenceMs: number
+  batchStartMs: number | null
+  batchEndMs: number | null
+}
+
+function positiveMs(value: unknown): number | null {
+  const parsed = Number(value)
+  return Number.isSafeInteger(parsed) && parsed > 0 ? parsed : null
+}
+
+/** A bounded recorder window around the exact evidence frame, not inference completion. */
+export function archivePlaybackWindow(detection: Detection): ArchivePlaybackWindow | null {
+  const payload = detection.raw?.payload || {}
+  const evidenceMs = positiveMs(payload.anchor_frame_timestamp_ms)
+    ?? positiveMs(payload.frame_timestamp_ms)
+    ?? positiveMs(detection.tsMs)
+  const channelId = positiveMs(detection.channelId)
+  if (!evidenceMs || !channelId) return null
+  const rawStart = positiveMs(payload.batch_start_ms ?? detection.raw?.batch_start_ms)
+  const rawEnd = positiveMs(payload.batch_end_ms ?? detection.raw?.batch_end_ms)
+  const batchStartMs = rawStart != null && rawEnd != null ? Math.min(rawStart, rawEnd) : rawStart
+  const batchEndMs = rawStart != null && rawEnd != null ? Math.max(rawStart, rawEnd) : rawEnd
+  const desiredStart = evidenceMs - 5_000
+  const desiredEnd = evidenceMs + 10_000
+  const startMs = Math.max(batchStartMs ?? desiredStart, desiredStart)
+  const boundedEnd = Math.min(batchEndMs != null ? batchEndMs + 1_000 : desiredEnd, desiredEnd)
+  const durationSec = Math.max(1, Math.min(15, Math.ceil(Math.max(1_000, boundedEnd - startMs) / 1_000)))
+  return { startMs, durationSec, evidenceMs, batchStartMs, batchEndMs }
+}
+
+export interface ArchivePlaybackMedia {
+  blob: Blob
+  mediaKind: 'video' | 'mjpeg'
+  resolvedTimeMs: number | null
+  frameAlignment: string
+}
+
+export async function fetchArchivePlayback(
+  detection: Detection,
+  signal: AbortSignal,
+): Promise<ArchivePlaybackMedia> {
+  const window = archivePlaybackWindow(detection)
+  if (!window || detection.channelId == null) throw new Error('This evidence has no recorder timestamp.')
+  const params = new URLSearchParams({
+    stream: 'mainStream',
+    time_ms: String(window.startMs),
+    duration_sec: String(window.durationSec),
+  })
+  const response = await fetch(`/luxriot/media/archive/${detection.channelId}?${params.toString()}`, {
+    method: 'GET',
+    cache: 'no-store',
+    credentials: 'same-origin',
+    signal,
+  })
+  const mediaKind = String(response.headers.get('X-EVA-Media-Kind') || '').toLowerCase()
+  if (!response.ok || (mediaKind !== 'video' && mediaKind !== 'mjpeg')) {
+    let detail = ''
+    try {
+      const body = await response.json()
+      detail = String(body?.error || body?.error_code || '')
+    } catch { /* response may already be a recorder media body */ }
+    throw new Error(detail || 'Recorder archive playback is unavailable.')
+  }
+  const blob = await response.blob()
+  if (!blob.size) throw new Error('Recorder returned an empty archive segment.')
+  return {
+    blob,
+    mediaKind,
+    resolvedTimeMs: positiveMs(response.headers.get('X-EVA-Archive-Resolved-Time-Ms')),
+    frameAlignment: String(response.headers.get('X-EVA-Archive-Frame-Alignment') || ''),
+  }
+}
+
 export async function findParentAlert(
   parentAlertId: string,
   channelId: number,

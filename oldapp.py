@@ -4547,7 +4547,17 @@ def _parse_lm_alerts(text: str, default_channel_id: int, default_ts_ms: Optional
                     snapshot_indices.append(snapshot_index)
             if snapshot_indices:
                 validated['snapshot_indices'] = snapshot_indices
-                validated['anchor_snapshot'] = snapshot_indices[-1]
+                try:
+                    explicit_anchor = int(raw.get('anchor_snapshot'))
+                except (TypeError, ValueError):
+                    explicit_anchor = None
+                validated['anchor_snapshot'] = (
+                    int(explicit_anchor)
+                    if explicit_anchor is not None
+                    and explicit_anchor > 0
+                    and explicit_anchor in snapshot_indices
+                    else snapshot_indices[0]
+                )
         return validated
 
     def _extract_balanced_json(blob: str, start_idx: int) -> Optional[Tuple[str, int]]:
@@ -9943,7 +9953,17 @@ def _vlm_archive_alert_events(raw_events: Any, channel_id: int) -> List[Dict[str
                     snapshot_indices.append(int(snapshot_index))
             if snapshot_indices:
                 event["snapshot_indices"] = snapshot_indices
-                event["anchor_snapshot"] = snapshot_indices[-1]
+                explicit_anchor = _to_optional_int(raw_event.get("anchor_snapshot"))
+                event["anchor_snapshot"] = (
+                    int(explicit_anchor)
+                    if explicit_anchor is not None
+                    and explicit_anchor > 0
+                    and explicit_anchor in snapshot_indices
+                    else snapshot_indices[0]
+                )
+        timestamp_source = str(raw_event.get("timestamp_source") or "").strip().lower()
+        if timestamp_source:
+            event["timestamp_source"] = timestamp_source[:40]
         events.append(event)
     return events
 
@@ -10030,7 +10050,7 @@ def _select_vlm_alert_anchor(
                 if parsed is not None and parsed > 0
             ]
             if parsed_indices:
-                snapshot_hint = parsed_indices[-1]
+                snapshot_hint = parsed_indices[0]
     reason = "batch_state_snapshot_reference"
     if snapshot_hint is None:
         snapshot_hint = _vlm_archive_snapshot_hint(event_text)
@@ -10269,6 +10289,9 @@ def _vlm_summary_frame_records(entry: Mapping[str, Any]) -> Tuple[List[Dict[str,
                 "timestamp_ms": event_ts,
                 "delivery_status": str(alert_event.get("delivery_status") or ""),
             }
+            timestamp_source = str(alert_event.get("timestamp_source") or "").strip().lower()
+            if timestamp_source:
+                event_payload["timestamp_source"] = timestamp_source[:40]
             parent_alert_id = str(
                 alert_event.get("id") or alert_event.get("alert_id") or ""
             ).strip()

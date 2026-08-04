@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 import {
   IconAlertTriangle,
   IconArrowsMaximize,
@@ -10,6 +10,8 @@ import {
   IconFlag,
   IconMessage,
   IconPhoto,
+  IconPlayerPlay,
+  IconPlayerStop,
   IconX,
 } from '@tabler/icons-react'
 import type { Channel, Detection } from '../../api/types'
@@ -18,6 +20,7 @@ import {
   describeFrame,
   detImageSrc,
   falsePositiveExportUrl,
+  fetchArchivePlayback,
   fullDetectionImageSrc,
   getAlertFeedback,
   loadDetectionBatchFrames,
@@ -112,6 +115,14 @@ export function InspectorModal({
   const [feedbackNote, setFeedbackNote] = useState('')
   const [hasFeedback, setHasFeedback] = useState(false)
   const [incidentDraft, setIncidentDraft] = useState<IncidentDraftInput | null>(null)
+  const [playback, setPlayback] = useState<{
+    state: 'idle' | 'loading' | 'playing' | 'error'
+    url?: string
+    kind?: 'video' | 'mjpeg'
+    detail?: string
+  }>({ state: 'idle' })
+  const playbackAbort = useRef<AbortController | null>(null)
+  const playbackUrl = useRef<string | null>(null)
 
   const active = frames[activeIndex] || d
   const previewSrc = detImageSrc(active)
@@ -138,7 +149,17 @@ export function InspectorModal({
   useEffect(() => {
     setSrc(fullSrc)
     setDesc(null)
+    playbackAbort.current?.abort()
+    playbackAbort.current = null
+    if (playbackUrl.current) URL.revokeObjectURL(playbackUrl.current)
+    playbackUrl.current = null
+    setPlayback({ state: 'idle' })
   }, [active.key, fullSrc])
+
+  useEffect(() => () => {
+    playbackAbort.current?.abort()
+    if (playbackUrl.current) URL.revokeObjectURL(playbackUrl.current)
+  }, [])
 
   useEffect(() => {
     let alive = true
@@ -226,6 +247,53 @@ export function InspectorModal({
     }
   }
 
+  function stopPlayback(detail?: string) {
+    playbackAbort.current?.abort()
+    playbackAbort.current = null
+    if (playbackUrl.current) URL.revokeObjectURL(playbackUrl.current)
+    playbackUrl.current = null
+    setPlayback(detail ? { state: 'error', detail } : { state: 'idle' })
+  }
+
+  async function playArchive() {
+    if (playback.state === 'loading') return
+    stopPlayback()
+    const controller = new AbortController()
+    playbackAbort.current = controller
+    const timeout = window.setTimeout(() => controller.abort(), 120_000)
+    setPlayback({ state: 'loading', detail: 'Preparing recorder archive around the evidence frame…' })
+    try {
+      const media = await fetchArchivePlayback(active, controller.signal)
+      if (controller.signal.aborted || playbackAbort.current !== controller) return
+      const url = URL.createObjectURL(media.blob)
+      playbackUrl.current = url
+      const alignment = media.resolvedTimeMs && media.resolvedTimeMs !== active.tsMs
+        ? ` · recorder aligned ${fmtFull(media.resolvedTimeMs)}`
+        : ''
+      setPlayback({
+        state: 'playing',
+        url,
+        kind: media.mediaKind,
+        detail: `Archive playback${alignment}`,
+      })
+    } catch (exception: any) {
+      if (playbackAbort.current !== controller) return
+      setPlayback({
+        state: 'error',
+        detail: controller.signal.aborted
+          ? 'Archive preparation timed out; the stored evidence frame remains available.'
+          : (exception?.message || 'Archive playback is unavailable.'),
+      })
+    } finally {
+      window.clearTimeout(timeout)
+      if (playbackAbort.current === controller) playbackAbort.current = null
+    }
+  }
+
+  const canPlayArchive = ['vlm_alert', 'vlm_summary'].includes(active.source)
+    && active.channelId != null
+    && active.tsMs != null
+
   return (
     <div className="scrim" onClick={onClose}>
       <div className="modal inspect-modal archive-review-modal" onClick={(event) => event.stopPropagation()}>
@@ -243,7 +311,24 @@ export function InspectorModal({
         <div className="modal-body archive-review-body">
           <div className="archive-review-evidence">
             <div className="inspect-frame archive-review-frame">
-              {src ? (
+              {playback.state === 'playing' && playback.url && playback.kind === 'video' ? (
+                <video
+                  src={playback.url}
+                  autoPlay
+                  muted
+                  loop
+                  controls
+                  playsInline
+                  onError={() => stopPlayback('The browser could not decode the recorder archive segment.')}
+                />
+              ) : playback.state === 'playing' && playback.url && playback.kind === 'mjpeg' ? (
+                <img
+                  className="archive-review-playback-mjpeg"
+                  src={playback.url}
+                  alt="Luxriot archive playback"
+                  onError={() => stopPlayback('The browser could not decode the recorder archive stream.')}
+                />
+              ) : src ? (
                 <>
                   <img
                     src={src}
@@ -260,6 +345,9 @@ export function InspectorModal({
                 </>
               ) : (
                 <div className="inspect-noimg"><IconPhoto size={30} /> No frame</div>
+              )}
+              {playback.state !== 'idle' && playback.detail && (
+                <div className={`archive-playback-status ${playback.state}`}>{playback.detail}</div>
               )}
             </div>
 
@@ -333,6 +421,19 @@ export function InspectorModal({
             {(busy || desc) && <div className="desc-box">{busy ? 'Generating description…' : desc}</div>}
 
             <div className="modal-actions">
+              {canPlayArchive && (
+                playback.state === 'playing'
+                  ? (
+                    <button className="btn" onClick={() => stopPlayback()}>
+                      <IconPlayerStop size={15} /> Stop playback
+                    </button>
+                  )
+                  : (
+                    <button className="btn primary" onClick={playArchive} disabled={playback.state === 'loading'}>
+                      <IconPlayerPlay size={15} /> {playback.state === 'loading' ? 'Preparing archive…' : 'Play archive video'}
+                    </button>
+                  )
+              )}
               <button className="btn" onClick={describe} disabled={busy || !detImageSrc(active)}>
                 <IconMessage size={15} /> Describe frame
               </button>

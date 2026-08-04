@@ -555,7 +555,19 @@ class AlertDeliveryResult(int):
                 ][:16]
                 if snapshot_indices:
                     event["snapshot_indices"] = snapshot_indices
-                    event["anchor_snapshot"] = snapshot_indices[-1]
+                    explicit_anchor = _parse_optional_int(
+                        raw_event.get("anchor_snapshot")
+                    )
+                    event["anchor_snapshot"] = (
+                        int(explicit_anchor)
+                        if explicit_anchor is not None and explicit_anchor > 0
+                        else snapshot_indices[0]
+                    )
+                timestamp_source = str(
+                    raw_event.get("timestamp_source") or ""
+                ).strip().lower()
+                if timestamp_source:
+                    event["timestamp_source"] = timestamp_source[:40]
                 cleaned_events.append(event)
         obj.alert_events = cleaned_events
         return obj
@@ -9327,7 +9339,21 @@ class LuxriotManager:
             ][:16]
             if snapshot_indices:
                 event["snapshot_indices"] = snapshot_indices
-                event["anchor_snapshot"] = snapshot_indices[-1]
+                explicit_anchor = _parse_optional_int(
+                    raw_event.get("anchor_snapshot")
+                )
+                event["anchor_snapshot"] = (
+                    int(explicit_anchor)
+                    if explicit_anchor is not None
+                    and explicit_anchor > 0
+                    and explicit_anchor in snapshot_indices
+                    else snapshot_indices[0]
+                )
+            timestamp_source = str(
+                raw_event.get("timestamp_source") or ""
+            ).strip().lower()
+            if timestamp_source:
+                event["timestamp_source"] = timestamp_source[:40]
             events.append(event)
         return events
 
@@ -19650,6 +19676,30 @@ class LuxriotManager:
                 self._coerce_float(accepted.get("interval_sec")) or 1.0,
             )
             tolerance_ms = max(1000, int(interval_sec * 1000.0))
+            snapshot_timestamps_ms: Dict[int, int] = {}
+            raw_archive_frames = accepted.get("archive_frames")
+            if isinstance(raw_archive_frames, Sequence) and not isinstance(
+                raw_archive_frames,
+                (str, bytes, bytearray),
+            ):
+                for raw_frame in raw_archive_frames:
+                    if not isinstance(raw_frame, Mapping):
+                        continue
+                    snapshot_index = _parse_optional_int(
+                        raw_frame.get("snapshot_index")
+                    )
+                    frame_timestamp_ms = _parse_optional_int(
+                        raw_frame.get("timestamp_ms")
+                    )
+                    if (
+                        snapshot_index is not None
+                        and snapshot_index > 0
+                        and frame_timestamp_ms is not None
+                        and frame_timestamp_ms > 0
+                    ):
+                        snapshot_timestamps_ms[int(snapshot_index)] = int(
+                            frame_timestamp_ms
+                        )
             try:
                 alert_processing_started_at_ms = int(time.time() * 1000.0)
                 alert_delivery = self.process_summary_alerts(
@@ -19658,6 +19708,7 @@ class LuxriotManager:
                     default_ts_ms=batch_end_ms,
                     min_ts_ms=batch_start_ms - tolerance_ms,
                     max_ts_ms=batch_end_ms + tolerance_ms,
+                    snapshot_timestamps_ms=snapshot_timestamps_ms,
                 )
             except Exception as exc:
                 alert_delivery = AlertDeliveryResult(
@@ -20473,6 +20524,7 @@ class LuxriotManager:
         min_ts_ms: Optional[int] = None,
         max_ts_ms: Optional[int] = None,
         delivery_lane: str = "full_l0",
+        snapshot_timestamps_ms: Optional[Mapping[int, int]] = None,
     ) -> AlertDeliveryResult:
         diagnostics = self._alert_output_diagnostics(summary_text)
         structured_contract = bool(diagnostics.get("structured_alert_contract"))
@@ -20519,23 +20571,6 @@ class LuxriotManager:
                 break
             if not isinstance(raw_alert, Mapping):
                 continue
-            alert = {
-                "title": str(raw_alert.get("title") or "Event"),
-                "description": str(raw_alert.get("description") or ""),
-                "severity": str(raw_alert.get("severity") or "normal"),
-                "state": str(raw_alert.get("state") or "new"),
-                "channel_id": int(channel_id),  # force observed stream channel
-                "timestamp_ms": self._normalize_alert_timestamp_ms_bounded(
-                    raw_alert.get("timestamp_ms"),
-                    base_ts_ms,
-                    min_ts_ms=min_ts_ms,
-                    max_ts_ms=max_ts_ms,
-                ),
-            }
-            alert["id"] = derive_parent_alert_id(
-                alert,
-                channel_id=int(channel_id),
-            )
             snapshot_indices = [
                 int(snapshot_index)
                 for snapshot_index in (
@@ -20544,9 +20579,69 @@ class LuxriotManager:
                 )
                 if snapshot_index is not None and snapshot_index > 0
             ][:16]
+            explicit_anchor = _parse_optional_int(raw_alert.get("anchor_snapshot"))
+            fallback_anchor = (
+                int(explicit_anchor)
+                if explicit_anchor is not None
+                and explicit_anchor > 0
+                and (not snapshot_indices or explicit_anchor in snapshot_indices)
+                else snapshot_indices[0]
+                if snapshot_indices
+                else None
+            )
+            anchor_snapshot = fallback_anchor
+            if isinstance(snapshot_timestamps_ms, Mapping):
+                mapped_candidates: List[int] = []
+                if explicit_anchor is not None and explicit_anchor > 0:
+                    mapped_candidates.append(int(explicit_anchor))
+                mapped_candidates.extend(snapshot_indices)
+                anchor_snapshot = next(
+                    (
+                        candidate
+                        for candidate in mapped_candidates
+                        if _parse_optional_int(snapshot_timestamps_ms.get(candidate))
+                        is not None
+                    ),
+                    fallback_anchor,
+                )
+            raw_event_timestamp = self._normalize_alert_timestamp_ms_bounded(
+                raw_alert.get("timestamp_ms"),
+                base_ts_ms,
+                min_ts_ms=min_ts_ms,
+                max_ts_ms=max_ts_ms,
+            )
+            timestamp_source = "model_or_batch_fallback"
+            if anchor_snapshot is not None and isinstance(
+                snapshot_timestamps_ms, Mapping
+            ):
+                observed_timestamp = _parse_optional_int(
+                    snapshot_timestamps_ms.get(int(anchor_snapshot))
+                )
+                if observed_timestamp is not None and observed_timestamp > 0:
+                    raw_event_timestamp = self._normalize_alert_timestamp_ms_bounded(
+                        observed_timestamp,
+                        base_ts_ms,
+                        min_ts_ms=min_ts_ms,
+                        max_ts_ms=max_ts_ms,
+                    )
+                    timestamp_source = "snapshot_index"
+            alert = {
+                "title": str(raw_alert.get("title") or "Event"),
+                "description": str(raw_alert.get("description") or ""),
+                "severity": str(raw_alert.get("severity") or "normal"),
+                "state": str(raw_alert.get("state") or "new"),
+                "channel_id": int(channel_id),  # force observed stream channel
+                "timestamp_ms": int(raw_event_timestamp),
+                "timestamp_source": timestamp_source,
+            }
+            alert["id"] = derive_parent_alert_id(
+                alert,
+                channel_id=int(channel_id),
+            )
             if snapshot_indices:
                 alert["snapshot_indices"] = snapshot_indices
-                alert["anchor_snapshot"] = snapshot_indices[-1]
+            if anchor_snapshot is not None:
+                alert["anchor_snapshot"] = int(anchor_snapshot)
             if self.is_local_channel(channel_id):
                 alert_events.append({**alert, "delivery_status": "local_source_no_recorder"})
                 continue
