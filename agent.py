@@ -5475,6 +5475,10 @@ class AgentTools:
             "deployment_id": raw_probe.get("deployment_id"),
             "metric_profile_id": raw_probe.get("metric_profile_id"),
         }
+        if isinstance(raw_probe.get("embedding_space"), Mapping):
+            payload["embedding_space"] = copy.deepcopy(
+                dict(raw_probe["embedding_space"])
+            )
         if existing:
             payload = _merge_probe(dict(existing), payload)
             payload["id"] = existing.get("id")
@@ -5503,6 +5507,9 @@ class AgentTools:
                             int(args.get("commissioning_after_minutes") or 15),
                         ),
                     ),
+                    probe_pos_floor=float(config.PROBE_POS_FLOOR_DEFAULT),
+                    probe_margin=float(config.PROBE_MARGIN_DEFAULT),
+                    probe_embedding_space=self._current_embedding_space(),
                 )
             else:
                 # Apply the already-previewed immutable plan. Rebuilding here
@@ -5526,6 +5533,9 @@ class AgentTools:
                                 int(args.get("commissioning_after_minutes") or 15),
                             ),
                         ),
+                        probe_pos_floor=float(config.PROBE_POS_FLOOR_DEFAULT),
+                        probe_margin=float(config.PROBE_MARGIN_DEFAULT),
+                        probe_embedding_space=self._current_embedding_space(),
                     )
         except DeploymentWorkflowError as exc:
             raise ToolError(str(exc)) from exc
@@ -5585,6 +5595,13 @@ class AgentTools:
                         "positives": list(item.get("positives") or []),
                         "negatives": list(item.get("negatives") or []),
                         "severity": item.get("severity"),
+                        "pos_floor": item.get("pos_floor"),
+                        "margin": item.get("margin"),
+                        "embedding_backend": (
+                            (item.get("embedding_space") or {}).get("backend")
+                            if isinstance(item.get("embedding_space"), Mapping)
+                            else None
+                        ),
                         "attention_only": bool(item.get("attention_only")),
                     }
                     for item in (plan.get("probes") or [])

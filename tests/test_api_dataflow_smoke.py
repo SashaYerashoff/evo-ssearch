@@ -289,6 +289,18 @@ class ApiDataflowSmokeTests(unittest.TestCase):
         self.assertEqual(payload["counts"]["persistent"], 1)
         self.assertEqual(payload["counts"]["temporary_active"], 1)
         self.assertEqual(payload["counts"]["temporary_expired_hidden"], 1)
+        self.assertEqual(
+            payload["defaults"]["pos_floor"],
+            config.PROBE_POS_FLOOR_DEFAULT,
+        )
+        self.assertEqual(
+            payload["defaults"]["margin"],
+            config.PROBE_MARGIN_DEFAULT,
+        )
+        self.assertEqual(
+            payload["defaults"]["embedding_backend"],
+            "siglip2" if "siglip2" in config.CLIP_MODEL.lower() else "openai_clip",
+        )
 
     def test_expired_probe_lineage_omits_heavy_runtime_thumbnails(self) -> None:
         payload = _expired_stored_probe_lineage_payload(

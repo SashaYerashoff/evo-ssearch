@@ -288,7 +288,7 @@ function DeploymentApprovalCard({ action, onApply, onSend }: {
               {scopeProbes.map((probe: any) => (
                 <div className="ag-deploy-proposal" key={`${probe.channel_id}-${probe.name}`}>
                   <b>CH {probe.channel_id} · {probe.name}</b>
-                  <span>P: {textValue(probe.positives)} · N: {textValue(probe.negatives)} · {probe.severity || 'normal'}</span>
+                  <span>P: {textValue(probe.positives)} · N: {textValue(probe.negatives)} · floor {textValue(probe.pos_floor)} · margin {textValue(probe.margin)} · {probe.embedding_backend || 'embedding space pending'} · {probe.severity || 'normal'}</span>
                 </div>
               ))}
               {scopeCounters.map((counter: any) => (

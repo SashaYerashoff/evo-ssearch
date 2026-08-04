@@ -5606,6 +5606,10 @@ def _admit_alert_derived_probes(
         if _to_optional_int(probe.get("channel_id")) == int(channel_id)
     )
     active_global = len(active_temporary)
+    try:
+        alert_probe_embedding_space = get_probe_embedding_space()
+    except Exception:
+        alert_probe_embedding_space = {}
     for raw_event in alert_events[:8]:
         if active_by_channel > 6 or active_global > 62:
             rejected += 1
@@ -5659,6 +5663,10 @@ def _admit_alert_derived_probes(
         ):
             stored_payload = dict(store_payload)
             stored_payload["attention_only"] = True
+            if alert_probe_embedding_space:
+                stored_payload["embedding_space"] = copy.deepcopy(
+                    dict(alert_probe_embedding_space)
+                )
             probes_store.upsert_probe(stored_payload)
             created_ids.append(str(probe.probe_id))
             lineage_records.append(_probe_lineage_payload(probe))
@@ -16344,6 +16352,15 @@ def _build_probe_payload(
         "bookmark_gate": existing.get("bookmark_gate"),
         "bookmark_gate_updated_at_ms": existing.get("bookmark_gate_updated_at_ms"),
     }
+    # A text probe's P/N/M thresholds are meaningful only in the embedding
+    # space in which the operator created or edited it.  Stamp the live space
+    # server-side; never trust a browser-supplied fingerprint and never
+    # silently relabel untouched legacy probes on read.
+    try:
+        probe["embedding_space"] = get_probe_embedding_space()
+    except Exception:
+        if isinstance(existing.get("embedding_space"), Mapping):
+            probe["embedding_space"] = copy.deepcopy(existing["embedding_space"])
     # This function rebuilds the probe from the request body, so authorship and
     # alert lineage must be carried over explicitly: an operator editing an
     # alert-derived probe must not silently turn it into an operator probe.
@@ -16661,6 +16678,17 @@ def probes_list():
         {
             'probes': probes,
             'channel_groups': _visible_probe_channel_groups(context),
+            'defaults': {
+                'pos_floor': float(config.PROBE_POS_FLOOR_DEFAULT),
+                'margin': float(config.PROBE_MARGIN_DEFAULT),
+                'embedding_backend': (
+                    'siglip2'
+                    if 'siglip2' in str(config.CLIP_MODEL or '').lower()
+                    else 'openai_clip'
+                ),
+                'embedding_model': str(config.CLIP_MODEL or ''),
+                'embedding_revision': str(config.CLIP_MODEL_REVISION or ''),
+            },
             'counts': {
                 'visible': len(probes),
                 'persistent': sum(

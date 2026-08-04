@@ -930,6 +930,9 @@ class ProtocolDeploymentStore:
         *,
         start_live: bool = True,
         commissioning_after_minutes: int = 15,
+        probe_pos_floor: float = 0.05,
+        probe_margin: float = 0.02,
+        probe_embedding_space: Optional[Mapping[str, Any]] = None,
     ) -> Dict[str, Any]:
         state = self.load(deployment_id)
         selected = [int(item) for item in state.get("selected_channel_ids") or []]
@@ -1037,8 +1040,8 @@ class ProtocolDeploymentStore:
                             "channel_id": channel_id,
                             "positives": [positive],
                             "negatives": [contrast],
-                            "pos_floor": 0.20,
-                            "margin": 0.05,
+                            "pos_floor": float(probe_pos_floor),
+                            "margin": max(0.0, float(probe_margin)),
                             "top_k": 6,
                             "window_sec": 300.0,
                             "severity": str(alert.get("severity") or "normal"),
@@ -1049,6 +1052,10 @@ class ProtocolDeploymentStore:
                             "starter_policy": bool(pack.get("starter_policy")),
                             "deployment_id": deployment_id,
                         }
+                        if probe_embedding_space:
+                            probe_payload["embedding_space"] = copy.deepcopy(
+                                dict(probe_embedding_space)
+                            )
                         probes.append(probe_payload)
                         channel_probe_counts[channel_id] = (
                             channel_probe_counts.get(channel_id, 0) + 1

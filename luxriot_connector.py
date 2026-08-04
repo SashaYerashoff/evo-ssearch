@@ -11520,8 +11520,18 @@ class LuxriotManager:
                 ) + 1
             positives = [str(item).strip() for item in (probe.get("positives") or []) if str(item).strip()]
             negatives = [str(item).strip() for item in (probe.get("negatives") or []) if str(item).strip()]
-            pos_floor = float(probe.get("pos_floor", 0.2))
-            margin_thr = float(probe.get("margin", 0.05))
+            pos_floor = float(
+                probe.get(
+                    "pos_floor",
+                    getattr(self.config, "PROBE_POS_FLOOR_DEFAULT", 0.05),
+                )
+            )
+            margin_thr = float(
+                probe.get(
+                    "margin",
+                    getattr(self.config, "PROBE_MARGIN_DEFAULT", 0.02),
+                )
+            )
             probe_id = str(probe.get("id") or probe.get("name") or "probe").strip()[:160]
             version_payload = json.dumps(
                 {

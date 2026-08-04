@@ -20,7 +20,7 @@ export function BenchmarkButton() {
       className={`bench-btn ${busy ? 'busy' : ''} ${bench ? 'done' : ''}`}
       onClick={run}
       disabled={busy}
-      title="Run CLIP throughput benchmark (GPU embed fps)"
+      title="Run embedding throughput benchmark (GPU embed fps)"
     >
       <IconBolt size={14} />
       {busy ? 'Benchmarking…' : bench ? <span className="mono">~{bench.approx_fps} fps · {bench.device}</span> : 'Benchmark'}

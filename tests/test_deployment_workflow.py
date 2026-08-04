@@ -229,7 +229,17 @@ def test_protocol_deploy_builds_bounded_durable_plan():
             "days": [0, 1, 2, 3, 4, 5, 6],
         },
     )
-    planned = store.build_plan(deployment_id)
+    embedding_space = {
+        "backend": "siglip2",
+        "model": "google/siglip2-base-patch16-224",
+        "revision": "test-revision",
+    }
+    planned = store.build_plan(
+        deployment_id,
+        probe_pos_floor=0.05,
+        probe_margin=0.02,
+        probe_embedding_space=embedding_space,
+    )
     plan = planned["plan"]
 
     assert planned["stage"] == "plan_ready"
@@ -239,6 +249,9 @@ def test_protocol_deploy_builds_bounded_durable_plan():
         {"name": "Operations", "channel_ids": [12]},
     ]
     assert len(plan["probes"]) == 1
+    assert plan["probes"][0]["pos_floor"] == 0.05
+    assert plan["probes"][0]["margin"] == 0.02
+    assert plan["probes"][0]["embedding_space"] == embedding_space
     assert len(plan["counted_states"]) == 1
     assert plan["probes"][0]["metric_profile_id"] == plan["counted_states"][0]["id"]
     assert "operator" not in plan["channels"][1]["alert_policy_prompt"].lower()

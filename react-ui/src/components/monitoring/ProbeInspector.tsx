@@ -41,7 +41,7 @@ export function ProbeInspector({ probe, status, busy, settingsBlockedReason, onS
   const ttl = probeTemporaryTtl(probe)
   return (
     <div className="mon-panel">
-      <div className="mon-panel-title">Selected CLIP probe</div>
+      <div className="mon-panel-title">Selected semantic probe</div>
 
       {/* who: one clean identity row */}
       <div className="pi-head">
@@ -99,7 +99,7 @@ export function ProbeInspector({ probe, status, busy, settingsBlockedReason, onS
         )}
         {(onSettings || settingsBlockedReason) && (
           <button className="mon-btn" disabled={!!settingsBlockedReason} title={settingsBlockedReason} onClick={onSettings}>
-            <IconSettings size={15} /> CLIP probe settings
+            <IconSettings size={15} /> Semantic probe settings
           </button>
         )}
         {onRun && (status === 'running'
