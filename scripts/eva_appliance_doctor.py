@@ -12,9 +12,10 @@ import subprocess
 import sys
 import urllib.error
 import urllib.request
+from urllib.parse import urlsplit
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Mapping
 
 from validate_appliance_config import parse_env_file, validate
 
@@ -138,7 +139,18 @@ def _service_status(service: str) -> dict[str, Any]:
     return result
 
 
-def _vllm_runtime_contract() -> dict[str, Any]:
+def _vllm_runtime_contract(values: Mapping[str, str]) -> dict[str, Any]:
+    base_url = str(values.get("EVOSSEARCH_LM_PROFILE_VLM_BASE_URL") or "").strip()
+    try:
+        hostname = str(urlsplit(base_url).hostname or "").lower()
+    except ValueError:
+        hostname = ""
+    if hostname and hostname not in {"127.0.0.1", "localhost", "::1"}:
+        return {
+            "ok": True,
+            "status": "external_profile",
+            "local_unit_required": False,
+        }
     result = _command(("systemctl", "cat", "eva-vllm.service", "--no-pager"))
     contract = _vllm_tool_calling_contract(str(result.get("output") or ""))
     if not result.get("ok"):
@@ -315,7 +327,7 @@ def collect(env_file: Path, state_file: Path) -> dict[str, Any]:
         "schema": schema,
         "services": {service: _service_status(service) for service in SERVICES},
         "runtime_contracts": {
-            "vlm_native_tool_calling": _vllm_runtime_contract(),
+            "vlm_native_tool_calling": _vllm_runtime_contract(values),
         },
         "endpoints": endpoints,
     }

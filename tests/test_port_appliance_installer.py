@@ -77,8 +77,10 @@ def test_port_payload_requires_maritime_runtime_and_react_assets():
     finalizer = (ROOT / "scripts" / "finalize_port_usb_bundle.py").read_text(
         encoding="utf-8"
     )
-    assert '"release_flavor": "ventspils-maritime-client"' in finalizer
+    assert '"ventspils-maritime-client", "universal-offline"' in finalizer
     assert "Refusing to finalize an uncommitted port client bundle" in finalizer
+    assert '"START_EVA_AI.sh"' in finalizer
+    assert '"manifest.txt"' in finalizer
 
 
 def test_predeploy_gate_runs_react_tests_and_production_build():
@@ -461,6 +463,7 @@ def test_bootstrap_deb_has_noninteractive_packaging_boundary(tmp_path):
         text=True,
     ).stdout
     assert "usr/sbin/eva-ai-install" in contents
+    assert "usr/sbin/eva-ai-deploy" in contents
     assert "usr/sbin/eva-ai-doctor" in contents
     assert "models/" not in contents
 

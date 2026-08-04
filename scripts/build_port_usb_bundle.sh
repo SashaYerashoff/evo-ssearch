@@ -112,12 +112,20 @@ rsync -a --delete \
 
 install -p -m 0755 "${SCRIPT_DIR}/install_port_appliance.py" "${STAGING_ROOT}/install_port_appliance.py"
 install -p -m 0755 "${SCRIPT_DIR}/install_port_appliance.sh" "${STAGING_ROOT}/install.sh"
+install -p -m 0755 "${SCRIPT_DIR}/eva_offline_deploy.py" "${STAGING_ROOT}/eva_offline_deploy.py"
+install -p -m 0755 "${SCRIPT_DIR}/eva_offline_deploy.sh" "${STAGING_ROOT}/START_EVA_AI.sh"
 install -p -m 0644 \
     "${REPO_ROOT}/deployment/port_4070s/constraints-port-4070s.txt" \
     "${STAGING_ROOT}/constraints-port-4070s.txt"
-install -p -m 0644 \
-    "${REPO_ROOT}/deployment/port_4070s/START_HERE.txt" \
-    "${STAGING_ROOT}/START_HERE.txt"
+if [[ "${RELEASE_FLAVOR}" == "universal-offline" ]]; then
+    install -p -m 0644 \
+        "${REPO_ROOT}/deployment/universal/START_HERE.md" \
+        "${STAGING_ROOT}/START_HERE.md"
+else
+    install -p -m 0644 \
+        "${REPO_ROOT}/deployment/port_4070s/START_HERE.txt" \
+        "${STAGING_ROOT}/START_HERE.txt"
+fi
 install -p -m 0644 \
     "${REPO_ROOT}/deployment/port_4070s/apt-packages-ubuntu-24.04.txt" \
     "${STAGING_ROOT}/apt/package-names.txt"
@@ -153,4 +161,5 @@ python3 "${SCRIPT_DIR}/build_appliance_installer_deb.py" \
     --output-dir "${STAGING_ROOT}/installer-deb"
 
 echo "Base payload prepared at ${STAGING_ROOT}"
+echo "Universal entry point: ${STAGING_ROOT}/START_EVA_AI.sh"
 echo "Populate wheelhouse/ and apt/, then run scripts/finalize_port_usb_bundle.py."

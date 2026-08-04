@@ -43,6 +43,8 @@ def build(output_dir: Path, version: str, architecture: str) -> Path:
         library.mkdir(parents=True)
         for name in (
             "install_port_appliance.py",
+            "eva_offline_deploy.py",
+            "eva_deployment_report.py",
             "validate_appliance_config.py",
             "eva_appliance_doctor.py",
             "wait_openai_endpoint.py",
@@ -55,6 +57,14 @@ def build(output_dir: Path, version: str, architecture: str) -> Path:
             """#!/bin/sh
 set -eu
 exec python3 /usr/lib/eva-ai-installer/install_port_appliance.py "$@"
+""",
+            0o755,
+        )
+        _write(
+            tree / "usr/sbin/eva-ai-deploy",
+            """#!/bin/sh
+set -eu
+exec python3 /usr/lib/eva-ai-installer/eva_offline_deploy.py "$@"
 """,
             0o755,
         )
@@ -86,7 +96,7 @@ Description: Offline EVA AI appliance bootstrap and diagnostics
             """#!/bin/sh
 set -eu
 install -d -o root -g root -m 0700 /var/lib/eva-ai-installer
-echo "EVA installer ready. Run: sudo eva-ai-install --bundle-root /path/to/bundle"
+echo "EVA installer ready. Run: sudo eva-ai-deploy --bundle-root /path/to/bundle"
 """,
             0o755,
         )

@@ -17,12 +17,16 @@ This split is intentional. Putting large model files or site secrets in the
 bootstrap package would duplicate tens of gigabytes during `dpkg` upgrades and
 make maintainer-script failures difficult to recover from.
 
-Install and configure from removable media:
+Install or update from removable media:
 
 ```bash
 sudo dpkg -i installer-deb/eva-ai-appliance-installer_*_amd64.deb
-sudo eva-ai-install --bundle-root "$PWD"
+sudo eva-ai-deploy --bundle-root "$PWD"
 ```
+
+`eva-ai-deploy` detects an existing system service and selects the update path;
+without an existing deployment it selects the full fresh-install path.
+`eva-ai-install` remains the direct fresh-provisioning recovery command.
 
 The direct `./install.sh` path remains equivalent for recovery. The installer
 stages APT content on the local disk, writes a crash-safe phase journal at

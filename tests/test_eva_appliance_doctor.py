@@ -46,3 +46,15 @@ def test_vllm_tool_calling_contract_requires_parser_value() -> None:
 
     assert result["ok"] is False
     assert result["tool_call_parser"] is None
+
+
+def test_external_vlm_profile_does_not_require_a_local_vllm_unit() -> None:
+    result = doctor._vllm_runtime_contract(
+        {"EVOSSEARCH_LM_PROFILE_VLM_BASE_URL": "http://vlm.internal:8000/v1"}
+    )
+
+    assert result == {
+        "ok": True,
+        "status": "external_profile",
+        "local_unit_required": False,
+    }

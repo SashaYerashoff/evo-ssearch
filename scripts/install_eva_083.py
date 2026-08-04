@@ -530,11 +530,11 @@ def prepare_migration_dsn(
         if not migration_dsn and not non_interactive:
             migration_dsn = getpass.getpass(
                 "Privileged PostgreSQL migration DSN "
-                "(stored as EVA_MIGRATION_DATABASE_DSN): "
+                "(used only by this installer run): "
             ).strip()
             if migration_dsn:
                 values["EVA_MIGRATION_DATABASE_DSN"] = migration_dsn
-                updates["EVA_MIGRATION_DATABASE_DSN"] = migration_dsn
+                source = "interactive process-only value"
     if not migration_dsn:
         return None, None, (
             "EVA_INSTALL_MIGRATION_DSN (process-only) or "
