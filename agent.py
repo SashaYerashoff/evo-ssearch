@@ -10430,6 +10430,47 @@ def _deployment_context_from_payload(
     }
 
 
+def _operator_supplies_deployment_requirements(user_text: Any) -> bool:
+    """Recognize a substantive policy answer, not a generic workflow continuation."""
+
+    text = unicodedata.normalize("NFKC", str(user_text or "")).casefold()
+    categories = (
+        r"\b(?:routine|normal(?:ly)?|expected|baseline)\b|рутин|обычн|нормальн|ожидаем",
+        r"\b(?:alert|watch|notify|alarm|severity|critical|high|low)\b|алерт|тревог|уведом|критич|важн",
+        r"\b(?:novelty|unexpected|unusual|unknown)\b|новизн|непредусмотр|необычн|неизвестн",
+        r"\b(?:count|counter|dwell|duration|how long)\b|сч[её]тчик|посчита|длительн|сколько\s+врем",
+        r"\b(?:quiet\s+window|consolidation|from\s+\d{1,2}(?::\d{2})?\s+to\s+\d{1,2})\b|"
+        r"тих\w*\s+окн|консолидац|с\s+\d{1,2}(?::\d{2})?\s+до\s+\d{1,2}",
+    )
+    return sum(bool(re.search(pattern, text)) for pattern in categories) >= 2
+
+
+def _trusted_deployment_state_message(state: Mapping[str, Any]) -> str:
+    """Bounded server-owned Protocol Deploy receipt for the small agent head."""
+
+    receipt = compact_deployment_state(state)
+    receipt["survey_fingerprints"] = [
+        {
+            "channel_id": row.get("channel_id"),
+            "title": row.get("title"),
+            "sample_count": row.get("sample_count"),
+            "scene_fingerprint": str(row.get("survey") or "")[:700],
+            "error": str(row.get("error") or "")[:200] or None,
+        }
+        for row in (state.get("surveys") or [])[:8]
+        if isinstance(row, Mapping)
+    ]
+    return (
+        "Trusted Protocol Deploy durable state (server-owned; never invent or replace "
+        "deployment_id, stage, channel IDs, groups, or survey evidence):\n"
+        + json.dumps(receipt, ensure_ascii=False, separators=(",", ":"), default=str)
+        + "\nAt stage surveyed, do not repeat inventory, scope configuration, or survey. "
+        "If the operator has not supplied policy requirements, ask for expected routine, "
+        "visible alert conditions and severity, novelty response, optional counters/dwell "
+        "metrics, and a preemptible consolidation quiet window."
+    )
+
+
 def _looks_like_deployment_followup(user_text: Any) -> bool:
     text = unicodedata.normalize("NFKC", str(user_text or "")).casefold()
     return bool(
@@ -10722,6 +10763,7 @@ def _bounded_workflow_plan_completed(context: Mapping[str, Any]) -> bool:
         context.get("incident_draft_completed")
         or context.get("counted_state_completed")
         or context.get("deployment_survey_completed")
+        or context.get("deployment_requirements_pending")
         or (
             "deployment" in (context.get("tool_intents") or ())
             and context.get("deployment_id")
@@ -10894,6 +10936,24 @@ def _turn_tool_cache_key(tool_name: str, args: Mapping[str, Any]) -> str:
 
 def _apply_turn_tool_context(tool_name: str, args: Dict[str, Any], context: Dict[str, Any]) -> Dict[str, Any]:
     prepared = dict(args or {})
+    if tool_name in (_DEPLOYMENT_TOOL_NAMES - {"start_deployment"}):
+        # Deployment identity and phase are durable server state.  A compact
+        # local model must not be able to substitute a plausible-looking ID.
+        deployment_id = str(context.get("deployment_id") or "").strip()
+        if deployment_id:
+            prepared["deployment_id"] = deployment_id
+        if (
+            tool_name == "configure_deployment"
+            and str(context.get("deployment_stage") or "")
+            in {"surveyed", "requirements_configured", "plan_ready"}
+        ):
+            # Resending channel_ids calls the workflow's scope-reset path and
+            # clears completed surveys.  Requirements turns may only change
+            # requirements/quiet-window/profile policy fields.
+            prepared.pop("channel_ids", None)
+            prepared.pop("groups", None)
+        if tool_name == "apply_deployment_plan":
+            prepared["preview"] = True
     operator_relative_range = str(context.get("operator_relative_range") or "").strip()
     if operator_relative_range and tool_name == "normalize_time_window":
         timezone = prepared.get("timezone")
@@ -12680,6 +12740,7 @@ class AgentRunner:
             except Exception:
                 active_deployment = None
             if isinstance(active_deployment, Mapping):
+                trusted_deployment_state = copy.deepcopy(dict(active_deployment))
                 durable_context = _deployment_context_from_payload(
                     compact_deployment_state(active_deployment)
                 )
@@ -12695,6 +12756,15 @@ class AgentRunner:
                             user_text,
                             selected,
                         )
+                    if (
+                        str(durable_context.get("deployment_stage") or "") == "surveyed"
+                        and not _operator_supplies_deployment_requirements(user_text)
+                    ):
+                        turn_tool_context["deployment_requirements_pending"] = True
+            else:
+                trusted_deployment_state = None
+        else:
+            trusted_deployment_state = None
         apply_console_context_defaults(turn_tool_context, console_context)
         turn_tool_context["active_skill_slugs"] = list(requested_skill_slugs)
         requested_skill_tool_names = _skill_tool_names(requested_skill_slugs)
@@ -12714,6 +12784,15 @@ class AgentRunner:
             tool_intents=turn_tool_context.get("tool_intents") or [],
         )
         trusted_research_messages: List[Dict[str, Any]] = []
+        if trusted_deployment_state is not None:
+            trusted_research_messages.append(
+                {
+                    "role": "system",
+                    "content": _trusted_deployment_state_message(
+                        trusted_deployment_state
+                    ),
+                }
+            )
         console_context_message = trusted_console_context_message(console_context)
         if console_context_message:
             trusted_research_messages.append(
@@ -12917,15 +12996,26 @@ class AgentRunner:
                     or _video_overview_research_plan_completed(turn_tool_context)
                 )
             ):
+                if turn_tool_context.get("deployment_requirements_pending"):
+                    completion_instruction = (
+                        "The trusted Protocol Deploy survey phase is complete. Do not call "
+                        "more tools in this turn. Briefly report the surveyed channels and "
+                        "scene fingerprints from trusted durable state, then ask the operator "
+                        "for expected routine, visible alert conditions and severity, novelty "
+                        "response, optional counter/dwell metrics, and the consolidation quiet "
+                        "window. Use the exact trusted deployment_id; never invent one."
+                    )
+                else:
+                    completion_instruction = (
+                        "The bounded server-owned workflow plan is complete. "
+                        "Do not call more tools in this turn. Synthesize the completed "
+                        "inventory and summary results now; state coverage and any "
+                        "unchecked scope."
+                    )
                 in_flight.append(
                     {
                         "role": "system",
-                        "content": (
-                            "The bounded server-owned workflow plan is complete. "
-                            "Do not call more tools in this turn. Synthesize the completed "
-                            "inventory and summary results now; state coverage and any "
-                            "unchecked scope."
-                        ),
+                        "content": completion_instruction,
                     }
                 )
                 yield _sse(

@@ -461,6 +461,79 @@ class AgentToolLoopTests(unittest.TestCase):
 
         self.assertTrue(agent._bounded_workflow_plan_completed(context))
 
+    def test_protocol_deploy_survey_boundary_uses_trusted_state_and_pins_id(self):
+        state = {
+            "deployment_id": "deploy-home-1",
+            "version": 1,
+            "stage": "surveyed",
+            "deployment_profile": "general",
+            "target_channel_count": 8,
+            "available_channels": [
+                {"id": 112, "title": "Zenbook webcam"},
+                {"id": 118, "title": "emu-1"},
+            ],
+            "selected_channel_ids": [112, 118],
+            "groups": [
+                {"name": "home_workspace", "channel_ids": [112]},
+                {"name": "traffic_simulation", "channel_ids": [118]},
+            ],
+            "surveys": [
+                {
+                    "channel_id": 112,
+                    "title": "Zenbook webcam",
+                    "sample_count": 4,
+                    "survey": "SCENE: home workspace; CHANGES: person crosses view",
+                },
+                {
+                    "channel_id": 118,
+                    "title": "emu-1",
+                    "sample_count": 4,
+                    "survey": "SCENE: road simulation; CHANGES: moving vehicle",
+                },
+            ],
+            "requirements": [],
+        }
+
+        receipt = agent._trusted_deployment_state_message(state)
+        self.assertIn("deploy-home-1", receipt)
+        self.assertIn("home workspace", receipt)
+        self.assertIn("road simulation", receipt)
+
+        context = {
+            "tool_intents": ["deployment"],
+            "deployment_id": "deploy-home-1",
+            "deployment_stage": "surveyed",
+            "deployment_requirements_pending": True,
+        }
+        self.assertTrue(agent._bounded_workflow_plan_completed(context))
+
+        prepared = _apply_turn_tool_context(
+            "configure_deployment",
+            {
+                "deployment_id": "deploy_001",
+                "channel_ids": [999],
+                "groups": [{"name": "wrong", "channel_ids": [999]}],
+                "requirements": [
+                    {"name": "desk", "channel_ids": [112]}
+                ],
+            },
+            context,
+        )
+        self.assertEqual(prepared["deployment_id"], "deploy-home-1")
+        self.assertNotIn("channel_ids", prepared)
+        self.assertNotIn("groups", prepared)
+        self.assertEqual(prepared["requirements"][0]["channel_ids"], [112])
+
+        self.assertFalse(
+            agent._operator_supplies_deployment_requirements("continue")
+        )
+        self.assertTrue(
+            agent._operator_supplies_deployment_requirements(
+                "Routine is desk work; alert if the person collapses with high "
+                "severity, and use a quiet window from 01:00 to 04:00."
+            )
+        )
+
     def test_protocol_deploy_runner_rehydrates_durable_state_when_history_omits_tools(self):
         state = {
             "deployment_id": "deploy-home-1",

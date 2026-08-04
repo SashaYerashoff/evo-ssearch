@@ -10,8 +10,12 @@ Format loosely follows Keep a Changelog.
   rehydrated from compact trusted tool receipts across chat turns. Operator
   channel/group selections deterministically advance through scope
   configuration and the bounded scene survey instead of being misrouted into
-  generic L1/L2 research. Appliance Doctor also fails readiness when an
-  installed vLLM unit lacks native tool-choice/parser flags.
+  generic L1/L2 research. The surveyed phase now injects a server-owned receipt
+  with bounded scene fingerprints, pins the durable deployment ID on every
+  subsequent tool call, and prevents a repeated scope payload from erasing the
+  survey while the agent asks for policy requirements. Appliance Doctor also
+  fails readiness when an installed vLLM unit lacks native tool-choice/parser
+  flags.
 - **Operator-mode boundary:** `Operator OFF` now suppresses all agent-chat
   console-driving effects server-side, with a React-side mixed-version guard.
   Read-only research and chat answers remain available; explicit operator Apply
