@@ -59,36 +59,38 @@ function ResearchTrace({
   message,
   onThumb,
   onApply,
+  onSend,
 }: {
   message: Msg
   onThumb: (url: string, title: string) => void
   onApply: (action: ToolAction) => void
+  onSend: (message: string) => void
 }) {
   // The operator owns this disclosure state. Streaming updates must not force
   // a trace open or closed after the user has touched it.
-  const [traceOpen, setTraceOpen] = useState(true)
-  const stepCount = (message.actions?.length ?? 0) + (message.notes?.length ?? 0)
-  const approvalActions = (message.actions || []).filter((action) => (
+  const [traceOpen, setTraceOpen] = useState(false)
+  const workflowActions = (message.actions || []).filter((action) => (
     Boolean(action.planId) || action.applied || action.result?.status === 'preview'
+    || ['start_deployment', 'configure_deployment', 'survey_deployment', 'apply_deployment_plan'].includes(action.name)
   ))
-  const traceActions = (message.actions || []).filter((action) => !approvalActions.includes(action))
+  const traceActions = (message.actions || []).filter((action) => !workflowActions.includes(action))
+  const stepCount = traceActions.length + (message.notes?.length ?? 0)
   return (
     <>
-      {approvalActions.map((action) => (
-        <ActionCard key={action.id} action={action} onThumb={onThumb} onApply={onApply} />
+      {workflowActions.map((action) => (
+        <ActionCard key={action.id} action={action} onThumb={onThumb} onApply={onApply} onSend={onSend} />
       ))}
       {(traceActions.length > 0 || (message.notes?.length ?? 0) > 0) && <details
         className="ag-trace"
         open={traceOpen}
-        onToggle={(event) => setTraceOpen(event.currentTarget.open)}
       >
-        <summary>Research trace · {stepCount} step{stepCount === 1 ? '' : 's'}</summary>
+        <summary onClick={(event) => { event.preventDefault(); setTraceOpen((open) => !open) }}>Research trace · {stepCount} step{stepCount === 1 ? '' : 's'}</summary>
         <div className="ag-trace-body">
           {message.notes?.map((note) => (
             <div key={note.id} className="ag-note"><span className="ag-note-badge">In progress</span>{note.message}</div>
           ))}
           {traceActions.map((action) => (
-            <ActionCard key={action.id} action={action} onThumb={onThumb} onApply={onApply} />
+            <ActionCard key={action.id} action={action} onThumb={onThumb} onApply={onApply} onSend={onSend} />
           ))}
         </div>
       </details>}
@@ -577,6 +579,7 @@ export function AgentPanel({
                     message={m}
                     onThumb={(url, title) => setLightbox({ url, title })}
                     onApply={applyPlan}
+                    onSend={(message) => send(message)}
                   />
                 )}
                 {m.error && <div className="chat-error"><IconAlertTriangle size={14} /> {m.error}</div>}

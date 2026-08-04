@@ -2,21 +2,26 @@ import { useEffect, useMemo, useState } from 'react'
 import {
   IconCheck,
   IconColorSwatch,
+  IconDeviceFloppy,
   IconRestore,
+  IconTrash,
   IconTypography,
   IconX,
 } from '@tabler/icons-react'
 import {
   DEFAULT_APPEARANCE,
+  CUSTOM_APPEARANCE_PRESETS_STORAGE_KEY,
   THEME_PRESETS,
   contrastRatio,
   contrastText,
   getThemePreset,
   hasCustomColors,
   normalizeHex,
+  normalizeSavedAppearancePresets,
   resolveThemePalette,
   type AppearancePreferences,
   type CustomColorKey,
+  type SavedAppearancePreset,
 } from '../../appearance/appearance'
 import { useAppearance } from '../../appearance/AppearanceProvider'
 import { useI18n, type UiLanguage } from '../../i18n/I18nProvider'
@@ -28,6 +33,14 @@ const COLOR_FIELDS: ReadonlyArray<{ key: CustomColorKey; label: string; help: st
   { key: 'text', label: 'Text', help: 'Primary readable content' },
   { key: 'accent', label: 'Accent', help: 'Primary actions and focus' },
 ]
+
+function readCustomPresets(): SavedAppearancePreset[] {
+  try {
+    return normalizeSavedAppearancePresets(JSON.parse(window.localStorage.getItem(CUSTOM_APPEARANCE_PRESETS_STORAGE_KEY) || '[]'))
+  } catch {
+    return []
+  }
+}
 
 export function AppearanceModal({ onClose }: { onClose: () => void }) {
   const { language, setLanguage, t } = useI18n()
@@ -41,6 +54,8 @@ export function AppearanceModal({ onClose }: { onClose: () => void }) {
     ...savedPreferences,
     overrides: { ...savedPreferences.overrides },
   }))
+  const [customPresets, setCustomPresets] = useState<SavedAppearancePreset[]>(readCustomPresets)
+  const [customPresetName, setCustomPresetName] = useState('')
   const palette = useMemo(() => resolveThemePalette(draft), [draft])
   const contrastWarnings = useMemo(() => {
     const warnings: string[] = []
@@ -89,6 +104,35 @@ export function AppearanceModal({ onClose }: { onClose: () => void }) {
 
   function resetColors() {
     update({ ...draft, overrides: {} })
+  }
+
+  function persistCustomPresets(next: SavedAppearancePreset[]) {
+    const normalized = normalizeSavedAppearancePresets(next)
+    setCustomPresets(normalized)
+    try {
+      window.localStorage.setItem(CUSTOM_APPEARANCE_PRESETS_STORAGE_KEY, JSON.stringify(normalized))
+    } catch {
+      // Presets remain available for this browser session when storage is locked.
+    }
+  }
+
+  function saveCustomPreset() {
+    const name = customPresetName.replace(/\s+/g, ' ').trim().slice(0, 48)
+    if (!name || contrastWarnings.length) return
+    const existing = customPresets.find((preset) => preset.name.toLocaleLowerCase() === name.toLocaleLowerCase())
+    const saved: SavedAppearancePreset = {
+      id: existing?.id || `custom-${Date.now().toString(36)}`,
+      name,
+      preferences: { ...draft, overrides: { ...draft.overrides } },
+    }
+    persistCustomPresets(existing
+      ? customPresets.map((preset) => preset.id === existing.id ? saved : preset)
+      : [...customPresets, saved])
+    setCustomPresetName('')
+  }
+
+  function loadCustomPreset(preset: SavedAppearancePreset) {
+    update({ ...preset.preferences, overrides: { ...preset.preferences.overrides } })
   }
 
   return (
@@ -158,6 +202,30 @@ export function AppearanceModal({ onClose }: { onClose: () => void }) {
                   {draft.preset === preset.id && <IconCheck className="theme-preset-check" size={17} />}
                 </button>
               ))}
+            </div>
+            <div className="appearance-custom-presets">
+              <div className="appearance-custom-save">
+                <input
+                  value={customPresetName}
+                  maxLength={48}
+                  placeholder="Custom preset name"
+                  onChange={(event) => setCustomPresetName(event.target.value)}
+                  onKeyDown={(event) => { if (event.key === 'Enter') saveCustomPreset() }}
+                />
+                <button className="btn" disabled={!customPresetName.trim() || contrastWarnings.length > 0} onClick={saveCustomPreset}>
+                  <IconDeviceFloppy size={14} /> Save custom preset
+                </button>
+              </div>
+              {customPresets.length > 0 && (
+                <div className="appearance-custom-list">
+                  {customPresets.map((preset) => (
+                    <div key={preset.id}>
+                      <button onClick={() => loadCustomPreset(preset)}>{preset.name}</button>
+                      <button className="appearance-custom-delete" onClick={() => persistCustomPresets(customPresets.filter((item) => item.id !== preset.id))} aria-label={`Delete ${preset.name}`}><IconTrash size={13} /></button>
+                    </div>
+                  ))}
+                </div>
+              )}
             </div>
           </section>
 

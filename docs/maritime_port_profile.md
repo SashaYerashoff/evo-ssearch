@@ -45,17 +45,20 @@ Start a fresh port draft in agent chat with:
 The target is a maximum, not a quota. Selecting six channels from an
 eight-channel target is valid. EVA then:
 
-1. lists only the currently visible channel inventory and asks for one or more
-   IDs plus optional groups;
-2. samples every selected channel and shows the sparse scene fingerprints;
+1. shows a searchable picker for up to 100 currently visible Evo channels,
+   enforces the eight-channel attention cap, and accepts optional group names;
+2. samples every selected channel and shows the sparse scene fingerprints in a
+   group/channel commissioning card;
 3. asks for each channel's maritime role/location card and whether conservative
    role starter watches should run as non-bookmarking shadow probes;
-4. asks, channel by channel, for normal routine, default visible alerts (or an
-   explicit `no default alerts`), unexpected-event severity, novelty
-   sensitivity, optional count/duration behavior, and the preemptible deep
-   consolidation window;
-5. renders a Protocol Deploy approval card with the selected channels,
-   policy/probe/counter counts, and an expandable policy for each channel;
+4. asks, group by group (or channel by channel when groups are omitted), for
+   normal routine, default visible alerts (or an explicit `no default alerts`),
+   unexpected-event severity, novelty sensitivity, optional count/duration
+   behavior, and the preemptible deep consolidation window. The operator may
+   ask EVA to draft grounded defaults directly from each survey card;
+5. renders a Protocol Deploy approval card that walks through the actual VLM
+   policy and then the proposed P/N probes/counters for every scope. Probe
+   proposals may be rejected without deleting the VLM policy;
 6. changes live settings only after `Apply deployment` succeeds.
 
 A useful alert answer names visible evidence and temporal behavior, not intent:
@@ -64,8 +67,10 @@ A useful alert answer names visible evidence and temporal behavior, not intent:
 dangerously close in the gate for 8 seconds; severity high; deduplicate one
 continuing episode for 2 minutes; count episodes.`
 
-If the draft needs correction, describe it in chat instead of pressing Apply.
-EVA generates a new approval card; an older card cannot apply a changed draft.
+If a policy needs correction, describe it in chat instead of advancing its
+review step. EVA generates a new approval card; an older card cannot apply a
+changed draft. Review is sequential but application is deliberately atomic, so
+an interrupted wizard never leaves only part of a site configured.
 
 ## Prompt hierarchy
 

@@ -30,7 +30,13 @@ Format loosely follows Keep a Changelog.
   preview. Explicit quoted Rule/Alert names form a server-side allowlist, so
   model-invented sibling policies cannot enter the durable draft. Appliance Doctor also
   fails readiness when an installed vLLM unit lacks native tool-choice/parser
-  flags.
+  flags. The React console now exposes the workflow instead of hiding it in a
+  research trace: a searchable inventory picker handles up to 100 visible Evo
+  channels while enforcing the eight-channel attention budget, a scene-survey
+  card offers per-group alert drafting or an explicit no-alert choice, and the
+  final card reviews VLM policies and P/N probes/counters scope by scope before
+  revealing the sole atomic Apply action. Explicit probe rejection rebuilds the
+  draft without discarding its VLM alert policy.
 - **Operator-mode boundary:** `Operator OFF` now suppresses all agent-chat
   console-driving effects server-side, with a React-side mixed-version guard.
   Read-only research and chat answers remain available; explicit operator Apply
@@ -55,6 +61,10 @@ Format loosely follows Keep a Changelog.
   the React console with a legacy URL fallback, records the exact clean client
   branch revision in its manifest, and refuses an accidental dirty or `main`
   bundle unless an explicit recovery override is supplied.
+- **Console polish:** Research traces are closed by default and only operator
+  clicks change their disclosure state. Appearance can save, recall, overwrite,
+  and delete up to twelve named browser-local custom presets after contrast
+  validation.
 
 ## β 0.8.5 — 2026-07-27 release candidate (adaptive attention and memory)
 

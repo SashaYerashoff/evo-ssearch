@@ -630,6 +630,34 @@ class AgentToolLoopTests(unittest.TestCase):
             ),
             [112, 118],
         )
+        self.assertEqual(
+            agent._deployment_no_probe_channel_ids(
+                "For channels 112, 118, keep the policies but reject probes and counters"
+            ),
+            [112, 118],
+        )
+        corrected = agent._deployment_requirements_without_probes(
+            [
+                {
+                    "name": "gate watch",
+                    "channel_ids": [112, 118],
+                    "alerts": [
+                        {
+                            "name": "Converging vessel",
+                            "positive_query": "vessel converging on fairway traffic",
+                            "contrast_query": "ordinary parallel passage",
+                            "counter_mode": "count_transitions",
+                        }
+                    ],
+                }
+            ],
+            [118],
+        )
+        self.assertEqual(corrected[0]["channel_ids"], [112])
+        self.assertEqual(corrected[0]["alerts"][0]["positive_query"], "vessel converging on fairway traffic")
+        self.assertEqual(corrected[1]["channel_ids"], [118])
+        self.assertEqual(corrected[1]["alerts"][0]["positive_query"], "")
+        self.assertEqual(corrected[1]["alerts"][0]["counter_mode"], "none")
         no_alerts = _apply_turn_tool_context(
             "configure_deployment",
             {
@@ -818,8 +846,7 @@ class AgentToolLoopTests(unittest.TestCase):
         list(
             runner.stream_chat(
                 "session-1",
-                "Continue Protocol Deploy. Select channels 112 and 118. "
-                "Group channel 112 as home_workspace and channel 118 as traffic_simulation.",
+                "112, 118; group home_workspace: 112; group traffic_simulation: 118",
             )
         )
 

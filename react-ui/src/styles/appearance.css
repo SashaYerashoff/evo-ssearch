@@ -285,6 +285,40 @@
   color: var(--accent);
 }
 
+.appearance-custom-presets {
+  display: grid;
+  gap: 8px;
+  padding-top: 2px;
+}
+
+.appearance-custom-save {
+  display: grid;
+  grid-template-columns: minmax(180px, 1fr) auto;
+  gap: 8px;
+}
+
+.appearance-custom-save input {
+  min-width: 0;
+  min-height: var(--control-min-h);
+  padding: var(--control-pad-y) var(--control-pad-x);
+  border: 1px solid var(--line-2);
+  border-radius: var(--control-radius);
+  outline: none;
+  color: var(--text);
+  background: var(--control);
+  font: inherit;
+}
+
+.appearance-custom-save input:focus { border-color: var(--accent-line); }
+.appearance-custom-save .btn { display: inline-flex; align-items: center; gap: 6px; }
+
+.appearance-custom-list { display: flex; flex-wrap: wrap; gap: 7px; }
+.appearance-custom-list > div { display: inline-flex; border: 1px solid var(--line); border-radius: var(--control-radius); overflow: hidden; background: var(--control); }
+.appearance-custom-list button { padding: 6px 9px; color: var(--text-2); background: transparent; border: 0; font: inherit; font-size: 11px; }
+.appearance-custom-list button:hover { color: var(--accent); background: var(--accent-soft); }
+.appearance-custom-list .appearance-custom-delete { display: grid; place-items: center; padding-inline: 7px; border-left: 1px solid var(--line); color: var(--text-mut); }
+.appearance-custom-list .appearance-custom-delete:hover { color: var(--danger); background: var(--danger-bg); }
+
 .appearance-columns {
   display: grid;
   grid-template-columns: minmax(0, 1.15fr) minmax(360px, .85fr);
@@ -620,6 +654,8 @@
   .appearance-color-grid {
     grid-template-columns: 1fr;
   }
+
+  .appearance-custom-save { grid-template-columns: 1fr; }
 
   .appearance-option-row {
     align-items: flex-start;

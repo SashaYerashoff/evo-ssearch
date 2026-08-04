@@ -978,10 +978,38 @@
 .ag-approval .ag-fields { padding: 0 12px 10px; }
 .ag-approval-foot { display: flex; justify-content: flex-end; padding: 0 12px 12px; }
 .ag-deployment-approval { margin: 8px 0; }
-.ag-deployment-channel { margin: 0 12px 8px; border: 1px solid var(--border); border-radius: 8px; background: rgba(0,0,0,.12); }
+.ag-deployment-channel { margin: 0 12px 8px; border: 1px solid var(--line-2); border-radius: 8px; background: rgba(0,0,0,.12); }
 .ag-deployment-channel > summary { cursor: pointer; padding: 8px 10px; color: var(--text); font-size: 12px; }
 .ag-deployment-channel > pre { margin: 0; padding: 0 10px 10px; max-height: 180px; overflow: auto; white-space: pre-wrap; overflow-wrap: anywhere; color: var(--text-dim); font: inherit; font-size: 11.5px; }
 .ag-approval-note { padding: 0 12px 10px; color: var(--text-dim); font-size: 11.5px; }
+.ag-deploy-inventory { margin: 8px 0; border: 1px solid var(--accent-line); border-radius: 10px; overflow: hidden; background: var(--accent-soft); }
+.ag-deploy-search { padding: 0 12px 8px; }
+.ag-deploy-search input, .ag-deploy-group-input { width: 100%; min-width: 0; border: 1px solid var(--line-2); border-radius: 7px; background: var(--panel-solid); color: var(--text); padding: 7px 9px; }
+.ag-deploy-channel-list { margin: 0 12px 10px; max-height: 310px; overflow: auto; border: 1px solid var(--line-2); border-radius: 8px; }
+.ag-deploy-channel-row { display: grid; grid-template-columns: minmax(0,1fr) minmax(110px,.45fr); align-items: center; gap: 8px; padding: 7px 9px; border-bottom: 1px solid var(--line-2); }
+.ag-deploy-channel-row:last-child { border-bottom: 0; }
+.ag-deploy-channel-row.selected { background: var(--accent-soft); }
+.ag-deploy-channel-row label { display: flex; align-items: center; gap: 8px; min-width: 0; cursor: pointer; }
+.ag-deploy-channel-row label span { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.ag-deploy-survey { margin: 8px 0; border: 1px solid var(--accent-line); border-radius: 10px; overflow: hidden; background: var(--accent-soft); }
+.ag-deploy-survey-example { display: grid; gap: 4px; margin: 0 12px 10px; padding: 9px 10px; border: 1px solid var(--line-2); border-radius: 8px; background: var(--panel-solid); }
+.ag-deploy-survey-example b { color: var(--accent); font-size: 10px; text-transform: uppercase; letter-spacing: .05em; }
+.ag-deploy-survey-example span { color: var(--text-2); font-size: 11.5px; line-height: 1.45; }
+.ag-deploy-scope-list { display: grid; gap: 8px; margin: 0 12px 10px; }
+.ag-deploy-scope { display: grid; gap: 7px; padding: 10px; border: 1px solid var(--line-2); border-radius: 8px; background: var(--panel-solid); }
+.ag-deploy-scope-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+.ag-deploy-scope-head b { color: var(--text); font-size: 12px; }
+.ag-deploy-scope-head span { color: var(--text-mut); font: 10px var(--mono); }
+.ag-deploy-fingerprint { display: grid; gap: 3px; padding: 7px 8px; border-left: 2px solid var(--accent-line); background: var(--accent-soft); }
+.ag-deploy-fingerprint b { color: var(--text-2); font-size: 10px; }
+.ag-deploy-fingerprint span { color: var(--text-mut); font-size: 10.5px; line-height: 1.4; white-space: pre-wrap; }
+.ag-deploy-review-step { display: grid; gap: 8px; padding-bottom: 10px; }
+.ag-deploy-review-title { margin: 0 12px; color: var(--text); font-size: 13px; font-weight: 650; }
+.ag-deploy-proposal { display: grid; gap: 3px; margin: 0 12px; padding: 8px 9px; border: 1px solid var(--line-2); border-radius: 7px; background: var(--panel-solid); }
+.ag-deploy-proposal b { color: var(--text-2); font-size: 11px; }
+.ag-deploy-proposal span { color: var(--text-mut); font-size: 10.5px; line-height: 1.4; }
+.ag-deploy-review-actions { display: flex; align-items: center; justify-content: flex-end; gap: 7px; padding: 0; }
+.ag-deploy-review-step > .ag-deploy-review-actions { padding: 0 12px; }
 .ag-tool-table {
   overflow: hidden; border: 1px solid var(--line); border-radius: 8px; background: var(--space-0);
 }
