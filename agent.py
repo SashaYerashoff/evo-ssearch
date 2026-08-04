@@ -10102,6 +10102,19 @@ def _select_relevant_tool_schemas(
         else:
             allowed_names.discard("query_counted_state_metric")
 
+    if "deployment" in intents:
+        # Protocol Deploy is a phase machine.  A 4B head gets only the one
+        # schema valid for the trusted durable stage, so it cannot narrate an
+        # update without writing the draft or skip straight to preview/apply.
+        if context.get("deployment_requirements_supplied"):
+            allowed_names.intersection_update({"configure_deployment"})
+        elif (
+            context.get("deployment_preview_pending")
+            or str(context.get("deployment_stage") or "")
+            == "requirements_configured"
+        ):
+            allowed_names.intersection_update({"apply_deployment_plan"})
+
     # A broad video request without a named channel must inventory scope first.
     # Once the inventory result is remembered, detail tools become available in
     # the same turn.
@@ -10724,6 +10737,20 @@ def _required_bounded_workflow_tool_call(
                 name="survey_deployment",
                 args={"deployment_id": deployment_id, "fast_mode": False},
             )
+        if (
+            deployment_id
+            and stage == "requirements_configured"
+            and "apply_deployment_plan" in available
+        ):
+            return _ToolCall(
+                id=f"required-deploy-preview-{uuid.uuid4().hex[:12]}",
+                name="apply_deployment_plan",
+                args={
+                    "deployment_id": deployment_id,
+                    "preview": True,
+                    "start_live": False,
+                },
+            )
 
     if (
         "deployment" in intents
@@ -10773,6 +10800,7 @@ def _bounded_workflow_plan_completed(context: Mapping[str, Any]) -> bool:
         or context.get("counted_state_completed")
         or context.get("deployment_survey_completed")
         or context.get("deployment_requirements_pending")
+        or context.get("deployment_preview_completed")
         or (
             "deployment" in (context.get("tool_intents") or ())
             and context.get("deployment_id")
@@ -11162,6 +11190,7 @@ def _remember_turn_tool_result(tool_name: str, result: Any, context: Dict[str, A
         "start_deployment",
         "configure_deployment",
         "survey_deployment",
+        "apply_deployment_plan",
         "get_deployment_status",
     }:
         deployment_id = str(result.get("deployment_id") or "").strip()
@@ -11187,6 +11216,15 @@ def _remember_turn_tool_result(tool_name: str, result: Any, context: Dict[str, A
             context["deployment_groups"] = copy.deepcopy(result.get("groups") or [])
         if tool_name == "survey_deployment" and result.get("survey_count") is not None:
             context["deployment_survey_completed"] = True
+        if (
+            tool_name == "configure_deployment"
+            and str(result.get("stage") or "") == "requirements_configured"
+        ):
+            context.pop("deployment_requirements_supplied", None)
+            context["deployment_preview_pending"] = True
+        if tool_name == "apply_deployment_plan" and result.get("status") == "preview":
+            context.pop("deployment_preview_pending", None)
+            context["deployment_preview_completed"] = True
         return
 
     if tool_name == "normalize_time_window":
@@ -12767,7 +12805,11 @@ class AgentRunner:
                         )
                     if (
                         str(durable_context.get("deployment_stage") or "") == "surveyed"
-                        and not _operator_supplies_deployment_requirements(user_text)
+                        and _operator_supplies_deployment_requirements(user_text)
+                    ):
+                        turn_tool_context["deployment_requirements_supplied"] = True
+                    elif (
+                        str(durable_context.get("deployment_stage") or "") == "surveyed"
                     ):
                         turn_tool_context["deployment_requirements_pending"] = True
             else:
@@ -13048,7 +13090,16 @@ class AgentRunner:
                 lm_cancel_event = threading.Event()
                 lm_tool_kwargs = (
                     {"tool_choice": "required"}
-                    if force_tools and tool_calls_used == 0 and available_tool_schemas
+                    if (
+                        tool_calls_used == 0
+                        and available_tool_schemas
+                        and (
+                            force_tools
+                            or turn_tool_context.get(
+                                "deployment_requirements_supplied"
+                            )
+                        )
+                    )
                     else {}
                 )
                 try:

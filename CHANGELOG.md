@@ -15,7 +15,9 @@ Format loosely follows Keep a Changelog.
   subsequent tool call, and prevents a repeated scope payload from erasing the
   survey while the agent asks for policy requirements. Authorization-only
   channel scope no longer leaks into the workflow payload and clears saved
-  groups during requirements collection. Appliance Doctor also
+  groups during requirements collection. Requirements and preview phases expose
+  only their single valid tool, so a small head cannot merely narrate an update
+  without persisting it or skip the operator-review preview. Appliance Doctor also
   fails readiness when an installed vLLM unit lacks native tool-choice/parser
   flags.
 - **Operator-mode boundary:** `Operator OFF` now suppresses all agent-chat

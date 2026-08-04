@@ -536,6 +536,38 @@ class AgentToolLoopTests(unittest.TestCase):
             )
         )
 
+        requirements_context = {
+            **context,
+            "deployment_requirements_pending": False,
+            "deployment_requirements_supplied": True,
+        }
+        schemas = _select_relevant_tool_schemas(
+            agent._TOOL_SCHEMAS,
+            requirements_context,
+        )
+        self.assertEqual(
+            {row["function"]["name"] for row in schemas},
+            {"configure_deployment"},
+        )
+        requirements_context.pop("deployment_requirements_supplied")
+        requirements_context["deployment_stage"] = "requirements_configured"
+        requirements_context["deployment_preview_pending"] = True
+        schemas = _select_relevant_tool_schemas(
+            agent._TOOL_SCHEMAS,
+            requirements_context,
+        )
+        self.assertEqual(
+            {row["function"]["name"] for row in schemas},
+            {"apply_deployment_plan"},
+        )
+        call = agent._required_bounded_workflow_tool_call(
+            requirements_context,
+            schemas,
+        )
+        self.assertEqual(call.name, "apply_deployment_plan")
+        self.assertIs(call.args["preview"], True)
+        self.assertIs(call.args["start_live"], False)
+
     def test_protocol_deploy_runner_rehydrates_durable_state_when_history_omits_tools(self):
         state = {
             "deployment_id": "deploy-home-1",
