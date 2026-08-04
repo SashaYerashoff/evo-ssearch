@@ -526,6 +526,24 @@ class AgentToolLoopTests(unittest.TestCase):
         self.assertNotIn("groups", prepared)
         self.assertEqual(prepared["requirements"][0]["channel_ids"], [112])
 
+        general_prepared = _apply_turn_tool_context(
+            "configure_deployment",
+            {
+                "deployment_id": "deploy_001",
+                "channel_roles": [
+                    {"channel_id": 118, "role": "maritime_mixed_ptz"}
+                ],
+                "starter_policy_mode": "shadow",
+                "requirements": [
+                    {"name": "traffic", "channel_ids": [118]}
+                ],
+            },
+            {**context, "deployment_profile": "general"},
+        )
+        self.assertNotIn("channel_roles", general_prepared)
+        self.assertNotIn("starter_policy_mode", general_prepared)
+        self.assertEqual(general_prepared["deployment_id"], "deploy-home-1")
+
         self.assertFalse(
             agent._operator_supplies_deployment_requirements("continue")
         )

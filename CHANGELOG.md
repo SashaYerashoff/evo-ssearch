@@ -24,7 +24,8 @@ Format loosely follows Keep a Changelog.
   coverage claims from the sparse survey. Partial requirements are durable and
   preview is blocked until every selected channel has a policy pack; the final
   partial and preview receipts are rendered from server truth instead of model
-  prose. Appliance Doctor also
+  prose, and general deployments discard model-invented maritime roles/starter
+  policy fields. Appliance Doctor also
   fails readiness when an installed vLLM unit lacks native tool-choice/parser
   flags.
 - **Operator-mode boundary:** `Operator OFF` now suppresses all agent-chat

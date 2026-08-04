@@ -11008,6 +11008,15 @@ def _apply_turn_tool_context(tool_name: str, args: Dict[str, Any], context: Dict
             # requirements/quiet-window/profile policy fields.
             prepared.pop("channel_ids", None)
             prepared.pop("groups", None)
+        if (
+            tool_name == "configure_deployment"
+            and str(context.get("deployment_profile") or "general")
+            != "maritime"
+        ):
+            # Maritime roles and starter packs are profile-owned.  Small
+            # general-purpose heads sometimes invent them from traffic words.
+            prepared.pop("channel_roles", None)
+            prepared.pop("starter_policy_mode", None)
         if tool_name == "apply_deployment_plan":
             prepared["preview"] = True
     operator_relative_range = str(context.get("operator_relative_range") or "").strip()
