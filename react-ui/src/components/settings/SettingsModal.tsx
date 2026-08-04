@@ -1,5 +1,5 @@
 import { useEffect, useState, useCallback } from 'react'
-import { IconX, IconDeviceFloppy, IconRotate, IconSearch } from '@tabler/icons-react'
+import { IconX, IconDeviceFloppy, IconHelpCircle, IconRotate, IconSearch } from '@tabler/icons-react'
 import type { AuthUser, Channel } from '../../api/types'
 import { canViewSettingsTab, hasPermission, PERMISSION } from '../../api/access'
 import { normalizeArchiveCapacity, settingsApi, type Settings } from '../../api/settings'
@@ -183,7 +183,18 @@ export function SettingsModal({
             <div className="modal-title">Settings</div>
             <div className="brand-sub">Tune runtime, ranking, Luxriot integration, and environment.</div>
           </div>
-          <button className="modal-close" onClick={onClose}><IconX size={18} /></button>
+          <div className="set-actions">
+            <a
+              className="mon-btn"
+              href="/ui-assets/quick-start.html"
+              target="_blank"
+              rel="noreferrer"
+              title="Open the EVA AI operator quick start"
+            >
+              <IconHelpCircle size={15} /> Quick start
+            </a>
+            <button className="modal-close" onClick={onClose}><IconX size={18} /></button>
+          </div>
         </div>
 
         <div className="set-body">

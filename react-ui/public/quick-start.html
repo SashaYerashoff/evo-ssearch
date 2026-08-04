@@ -1,0 +1,149 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>EVA AI — Operator Quick Start</title>
+  <style>
+    :root { color-scheme: dark; --bg:#0d131c; --panel:#151d29; --line:#314052; --text:#e8edf4; --muted:#9aa8ba; --accent:#e05c9b; --ok:#51d89a; --warn:#f1bd58; }
+    * { box-sizing:border-box; }
+    body { margin:0; background:radial-gradient(circle at 80% 0,#1b2740 0,transparent 36%),var(--bg); color:var(--text); font:16px/1.55 system-ui,-apple-system,"Segoe UI",sans-serif; }
+    main { width:min(1040px,calc(100% - 32px)); margin:32px auto 80px; }
+    header { border:1px solid var(--line); border-top:4px solid var(--accent); border-radius:14px; padding:28px; background:rgba(21,29,41,.94); }
+    h1 { margin:0 0 6px; font-size:clamp(28px,5vw,44px); letter-spacing:.02em; }
+    h2 { margin:38px 0 12px; padding-bottom:8px; border-bottom:1px solid var(--line); }
+    h3 { margin:24px 0 8px; }
+    p, li { max-width:82ch; }
+    a { color:#ff84bd; }
+    code, kbd { font-family:ui-monospace,"SFMono-Regular",Consolas,monospace; background:#0a1018; border:1px solid var(--line); border-radius:5px; padding:2px 6px; }
+    .lead { color:var(--muted); margin:0; font-size:18px; }
+    .card { background:rgba(21,29,41,.92); border:1px solid var(--line); border-radius:12px; padding:18px 22px; margin:14px 0; }
+    .steps { counter-reset:step; display:grid; gap:12px; padding:0; }
+    .steps > li { list-style:none; padding:14px 16px 14px 56px; border:1px solid var(--line); border-radius:10px; background:var(--panel); position:relative; }
+    .steps > li::before { counter-increment:step; content:counter(step); position:absolute; left:15px; top:13px; width:28px; height:28px; display:grid; place-items:center; border-radius:50%; background:var(--accent); color:white; font-weight:700; }
+    .ok { border-left:4px solid var(--ok); }
+    .warn { border-left:4px solid var(--warn); }
+    .tag { display:inline-block; padding:2px 8px; border:1px solid var(--line); border-radius:999px; color:var(--muted); font-size:13px; }
+    table { width:100%; border-collapse:collapse; background:var(--panel); }
+    th, td { text-align:left; vertical-align:top; padding:10px 12px; border:1px solid var(--line); }
+    th { color:var(--muted); }
+    @media print { :root { color-scheme:light; } body { background:white; color:#17202d; } main { width:100%; margin:0; } header,.card,.steps>li,table { background:white; } a { color:#7c2452; } }
+  </style>
+</head>
+<body>
+<main>
+  <header>
+    <div class="tag">EVA AI 0.8.5 · port appliance</div>
+    <h1>Operator Quick Start</h1>
+    <p class="lead">Connect Luxriot Evo, select streams, create attention probes and VLM alerts, review summaries, and ask the agent for evidence.</p>
+  </header>
+
+  <section class="card ok">
+    <strong>Start here.</strong> Open <code>http://&lt;EVA-IP&gt;:5000</code>, sign in with the credentials supplied by the administrator, then configure Luxriot before starting any stream. The interface can be switched between English and Latvian in <strong>Appearance</strong>; evidence, channel names, summaries, reports, and agent conversations are not translated.
+  </section>
+
+  <h2>1. First connection to Luxriot Evo</h2>
+  <ol class="steps">
+    <li>Open the side <strong>MENU</strong>, then <strong>Settings</strong> → <strong>Luxriot</strong>.</li>
+    <li>Set <strong>Base URL</strong> to the Evo HTTP API address, for example <code>http://192.168.1.50:8080</code>. Enter the Evo <strong>Username</strong> and <strong>Password</strong>. Set a valid <strong>Default channel ID</strong>.</li>
+    <li>Press <strong>Save settings</strong>. A blank password means “keep the current password”, not “remove it”.</li>
+    <li>Wait for the bottom status line to show <strong>LUXRIOT CONNECTED</strong> and a non-zero channel count. A green state means EVA received fresh inventory or stream data, not merely that an address is configured.</li>
+    <li>If channels do not appear, confirm that EVA can reach the Evo IP, the API port is correct, and the Evo account can view the required cameras. Re-open Settings and save corrected credentials.</li>
+  </ol>
+  <div class="card warn"><strong>Do not start all cameras at once.</strong> Select the intended 6–8 operational channels and bring them up in small groups while watching latency and GPU load. PTZ movement or a preset tour changes the scene; EVA marks that view transition and needs a short steady interval to establish the new view.</div>
+
+  <h2>2. The main interface</h2>
+  <table>
+    <thead><tr><th>Area</th><th>Purpose</th></tr></thead>
+    <tbody>
+      <tr><td><strong>Archive</strong></td><td>Search stored visual evidence by time, channel, source, text, or image. Open a result to inspect neighbouring frames and recorder playback.</td></tr>
+      <tr><td><strong>Stream summaries</strong></td><td><strong>Stream review</strong> reads L0–L3 descriptions. <strong>Stream settings</strong> starts/stops a channel and controls batching, cadence, model, prompts, and alerts.</td></tr>
+      <tr><td><strong>Probes</strong></td><td>Fast semantic attention checks evaluated against the continuously indexed frames. Probes can create low-latency Evo bookmarks.</td></tr>
+      <tr><td><strong>Agent</strong></td><td>Researches archive evidence, summaries, alerts, incidents, and runtime state. It can prepare UI actions when Operator mode is on.</td></tr>
+      <tr><td><strong>Bottom status line</strong></td><td>Fresh Luxriot connectivity, visible channels, agent state, and configured probe count.</td></tr>
+    </tbody>
+  </table>
+
+  <h2>3. Start and review stream summaries</h2>
+  <ol class="steps">
+    <li>Open <strong>Stream summaries</strong> → <strong>Stream settings</strong>. Select a channel. Channel selection here is independent of Stream review.</li>
+    <li>Choose the batch limit, sampling cadence, and model. The appliance is designed to adapt the actual frame selection using motion and attention signals; do not use a high fixed rate merely to compensate for a weak alert definition.</li>
+    <li>Press <strong>Apply changes</strong>, then <strong>Start summaries</strong>. Use <strong>Flush</strong> only when an incomplete batch must be submitted immediately.</li>
+    <li>Return to <strong>Stream review</strong>. Select the channel, period, and resolution: observations (L0), 15-minute (L1), one-hour (L2), or eight-hour (L3). <strong>Auto</strong> chooses a useful depth for the selected period.</li>
+  </ol>
+  <div class="card">
+    <h3>How to read a summary</h3>
+    <ul>
+      <li><strong>L0</strong> describes one visual batch and carries the direct alert decision.</li>
+      <li><strong>L1/L2/L3</strong> consolidate shorter descriptions into minutes, hours, and an eight-hour operator-oriented account. They are not independent visual observations.</li>
+      <li><strong>Alert badges</strong> show severity and count. <strong>Burst</strong> means motion exceeded the channel baseline. <strong>PTZ/view</strong> badges mean the camera moved or the current view has not yet been confirmed.</li>
+      <li>The representative image is the VLM cover frame. Click it to open archive review with neighbouring batch frames. Recorder playback may take tens of seconds to prepare.</li>
+      <li><strong>BATCH_STATE_JSON</strong> is machine state. Operators normally read the narrative above it; expand the JSON only for diagnostics.</li>
+    </ul>
+  </div>
+
+  <h2>4. Create a semantic probe</h2>
+  <ol class="steps">
+    <li>Open <strong>Probes</strong> and press <strong>New probe</strong>.</li>
+    <li>Choose the channel and give the probe an operational name, such as “small craft entering harbour gate”.</li>
+    <li>In <strong>Positive scene</strong>, describe what should attract attention. In <strong>Negative look-alike</strong>, describe the closest normal scene that should be suppressed. Example: positive <code>small sailing craft crossing the harbour entrance</code>; negative <code>open water and breakwater with no nearby craft</code>.</li>
+    <li>Keep the displayed SigLIP defaults for <strong>Positive floor</strong> and <strong>Margin</strong> on the first run. Change thresholds only after reviewing real hits and misses.</li>
+    <li>Optionally enable <strong>Make bookmarks in Luxriot on hits</strong>, choose severity, cooldown, and deduplication. Enable the probe and press <strong>Save probe</strong>.</li>
+    <li>Watch several genuine and quiet examples. Raise the positive floor to reduce broad matches; increase the margin when the negative look-alike scores too close. Use ROI only for a fixed camera view—do not copy an ROI blindly across PTZ presets.</li>
+  </ol>
+  <div class="card warn"><strong>A probe is an attention hint, not a fact.</strong> A hit narrows the search and may raise frame density. Confirm safety/security conclusions in the visual evidence or VLM description.</div>
+
+  <h2>5. Create a VLM alert</h2>
+  <ol class="steps">
+    <li>Open <strong>Stream summaries</strong> → <strong>Stream settings</strong>, select the channel, then press <strong>Prompts &amp; alerts</strong>.</li>
+    <li>Open the <strong>Alerts</strong> tab. Describe observable alert criteria, severity, and important exclusions. Keep identity claims conservative and use visible behaviour, geometry, and direction of travel.</li>
+    <li>Example: <code>HIGH: two vessels are converging on crossing trajectories near the harbour entrance, or a small craft is on a collision course with a larger vessel. Do not alert on perspective-only overlap when motion history shows safe separation.</code></li>
+    <li>Enable <strong>Make bookmarks on alerts</strong> if the event must appear in Evo. Set a cooldown appropriate to the event duration, then press <strong>Save</strong>.</li>
+    <li>Run the stream and verify the alert badge, cover frame, neighbouring frames, and bookmark time. Correct the criterion when evidence is ambiguous; do not compensate only by lowering thresholds.</li>
+  </ol>
+  <div class="card"><strong>Stream vs Alerts.</strong> The <strong>Stream</strong> prompt explains how to interpret the scene. Alert/watch criteria belong in <strong>Alerts</strong>, so they do not compete with the core L0 observation contract.</div>
+
+  <h2>6. Search evidence and report an incident</h2>
+  <ul>
+    <li>In <strong>Archive</strong>, select one or more valid channels, evidence sources, and a time range. Use <strong>Text query</strong> for semantic search; its similarity control filters the returned result set from 0 to 1.</li>
+    <li>Click a result to inspect adjacent frames. Use <strong>Play archive video</strong> to request recorder footage around the evidence timestamp.</li>
+    <li><strong>Report incident</strong> creates a durable incident draft from an evidence point. Review the proposed start/end, evidence sequence, and description before saving.</li>
+    <li>Use <strong>Report false positive</strong> when an alert is visually wrong. This feedback is retained for later consolidation and probe/alert tuning.</li>
+  </ul>
+
+  <h2>7. Ask the EVA Agent</h2>
+  <div class="card">
+    <p>Good requests contain a <strong>channel or group</strong>, an explicit <strong>time window</strong>, and the required <strong>evidence/output</strong>.</p>
+    <ul>
+      <li><code>Show high and critical VLM alerts on Harbour Gate West during the last two hours. Include evidence timestamps.</code></li>
+      <li><code>Search the last three days for small sailing craft entering the harbour. Group likely repeats and show the six strongest visual matches.</code></li>
+      <li><code>Build an incident report around this alert, including the first approach, closest point, and final separation.</code></li>
+      <li><code>Check stream health for the selected eight channels and list coverage gaps without guessing what happened during missing video.</code></li>
+    </ul>
+  </div>
+  <ul>
+    <li><strong>Operator ON</strong> allows the agent to drive supported UI views and prepare controlled actions. <strong>Operator OFF</strong> keeps the conversation/read path but blocks UI control.</li>
+    <li>Research traces remain collapsed until the operator opens them. Tool activity is evidence of a lookup, not proof that the final wording is correct.</li>
+    <li>Ask the agent to distinguish <strong>observed evidence</strong>, <strong>inference</strong>, and <strong>coverage gaps</strong>. Challenge claims of “nothing happened” when coverage is incomplete.</li>
+    <li>The guided <strong>protocol: deploy</strong> workflow is not part of this handoff. Configure the initial channels, prompts, and probes manually using the steps above.</li>
+  </ul>
+
+  <h2>8. Handoff health check</h2>
+  <ol class="steps">
+    <li>Luxriot status becomes connected only after fresh data arrives.</li>
+    <li>The intended channels appear and the selected stream produces a recent preview.</li>
+    <li>A test stream produces an L0 summary within its configured maximum batch window.</li>
+    <li>A test probe shows current frames and can be enabled/disabled.</li>
+    <li>Archive search returns a real thumbnail; recorder playback opens around that evidence time.</li>
+    <li>The agent can answer a bounded stream-status request without inventing unavailable coverage.</li>
+  </ol>
+
+  <section class="card">
+    <strong>Where to find this guide</strong><br>
+    In EVA: <strong>MENU → Settings → Quick start</strong><br>
+    On the appliance: <code>~/Desktop/EVA AI Operator Quick Start.html</code><br>
+    URL: <code>http://&lt;EVA-IP&gt;:5000/ui-assets/quick-start.html</code>
+  </section>
+</main>
+</body>
+</html>
