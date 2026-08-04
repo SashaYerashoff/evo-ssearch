@@ -102,7 +102,8 @@ def test_port_vlm_uses_stable_vision_backend_and_content_watchdog(tmp_path):
     source = MODULE_PATH.read_text(encoding="utf-8")
     assert "--mm-encoder-attn-backend FLASH_ATTN" in source
     assert "--mm-processor-cache-gb 0" in source
-    assert "--max-num-seqs 8" in source
+    assert "--gpu-memory-utilization 0.72" in source
+    assert "--max-num-seqs 4" in source
     assert "--enforce-eager" not in source
     assert "ExecStartPost={app_dir}/.venv/bin/python {app_dir}/scripts/wait_openai_endpoint.py --timeout 240" in source
     assert "eva-vlm-vision-watchdog.timer" in source
