@@ -47,4 +47,33 @@ describe('agent transcript restore', () => {
       applied: true,
     })
   })
+
+  it('restores a compact deployment approval after reload', () => {
+    const restored = restoreAgentTranscript([
+      {
+        role: 'assistant',
+        content: '',
+        tool_calls: [{
+          id: 'deploy-call',
+          type: 'function',
+          function: { name: 'apply_deployment_plan', arguments: '{}' },
+        }],
+      },
+      {
+        role: 'tool',
+        content: '',
+        tool_call_id: 'deploy-call',
+        tool_name: 'apply_deployment_plan',
+        tool_result: JSON.stringify({
+          status: 'preview',
+          deployment_id: 'deploy-1',
+          action_plan: { plan_id: 'plan-1', status: 'awaiting_ui_apply' },
+        }),
+      },
+    ])
+    expect(restored[0].actions?.[0]).toMatchObject({
+      name: 'apply_deployment_plan',
+      planId: 'plan-1',
+    })
+  })
 })

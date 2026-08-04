@@ -279,7 +279,7 @@ export function AgentPanel({
         else if (e.type === 'tool_call') {
           patchLast((m) => ({ ...m, status: `Running ${labelTool(e.name || '')}…` }))
         } else if (e.type === 'tool_result') {
-          const planId = e.result?.approval?.plan_id || (e.result?.status === 'preview' ? e.result?.plan_id : null) || null
+          const planId = e.result?.approval?.plan_id || e.result?.action_plan?.plan_id || (e.result?.status === 'preview' ? e.result?.plan_id : null) || null
           const act: ToolAction = { id: ++idRef.current, name: e.name || '', result: e.result, error: e.error, planId }
           patchLast((m) => ({ ...m, actions: [...(m.actions || []), act], status: '' }))
           const effects = normalizeConsoleUiEffects(e.ui_effects)
