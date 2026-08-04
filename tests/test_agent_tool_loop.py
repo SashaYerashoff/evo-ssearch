@@ -461,6 +461,88 @@ class AgentToolLoopTests(unittest.TestCase):
 
         self.assertTrue(agent._bounded_workflow_plan_completed(context))
 
+    def test_protocol_deploy_runner_rehydrates_durable_state_when_history_omits_tools(self):
+        state = {
+            "deployment_id": "deploy-home-1",
+            "version": 1,
+            "stage": "inventory",
+            "deployment_profile": "general",
+            "target_channel_count": 8,
+            "available_channels": [
+                {"id": 112, "title": "Zenbook webcam"},
+                {"id": 118, "title": "emu-1"},
+            ],
+            "selected_channel_ids": [],
+            "groups": [],
+            "surveys": [],
+            "requirements": [],
+        }
+
+        class DeploymentStore:
+            def latest_unfinished(self):
+                return dict(state)
+
+        class DeploymentTools(_FakeTools):
+            def __init__(self):
+                super().__init__()
+                self._deployment_store = DeploymentStore()
+
+            def execute(self, name, args, progress_cb=None):
+                self.calls += 1
+                self.call_args.append((name, dict(args)))
+                if name == "configure_deployment":
+                    state.update(
+                        {
+                            "stage": "scope_configured",
+                            "selected_channel_ids": list(args["channel_ids"]),
+                            "groups": list(args["groups"]),
+                        }
+                    )
+                elif name == "survey_deployment":
+                    state.update(
+                        {
+                            "stage": "surveyed",
+                            "surveys": [
+                                {"channel_id": 112},
+                                {"channel_id": 118},
+                            ],
+                        }
+                    )
+                return agent.compact_deployment_state(state)
+
+        runner = AgentRunner.__new__(AgentRunner)
+        runner.store = _FakeStore(
+            history=[
+                {"role": "user", "content": "Protocol Deploy, target 8 channels"},
+                {"role": "assistant", "content": "Choose channels."},
+            ]
+        )
+        runner._lm_client = _FakeLMClient(tool_rounds=0)
+        runner._tools = DeploymentTools()
+        runner._ps = object()
+        runner._ds = object()
+        runner._lxm = object()
+
+        list(
+            runner.stream_chat(
+                "session-1",
+                "Continue Protocol Deploy. Select channels 112 and 118. "
+                "Group channel 112 as home_workspace and channel 118 as traffic_simulation.",
+            )
+        )
+
+        self.assertEqual(
+            [name for name, _args in runner._tools.call_args],
+            ["configure_deployment", "survey_deployment"],
+        )
+        self.assertEqual(
+            runner._tools.call_args[0][1]["groups"],
+            [
+                {"name": "home_workspace", "channel_ids": [112]},
+                {"name": "traffic_simulation", "channel_ids": [118]},
+            ],
+        )
+
     def test_video_period_research_executes_required_reads_before_model_narrative(self):
         class ResearchTools(_FakeTools):
             def execute(self, name, args, progress_cb=None):

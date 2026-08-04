@@ -10399,28 +10399,35 @@ def _latest_deployment_context(
         payload = _tool_result_payload(message)
         if not payload or payload.get("error"):
             continue
-        deployment_id = str(payload.get("deployment_id") or "").strip()
-        stage = str(payload.get("stage") or "").strip()
-        if not deployment_id or stage in {"applied", "cancelled", "failed"}:
-            return None
-        available = [
-            int(item.get("id"))
-            for item in (payload.get("available_channels") or [])
-            if isinstance(item, Mapping) and _opt_int(item.get("id")) is not None
-        ]
-        selected = [
-            int(item)
-            for item in (payload.get("selected_channel_ids") or [])
-            if _opt_int(item) is not None
-        ]
-        return {
-            "deployment_id": deployment_id,
-            "deployment_stage": stage,
-            "deployment_available_channel_ids": available,
-            "deployment_selected_channel_ids": selected,
-            "deployment_groups": copy.deepcopy(payload.get("groups") or []),
-        }
+        return _deployment_context_from_payload(payload)
     return None
+
+
+def _deployment_context_from_payload(
+    payload: Mapping[str, Any],
+) -> Optional[Dict[str, Any]]:
+    deployment_id = str(payload.get("deployment_id") or "").strip()
+    stage = str(payload.get("stage") or "").strip()
+    if not deployment_id or stage in {"applied", "cancelled", "failed"}:
+        return None
+    available = [
+        int(item.get("id"))
+        for item in (payload.get("available_channels") or [])
+        if isinstance(item, Mapping) and _opt_int(item.get("id")) is not None
+    ]
+    selected = [
+        int(item)
+        for item in (payload.get("selected_channel_ids") or [])
+        if _opt_int(item) is not None
+    ]
+    return {
+        "deployment_id": deployment_id,
+        "deployment_stage": stage,
+        "deployment_profile": str(payload.get("deployment_profile") or "general"),
+        "deployment_available_channel_ids": available,
+        "deployment_selected_channel_ids": selected,
+        "deployment_groups": copy.deepcopy(payload.get("groups") or []),
+    }
 
 
 def _looks_like_deployment_followup(user_text: Any) -> bool:
@@ -12664,6 +12671,30 @@ class AgentRunner:
             user_text,
             history_prefix,
         )
+        if "deployment" in (turn_tool_context.get("tool_intents") or ()):
+            # PostgreSQL chat history intentionally omits raw tool messages.
+            # Rehydrate only the compact deployment receipt from its durable
+            # workflow store; never ask the model to reconstruct phase state.
+            try:
+                active_deployment = self._tools._deployment_store.latest_unfinished()
+            except Exception:
+                active_deployment = None
+            if isinstance(active_deployment, Mapping):
+                durable_context = _deployment_context_from_payload(
+                    compact_deployment_state(active_deployment)
+                )
+                if durable_context:
+                    turn_tool_context.update(durable_context)
+                    selected = _deployment_channel_selection(
+                        user_text,
+                        durable_context.get("deployment_available_channel_ids") or (),
+                    )
+                    if selected:
+                        turn_tool_context["deployment_selected_channel_ids"] = selected
+                        turn_tool_context["deployment_groups"] = _deployment_groups_from_text(
+                            user_text,
+                            selected,
+                        )
         apply_console_context_defaults(turn_tool_context, console_context)
         turn_tool_context["active_skill_slugs"] = list(requested_skill_slugs)
         requested_skill_tool_names = _skill_tool_names(requested_skill_slugs)
