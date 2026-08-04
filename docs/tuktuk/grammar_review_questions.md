@@ -106,3 +106,30 @@ grammar and need Sasha-level review before the grammar or implementation moves.
   4018 candidates" with no results silently dropped, and describe_frame
   (separately routed to the VLM profile, see the sibling commit) returns
   a real visual description instead of an LM 500 error.
+
+- **Archive RANK → batch DRILL grounding** (resolved 2026-08-03, Codex+Sasha).
+  `search_archive` remains the grammar's `RANK` stage: SigLIP scores order
+  attention candidates and are neither binary detections nor probabilities.
+  The existing `describe_frame` tool now accepts one bounded array of 1–9
+  `detection_ids`; the default archive harness selects eight (operator-configured
+  within 6–9), deduplicates equivalent visual frames, and sends them in one
+  multi-image VLM request. This is not a new temporary entity or a model-owned
+  workflow. The harness copies all IDs from the immediately preceding compact
+  `RANK` result, the security adapter resolves durable channel ownership for
+  every ID, and the tool returns stable `match` / `no_match` / `uncertain`
+  verdicts keyed back to those IDs. The terminal guard treats positive and
+  negative visual claims symmetrically: an unparsed, missing, or contradictory
+  batch triggers an evidence-only fallback, and even an all-`no_match` top batch
+  is reported as bounded candidate coverage rather than proof of absence in the
+  whole archive. This preserves `RANK → DRILL → TERM`, strengthens the pinned
+  coverage-honesty gate, and introduces no new mutation/devalidation path.
+
+- **Operator-mode UI projection gate** (resolved 2026-08-04, Codex+Sasha).
+  Console-driving effects remain harness-owned `TERM` projections derived from
+  trusted tool arguments/results; the model still cannot emit DOM/UI commands.
+  The operator's closed boolean `operator_mode` now gates emission of those
+  effects. `OFF` does not remove read tools or alter compact results—it only
+  suppresses navigation/filter/modal effects in the SSE envelope. Explicit UI
+  Apply remains operator-owned and may refresh the committed workspace after a
+  trusted receipt. No tool schema, model argument, stable compact key, or
+  d01–d15 correction path changes.

@@ -18848,7 +18848,7 @@ def agent_chat():
         return jsonify({'error': 'message is required'}), 400
     session_id = str(data.get('session_id') or '').strip() or None
     image_b64  = str(data.get('image_b64') or '').strip() or None
-    operator_mode = bool(data.get('operator_mode'))
+    operator_mode = data.get('operator_mode') is True
     tool_context = None
     auth_context = _current_auth_context()
     console_context = normalize_agent_console_context(
@@ -18887,6 +18887,7 @@ def agent_chat():
             tool_context=tool_context,
             force_tools=operator_mode,
             console_context=console_context,
+            drive_console=operator_mode,
         )
 
     response = Response(

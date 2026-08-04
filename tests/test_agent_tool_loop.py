@@ -277,6 +277,53 @@ class AgentToolLoopTests(unittest.TestCase):
         self.assertEqual(call.name, "track_visual_state_transitions")
         self.assertNotRegex(call.args["negative_state_query"], r"\b(?:no|not|without)\b")
 
+        archive = _seed_turn_tool_context(
+            'Search the video-description archive for "Zenbook webcam" look for sphynx cat'
+        )
+        self.assertIn("archive_research", archive["tool_intents"])
+        self.assertEqual(archive["archive_search_query"], "sphynx cat")
+        self.assertIn(
+            "archive_research",
+            agent._extract_requested_skill_slugs(
+                'Search the video-description archive for "Zenbook webcam" look for sphynx cat'
+            ),
+        )
+        archive["active_skill_slugs"] = ["archive_research"]
+        archive["skill_tool_names"] = sorted(
+            agent._skill_tool_names(["archive_research"])
+        )
+        schemas = _select_relevant_tool_schemas(agent._TOOL_SCHEMAS, archive)
+        self.assertIn(
+            "search_archive",
+            {schema["function"]["name"] for schema in schemas},
+        )
+        call = agent._required_bounded_workflow_tool_call(archive, schemas)
+        self.assertEqual(call.name, "search_archive")
+        self.assertNotIn("channel_id", call.args)
+
+        archive.update({"channel_id": 112, "video_inventory_completed": True})
+        schemas = _select_relevant_tool_schemas(agent._TOOL_SCHEMAS, archive)
+        call = agent._required_bounded_workflow_tool_call(archive, schemas)
+        self.assertEqual(call.name, "search_archive")
+        self.assertEqual(call.args["query"], "sphynx cat")
+        self.assertEqual(call.args["channel_id"], 112)
+        self.assertGreaterEqual(call.args["limit"], 6)
+
+        archive.update(
+            {
+                "archive_search_completed": True,
+                "archive_search_query": "sphynx cat",
+                "archive_vision_required": True,
+                "archive_vision_completed": False,
+                "archive_vision_candidate_ids": list(range(101, 109)),
+            }
+        )
+        schemas = _select_relevant_tool_schemas(agent._TOOL_SCHEMAS, archive)
+        call = agent._required_bounded_workflow_tool_call(archive, schemas)
+        self.assertEqual(call.name, "describe_frame")
+        self.assertEqual(call.args["detection_ids"], list(range(101, 109)))
+        self.assertIn("sphynx cat", call.args["prompt"])
+
         incident = _seed_turn_tool_context(
             "Report incident on channel 112 for the last 10 minutes"
         )
@@ -534,6 +581,38 @@ class AgentToolLoopTests(unittest.TestCase):
         self.assertEqual(runner._tools.call_args[0][1]["since_ms"], 1_000)
         self.assertEqual(result["ui_effects"][0]["target"], "archive")
         self.assertEqual(result["ui_effects"][0]["action"], "show_results")
+
+    def test_operator_off_keeps_research_but_suppresses_console_effects(self):
+        runner = AgentRunner.__new__(AgentRunner)
+        runner.store = _FakeStore()
+        runner._lm_client = _FakeLMClient(
+            tool_rounds=1,
+            tool_name="search_archive",
+        )
+        runner._tools = _FakeTools(
+            result={
+                "query": "person at gate",
+                "results": [{"id": 77, "channel_id": 7, "timestamp_ms": 2_000}],
+            }
+        )
+        runner._ps = object()
+        runner._ds = object()
+        runner._lxm = object()
+
+        events = [
+            json.loads(item.removeprefix("data: ").strip())
+            for item in runner.stream_chat(
+                "session-1",
+                "Search the archive for person at gate",
+                drive_console=False,
+            )
+            if item.startswith("data: ")
+        ]
+
+        self.assertEqual(runner._tools.calls, 1)
+        result = next(item for item in events if item.get("type") == "tool_result")
+        self.assertEqual(result["name"], "search_archive")
+        self.assertEqual(result["ui_effects"], [])
 
     def test_activated_runbook_tools_pass_the_intent_gate(self):
         query = "проверь канал 115, был ли почтальон вчера вечером?"

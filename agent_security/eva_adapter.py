@@ -181,6 +181,11 @@ class EvaAgentToolAdapter:
             allowed_arguments = set(map(str, properties))
             if name in {"delete_probes", "update_probe"}:
                 allowed_arguments.update({"channel_id", "channel_ids"})
+            if name == "describe_frame":
+                # Resolved from detection_id/detection_ids before the generic
+                # gateway performs per-channel authorization. The model never
+                # authors this hidden scope.
+                allowed_arguments.add("channel_ids")
             if name in {
                 "start_deployment",
                 "configure_deployment",
@@ -830,6 +835,61 @@ class EvaAgentToolAdapter:
 
     def _resolve_detection_channel(self, arguments: dict[str, Any]) -> None:
         detection_id = arguments.get("detection_id")
+        raw_detection_ids = arguments.get("detection_ids")
+        if detection_id is not None and raw_detection_ids is not None:
+            raise InvalidToolArgumentsError(
+                "use detection_id or detection_ids, not both"
+            )
+        if raw_detection_ids is not None:
+            if not isinstance(raw_detection_ids, list):
+                raise InvalidToolArgumentsError(
+                    "detection_ids must be an array"
+                )
+            if not 1 <= len(raw_detection_ids) <= 9:
+                raise InvalidToolArgumentsError(
+                    "detection_ids must contain between 1 and 9 IDs"
+                )
+            normalized_ids: list[int] = []
+            for raw_id in raw_detection_ids:
+                try:
+                    normalized_id = int(raw_id)
+                except (TypeError, ValueError) as exc:
+                    raise InvalidToolArgumentsError(
+                        "detection_ids must contain integers"
+                    ) from exc
+                if normalized_id <= 0 or normalized_id in normalized_ids:
+                    if normalized_id <= 0:
+                        raise InvalidToolArgumentsError(
+                            "detection_ids must contain positive integers"
+                        )
+                    continue
+                normalized_ids.append(normalized_id)
+            records = self._legacy_tools._ds.fetch_detections_by_ids(
+                normalized_ids,
+                include_vectors=False,
+            )
+            if len(records) != len(normalized_ids):
+                raise InvalidToolArgumentsError(
+                    "one or more detections do not exist"
+                )
+            channel_ids = {
+                str(record.get("channel_id"))
+                for record in records
+                if record.get("channel_id") is not None
+            }
+            if len(channel_ids) == 0:
+                raise InvalidToolArgumentsError(
+                    "detections have no channel ownership metadata"
+                )
+            if any(record.get("channel_id") is None for record in records):
+                raise InvalidToolArgumentsError(
+                    "one or more detections have no channel ownership metadata"
+                )
+            arguments["detection_ids"] = normalized_ids
+            arguments["channel_ids"] = sorted(channel_ids)
+            if len(channel_ids) == 1:
+                arguments["channel_id"] = next(iter(channel_ids))
+            return
         if detection_id is None:
             return
         try:

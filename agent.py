@@ -97,6 +97,12 @@ def _int_env(name: str, default: int, *, minimum: int = 0, maximum: Optional[int
     return value
 
 
+AGENT_ARCHIVE_VISION_BATCH_SIZE = _int_env(
+    "EVOSSEARCH_AGENT_ARCHIVE_VISION_BATCH_SIZE",
+    8,
+    minimum=6,
+    maximum=9,
+)
 AGENT_VIDEO_RESEARCH_MAX_TOOL_CALLS = _int_env(
     "EVOSSEARCH_AGENT_VIDEO_RESEARCH_MAX_TOOL_CALLS",
     10,
@@ -196,6 +202,34 @@ def _image_data_url(value: Any, default_mime: str = "image/jpeg") -> Optional[st
     if text.lower().startswith("data:image/"):
         return text
     return f"data:{default_mime};base64,{text}"
+
+
+def _extract_first_json_mapping(value: Any) -> Optional[Dict[str, Any]]:
+    text = str(value or "").strip()
+    if not text:
+        return None
+    decoder = json.JSONDecoder()
+    for index, char in enumerate(text):
+        if char != "{":
+            continue
+        try:
+            parsed, _end = decoder.raw_decode(text[index:])
+        except json.JSONDecodeError:
+            continue
+        if isinstance(parsed, dict):
+            return parsed
+    return None
+
+
+def _normalize_archive_vision_verdict(
+    value: Any,
+) -> str:
+    normalized = re.sub(r"[^a-z_]+", "_", str(value or "").strip().lower()).strip("_")
+    if normalized in {"match", "matched", "yes", "present", "positive", "confirmed"}:
+        return "match"
+    if normalized in {"no_match", "not_match", "no", "absent", "negative", "rejected"}:
+        return "no_match"
+    return "uncertain"
 
 
 _TOOL_SCHEMAS: List[Dict[str, Any]] = [
@@ -1234,10 +1268,11 @@ _TOOL_SCHEMAS: List[Dict[str, Any]] = [
         "function": {
             "name": "describe_frame",
             "description": (
-                "Send an image frame to the vision language model for a detailed description. "
+                "Send one image frame or a bounded archive-candidate batch to the vision language model. "
                 "Accepts a live camera snapshot (channel_id), a detection record (detection_id), "
-                "or a filesystem path (image_path). "
-                "Use to understand what is happening on camera right now, or to analyze a past detection."
+                "a copied list of 1-9 detection_ids from a prior archive result, or a filesystem path (image_path). "
+                "Use the batch form to verify top semantic candidates in one multimodal request before "
+                "making either a positive or negative visual claim."
             ),
             "parameters": {
                 "type": "object",
@@ -1260,6 +1295,16 @@ _TOOL_SCHEMAS: List[Dict[str, Any]] = [
                     "detection_id": {
                         "type": "integer",
                         "description": "Detection record ID. The stored thumbnail will be used.",
+                    },
+                    "detection_ids": {
+                        "type": "array",
+                        "items": {"type": "integer"},
+                        "minItems": 1,
+                        "maxItems": 9,
+                        "description": (
+                            "One to nine detection IDs copied from a prior search_archive result. "
+                            "EVA sends all available images in one VLM request and returns per-frame verdicts."
+                        ),
                     },
                     "prompt": {
                         "type": "string",
@@ -3075,6 +3120,20 @@ class AgentTools:
             coverage_raw = results.get("coverage")
             coverage = dict(coverage_raw) if isinstance(coverage_raw, Mapping) else None
             results = results.get("results") if isinstance(results.get("results"), list) else []
+        annotated_results = [
+            _annotate_archive_query_evidence(result, query)
+            for result in results
+            if isinstance(result, Mapping)
+        ]
+        vision_candidates = _select_archive_vision_candidates(annotated_results)
+        lexical_match_count = sum(
+            1 for result in annotated_results if bool(result.get("lexical_match"))
+        )
+        if coverage is not None:
+            coverage["coverage_semantics"] = (
+                "retrieval coverage over compatible indexed candidates; not proof that the visual event is absent"
+            )
+        time_window = _archive_requested_time_window(since_ms, until_ms)
         # `coverage` is ordered before the (potentially large) `results` list
         # on purpose: the security-layer output sanitizer enforces a shared
         # item budget across the whole dict and stops once it is spent, so a
@@ -3084,11 +3143,22 @@ class AgentTools:
         # class of bug and docs/tuktuk/grammar_review_questions.md.
         return {
             "scope": scope,
+            "query": query,
             "source": source,
             "source_label": _archive_source_label(source),
-            "count": len(results),
+            "count": len(annotated_results),
+            "match_semantics": "ranked_candidates_not_binary_matches",
+            "time_window": time_window,
+            "lexical_match_count_in_returned": lexical_match_count,
+            "vision_candidate_ids": [
+                int(result["detection_id"]) for result in vision_candidates
+            ],
+            "vision_candidate_count": len(vision_candidates),
+            "vision_verification_required": bool(vision_candidates),
             "coverage": coverage,
-            "results": _strip_thumbnails([_annotate_archive_row(result) for result in results]),
+            "results": _strip_thumbnails([
+                _annotate_archive_row(result) for result in annotated_results
+            ]),
         }
 
     # ── get_visual_window_signals ─────────────────────────────────────────────
@@ -6568,10 +6638,30 @@ class AgentTools:
         channel_id   = self._resolve_channel_id(args, required=False)
         image_path   = str(args.get("image_path") or "").strip() or None
         detection_id = _opt_int(args.get("detection_id"))
+        raw_detection_ids = args.get("detection_ids")
+        detection_ids: List[int] = []
+        if isinstance(raw_detection_ids, Sequence) and not isinstance(
+            raw_detection_ids, (str, bytes, bytearray)
+        ):
+            for raw_id in raw_detection_ids:
+                normalized_id = _opt_int(raw_id)
+                if normalized_id is None or normalized_id <= 0:
+                    raise ToolError("detection_ids must contain positive integers.")
+                if int(normalized_id) not in detection_ids:
+                    detection_ids.append(int(normalized_id))
+        elif raw_detection_ids is not None:
+            raise ToolError("detection_ids must be an array of detection IDs.")
+        if len(detection_ids) > 9:
+            raise ToolError("describe_frame accepts at most 9 detection_ids per vision batch.")
         prompt = str(args.get("prompt") or "").strip() or (
             "Describe what is happening in this image in detail. "
             "Note any people, vehicles, objects, or unusual activity."
         )
+
+        if detection_ids:
+            if image_path is not None or detection_id is not None:
+                raise ToolError("Use detection_ids alone for a batch; do not combine it with detection_id or image_path.")
+            return self._describe_detection_batch(detection_ids, prompt)
 
         # Prefer explicit archive/file evidence over a live snapshot. Users often
         # ask about "channel X" while also passing detection_id from archive search.
@@ -6649,6 +6739,153 @@ class AgentTools:
             "image_url": f"/detections/image?image_path={quote(resolved_path, safe='')}",
             "detection_id": detection_id,
             "snapshot_b64": encoded,
+        }
+
+    def _describe_detection_batch(
+        self,
+        detection_ids: Sequence[int],
+        prompt: str,
+    ) -> Dict[str, Any]:
+        requested_ids = [int(item) for item in detection_ids[:9]]
+        records = self._ds.fetch_detections_by_ids(
+            requested_ids,
+            include_vectors=False,
+        )
+        by_id = {
+            int(record.get("id") or record.get("detection_id")): record
+            for record in records
+            if _opt_int(record.get("id") or record.get("detection_id")) is not None
+        }
+        prepared: List[Dict[str, Any]] = []
+        missing_ids: List[int] = []
+        for detection_id in requested_ids:
+            record = by_id.get(detection_id)
+            if not isinstance(record, Mapping):
+                missing_ids.append(detection_id)
+                continue
+            image_data_url: Optional[str] = None
+            image_path = str(record.get("image_path") or "").strip()
+            if image_path and Path(image_path).exists():
+                try:
+                    encoded = self._jpeg(Image.open(image_path), max_edge=960, quality=88)
+                    image_data_url = _image_data_url(encoded)
+                except Exception:
+                    image_data_url = None
+            if image_data_url is None:
+                image_data_url = _image_data_url(record.get("thumbnail"))
+            if image_data_url is None:
+                missing_ids.append(detection_id)
+                continue
+            prepared.append(
+                {
+                    "detection_id": detection_id,
+                    "channel_id": _opt_int(record.get("channel_id")),
+                    "timestamp_ms": _detection_timestamp_ms(record),
+                    "source": str(record.get("source") or "").strip() or None,
+                    "image_url": f"/detections/thumbnail/{detection_id}",
+                    "data_url": image_data_url,
+                }
+            )
+        if not prepared:
+            raise ToolError("None of the selected archive candidates has usable visual evidence.")
+
+        instruction = (
+            "Analyze every archive candidate independently against the operator hypothesis below. "
+            "Use only visible pixels in the corresponding image; do not reuse prior summaries, labels, "
+            "or other candidates as evidence. Return exactly one JSON object with key verdicts. "
+            "verdicts must contain one item per Snapshot with snapshot_index, verdict "
+            "(match, no_match, or uncertain), and a short visible_evidence string. "
+            "Do not omit uncertain images.\n\n"
+            f"Operator hypothesis: {prompt}"
+        )
+        content: List[Dict[str, Any]] = [{"type": "text", "text": instruction}]
+        for index, candidate in enumerate(prepared, start=1):
+            content.append(
+                {
+                    "type": "text",
+                    "text": (
+                        f"Snapshot {index}; detection_id={candidate['detection_id']}; "
+                        f"channel_id={candidate.get('channel_id')}; timestamp_ms={candidate.get('timestamp_ms')}"
+                    ),
+                }
+            )
+            content.append(
+                {
+                    "type": "image_url",
+                    "image_url": {
+                        "url": candidate["data_url"],
+                        "detail": "high",
+                    },
+                }
+            )
+        messages = [
+            {
+                "role": "system",
+                "content": (
+                    "You are EVA's bounded visual verification stage. Compare each supplied image "
+                    "with the stated visible hypothesis and return factual JSON only."
+                ),
+            },
+            {"role": "user", "content": content},
+        ]
+        raw_description = str(self._lm(messages) or "").strip()
+        parsed = _extract_first_json_mapping(raw_description)
+        raw_verdicts = parsed.get("verdicts") if isinstance(parsed, Mapping) else None
+        by_snapshot: Dict[int, Mapping[str, Any]] = {}
+        if isinstance(raw_verdicts, list):
+            for raw in raw_verdicts:
+                if not isinstance(raw, Mapping):
+                    continue
+                snapshot_index = _opt_int(raw.get("snapshot_index"))
+                if snapshot_index is None or not 1 <= snapshot_index <= len(prepared):
+                    continue
+                by_snapshot.setdefault(int(snapshot_index), raw)
+
+        verdicts: List[Dict[str, Any]] = []
+        for index, candidate in enumerate(prepared, start=1):
+            raw = by_snapshot.get(index, {})
+            verdict = _normalize_archive_vision_verdict(raw.get("verdict"))
+            evidence = re.sub(
+                r"\s+",
+                " ",
+                str(raw.get("visible_evidence") or raw.get("evidence") or "").strip(),
+            )[:320]
+            verdicts.append(
+                {
+                    "snapshot_index": index,
+                    "detection_id": candidate["detection_id"],
+                    "channel_id": candidate.get("channel_id"),
+                    "timestamp_ms": candidate.get("timestamp_ms"),
+                    "source": candidate.get("source"),
+                    "image_url": candidate.get("image_url"),
+                    "verdict": verdict,
+                    "visible_evidence": evidence or "VLM did not return grounded evidence for this candidate.",
+                }
+            )
+        match_ids = [row["detection_id"] for row in verdicts if row["verdict"] == "match"]
+        no_match_ids = [row["detection_id"] for row in verdicts if row["verdict"] == "no_match"]
+        uncertain_ids = [row["detection_id"] for row in verdicts if row["verdict"] == "uncertain"]
+        return {
+            "description": raw_description,
+            "source": "archive_candidate_batch",
+            "query": prompt,
+            "vision_checked": True,
+            "parse_status": "parsed" if isinstance(raw_verdicts, list) else "unparsed",
+            "requested_count": len(requested_ids),
+            "candidate_count": len(prepared),
+            "detection_ids": [row["detection_id"] for row in prepared],
+            "missing_detection_ids": missing_ids,
+            "match_count": len(match_ids),
+            "no_match_count": len(no_match_ids),
+            "uncertain_count": len(uncertain_ids),
+            "matched_detection_ids": match_ids,
+            "no_match_detection_ids": no_match_ids,
+            "uncertain_detection_ids": uncertain_ids,
+            "verdicts": verdicts,
+            "note": (
+                "Vision verdicts cover only this bounded SigLIP candidate batch; "
+                "they do not prove absence outside the reviewed candidates."
+            ),
         }
 
     def _describe_from_thumb_b64(
@@ -9377,7 +9614,8 @@ def _build_scoped_agent_system_prompt(
             "Archive research route:\n"
             "- Resolve channel/time scope and report search coverage. Semantic matches rank attention, not factual confirmation.\n"
             "- Preserve source semantics: probe, semantic snapshot, VLM summary, and VLM alert are different evidence classes.\n"
-            "- Use describe_frame before saying a visual claim is confirmed."
+            "- EVA batches up to nine diverse top candidates through describe_frame. Use those per-frame verdicts for conclusions.\n"
+            "- Positive and negative visual claims are symmetric: never say the event is absent when the vision batch is missing, unparsed, or uncertain."
         )
 
     if "help" in intents:
@@ -9603,6 +9841,7 @@ def build_system_prompt(
         f"- If the operator asks to confirm video-summary findings with images/snaps, use get_video_summaries with include_evidence_frames=true or call get_detections with source=vlm_summary/source=vlm_alert, the same channel, and the same since_ms/until_ms. Do not use semantic search as the first proof step for exact time evidence.\n"
         f"- For image confirmation of video summaries, do not fall back to source=probe detections or a live frame unless the operator explicitly asks for probe/live corroboration. If no vlm_summary/vlm_alert archive frames are available, say that VLM snap evidence is unavailable for that period.\n"
         f"- Never say that an event is visually confirmed unless a tool in this turn returned archive frame rows with image_url for the relevant channel/time and describe_frame analyzed the relevant frame(s). If no image rows are returned, say that only text-summary evidence is available and provide the exact image query attempted.\n"
+        f"- Absence needs the same visual discipline as presence. search_archive returns ranked candidates, never a binary zero-match verdict. Do not say 'no visual evidence', 'not detected', or 'all results contain no X' unless the bounded describe_frame batch completed with parsed no_match verdicts; even then limit the conclusion to the reviewed candidates.\n"
         f"- Use get_visual_window_signals when you need a quick CLIP P/N/M attention signal over video-description frames. Treat P/N/M as a cue for where to inspect next, not as proof. Before concluding, inspect summaries and call describe_frame on relevant candidate frames.\n"
         f"- Summary rows may carry vector_signal.capture_attention: seconds whose measured motion was far above that channel's own learned norm (mode=burst; activity_x = times above typical). Bursts are trusted server-side attention markers - prefer those windows when picking evidence frames and when the operator asks about spikes, sudden motion, or 'что резкого было'. Motion blur on burst frames is expected physics of fast events; a sharper companion frame of the same second may exist in the archive as anchor_role=burst_companion. Bursts are statistical attention, not semantic proof - verify in frames before alerting.\n"
         f"- For burst/spike/attention questions call list_attention_bursts FIRST: it is bounded and already sorted by strength. Do not fan out over get_video_summaries or L1 rollups to find spikes. Rows with coverage_gap=true (and any backpressure_gap_count) mean those windows were dropped under LM backpressure: report them as unknown intervals, never as calm.\n"
@@ -9868,6 +10107,7 @@ def _select_relevant_tool_schemas(
     # the same turn.
     if (
         "video_research" in intents
+        and "archive_research" not in intents
         and context.get("channel_id") is None
         and not context.get("video_inventory_completed")
         and not context.get("research_continuation")
@@ -9880,6 +10120,45 @@ def _select_relevant_tool_schemas(
         if isinstance(schema, Mapping)
         and str((schema.get("function") or {}).get("name") or "") in allowed_names
     ]
+
+
+def _extract_archive_search_query(value: Any) -> Optional[str]:
+    """Extract the visible hypothesis from an explicit archive request.
+
+    This is intentionally conservative. It only runs after archive intent was
+    classified and exists to keep the server-owned RANK step deterministic for
+    a small local model; it is not a general natural-language parser.
+    """
+
+    text = unicodedata.normalize("NFKC", str(value or "")).strip()
+    if not text:
+        return None
+    patterns = (
+        r"\blook\s+for\s+(.+)$",
+        r"\bfind\s+(.+?)\s+in\s+(?:the\s+)?(?:video-description\s+)?archive\b",
+        r"\b(?:video-description\s+)?archive\s+(?:for|about)\s+(.+)$",
+        r"(?:ищи|найди|найдите|поиск)\s+(.+?)\s+в\s+архиве\b",
+        r"(?:поиск\s+по|в)\s+архив(?:у|е)\s+(?:по|для|про)?\s*(.+)$",
+    )
+    candidate = ""
+    for pattern in patterns:
+        match = re.search(pattern, text, flags=re.IGNORECASE)
+        if match:
+            candidate = str(match.group(1) or "").strip()
+            break
+    if not candidate:
+        return None
+    candidate = re.split(
+        r"\b(?:during|within|over|from)\s+(?:the\s+)?(?:last|past)\b|"
+        r"\b(?:за|в\s+течение)\s+(?:последн\w+)?\s*\d",
+        candidate,
+        maxsplit=1,
+        flags=re.IGNORECASE,
+    )[0]
+    candidate = candidate.strip(" \t\r\n.,;:!?\"'“”«»")
+    if not candidate or len(candidate) > 500:
+        return None
+    return candidate
 
 
 def _extract_vlm_alert_criterion(text: Any) -> Optional[str]:
@@ -9927,6 +10206,10 @@ def _seed_turn_tool_context(user_text: Any) -> Dict[str, Any]:
         )
     )
     context["tool_intents"] = _classify_tool_intents(routing_text, context)
+    if "archive_research" in context["tool_intents"]:
+        archive_query = _extract_archive_search_query(routing_text)
+        if archive_query:
+            context["archive_search_query"] = archive_query
     if "counted_state" in context["tool_intents"]:
         context["counted_state_saved_metric"] = bool(
             re.search(
@@ -10109,6 +10392,56 @@ def _required_bounded_workflow_tool_call(
         )
 
     if (
+        "archive_research" in intents
+        and not context.get("archive_search_completed")
+        and context.get("archive_search_query")
+        and "search_archive" in available
+        and not (
+            relative_range
+            and not isinstance(time_window, Mapping)
+            and "normalize_time_window" in available
+        )
+    ):
+        search_args: Dict[str, Any] = {
+            "query": str(context["archive_search_query"])[:500],
+            "scope": "detections",
+            "limit": max(6, min(48, AGENT_ARCHIVE_VISION_BATCH_SIZE * 3)),
+        }
+        if context.get("channel_id") is not None:
+            search_args["channel_id"] = int(context["channel_id"])
+        return _ToolCall(
+            id=f"required-archive-rank-{uuid.uuid4().hex[:12]}",
+            name="search_archive",
+            args=search_args,
+        )
+
+    if (
+        "archive_research" in intents
+        and context.get("archive_search_completed")
+        and context.get("archive_vision_required")
+        and not context.get("archive_vision_completed")
+        and "describe_frame" in available
+    ):
+        detection_ids = [
+            int(item)
+            for item in (context.get("archive_vision_candidate_ids") or [])[:9]
+            if _opt_int(item) is not None and int(item) > 0
+        ]
+        if detection_ids:
+            query = str(context.get("archive_search_query") or "visible archive event").strip()
+            return _ToolCall(
+                id=f"required-archive-vision-{uuid.uuid4().hex[:12]}",
+                name="describe_frame",
+                args={
+                    "detection_ids": detection_ids,
+                    "prompt": (
+                        "Verify whether each candidate visibly matches the archive query: "
+                        + query[:500]
+                    ),
+                },
+            )
+
+    if (
         context.get("incident_operation") == "draft"
         and not context.get("incident_draft_completed")
         and context.get("channel_id") is not None
@@ -10191,6 +10524,14 @@ def _bounded_workflow_plan_completed(context: Mapping[str, Any]) -> bool:
         context.get("incident_draft_completed")
         or context.get("counted_state_completed")
         or context.get("deployment_survey_completed")
+        or (
+            "archive_research" in (context.get("tool_intents") or ())
+            and context.get("archive_search_completed")
+            and (
+                not context.get("archive_vision_required")
+                or context.get("archive_vision_completed")
+            )
+        )
     )
 
 
@@ -10438,7 +10779,7 @@ def _apply_turn_tool_context(tool_name: str, args: Dict[str, Any], context: Dict
     channel_id = context.get("channel_id")
     should_default_channel = not (
         tool_name == "describe_frame"
-        and _has_any_arg(prepared, ("detection_id", "image_path"))
+        and _has_any_arg(prepared, ("detection_id", "detection_ids", "image_path"))
     )
     if should_default_channel and channel_id is not None and tool_name in {
         "get_video_summaries",
@@ -10572,6 +10913,36 @@ def _remember_turn_tool_result(tool_name: str, result: Any, context: Dict[str, A
                 "relative_range": result.get("relative_range"),
                 "duration_sec": result.get("duration_sec"),
             }
+        return
+
+    if tool_name == "search_archive":
+        context["archive_search_completed"] = True
+        context["archive_search_query"] = str(result.get("query") or "").strip()
+        candidate_ids = [
+            int(item)
+            for item in (result.get("vision_candidate_ids") or [])[:9]
+            if _opt_int(item) is not None and int(item) > 0
+        ]
+        context["archive_vision_candidate_ids"] = candidate_ids
+        context["archive_vision_required"] = bool(candidate_ids)
+        context["archive_vision_completed"] = False
+        context["archive_vision_parse_status"] = None
+        context["archive_vision_match_count"] = None
+        time_window = result.get("time_window")
+        if isinstance(time_window, Mapping):
+            context["time_window"] = dict(time_window)
+        return
+
+    if tool_name == "describe_frame" and result.get("source") == "archive_candidate_batch":
+        context["archive_vision_completed"] = bool(result.get("vision_checked"))
+        context["archive_vision_parse_status"] = result.get("parse_status")
+        context["archive_vision_candidate_count"] = _opt_int(result.get("candidate_count"))
+        context["archive_vision_match_count"] = _opt_int(result.get("match_count"))
+        context["archive_vision_no_match_count"] = _opt_int(result.get("no_match_count"))
+        context["archive_vision_uncertain_count"] = _opt_int(result.get("uncertain_count"))
+        context["archive_vision_matched_detection_ids"] = list(
+            result.get("matched_detection_ids") or []
+        )[:9]
         return
 
     if tool_name == "get_prompt_settings":
@@ -11225,6 +11596,7 @@ def _record_turn_signal_ledger(
         return
 
     if tool_name == "describe_frame":
+        verdicts = result.get("verdicts") if isinstance(result.get("verdicts"), list) else []
         _signal_ledger_append(
             ledger,
             "evidence",
@@ -11233,6 +11605,22 @@ def _record_turn_signal_ledger(
                 "channel_id": result.get("channel_id"),
                 "source": result.get("source"),
                 "has_description": bool(str(result.get("description") or "").strip()),
+                "vision_checked": bool(result.get("vision_checked")),
+                "parse_status": result.get("parse_status"),
+                "candidate_count": result.get("candidate_count"),
+                "match_count": result.get("match_count"),
+                "no_match_count": result.get("no_match_count"),
+                "uncertain_count": result.get("uncertain_count"),
+                "matched_detection_ids": list(result.get("matched_detection_ids") or [])[:9],
+                "verdict_samples": [
+                    {
+                        "detection_id": row.get("detection_id"),
+                        "verdict": row.get("verdict"),
+                        "visible_evidence": _compact_signal_value(row.get("visible_evidence"), 180),
+                    }
+                    for row in verdicts[:6]
+                    if isinstance(row, Mapping)
+                ],
                 "note": _compact_signal_value(result.get("note"), 180),
             },
         )
@@ -11453,6 +11841,173 @@ def _video_research_response_needs_recovery(
         or bool(re.search(r"\bch\s*#?\s*\d+\b", normalized))
     )
     return factual_claim
+
+
+def _archive_research_response_needs_recovery(
+    value: Any,
+    context: Mapping[str, Any],
+) -> bool:
+    """Reject archive conclusions that outrun the bounded vision drill."""
+
+    if "archive_research" not in (context.get("tool_intents") or ()):
+        return False
+    if not context.get("archive_search_completed"):
+        return False
+    text = unicodedata.normalize("NFKC", str(value or "")).casefold()
+    if not text.strip():
+        return True
+    definitive_negative = bool(
+        re.search(
+            r"\b(?:no\s+(?:visual\s+)?evidence|no\s+(?:direct\s+)?matches?|"
+            r"no\b.{0,80}\b(?:found|detected|present)|"
+            r"nothing\s+(?:was\s+)?found|not\s+(?:found|detected|present)|"
+            r"no\s+(?:animal|person|vehicle|object|event))\b|"
+            r"(?:не\s+найден|не\s+обнаружен|ни\s+одн\w*.{0,80}(?:не\s+найден|не\s+обнаружен)|"
+            r"визуальн\w*\s+доказательств\s+нет|"
+            r"совпадени\w*\s+нет|отсутствует\s+на\s+всех)",
+            text,
+        )
+    )
+    definitive_positive = bool(
+        re.search(
+            r"\b(?:visual\s+evidence\s+(?:was\s+)?found|evidence\s+found|"
+            r"visual\s+match(?:es)?\s+(?:was|were)?\s*found|"
+            r"(?:is|are|was|were)\s+visibly\s+present|"
+            r"image(?:s)?\s+(?:shows?|confirms?)\b|"
+            r"визуальн\w*\s+(?:совпадени\w*|подтверждени\w*)\s+найден|"
+            r"на\s+кадр(?:е|ах)\s+(?:виден|видна|видно|видны))\b",
+            text,
+        )
+    )
+    coverage_overclaim = bool(
+        re.search(r"100\s*%\s+(?:of\s+)?(?:the\s+)?archive|100\s*%\s+архив", text)
+    )
+    if coverage_overclaim:
+        return True
+    if not definitive_negative and not definitive_positive:
+        return False
+    if context.get("archive_vision_required") and not context.get("archive_vision_completed"):
+        return True
+    if context.get("archive_vision_parse_status") != "parsed":
+        return True
+    match_count = _opt_int(context.get("archive_vision_match_count"))
+    if definitive_positive:
+        return match_count is None or match_count <= 0
+    uncertain_count = _opt_int(context.get("archive_vision_uncertain_count"))
+    no_match_count = _opt_int(context.get("archive_vision_no_match_count"))
+    return bool(
+        match_count is None
+        or match_count > 0
+        or uncertain_count is None
+        or uncertain_count > 0
+        or no_match_count is None
+        or no_match_count <= 0
+    )
+
+
+def _format_archive_research_fallback(
+    ledger: Mapping[str, Any],
+    *,
+    tool_messages: Optional[Sequence[Mapping[str, Any]]] = None,
+) -> str:
+    query_text = str(ledger.get("user_query") or "")
+    russian = bool(re.search(r"[а-яё]", query_text, flags=re.IGNORECASE))
+    search_result: Mapping[str, Any] = {}
+    vision_result: Mapping[str, Any] = {}
+    for message in tool_messages or ():
+        if not isinstance(message, Mapping) or str(message.get("role") or "") != "tool":
+            continue
+        name = str(message.get("name") or "")
+        raw_content = message.get("content")
+        try:
+            payload = json.loads(raw_content) if isinstance(raw_content, str) else raw_content
+        except Exception:
+            payload = None
+        if not isinstance(payload, Mapping):
+            continue
+        if name == "search_archive":
+            search_result = payload
+        elif name == "describe_frame" and payload.get("source") == "archive_candidate_batch":
+            vision_result = payload
+
+    query = str(search_result.get("query") or query_text or "archive query").strip()
+    count = _opt_int(search_result.get("count")) or 0
+    shown = _opt_int(search_result.get("results_returned_to_model")) or 0
+    lexical = _opt_int(search_result.get("lexical_match_count_in_returned")) or 0
+    time_window = search_result.get("time_window") if isinstance(search_result.get("time_window"), Mapping) else {}
+    coverage = search_result.get("coverage") if isinstance(search_result.get("coverage"), Mapping) else {}
+    scanned = _opt_int(coverage.get("scanned_candidates"))
+    total = _opt_int(coverage.get("total_candidates"))
+    lines = [
+        f"Результат архивного поиска: `{query}`"
+        if russian
+        else f"Archive search result: `{query}`"
+    ]
+    if time_window:
+        start = time_window.get("from_local") or time_window.get("from_utc")
+        end = time_window.get("to_local") or time_window.get("to_utc")
+        duration = time_window.get("duration_sec")
+        lines.append(
+            (f"- Период сервера: {start} — {end}; {duration} секунд."
+             if russian else f"- Server-resolved window: {start} — {end}; {duration} seconds.")
+        )
+    lines.append(
+        (
+            f"- SigLIP вернул {count} ранжированных кандидатов; модели показано {shown}. "
+            f"Текстовых совпадений среди возвращённых: {lexical}."
+            if russian
+            else f"- SigLIP returned {count} ranked candidates; {shown} were exposed to the agent. "
+            f"Lexical matches in the returned set: {lexical}."
+        )
+    )
+    if scanned is not None or total is not None:
+        lines.append(
+            (
+                f"- Retrieval coverage: просмотрено {scanned} из {total} совместимых индексированных кандидатов."
+                if russian
+                else f"- Retrieval coverage: scanned {scanned} of {total} compatible indexed candidates."
+            )
+        )
+
+    if vision_result:
+        candidate_count = _opt_int(vision_result.get("candidate_count")) or 0
+        match_count = _opt_int(vision_result.get("match_count")) or 0
+        no_match_count = _opt_int(vision_result.get("no_match_count")) or 0
+        uncertain_count = _opt_int(vision_result.get("uncertain_count")) or 0
+        parse_status = str(vision_result.get("parse_status") or "unknown")
+        lines.append(
+            (
+                f"- Vision batch: проверено {candidate_count}; match={match_count}, "
+                f"no_match={no_match_count}, uncertain={uncertain_count}; parser={parse_status}."
+                if russian
+                else f"- Vision batch: reviewed {candidate_count}; match={match_count}, "
+                f"no_match={no_match_count}, uncertain={uncertain_count}; parser={parse_status}."
+            )
+        )
+        verdicts = vision_result.get("verdicts") if isinstance(vision_result.get("verdicts"), list) else []
+        for row in verdicts[:9]:
+            if not isinstance(row, Mapping) or row.get("verdict") not in {"match", "uncertain"}:
+                continue
+            lines.append(
+                f"- #{row.get('detection_id')} — {row.get('verdict')}: "
+                f"{str(row.get('visible_evidence') or '')[:320]}"
+            )
+    else:
+        lines.append(
+            (
+                "- Vision-проверка кандидатов не завершилась; делать вывод об отсутствии события нельзя."
+                if russian
+                else "- Candidate vision verification did not complete; absence cannot be concluded."
+            )
+        )
+    lines.append(
+        (
+            "Это вывод только по ограниченному vision-батчу лучших кандидатов, а не доказательство отсутствия во всём архиве."
+            if russian
+            else "This conclusion covers only the bounded vision batch of top candidates; it is not proof of absence across the whole archive."
+        )
+    )
+    return "\n".join(lines)
 
 
 def _format_completion_fallback(
@@ -11738,6 +12293,7 @@ class AgentRunner:
         tool_context: Optional[ToolExecutionContext] = None,
         force_tools: bool = False,
         console_context: Optional[Mapping[str, Any]] = None,
+        drive_console: bool = True,
     ) -> Generator[str, None, None]:
         """
         Main entry point. Yields SSE-formatted strings.
@@ -12379,17 +12935,22 @@ class AgentRunner:
                     _remember_turn_tool_result(tc.name, result, turn_tool_context)
                     _record_turn_signal_ledger(turn_signal_ledger, tc.name, result_for_model)
                     ui_result = _tool_result_for_ui(tc.name, result)
+                    ui_effects = (
+                        derive_agent_ui_effects(
+                            tc.name,
+                            tc.args,
+                            ui_result,
+                            seed=tc.id,
+                        )
+                        if drive_console
+                        else []
+                    )
                     yield _sse({
                         "type": "tool_result",
                         "call_id": tc.id,
                         "name": tc.name,
                         "result": ui_result,
-                        "ui_effects": derive_agent_ui_effects(
-                            tc.name,
-                            tc.args,
-                            ui_result,
-                            seed=tc.id,
-                        ),
+                        "ui_effects": ui_effects,
                     })
                     if research_event is not None:
                         yield _sse({"type": "research_state", **research_event})
@@ -12579,10 +13140,16 @@ class AgentRunner:
                 })
 
         if final_transport_error is not None:
-            final_text = _format_completion_fallback(
-                turn_signal_ledger,
-                tool_messages=in_flight,
-            )
+            if turn_tool_context.get("archive_search_completed"):
+                final_text = _format_archive_research_fallback(
+                    turn_signal_ledger,
+                    tool_messages=in_flight,
+                )
+            else:
+                final_text = _format_completion_fallback(
+                    turn_signal_ledger,
+                    tool_messages=in_flight,
+                )
             yield _sse({
                 "type": "completion_recovery",
                 "message": (
@@ -12592,6 +13159,10 @@ class AgentRunner:
             })
         else:
             final_text = "".join(full_text_parts)
+        archive_recovery_needed = _archive_research_response_needs_recovery(
+            final_text,
+            turn_tool_context,
+        )
         if (
             _final_response_is_incomplete(final_text)
             or _video_research_response_needs_recovery(
@@ -12599,11 +13170,18 @@ class AgentRunner:
                 turn_tool_context,
                 turn_signal_ledger,
             )
+            or archive_recovery_needed
         ):
-            final_text = _format_completion_fallback(
-                turn_signal_ledger,
-                tool_messages=in_flight,
-            )
+            if turn_tool_context.get("archive_search_completed"):
+                final_text = _format_archive_research_fallback(
+                    turn_signal_ledger,
+                    tool_messages=in_flight,
+                )
+            else:
+                final_text = _format_completion_fallback(
+                    turn_signal_ledger,
+                    tool_messages=in_flight,
+                )
             yield _sse({
                 "type": "completion_recovery",
                 "message": "The local model returned an incomplete final response; using completed tool results.",
@@ -14052,6 +14630,148 @@ def _detection_timestamp_ms(row: Mapping[str, Any]) -> int:
     return 0
 
 
+def _archive_payload(row: Mapping[str, Any]) -> Mapping[str, Any]:
+    for key in ("payload", "payload_json"):
+        value = row.get(key)
+        if isinstance(value, Mapping):
+            return value
+    return {}
+
+
+def _archive_summary_text(row: Mapping[str, Any]) -> str:
+    direct = str(row.get("summary") or "").strip()
+    if direct:
+        return direct
+    return str(_archive_payload(row).get("summary") or "").strip()
+
+
+def _normalize_archive_lexical_text(value: Any) -> str:
+    return re.sub(
+        r"[^\w]+",
+        " ",
+        unicodedata.normalize("NFKC", str(value or "")).casefold(),
+        flags=re.UNICODE,
+    ).strip()
+
+
+def _annotate_archive_query_evidence(
+    row: Mapping[str, Any],
+    query: str,
+) -> Dict[str, Any]:
+    annotated = dict(row)
+    summary = _archive_summary_text(row)
+    if summary:
+        annotated["text_evidence_excerpt"] = re.sub(r"\s+", " ", summary).strip()[:500]
+    normalized_query = _normalize_archive_lexical_text(query)
+    normalized_summary = _normalize_archive_lexical_text(summary)
+    query_terms = [term for term in normalized_query.split() if len(term) >= 2]
+    exact_phrase = bool(
+        normalized_query
+        and normalized_summary
+        and normalized_query in normalized_summary
+    )
+    all_terms = bool(
+        query_terms
+        and normalized_summary
+        and all(term in normalized_summary.split() for term in query_terms)
+    )
+    annotated["lexical_match"] = bool(exact_phrase or all_terms)
+    annotated["lexical_match_kind"] = (
+        "exact_phrase"
+        if exact_phrase
+        else "all_query_terms"
+        if all_terms
+        else "none"
+    )
+    return annotated
+
+
+def _archive_candidate_visual_key(row: Mapping[str, Any]) -> Tuple[Any, ...]:
+    payload = _archive_payload(row)
+    provenance = payload.get("provenance") if isinstance(payload.get("provenance"), Mapping) else {}
+    frame_hash = str(
+        row.get("frame_hash")
+        or payload.get("frame_hash")
+        or provenance.get("selected_frame_hash")
+        or ""
+    ).strip()
+    channel_id = _opt_int(row.get("channel_id"))
+    if frame_hash:
+        return ("hash", channel_id, frame_hash)
+    timestamp_ms = _detection_timestamp_ms(row)
+    if timestamp_ms > 0:
+        return ("time", channel_id, timestamp_ms)
+    return ("id", _opt_int(row.get("detection_id") or row.get("id")))
+
+
+def _select_archive_vision_candidates(
+    rows: Sequence[Mapping[str, Any]],
+    *,
+    limit: int = AGENT_ARCHIVE_VISION_BATCH_SIZE,
+) -> List[Dict[str, Any]]:
+    bounded_limit = max(1, min(9, int(limit)))
+    source_priority = {
+        "vlm_summary": 4,
+        "vlm_alert": 3,
+        "semantic_snapshot": 2,
+        "probe": 1,
+    }
+    selected: List[Dict[str, Any]] = []
+    positions: Dict[Tuple[Any, ...], int] = {}
+    for raw in rows:
+        if not isinstance(raw, Mapping):
+            continue
+        detection_id = _opt_int(raw.get("detection_id") or raw.get("id"))
+        if detection_id is None or detection_id <= 0:
+            continue
+        candidate = dict(raw)
+        candidate["detection_id"] = int(detection_id)
+        key = _archive_candidate_visual_key(candidate)
+        prior_position = positions.get(key)
+        if prior_position is not None:
+            prior = selected[prior_position]
+            prior_priority = source_priority.get(str(prior.get("source") or ""), 0)
+            candidate_priority = source_priority.get(str(candidate.get("source") or ""), 0)
+            if candidate_priority > prior_priority:
+                selected[prior_position] = candidate
+            continue
+        if len(selected) >= bounded_limit:
+            continue
+        positions[key] = len(selected)
+        selected.append(candidate)
+    return selected
+
+
+def _archive_requested_time_window(
+    since_ms: Optional[int],
+    until_ms: Optional[int],
+) -> Dict[str, Any]:
+    from datetime import datetime, timezone
+    from zoneinfo import ZoneInfo
+
+    resolved_until_ms = int(until_ms if until_ms is not None else time.time() * 1000.0)
+    resolved_since_ms = int(since_ms if since_ms is not None else resolved_until_ms)
+    if resolved_since_ms > resolved_until_ms:
+        resolved_since_ms, resolved_until_ms = resolved_until_ms, resolved_since_ms
+    try:
+        local_tz = ZoneInfo(AGENT_SITE_TIMEZONE)
+    except Exception:
+        local_tz = timezone.utc
+
+    start_utc = datetime.fromtimestamp(resolved_since_ms / 1000.0, timezone.utc)
+    end_utc = datetime.fromtimestamp(resolved_until_ms / 1000.0, timezone.utc)
+    return {
+        "timezone": AGENT_SITE_TIMEZONE,
+        "since_ms": resolved_since_ms,
+        "until_ms": resolved_until_ms,
+        "from_utc": start_utc.isoformat(),
+        "to_utc": end_utc.isoformat(),
+        "from_local": start_utc.astimezone(local_tz).isoformat(),
+        "to_local": end_utc.astimezone(local_tz).isoformat(),
+        "duration_sec": max(0.0, (resolved_until_ms - resolved_since_ms) / 1000.0),
+    }
+
+
 def _archive_score_semantics(source: Any) -> str:
     source_text = str(source or "").strip().lower()
     logical_source = ARCHIVE_SOURCE_ALIASES.get(source_text, source_text)
@@ -15478,10 +16198,15 @@ def _compact_search_result_for_model(r: Dict[str, Any]) -> Dict[str, Any]:
         "probe_name": r.get("probe_name"),
         "channel_id": r.get("channel_id"),
         "image_url": r.get("image_url"),
+        "text_evidence_excerpt": str(r.get("text_evidence_excerpt") or "")[:500] or None,
+        "lexical_match": bool(r.get("lexical_match")),
+        "lexical_match_kind": r.get("lexical_match_kind"),
+        "score_semantics": "semantic_retrieval_ranking_not_probability",
+        "needs_describe_frame": bool(r.get("image_url")),
     }
     if detection_id is not None:
         row["detection_id"] = detection_id
-    return row
+    return {key: value for key, value in row.items() if value is not None}
 
 
 def _compact_prompt_settings_for_model(result: Dict[str, Any]) -> Dict[str, Any]:
@@ -16006,13 +16731,27 @@ def _compact_tool_result_for_model(tool_name: str, result: Any) -> Any:
 
     if tool_name == "search_archive":
         rows = result.get("results") if isinstance(result.get("results"), list) else []
+        visible_rows = [
+            _compact_search_result_for_model(r)
+            for r in rows[:8]
+            if isinstance(r, dict)
+        ]
         return {
             "scope": result.get("scope"),
+            "query": result.get("query"),
             "source": result.get("source"),
             "source_label": result.get("source_label") or _archive_source_label(result.get("source")),
             "count": result.get("count"),
+            "match_semantics": result.get("match_semantics") or "ranked_candidates_not_binary_matches",
+            "time_window": result.get("time_window"),
+            "lexical_match_count_in_returned": result.get("lexical_match_count_in_returned"),
+            "vision_candidate_ids": list(result.get("vision_candidate_ids") or [])[:9],
+            "vision_candidate_count": result.get("vision_candidate_count"),
+            "vision_verification_required": bool(result.get("vision_verification_required")),
+            "results_returned_to_model": len(visible_rows),
+            "results_omitted_from_model": max(0, len(rows) - len(visible_rows)),
             "coverage": result.get("coverage"),
-            "results": [_compact_search_result_for_model(r) for r in rows[:8] if isinstance(r, dict)],
+            "results": visible_rows,
         }
 
     if tool_name == "build_research_batch":
@@ -16796,6 +17535,39 @@ def _compact_tool_result_for_model(tool_name: str, result: Any) -> Any:
         }, result)
 
     if tool_name == "describe_frame":
+        if result.get("source") == "archive_candidate_batch":
+            verdicts = result.get("verdicts") if isinstance(result.get("verdicts"), list) else []
+            return {
+                "source": "archive_candidate_batch",
+                "query": result.get("query"),
+                "vision_checked": bool(result.get("vision_checked")),
+                "parse_status": result.get("parse_status"),
+                "requested_count": result.get("requested_count"),
+                "candidate_count": result.get("candidate_count"),
+                "missing_detection_ids": list(result.get("missing_detection_ids") or [])[:9],
+                "match_count": result.get("match_count"),
+                "no_match_count": result.get("no_match_count"),
+                "uncertain_count": result.get("uncertain_count"),
+                "matched_detection_ids": list(result.get("matched_detection_ids") or [])[:9],
+                "no_match_detection_ids": list(result.get("no_match_detection_ids") or [])[:9],
+                "uncertain_detection_ids": list(result.get("uncertain_detection_ids") or [])[:9],
+                "verdicts": [
+                    {
+                        "snapshot_index": row.get("snapshot_index"),
+                        "detection_id": row.get("detection_id"),
+                        "channel_id": row.get("channel_id"),
+                        "timestamp_ms": row.get("timestamp_ms"),
+                        "source": row.get("source"),
+                        "image_url": row.get("image_url"),
+                        "verdict": row.get("verdict"),
+                        "visible_evidence": str(row.get("visible_evidence") or "")[:320],
+                    }
+                    for row in verdicts[:9]
+                    if isinstance(row, Mapping)
+                ],
+                "description": str(result.get("description") or "")[:1_500],
+                "note": result.get("note"),
+            }
         return {
             "description": result.get("description"),
             "source": result.get("source"),

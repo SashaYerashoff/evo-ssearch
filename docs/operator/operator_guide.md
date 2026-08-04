@@ -73,6 +73,11 @@ This is the main investigation surface.
   period or start a fresh session.
 - **Quick-question chips** are video-description-first — use them as starting
   points and edit the channel/period.
+- **Operator ON/OFF** controls console driving, not access to evidence. With
+  **ON**, completed tool results may open Archive/Video/Probes views and apply
+  their filters. With **OFF**, the agent may still research with read tools and
+  answer in chat, but it cannot move, open, or refilter the console. A mutation
+  still requires the operator to press its explicit Apply button.
 - **Read the coverage line** in answers: it tells you the period requested vs.
   actually inspected vs. returned, and whether results were truncated. This is how
   you know an answer is complete.

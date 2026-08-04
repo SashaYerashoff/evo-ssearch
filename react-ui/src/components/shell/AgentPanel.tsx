@@ -274,7 +274,9 @@ export function AgentPanel({
           const act: ToolAction = { id: ++idRef.current, name: e.name || '', result: e.result, error: e.error, planId }
           patchLast((m) => ({ ...m, actions: [...(m.actions || []), act], status: '' }))
           const effects = normalizeConsoleUiEffects(e.ui_effects)
-          if (effects.length) onUiEffects(effects, e.result)
+          // Server-side drive_console is authoritative; this request-local
+          // check is defense in depth for mixed-version deployments.
+          if (operatorMode && effects.length) onUiEffects(effects, e.result)
         } else if (e.type === 'tool_progress') {
           patchLast((m) => ({ ...m, notes: [...(m.notes || []), { id: ++idRef.current, message: e.message || 'Working…' }], status: e.message || 'Working…' }))
         } else if (e.type === 'heartbeat') patchLast((m) => ({ ...m, status: m.text ? '' : 'Still working…' }))
@@ -444,11 +446,11 @@ export function AgentPanel({
         )}
       </div>
 
-      {/* Operator Mode — forces the agent to act via tools & drive the console */}
+      {/* Operator Mode — forces tool use and permits harness-owned console effects */}
       <button
         className={`ag-op-toggle ${operatorMode ? 'on' : ''}`}
         onClick={() => setOperatorMode((v) => !v)}
-        title={operatorMode ? 'Operator Mode ON — agent is forced to use tools and drive the console' : 'Operator Mode OFF — agent answers freely'}
+        title={operatorMode ? 'Operator Mode ON — agent may use tools and drive the console' : 'Operator Mode OFF — agent may research, but will not move or open the console UI'}
       >
         <IconDeviceGamepad2 size={14} /> Operator {operatorMode ? 'ON' : 'OFF'}
       </button>

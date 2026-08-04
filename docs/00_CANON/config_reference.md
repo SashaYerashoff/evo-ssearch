@@ -199,6 +199,7 @@ thresholds, alert policy, live sampling, or the live routine context.
 | `EVOSSEARCH_AGENT_CONTEXT_HISTORY_BUDGET_TOKENS` (`16000`) | Old chat history budget before trimming |
 | `EVOSSEARCH_AGENT_CONTEXT_WARNING_TOKENS` (`52000`) | Adds an internal compact-answer warning; includes tool-schema estimates during tool decisions |
 | `EVOSSEARCH_AGENT_CONTEXT_HARD_TOKENS` (`60000`) | Stops further tool use and compacts tool payloads before the final model call |
+| `EVOSSEARCH_AGENT_ARCHIVE_VISION_BATCH_SIZE` (`8`, clamped `6`–`9`) | Number of diverse top SigLIP archive candidates verified together in one multi-image VLM request. This is a bounded visual drill, not exhaustive archive coverage |
 
 ## Inference queue
 

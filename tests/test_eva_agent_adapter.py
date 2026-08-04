@@ -26,6 +26,16 @@ class _DetectionStore:
     def fetch_detections_by_ids(self, ids, include_vectors=False):
         if ids == [80]:
             return [{"id": 80, "channel_id": 8}]
+        if ids == [70, 71]:
+            return [
+                {"id": 70, "channel_id": 7},
+                {"id": 71, "channel_id": 7},
+            ]
+        if ids == [70, 80]:
+            return [
+                {"id": 70, "channel_id": 7},
+                {"id": 80, "channel_id": 8},
+            ]
         return []
 
 
@@ -426,6 +436,9 @@ class EvaAgentToolAdapterTests(unittest.TestCase):
         )
         describe = schemas["describe_frame"]["function"]["parameters"]
         self.assertNotIn("image_path", describe["properties"])
+        self.assertIn("detection_ids", describe["properties"])
+        self.assertEqual(describe["properties"]["detection_ids"]["maxItems"], 9)
+        self.assertNotIn("channel_ids", describe["properties"])
         create_probe = schemas["create_probe"]["function"]
         self.assertIn("VLM-alert follow-up", create_probe["description"])
         self.assertIn(
@@ -747,6 +760,27 @@ class EvaAgentToolAdapterTests(unittest.TestCase):
             self.adapter.execute(
                 "describe_frame",
                 {"detection_id": 80, "channel_id": 7},
+                self.context,
+            )
+
+        self.assertEqual(self.legacy.calls, [])
+
+    def test_detection_batch_resolves_hidden_channel_ownership(self):
+        result = self.adapter.execute(
+            "describe_frame",
+            {"detection_ids": [70, 71], "prompt": "sphynx cat"},
+            self.context,
+        )
+
+        self.assertEqual(result["arguments"]["detection_ids"], [70, 71])
+        self.assertEqual(result["arguments"]["channel_ids"], ["7"])
+        self.assertEqual(result["arguments"]["channel_id"], "7")
+
+    def test_detection_batch_rejects_one_unauthorized_candidate(self):
+        with self.assertRaises(ChannelAccessDeniedError):
+            self.adapter.execute(
+                "describe_frame",
+                {"detection_ids": [70, 80], "prompt": "sphynx cat"},
                 self.context,
             )
 

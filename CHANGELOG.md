@@ -6,6 +6,18 @@ Format loosely follows Keep a Changelog.
 
 ## Unreleased
 
+- **Operator-mode boundary:** `Operator OFF` now suppresses all agent-chat
+  console-driving effects server-side, with a React-side mixed-version guard.
+  Read-only research and chat answers remain available; explicit operator Apply
+  actions still refresh the affected workspace after a trusted receipt.
+- **Grounded archive search:** SigLIP archive search is explicitly a ranked
+  candidate stage rather than a binary detector. EVA preserves bounded text
+  evidence and server-resolved time/coverage metadata, deduplicates equivalent
+  frames, and verifies the top 6–9 candidates in one multi-image VLM call.
+  Positive and negative visual conclusions now require parsed per-frame
+  verdicts; an uncertain or failed vision batch cannot become a confident
+  “nothing found”, and the reviewed top batch is never presented as exhaustive
+  proof about the whole archive.
 - **Maritime deployment profile:** Protocol Deploy can assign each selected
   channel a port-gate, coastline, or mixed-PTZ role and preview bounded
   maritime L0–L3 prompts plus four role-specific shadow probes. Global pan,

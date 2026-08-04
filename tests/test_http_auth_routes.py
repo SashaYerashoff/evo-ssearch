@@ -1878,6 +1878,7 @@ class HttpAuthRouteTests(unittest.TestCase):
             headers={"X-CSRF-Token": csrf_token},
             json={
                 "message": "inspect channel 7",
+                "operator_mode": False,
                 "actor_id": "forged-admin",
                 "allowed_channel_ids": ["*"],
                 "console_context": {
@@ -1902,6 +1903,8 @@ class HttpAuthRouteTests(unittest.TestCase):
         self.assertEqual(context.tenant_id, TENANT_ID)
         self.assertEqual(context.allowed_channel_ids, frozenset({"7"}))
         self.assertNotEqual(context.actor_id, "forged-admin")
+        self.assertIs(runner.calls[0]["force_tools"], False)
+        self.assertIs(runner.calls[0]["drive_console"], False)
         self.assertEqual(
             runner.calls[0]["console_context"],
             {
@@ -1915,6 +1918,24 @@ class HttpAuthRouteTests(unittest.TestCase):
                 },
             },
         )
+
+    def test_agent_operator_on_enables_console_drive(self) -> None:
+        _, csrf_token = self._login()
+        runner = _AgentRunner()
+        original_runner = oldapp._agent_runner
+        oldapp._agent_runner = runner
+        self.addCleanup(setattr, oldapp, "_agent_runner", original_runner)
+
+        response = self.client.post(
+            "/agent/chat",
+            headers={"X-CSRF-Token": csrf_token},
+            json={"message": "inspect channel 7", "operator_mode": True},
+        )
+        response.get_data()
+
+        self.assertEqual(response.status_code, 200)
+        self.assertIs(runner.calls[0]["force_tools"], True)
+        self.assertIs(runner.calls[0]["drive_console"], True)
 
     def test_agent_action_plan_execute_uses_server_context(self) -> None:
         _, csrf_token = self._login()
