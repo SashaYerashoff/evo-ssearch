@@ -498,6 +498,8 @@ class AgentToolLoopTests(unittest.TestCase):
         self.assertIn("deploy-home-1", receipt)
         self.assertIn("home workspace", receipt)
         self.assertIn("road simulation", receipt)
+        self.assertIn("groups are already configured", receipt)
+        self.assertIn("do not ask to recreate them", receipt)
 
         context = {
             "tool_intents": ["deployment"],

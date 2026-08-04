@@ -10460,12 +10460,21 @@ def _trusted_deployment_state_message(state: Mapping[str, Any]) -> str:
         for row in (state.get("surveys") or [])[:8]
         if isinstance(row, Mapping)
     ]
+    groups = list(receipt.get("groups") or [])
+    group_guard = (
+        " Existing operator groups are already configured exactly as shown in "
+        "groups; list them accurately and do not ask to recreate them or claim "
+        "that grouping is unset."
+        if groups
+        else " No operator groups are configured in this durable state."
+    )
     return (
         "Trusted Protocol Deploy durable state (server-owned; never invent or replace "
         "deployment_id, stage, channel IDs, groups, or survey evidence):\n"
         + json.dumps(receipt, ensure_ascii=False, separators=(",", ":"), default=str)
         + "\nAt stage surveyed, do not repeat inventory, scope configuration, or survey. "
-        "If the operator has not supplied policy requirements, ask for expected routine, "
+        + group_guard
+        + " If the operator has not supplied policy requirements, ask for expected routine, "
         "visible alert conditions and severity, novelty response, optional counters/dwell "
         "metrics, and a preemptible consolidation quiet window."
     )
@@ -13003,7 +13012,9 @@ class AgentRunner:
                         "scene fingerprints from trusted durable state, then ask the operator "
                         "for expected routine, visible alert conditions and severity, novelty "
                         "response, optional counter/dwell metrics, and the consolidation quiet "
-                        "window. Use the exact trusted deployment_id; never invent one."
+                        "window. Preserve and list any existing groups exactly; do not ask the "
+                        "operator to recreate them. Use the exact trusted deployment_id; never "
+                        "invent one."
                     )
                 else:
                     completion_instruction = (
