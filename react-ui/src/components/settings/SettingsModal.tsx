@@ -192,9 +192,9 @@ export function SettingsModal({
               href="/ui-assets/quick-start.html"
               target="_blank"
               rel="noreferrer"
-              title="Open the EVA AI operator quick start"
+              title="Atvērt EVA AI operatora īso instrukciju"
             >
-              <IconHelpCircle size={15} /> Quick start
+              <IconHelpCircle size={15} /> Īsā instrukcija
             </a>
             <button className="modal-close" onClick={onClose}><IconX size={18} /></button>
           </div>

@@ -1608,6 +1608,7 @@
 
 /* each section is a card */
 .set-section { display: flex; flex-direction: column; gap: 12px; background: var(--panel); border: 1px solid var(--line); border-radius: 14px; padding: 16px 18px; }
+.set-section:has(.dd-pop) { position: relative; z-index: 80; }
 .set-section h3 { display: flex; align-items: center; gap: 10px; font-size: 12px; font-weight: 700; letter-spacing: .07em; text-transform: uppercase; color: var(--accent); margin: 0; }
 .set-section-help { font-size: 12.5px; color: var(--text-mut); margin: -6px 0 2px; line-height: 1.5; }
 /* fields flow in a responsive grid instead of one raw column */
