@@ -147,6 +147,40 @@ def _vllm_runtime_contract() -> dict[str, Any]:
     return contract
 
 
+def _intel_qsv_status() -> dict[str, Any]:
+    devices = sorted(Path("/dev/dri").glob("renderD*"))
+    intel_device: Path | None = None
+    for device in devices:
+        vendor_path = Path("/sys/class/drm") / device.name / "device" / "vendor"
+        try:
+            vendor = vendor_path.read_text(encoding="utf-8").strip().lower()
+        except OSError:
+            continue
+        if vendor == "0x8086":
+            intel_device = device
+            break
+    if intel_device is None:
+        return {"ok": False, "status": "Intel DRM render node not found"}
+    if not shutil.which("vainfo"):
+        return {
+            "ok": False,
+            "device": str(intel_device),
+            "status": "vainfo not installed",
+        }
+    result = _command(
+        (
+            "vainfo",
+            "--display",
+            "drm",
+            "--device",
+            str(intel_device),
+        )
+    )
+    result["device"] = str(intel_device)
+    result["status"] = "ready" if result.get("ok") else "driver initialization failed"
+    return result
+
+
 def _safe_state(path: Path) -> dict[str, Any]:
     if not path.is_file():
         return {"present": False}
@@ -251,6 +285,7 @@ def collect(env_file: Path, state_file: Path) -> dict[str, Any]:
             )
             if shutil.which("nvidia-smi")
             else {"ok": False, "error": "nvidia-smi not found"},
+            "intel_qsv": _intel_qsv_status(),
         },
         "installer": _safe_state(state_file),
         "configuration": {

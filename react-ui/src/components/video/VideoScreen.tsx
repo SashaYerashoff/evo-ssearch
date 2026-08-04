@@ -27,7 +27,6 @@ import {
   type StreamsStatus,
   type SummaryEntry,
 } from '../../api/video'
-import type { DropOption } from '../shell/Dropdown'
 import { renderMarkdown } from '../agent/markdown'
 import { StreamControl, type VideoWorkspaceTab } from './StreamControl'
 import { PromptSettingsModal } from './PromptSettingsModal'
@@ -376,7 +375,6 @@ export function VideoScreen({
   const [feed, setFeed] = useState<SummaryEntry[]>([])
   const [batch, setBatch] = useState('12')
   const [every, setEvery] = useState('5')
-  const [model, setModel] = useState('auto')
   const [period, setPeriod] = useState<SummaryPeriod>('live')
   const [resolution, setResolution] = useState<SummaryResolution>('AUTO')
   const [customFrom, setCustomFrom] = useState('')
@@ -400,7 +398,6 @@ export function VideoScreen({
   const [reviewPreviewOpen, setReviewPreviewOpen] = useState(false)
   const [settingsDirty, setSettingsDirty] = useState(false)
   const [pendingSettingsSwitch, setPendingSettingsSwitch] = useState<{ channelId: number; openSettings: boolean } | null>(null)
-  const [modelOptions, setModelOptions] = useState<DropOption[]>([{ value: 'auto', label: 'Auto (balance)' }])
   const [collapsedSummaries, setCollapsedSummaries] = useState<Set<string>>(new Set())
   const [summaryImage, setSummaryImage] = useState<{ src: string; title: string } | null>(null)
   const [incidentDraft, setIncidentDraft] = useState<IncidentDraftInput | null>(null)
@@ -555,7 +552,6 @@ export function VideoScreen({
     hydratedSettingsChannelRef.current = null
     setBatch('12')
     setEvery('5')
-    setModel('auto')
     setSettingsDirty(false)
   }, [settingsChannelId])
   useEffect(() => {
@@ -565,21 +561,9 @@ export function VideoScreen({
     const nextEvery = Number(settingsRt.video?.interval_sec)
     setBatch(Number.isFinite(nextBatch) && nextBatch > 0 ? String(nextBatch) : '12')
     setEvery(Number.isFinite(nextEvery) && nextEvery > 0 ? String(nextEvery) : '5')
-    setModel(String(settingsRt.video?.model || 'auto'))
     hydratedSettingsChannelRef.current = settingsChannelId
     setSettingsDirty(false)
   }, [settingsChannelId, settingsRt])
-
-  // available VLM models for the "Live model" selector (matches the original /lm/models)
-  useEffect(() => {
-    videoApi.lmModels().then((cat) => {
-      const autoVal = cat.auto_model_selector || 'auto'
-      const opts: DropOption[] = [{ value: autoVal, label: cat.auto_model_label || 'Auto (balance)' }]
-      for (const m of cat.models || []) if (m && m !== autoVal) opts.push({ value: m, label: m })
-      setModelOptions(opts)
-      setModel((cur) => (cur === 'auto' ? autoVal : cur))
-    }).catch(() => {})
-  }, [])
 
   // poll streams (runtime) every 4s
   useEffect(() => { const t = window.setInterval(loadStreams, 4000); return () => window.clearInterval(t) }, [loadStreams])
@@ -716,7 +700,7 @@ export function VideoScreen({
     if (settingsChannelId == null) return
     setBusy(true); setError(null)
     try {
-      const r = await videoApi.startCapture(buildCaptureInput(settingsChannelId, { batch, every, model }))
+      const r = await videoApi.startCapture(buildCaptureInput(settingsChannelId, { batch, every }))
       if (!r.success) throw new Error(r.error || 'Start failed')
       hydratedSettingsChannelRef.current = settingsChannelId
       setSettingsDirty(false)
@@ -827,18 +811,13 @@ export function VideoScreen({
     setEvery(value)
     setSettingsDirty(true)
   }, [])
-  const updateModel = useCallback((value: string) => {
-    setModel(value)
-    setSettingsDirty(true)
-  }, [])
   const discardSettingsDraft = useCallback(() => {
     const nextBatch = Number(settingsRt?.video?.batch_size)
     const nextEvery = Number(settingsRt?.video?.interval_sec)
     setBatch(Number.isFinite(nextBatch) && nextBatch > 0 ? String(nextBatch) : '12')
     setEvery(Number.isFinite(nextEvery) && nextEvery > 0 ? String(nextEvery) : '5')
-    setModel(String(settingsRt?.video?.model || modelOptions[0]?.value || 'auto'))
     setSettingsDirty(false)
-  }, [modelOptions, settingsRt])
+  }, [settingsRt])
 
   const previewCard = (
     <div className="vid-preview-card">
@@ -921,7 +900,7 @@ export function VideoScreen({
         settingsChannelId={settingsChannelId} onSettingsChannel={(channelId) => requestSettingsChannel(channelId)}
         reviewChannelId={reviewChannelId} onReviewChannel={setReviewChannelId}
         onReload={reloadChannels}
-        batch={batch} onBatch={updateBatch} every={every} onEvery={updateEvery} model={model} onModel={updateModel} modelOptions={modelOptions}
+        batch={batch} onBatch={updateBatch} every={every} onEvery={updateEvery}
         canCapture={canCapture} canManagePrompts={canManagePrompts}
         capturing={capturing} busy={busy} onStart={start} onStop={stop} onFlush={flush}
         onPromptSettings={() => setPromptOpen(true)}
@@ -1015,7 +994,7 @@ export function VideoScreen({
                 <div><span>Draft</span><b className={settingsDirty ? 'bad' : 'good'}>{settingsDirty ? 'not applied' : 'in sync'}</b></div>
               </div>
               <div className="vid-sel-list">
-                <div><span>Live model</span><b>{String(settingsRt?.video?.model || model || 'auto')}</b></div>
+                <div><span>Active VLM profile</span><b>{String(settingsRt?.video?.model || 'configured default')}</b></div>
                 <div><span>Frame selector</span><b>{selectorLabel}</b></div>
                 <div>
                   <span>Summary queue</span>
@@ -1043,7 +1022,7 @@ export function VideoScreen({
           <div className="modal usr-confirm" onClick={(event) => event.stopPropagation()}>
             <div className="usr-confirm-title"><IconAlertTriangle size={16} /> Unsaved stream settings</div>
             <p>
-              Batch, cadence, or model changes for <b>{channelName(settingsChannelId ?? -1) || `#${settingsChannelId}`}</b> have not been applied.
+              Batch or cadence changes for <b>{channelName(settingsChannelId ?? -1) || `#${settingsChannelId}`}</b> have not been applied.
               Discard them and open <b>{channelName(pendingSettingsSwitch.channelId) || `#${pendingSettingsSwitch.channelId}`}</b>?
             </p>
             <div className="usr-confirm-actions">

@@ -25,7 +25,7 @@ from inference_queue import (
 )
 from archive_store import PostgresRuntimeStateStore
 from attention_policy import AttentionMode, CostBudgetState
-from luxriot_connector import LuxriotCaptureSession, LuxriotManager
+from luxriot_connector import LuxriotCaptureSession, LuxriotManager, _intel_hwaccel_for_config
 
 
 def build_manager(
@@ -99,6 +99,16 @@ class MemoryRuntimeStateStore:
 
     def save_state(self, key, payload):
         self.payloads[key] = payload
+
+
+def test_intel_hwaccel_auto_falls_through_from_qsv_to_vaapi() -> None:
+    config = SimpleNamespace(LUXRIOT_FFMPEG_HWACCEL="auto", LUXRIOT_FFMPEG_INTEL_DEVICE="")
+    with (
+        patch("luxriot_connector._discover_intel_render_device", return_value="/dev/dri/renderD128"),
+        patch("luxriot_connector._probe_qsv_runtime", return_value=(False, "MFX session failed")),
+        patch("luxriot_connector._probe_vaapi_runtime", return_value=(True, None)),
+    ):
+        assert _intel_hwaccel_for_config(config) == ("vaapi", "/dev/dri/renderD128", None)
 
 
 class DurableRollupMemoryStateStore(MemoryRuntimeStateStore):
@@ -2265,6 +2275,164 @@ class LuxriotCaptureDispatchTests(unittest.TestCase):
             self.assertNotIn("Authorization", command_text)
             self.assertIn("pipe:0", command_text)
             self.assertNotIn("segment.mp4", command_text)
+
+    def test_ffmpeg_uses_intel_qsv_or_vaapi_decode_when_probe_passes(self):
+        commands = []
+
+        class FakePipe:
+            def write(self, data):
+                return len(data)
+
+            def close(self):
+                return None
+
+        encoded = BytesIO()
+        Image.new("RGB", (24, 16), color=(50, 80, 120)).save(encoded, format="JPEG")
+        jpeg = encoded.getvalue()
+
+        class FakeStdout:
+            def __init__(self):
+                self.sent = False
+
+            def read(self, _size):
+                if self.sent:
+                    return b""
+                self.sent = True
+                return jpeg
+
+        class FakeProcess:
+            def __init__(self, command, **_kwargs):
+                commands.append([str(item) for item in command])
+                self.stdin = FakePipe()
+                self.stdout = FakeStdout()
+                self.returncode = None
+
+            def poll(self):
+                return self.returncode
+
+            def wait(self, timeout=None):
+                self.returncode = 0
+                return 0
+
+            def kill(self):
+                self.returncode = -9
+
+        class Response:
+            headers = {}
+
+            def iter_content(self, _chunk_size):
+                yield b"video-bytes"
+
+            def close(self):
+                return None
+
+        with tempfile.TemporaryDirectory() as temp:
+            manager = build_manager(Path(temp), config_overrides={"LUXRIOT_LIVE_SEGMENT_FPS": 1.0})
+            session = LuxriotCaptureSession(manager, channel_id=7, batch_size=2, prompt="Describe.", run_id="run-7")
+            session.client = SimpleNamespace(open_live_stream=lambda *_args, **_kwargs: Response())
+            with (
+                patch("luxriot_connector._intel_hwaccel_for_config", return_value=("qsv", "/dev/dri/renderD128", None)),
+                patch("luxriot_connector.subprocess.Popen", side_effect=FakeProcess),
+            ):
+                handled = session._run_ffmpeg_live_segment_once()
+
+            vaapi_session = LuxriotCaptureSession(manager, channel_id=8, batch_size=2, prompt="Describe.", run_id="run-8")
+            vaapi_session.client = SimpleNamespace(open_live_stream=lambda *_args, **_kwargs: Response())
+            with (
+                patch("luxriot_connector._intel_hwaccel_for_config", return_value=("vaapi", "/dev/dri/renderD128", None)),
+                patch("luxriot_connector.subprocess.Popen", side_effect=FakeProcess),
+            ):
+                vaapi_handled = vaapi_session._run_ffmpeg_live_segment_once()
+
+        self.assertTrue(handled)
+        self.assertTrue(vaapi_handled)
+        self.assertEqual(len(commands), 2)
+        command = commands[0]
+        self.assertIn("qsv=eva_qsv:/dev/dri/renderD128", command)
+        self.assertEqual(command[command.index("-hwaccel") + 1], "qsv")
+        self.assertIn("vpp_qsv=framerate=1/1:format=nv12", command[command.index("-vf") + 1])
+        self.assertEqual(session.status()["live_segment_decoder"], "intel_qsv")
+        self.assertTrue(session.status()["live_segment_hwaccel_available"])
+        vaapi_command = commands[1]
+        self.assertIn("vaapi=eva_va:/dev/dri/renderD128", vaapi_command)
+        self.assertEqual(vaapi_command[vaapi_command.index("-hwaccel") + 1], "vaapi")
+        self.assertIn("scale_vaapi=w=800:h=800", vaapi_command[vaapi_command.index("-vf") + 1])
+        self.assertEqual(vaapi_session.status()["live_segment_decoder"], "intel_vaapi")
+
+    def test_ffmpeg_qsv_failure_retries_once_in_software(self):
+        commands = []
+
+        class FakePipe:
+            def write(self, data):
+                return len(data)
+
+            def close(self):
+                return None
+
+        encoded = BytesIO()
+        Image.new("RGB", (24, 16), color=(30, 60, 90)).save(encoded, format="JPEG")
+        jpeg = encoded.getvalue()
+
+        class FakeProcess:
+            def __init__(self, command, *, stderr, **_kwargs):
+                self.command = [str(item) for item in command]
+                commands.append(self.command)
+                self.stdin = FakePipe()
+                self.returncode = None
+                if "-hwaccel" in self.command:
+                    stderr.write(b"QSV device initialization failed")
+                    stderr.flush()
+                    self.stdout = SimpleNamespace(read=lambda _size: b"")
+                    self.exit_code = 1
+                else:
+                    sent = {"value": False}
+
+                    def read(_size):
+                        if sent["value"]:
+                            return b""
+                        sent["value"] = True
+                        return jpeg
+
+                    self.stdout = SimpleNamespace(read=read)
+                    self.exit_code = 0
+
+            def poll(self):
+                return self.returncode
+
+            def wait(self, timeout=None):
+                self.returncode = self.exit_code
+                return self.returncode
+
+            def kill(self):
+                self.returncode = -9
+
+        class Response:
+            headers = {}
+
+            def iter_content(self, _chunk_size):
+                yield b"video-bytes"
+
+            def close(self):
+                return None
+
+        with tempfile.TemporaryDirectory() as temp:
+            manager = build_manager(Path(temp), config_overrides={"LUXRIOT_LIVE_SEGMENT_FPS": 1.0})
+            session = LuxriotCaptureSession(manager, channel_id=7, batch_size=2, prompt="Describe.", run_id="run-7")
+            session.client = SimpleNamespace(open_live_stream=lambda *_args, **_kwargs: Response())
+            with (
+                patch("luxriot_connector._intel_hwaccel_for_config", return_value=("qsv", "/dev/dri/renderD128", None)),
+                patch("luxriot_connector.subprocess.Popen", side_effect=FakeProcess),
+            ):
+                handled = session._run_ffmpeg_live_segment_once()
+
+        self.assertTrue(handled)
+        self.assertEqual(len(commands), 2)
+        self.assertIn("-hwaccel", commands[0])
+        self.assertNotIn("-hwaccel", commands[1])
+        status = session.status()
+        self.assertEqual(status["live_segment_decoder"], "software")
+        self.assertEqual(status["live_segment_hwaccel_fallback_count"], 1)
+        self.assertIn("QSV device initialization failed", status["live_segment_hwaccel_probe_error"])
 
     def test_ffmpeg_dense_budget_represents_full_batch_window_and_only_apex_reaches_sinks(self):
         probe_calls = []

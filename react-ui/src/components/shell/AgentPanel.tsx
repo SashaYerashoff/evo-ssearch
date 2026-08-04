@@ -2,7 +2,7 @@ import { useRef, useState, useEffect, useCallback } from 'react'
 import {
   IconSparkles, IconX, IconArrowUp,
   IconPlus, IconTrash, IconPaperclip, IconAlertTriangle, IconPencil, IconChevronRight,
-  IconChevronDown, IconWand, IconCpu, IconVideo, IconDeviceGamepad2, IconArrowAutofitWidth, IconHistory,
+  IconChevronDown, IconWand, IconVideo, IconDeviceGamepad2, IconArrowAutofitWidth, IconHistory,
   IconMaximize, IconMinimize, IconPlayerStop,
 } from '@tabler/icons-react'
 import type { Channel, ArchiveFilters } from '../../api/types'
@@ -116,7 +116,7 @@ function sessionLabel(s: AgentSession): string {
 
 export function AgentPanel({
   open, full, onClose, onToggleFull, section, channels, archiveFilters, onUiEffects, onBusyChange,
-  onLayoutPresetChange, onLayoutPresetCommit, canManageModels, canManageSkills,
+  onLayoutPresetChange, onLayoutPresetCommit, canManageSkills,
 }: {
   open: boolean
   full: boolean
@@ -129,7 +129,6 @@ export function AgentPanel({
   onBusyChange?: (busy: boolean) => void
   onLayoutPresetChange?: (archiveColumns: number) => void
   onLayoutPresetCommit?: (archiveColumns: number) => void
-  canManageModels: boolean
   canManageSkills: boolean
 }) {
   const [msgs, setMsgs] = useState<Msg[]>([])
@@ -139,13 +138,11 @@ export function AgentPanel({
   const [err, setErr] = useState<string | null>(null)
   const [sessions, setSessions] = useState<AgentSession[]>([])
   const [curSession, setCurSession] = useState<string | null>(null)
-  const [model, setModel] = useState('')
-  const [modelDefault, setModelDefault] = useState('')
   const [skills, setSkills] = useState<AgentSkill[]>([])
   const [streams, setStreams] = useState<any[]>([])
   const [lightbox, setLightbox] = useState<{ url: string; title: string } | null>(null)
   const [skillModal, setSkillModal] = useState<{ mode: 'create' | 'edit'; name: string; slug: string; content: string } | null>(null)
-  const [openMenu, setOpenMenu] = useState<'history' | 'skills' | 'model' | 'streams' | null>(null)
+  const [openMenu, setOpenMenu] = useState<'history' | 'skills' | 'streams' | null>(null)
   const [operatorMode, setOperatorMode] = useState(true)
   const [widthPresetIndex, setWidthPresetIndex] = useState(() => {
     const presets = agentWidthPresets(window.innerWidth)
@@ -213,7 +210,6 @@ export function AgentPanel({
     if (!open || loadedRef.current) return
     loadedRef.current = true
     refreshSessions()
-    agentApi.getConfig().then((c) => { setModel(c.model || c.default_model || ''); setModelDefault(c.default_model || '') }).catch(() => {})
     agentApi.skills().then((r) => setSkills(r.skills || [])).catch(() => {})
     refreshStreams()
     const last = localStorage.getItem(LS_SESSION)
@@ -487,23 +483,6 @@ export function AgentPanel({
                 </div>
               ))}
             </div>
-          </div>
-        )}
-      </div>
-
-      {/* Model */}
-      <div className="ag-drop">
-        <button className={`ag-drop-btn ${openMenu === 'model' ? 'on' : ''}`} onClick={() => setOpenMenu(openMenu === 'model' ? null : 'model')}>
-          <IconCpu size={14} /> <span className="ag-drop-model">{model || 'default'}</span> <IconChevronDown size={13} />
-        </button>
-        {openMenu === 'model' && (
-          <div className="ag-drop-pop">
-            <div className="ag-drop-head"><span>Agent model</span></div>
-            <div className="ag-model">
-              <input value={model} onChange={(e) => setModel(e.target.value)} placeholder="default" title={modelDefault ? `Default: ${modelDefault}` : ''} disabled={busy || !canManageModels} />
-              {canManageModels && <button className="ag-mini-btn wide" disabled={busy} onClick={() => agentApi.saveConfig(model.trim()).then((c) => { setModel(c.model || model); setOpenMenu(null) }).catch(() => setErr('Failed to set model'))}>Apply</button>}
-            </div>
-            {modelDefault && <div className="ag-drop-note">Default: {modelDefault}</div>}
           </div>
         )}
       </div>

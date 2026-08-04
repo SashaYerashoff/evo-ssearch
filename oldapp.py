@@ -18200,6 +18200,8 @@ def get_settings():
         )
         clip_model = _normalize_clip_model_for_policy(config.CLIP_MODEL)
         index_mode = _normalize_index_mode_for_policy(config.INDEX_MODE)
+        vlm_profile = _resolve_lm_profile(kind="vlm")
+        agent_profile = _resolve_lm_profile(kind="agent")
         settings = {
             'host': config.HOST,
             'port': config.PORT,
@@ -18249,6 +18251,16 @@ def get_settings():
             'defaultResults': config.DEFAULT_RESULTS,
             'batchSize': config.BATCH_SIZE,
             'thumbnailQuality': config.THUMBNAIL_QUALITY,
+            'vlmBaseUrl': str(vlm_profile.get('base_url') or ''),
+            'vlmModel': str(vlm_profile.get('model') or ''),
+            'vlmApiKey': '',
+            'vlmApiKeySet': bool(vlm_profile.get('api_key')),
+            'vlmTimeout': int(vlm_profile.get('timeout') or config.LM_TIMEOUT),
+            'agentBaseUrl': str(agent_profile.get('base_url') or ''),
+            'agentModel': str(agent_profile.get('model') or ''),
+            'agentApiKey': '',
+            'agentApiKeySet': bool(agent_profile.get('api_key')),
+            'agentTimeout': int(agent_profile.get('timeout') or config.LM_TIMEOUT),
             'maxCommentLength': config.MAX_COMMENT_LENGTH,
             'maxFileSize': config.MAX_FILE_SIZE_MB,
             'indexFolderName': config.INDEX_FOLDER_NAME,
@@ -18303,7 +18315,7 @@ def save_settings():
         if not data:
             return jsonify({'success': False, 'error': 'No data provided'}), 400
 
-        global active_embedder, clip_model, clip_preprocess, clip_processor, clip_backend_kind, clip_runtime_model, dino_encoder, probe_bookmark_gate
+        global active_embedder, clip_model, clip_preprocess, clip_processor, clip_backend_kind, clip_runtime_model, dino_encoder, probe_bookmark_gate, _agent_runner, _agent_runtime_model_override
 
         required_fields = ['host', 'port', 'debug', 'clipModel', 'minResults', 'maxResults', 'defaultResults']
         for field in required_fields:
@@ -18311,6 +18323,72 @@ def save_settings():
                 return jsonify({'success': False, 'error': f'Missing required field: {field}'}), 400
         debug_enabled = _coerce_bool(data.get('debug', config.DEBUG), config.DEBUG)
         experimental_embedders_enabled = _experimental_embedding_models_enabled()
+
+        current_vlm_profile = _resolve_lm_profile(kind="vlm")
+        current_agent_profile = _resolve_lm_profile(kind="agent")
+        vlm_profile_id = str(current_vlm_profile.get("id") or "vlm").strip() or "vlm"
+        agent_profile_id = str(current_agent_profile.get("id") or "agent").strip() or "agent"
+        if vlm_profile_id == agent_profile_id or vlm_profile_id == "default":
+            vlm_profile_id = "vlm"
+        if agent_profile_id == vlm_profile_id or agent_profile_id == "default":
+            agent_profile_id = "agent"
+
+        def normalize_inference_profile(prefix: str, current: Mapping[str, Any]) -> Dict[str, Any]:
+            base_url = str(data.get(f"{prefix}BaseUrl", current.get("base_url") or "")).strip().rstrip("/")
+            if base_url:
+                parsed = urlparse(base_url)
+                if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+                    raise ValueError(f"{prefix.upper()} base URL must be an http(s) URL")
+            model = str(data.get(f"{prefix}Model", current.get("model") or "")).strip()
+            if not model:
+                raise ValueError(f"{prefix.upper()} model is required")
+            api_key_raw = data.get(f"{prefix}ApiKey")
+            api_key = (
+                str(api_key_raw).strip()
+                if api_key_raw is not None and str(api_key_raw).strip()
+                else str(current.get("api_key") or "").strip()
+            )
+            try:
+                timeout = int(data.get(f"{prefix}Timeout", current.get("timeout") or config.LM_TIMEOUT))
+            except (TypeError, ValueError) as exc:
+                raise ValueError(f"{prefix.upper()} timeout must be an integer") from exc
+            return {
+                "base_url": base_url,
+                "model": model,
+                "api_key": api_key.replace("\r", "").replace("\n", ""),
+                "timeout": min(3600, max(1, timeout)),
+            }
+
+        try:
+            vlm_settings = normalize_inference_profile("vlm", current_vlm_profile)
+            agent_settings = normalize_inference_profile("agent", current_agent_profile)
+        except ValueError as exc:
+            return jsonify({'success': False, 'error': str(exc)}), 400
+
+        configured_lm_profiles = _configured_lm_profiles()
+        updated_lm_profiles = {
+            profile_id: dict(profile)
+            for profile_id, profile in configured_lm_profiles.items()
+        }
+        updated_lm_profiles[vlm_profile_id] = {
+            **dict(updated_lm_profiles.get(vlm_profile_id) or {}),
+            "id": vlm_profile_id,
+            "kind": "vlm",
+            **vlm_settings,
+            "enabled": True,
+        }
+        updated_lm_profiles[agent_profile_id] = {
+            **dict(updated_lm_profiles.get(agent_profile_id) or {}),
+            "id": agent_profile_id,
+            "kind": "agent",
+            **agent_settings,
+            "enabled": True,
+        }
+        lm_profile_ids = [
+            profile_id
+            for profile_id in updated_lm_profiles
+            if profile_id != "default"
+        ]
 
         try:
             port = int(data['port'])
@@ -18701,6 +18779,17 @@ EVOSSEARCH_ALLOWED_ROOTS={os.pathsep.join(config.ALLOWED_ROOTS)}
 """
 
         parsed_env_content = _parse_env_editor_text(env_content)
+        parsed_env_content["EVOSSEARCH_LM_PROFILES"] = ",".join(lm_profile_ids)
+        parsed_env_content["EVOSSEARCH_LM_VLM_PROFILE_ID"] = vlm_profile_id
+        parsed_env_content["EVOSSEARCH_LM_AGENT_PROFILE_ID"] = agent_profile_id
+        for profile_id in (vlm_profile_id, agent_profile_id):
+            profile = updated_lm_profiles[profile_id]
+            parsed_env_content[_lm_profile_env_key(profile_id, "KIND")] = str(profile.get("kind") or "general")
+            parsed_env_content[_lm_profile_env_key(profile_id, "BASE_URL")] = str(profile.get("base_url") or "")
+            parsed_env_content[_lm_profile_env_key(profile_id, "MODEL")] = str(profile.get("model") or "")
+            parsed_env_content[_lm_profile_env_key(profile_id, "API_KEY")] = str(profile.get("api_key") or "")
+            parsed_env_content[_lm_profile_env_key(profile_id, "TIMEOUT")] = str(profile.get("timeout") or config.LM_TIMEOUT)
+            parsed_env_content[_lm_profile_env_key(profile_id, "ENABLED")] = "true"
         known_env_keys = set(parsed_env_content.keys())
         env_content = (
             "# evo-ssearch Configuration\n"
@@ -18741,6 +18830,12 @@ EVOSSEARCH_ALLOWED_ROOTS={os.pathsep.join(config.ALLOWED_ROOTS)}
         config.MAX_COMMENT_LENGTH = max_comment_length
         config.MAX_FILE_SIZE_MB = max_file_size
         config.INDEX_FOLDER_NAME = index_folder
+        config.LM_PROFILES = updated_lm_profiles
+        config.LM_VLM_PROFILE_ID = vlm_profile_id
+        config.LM_AGENT_PROFILE_ID = agent_profile_id
+        with _agent_runner_lock:
+            _agent_runtime_model_override = None
+            _agent_runner = None
         app.config["MAX_CONTENT_LENGTH"] = max(1, int(config.MAX_FILE_SIZE_MB)) * 1024 * 1024
         config.FUSION_ENABLED = fusion_enabled
         config.FUSION_ALPHA = fusion_alpha

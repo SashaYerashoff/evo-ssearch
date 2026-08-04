@@ -15,6 +15,8 @@ const DEFAULTS: Settings = {
   minResults: 3, maxResults: 48, defaultResults: 12,
   embedder: 'clip', clipModel: 'ViT-B/32', dinoModel: 'dinov3_vitb16', dinoEmbedDim: 1280, dinoWeightsPath: '',
   fusionEnabled: false, fusionAlpha: 0.7, batchSize: 32, thumbnailQuality: 85,
+  vlmBaseUrl: '', vlmModel: '', vlmApiKey: '', vlmTimeout: 600,
+  agentBaseUrl: '', agentModel: '', agentApiKey: '', agentTimeout: 600,
   rerankEnabled: false, rerankTopK: 50, segmentsEnabled: false, segmentMinPatches: 3, maxCommentLength: 100, maxFileSize: 50,
   luxriotBaseUrl: '', luxriotUsername: '', luxriotPassword: '', luxriotDefaultChannelId: 1,
   luxriotSnapshotInterval: 5, luxriotSnapshotMaxEdge: 800, luxriotMaxBufferFrames: 180,
@@ -137,12 +139,13 @@ export function SettingsModal({
     try {
       const payload: Settings = {}
       for (const k of WRITABLE_KEYS) {
-        if (k === 'luxriotPassword' && !s[k]) continue // blank = keep current
+        if (['luxriotPassword', 'vlmApiKey', 'agentApiKey'].includes(k) && !s[k]) continue // blank = keep current
         if (s[k] !== undefined) payload[k] = s[k]
       }
       if (Number(payload.minResults) > Number(payload.maxResults)) throw new Error('Min results must not exceed max results')
       const r = await settingsApi.save(payload)
       if (!r.success) throw new Error(r.error || 'Save failed')
+      setS((current) => ({ ...current, luxriotPassword: '', vlmApiKey: '', agentApiKey: '' }))
       setStatus({ msg: r.message || 'Settings saved. Some changes need a server restart.', ok: true })
     } catch (e: any) { setStatus({ msg: e?.message || 'Save failed', ok: false }) }
     finally { setSaving(false) }

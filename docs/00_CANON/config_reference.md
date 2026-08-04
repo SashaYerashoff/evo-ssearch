@@ -77,6 +77,8 @@ EVOSSEARCH_AUTH_COOKIE_SECURE=true   # when TLS terminates at app or proxy
 | `EVOSSEARCH_LUXRIOT_SNAPSHOT_INTERVAL` (`5`) | Capture cadence (s). Pilot uses aggressive values `[FIELD]` — see sizing |
 | `EVOSSEARCH_LUXRIOT_SNAPSHOT_MAX_EDGE` (`800`) | Snapshot max edge px |
 | `EVOSSEARCH_LUXRIOT_CAPTURE_SOURCE` (`auto`) | `snapshot`, `live_segment`, or automatic fallback. A true intra-second CV apex requires `live_segment` |
+| `EVOSSEARCH_LUXRIOT_FFMPEG_HWACCEL` (`auto`) | `auto` probes QSV, then Intel VAAPI, and uses the first working hardware decode/VPP path; any channel-level failure is retried in software. Use `qsv`, `vaapi`, or `software`/`off` to force a guarded backend |
+| `EVOSSEARCH_LUXRIOT_FFMPEG_INTEL_DEVICE` (auto-discovered) | Optional Intel DRM render node such as `/dev/dri/renderD128`. Auto-discovery verifies PCI vendor `0x8086` and never selects the NVIDIA render node. The legacy `...QSV_DEVICE` name remains a compatibility alias |
 | `EVOSSEARCH_LUXRIOT_LIVE_SEGMENT_SECONDS` (`60`) | Bounded lifetime of one incremental dense-capture pipe. Summaries are emitted inside the window; the longer lease amortizes recorder-open latency |
 | `EVOSSEARCH_LUXRIOT_LIVE_SEGMENT_FPS` (`3`) | Raw dense candidates per source-second before one CV apex is selected |
 | `EVOSSEARCH_LUXRIOT_CAPTURE_REQUEST_TIMEOUT_SEC` (`5`) | Short timeout for per-frame snapshot capture; prevents stale UI when Luxriot stalls |

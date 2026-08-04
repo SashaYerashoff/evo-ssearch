@@ -293,12 +293,10 @@ describe('React/backend contract normalizers', () => {
     expect(buildCaptureInput(7, {
       batch: '12',
       every: '5',
-      model: '  auto ',
     })).toEqual({
       channel_id: 7,
       batch_size: 12,
       interval_sec: 5,
-      model: 'auto',
     })
   })
 

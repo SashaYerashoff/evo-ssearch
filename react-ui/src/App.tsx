@@ -462,7 +462,6 @@ export default function App() {
               onBusyChange={handleAgentBusy}
               onLayoutPresetChange={setAgentArchiveColumns}
               onLayoutPresetCommit={setAgentCommittedArchiveColumns}
-              canManageModels={hasPermission(user, PERMISSION.modelsManage)}
               canManageSkills={hasPermission(user, PERMISSION.promptsManage)}
             />
           </>

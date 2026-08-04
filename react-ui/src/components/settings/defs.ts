@@ -26,6 +26,8 @@ export const WRITABLE_KEYS: string[] = [
   'minResults', 'maxResults', 'defaultResults',
   'embedder', 'clipModel', 'dinoModel', 'dinoEmbedDim', 'dinoWeightsPath', 'indexMode',
   'fusionEnabled', 'fusionAlpha', 'batchSize', 'thumbnailQuality',
+  'vlmBaseUrl', 'vlmModel', 'vlmApiKey', 'vlmTimeout',
+  'agentBaseUrl', 'agentModel', 'agentApiKey', 'agentTimeout',
   'rerankEnabled', 'rerankTopK', 'segmentsEnabled', 'segmentMinPatches', 'maxCommentLength', 'maxFileSize',
   'luxriotBaseUrl', 'luxriotUsername', 'luxriotPassword', 'luxriotDefaultChannelId',
   'luxriotSnapshotInterval', 'luxriotSnapshotMaxEdge', 'luxriotMaxBufferFrames',
@@ -64,7 +66,25 @@ export const TABS: TabDef[] = [
     id: 'models', label: 'Models',
     sections: [
       {
-        title: 'Backend & model', help: 'Embedding backend and thumbnail quality. DINO / fusion are experimental.',
+        title: 'VLM inference', help: 'Vision-language endpoint used for live L0 descriptions and visual alerts. API key is write-only; leave it blank to keep the stored value.',
+        fields: [
+          { key: 'vlmBaseUrl', label: 'VLM API base URL', type: 'text', note: 'OpenAI-compatible /v1 endpoint' },
+          { key: 'vlmModel', label: 'VLM model', type: 'text' },
+          { key: 'vlmApiKey', label: 'VLM API key', type: 'password' },
+          { key: 'vlmTimeout', label: 'VLM timeout (s)', type: 'number', min: 1, max: 3600 },
+        ],
+      },
+      {
+        title: 'Agent inference', help: 'Language-model endpoint used by EVA Agent and semantic consolidation. API key is write-only; leave it blank to keep the stored value.',
+        fields: [
+          { key: 'agentBaseUrl', label: 'Agent API base URL', type: 'text', note: 'OpenAI-compatible /v1 endpoint' },
+          { key: 'agentModel', label: 'Agent model', type: 'text' },
+          { key: 'agentApiKey', label: 'Agent API key', type: 'password' },
+          { key: 'agentTimeout', label: 'Agent timeout (s)', type: 'number', min: 1, max: 3600 },
+        ],
+      },
+      {
+        title: 'Embedding backend', help: 'Semantic archive backend and thumbnail quality. DINO / fusion are experimental.',
         fields: [
           { key: 'embedder', label: 'Backend', type: 'select', options: [{ v: 'clip' }, { v: 'dino' }, { v: 'fusion' }], note: 'dino / fusion require experimental embedders' },
           { key: 'clipModel', label: 'CLIP model', type: 'select', options: CLIP_MODELS },

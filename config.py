@@ -868,6 +868,17 @@ class Config:
     except (TypeError, ValueError):
         LUXRIOT_LIVE_SEGMENT_READ_TIMEOUT_SEC = 5.0
     LUXRIOT_LIVE_SEGMENT_READ_TIMEOUT_SEC = max(1.0, min(30.0, LUXRIOT_LIVE_SEGMENT_READ_TIMEOUT_SEC))
+    LUXRIOT_FFMPEG_HWACCEL = str(
+        os.getenv('EVOSSEARCH_LUXRIOT_FFMPEG_HWACCEL', 'auto') or 'auto'
+    ).strip().lower()
+    if LUXRIOT_FFMPEG_HWACCEL not in {'auto', 'qsv', 'vaapi', 'software', 'none', 'off'}:
+        LUXRIOT_FFMPEG_HWACCEL = 'auto'
+    LUXRIOT_FFMPEG_INTEL_DEVICE = str(
+        os.getenv('EVOSSEARCH_LUXRIOT_FFMPEG_INTEL_DEVICE', '') or ''
+    ).strip()
+    LUXRIOT_FFMPEG_QSV_DEVICE = str(
+        os.getenv('EVOSSEARCH_LUXRIOT_FFMPEG_QSV_DEVICE', '') or ''
+    ).strip()
     try:
         LUXRIOT_MEDIA_CONNECT_TIMEOUT_SEC = float(
             os.getenv('EVOSSEARCH_LUXRIOT_MEDIA_CONNECT_TIMEOUT_SEC', '3.0')

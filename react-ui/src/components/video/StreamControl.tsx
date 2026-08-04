@@ -11,7 +11,7 @@ import {
   IconVideo,
 } from '@tabler/icons-react'
 import type { Channel } from '../../api/types'
-import { Dropdown, type DropOption } from '../shell/Dropdown'
+import { Dropdown } from '../shell/Dropdown'
 import { ToolTabs } from '../shell/ToolTabs'
 import type { SummaryPeriod, SummaryResolution } from './summaryView'
 import { useI18n, type TranslationKey } from '../../i18n/I18nProvider'
@@ -56,7 +56,6 @@ export function StreamControl(p: {
   onReload: () => void
   batch: string; onBatch: (v: string) => void
   every: string; onEvery: (v: string) => void
-  model: string; onModel: (v: string) => void; modelOptions: DropOption[]
   canCapture: boolean
   canManagePrompts: boolean
   capturing: boolean; busy: boolean
@@ -120,12 +119,6 @@ export function StreamControl(p: {
               <div className="wfield xs"><label>{t('video.every')}</label>
                 <input type="number" min={0.2} max={300} step={0.1} value={p.every} onChange={(e) => p.onEvery(e.target.value)} />
               </div>
-            </div>
-          </section>
-          <section className="vid-control-group inference">
-            <div className="vid-control-group-title">{t('video.inference')}</div>
-            <div className="wfield model"><label>{t('video.liveModel')}</label>
-              <Dropdown value={p.model} onChange={p.onModel} options={p.modelOptions} />
             </div>
           </section>
           <section className="vid-control-group actions">

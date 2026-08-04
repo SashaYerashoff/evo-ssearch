@@ -153,13 +153,12 @@ export interface CaptureInput {
 
 export function buildCaptureInput(
   channelId: number,
-  values: { batch: string; every: string; model: string },
+  values: { batch: string; every: string },
 ): CaptureInput {
   return {
     channel_id: channelId,
     batch_size: Number(values.batch),
     interval_sec: Number(values.every),
-    model: values.model.trim() || undefined,
   }
 }
 

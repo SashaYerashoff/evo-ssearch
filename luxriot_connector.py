@@ -114,6 +114,151 @@ def _ffmpeg_binary() -> str:
     return shutil.which("ffmpeg") or "ffmpeg"
 
 
+_INTEL_MEDIA_PROBE_LOCK = threading.Lock()
+_INTEL_MEDIA_PROBE_CACHE: Dict[Tuple[str, str, str], Tuple[bool, Optional[str]]] = {}
+
+
+def _discover_intel_render_device(configured: Optional[str] = None) -> Optional[str]:
+    """Return an accessible Intel DRM render node, never an NVIDIA node."""
+
+    explicit = str(configured or "").strip()
+    candidates = [Path(explicit)] if explicit else sorted(Path("/dev/dri").glob("renderD*"))
+    for device in candidates:
+        if not device.exists() or not os.access(device, os.R_OK | os.W_OK):
+            continue
+        vendor_path = Path("/sys/class/drm") / device.name / "device" / "vendor"
+        try:
+            vendor = vendor_path.read_text(encoding="utf-8").strip().lower()
+        except OSError:
+            vendor = ""
+        if vendor == "0x8086":
+            return str(device)
+    return None
+
+
+def _probe_qsv_runtime(ffmpeg_bin: str, device: str) -> Tuple[bool, Optional[str]]:
+    """Bounded one-shot QSV init/filter probe cached per ffmpeg/device pair."""
+
+    key = ("qsv", str(ffmpeg_bin), str(device))
+    with _INTEL_MEDIA_PROBE_LOCK:
+        cached = _INTEL_MEDIA_PROBE_CACHE.get(key)
+    if cached is not None:
+        return cached
+    command = [
+        str(ffmpeg_bin),
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-init_hw_device",
+        f"qsv=eva_qsv:{device}",
+        "-filter_hw_device",
+        "eva_qsv",
+        "-f",
+        "lavfi",
+        "-i",
+        "color=size=64x64:rate=1:duration=0.1",
+        "-vf",
+        "format=nv12,hwupload=extra_hw_frames=8,vpp_qsv=w=32:h=32:format=nv12",
+        "-frames:v",
+        "1",
+        "-f",
+        "null",
+        "-",
+    ]
+    try:
+        result = subprocess.run(
+            command,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            timeout=5.0,
+            check=False,
+        )
+        error = _safe_error_text(result.stderr, 240) if result.returncode else None
+        outcome = (result.returncode == 0, error)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        outcome = (False, _safe_error_text(exc, 240) or exc.__class__.__name__)
+    with _INTEL_MEDIA_PROBE_LOCK:
+        _INTEL_MEDIA_PROBE_CACHE[key] = outcome
+    return outcome
+
+
+def _probe_vaapi_runtime(ffmpeg_bin: str, device: str) -> Tuple[bool, Optional[str]]:
+    """Bounded VAAPI init/filter probe using the same Intel media engine."""
+
+    key = ("vaapi", str(ffmpeg_bin), str(device))
+    with _INTEL_MEDIA_PROBE_LOCK:
+        cached = _INTEL_MEDIA_PROBE_CACHE.get(key)
+    if cached is not None:
+        return cached
+    command = [
+        str(ffmpeg_bin),
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-init_hw_device",
+        f"vaapi=eva_va:{device}",
+        "-filter_hw_device",
+        "eva_va",
+        "-f",
+        "lavfi",
+        "-i",
+        "color=size=64x64:rate=1:duration=0.1",
+        "-vf",
+        "format=nv12,hwupload=extra_hw_frames=8,scale_vaapi=w=32:h=32:format=nv12",
+        "-frames:v",
+        "1",
+        "-f",
+        "null",
+        "-",
+    ]
+    try:
+        result = subprocess.run(
+            command,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            timeout=5.0,
+            check=False,
+        )
+        error = _safe_error_text(result.stderr, 240) if result.returncode else None
+        outcome = (result.returncode == 0, error)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        outcome = (False, _safe_error_text(exc, 240) or exc.__class__.__name__)
+    with _INTEL_MEDIA_PROBE_LOCK:
+        _INTEL_MEDIA_PROBE_CACHE[key] = outcome
+    return outcome
+
+
+def _intel_hwaccel_for_config(
+    config: Any,
+) -> Tuple[Optional[str], Optional[str], Optional[str]]:
+    mode = str(getattr(config, "LUXRIOT_FFMPEG_HWACCEL", "auto") or "auto").strip().lower()
+    if mode in {"software", "none", "off"}:
+        return None, None, "disabled"
+    configured_device = str(
+        getattr(config, "LUXRIOT_FFMPEG_INTEL_DEVICE", "")
+        or getattr(config, "LUXRIOT_FFMPEG_QSV_DEVICE", "")
+        or ""
+    ).strip()
+    device = _discover_intel_render_device(configured_device)
+    if not device:
+        return None, None, "no accessible Intel DRM render device"
+    errors: List[str] = []
+    ffmpeg_bin = _ffmpeg_binary()
+    if mode in {"auto", "qsv"}:
+        available, error = _probe_qsv_runtime(ffmpeg_bin, device)
+        if available:
+            return "qsv", device, None
+        errors.append(f"qsv: {error or 'runtime probe failed'}")
+    if mode in {"auto", "vaapi"}:
+        available, error = _probe_vaapi_runtime(ffmpeg_bin, device)
+        if available:
+            return "vaapi", device, None
+        errors.append(f"vaapi: {error or 'runtime probe failed'}")
+    if not errors:
+        errors.append(f"unsupported hardware mode: {mode}")
+    return None, None, "; ".join(errors)
+
+
 class SummaryBatchSuperseded(RuntimeError):
     """A queued summary belongs to a stopped or replaced channel generation."""
 
@@ -145,7 +290,10 @@ _ERROR_AUTH_HEADER_RE = re.compile(
 def _safe_error_text(value: object, max_len: int = 500) -> str:
     """Return a bounded diagnostic string with URL/header credentials removed."""
 
-    text = str(value or "").strip()
+    if isinstance(value, (bytes, bytearray)):
+        text = bytes(value).decode("utf-8", errors="replace").strip()
+    else:
+        text = str(value or "").strip()
     if not text:
         return ""
     text = _ERROR_URL_USERINFO_RE.sub(r"\g<scheme><redacted>@", text)
@@ -1535,6 +1683,12 @@ class LuxriotCaptureSession:
         self.last_live_segment_source_start_timestamp_ms: Optional[int] = None
         self.last_live_segment_last_source_timestamp_ms: Optional[int] = None
         self.last_live_segment_timestamp_source: Optional[str] = None
+        self.live_segment_decoder = "software"
+        self.live_segment_hwaccel_available = False
+        self.live_segment_hwaccel_device: Optional[str] = None
+        self.live_segment_hwaccel_probe_error: Optional[str] = None
+        self.live_segment_hwaccel_fallback_count = 0
+        self.live_segment_hwaccel_disabled_for_session = False
         self.live_segment_inflight = False
         self.live_segment_capture_started_at: Optional[float] = None
         self.live_segment_inflight_target_seconds = 0.0
@@ -2147,7 +2301,7 @@ class LuxriotCaptureSession:
             del buffer[: end + 2]
         return frames
 
-    def _run_ffmpeg_live_segment_once(self) -> Optional[bool]:
+    def _run_ffmpeg_live_segment_once(self, *, force_software: bool = False) -> Optional[bool]:
         budget = self._live_segment_capture_budget()
         frame_limit = int(budget["raw_frame_budget"])
         fps = float(budget["fps"])
@@ -2193,6 +2347,21 @@ class LuxriotCaptureSession:
                 "/dev/video"
             )
         )
+        hw_backend: Optional[str] = None
+        hw_device: Optional[str] = None
+        hw_probe_error: Optional[str] = None
+        if not force_software and not self.live_segment_hwaccel_disabled_for_session:
+            hw_backend, hw_device, hw_probe_error = _intel_hwaccel_for_config(self.manager.config)
+        with self.lock:
+            if hw_backend and hw_device:
+                self.live_segment_hwaccel_available = True
+                self.live_segment_hwaccel_device = hw_device
+                self.live_segment_hwaccel_probe_error = None
+            elif not force_software and not self.live_segment_hwaccel_disabled_for_session:
+                self.live_segment_hwaccel_available = False
+                self.live_segment_hwaccel_device = None
+                self.live_segment_hwaccel_probe_error = hw_probe_error
+            self.live_segment_decoder = f"intel_{hw_backend}" if hw_backend else "software"
         self._mark_live_segment_inflight(budget)
 
         def close_window_io(*, terminate: bool) -> None:
@@ -2282,18 +2451,60 @@ class LuxriotCaptureSession:
                         "pipe:0",
                     ]
                 )
+                if hw_backend == "qsv" and hw_device:
+                    hw_input_args = [
+                        "-init_hw_device",
+                        f"qsv=eva_qsv:{hw_device}",
+                        "-filter_hw_device",
+                        "eva_qsv",
+                        "-hwaccel",
+                        "qsv",
+                        "-hwaccel_device",
+                        "eva_qsv",
+                        "-hwaccel_output_format",
+                        "qsv",
+                    ]
+                    video_filter = (
+                        f"vpp_qsv=framerate={fps:g}/1:format=nv12,"
+                        "hwdownload,format=nv12,"
+                        f"scale={dense_max_edge}:{dense_max_edge}:"
+                        "force_original_aspect_ratio=decrease"
+                    )
+                elif hw_backend == "vaapi" and hw_device:
+                    hw_input_args = [
+                        "-init_hw_device",
+                        f"vaapi=eva_va:{hw_device}",
+                        "-filter_hw_device",
+                        "eva_va",
+                        "-hwaccel",
+                        "vaapi",
+                        "-hwaccel_device",
+                        "eva_va",
+                        "-hwaccel_output_format",
+                        "vaapi",
+                    ]
+                    video_filter = (
+                        f"scale_vaapi=w={dense_max_edge}:h={dense_max_edge}:"
+                        "force_original_aspect_ratio=decrease:format=nv12,"
+                        "hwdownload,format=nv12,"
+                        f"fps={fps:g}"
+                    )
+                else:
+                    hw_input_args = []
+                    video_filter = (
+                        f"fps={fps:g},scale={dense_max_edge}:{dense_max_edge}:"
+                        "force_original_aspect_ratio=decrease"
+                    )
                 cmd = [
                     _ffmpeg_binary(),
                     "-hide_banner",
                     "-loglevel",
                     "error",
                     "-nostdin",
+                    *hw_input_args,
                     *input_args,
                     "-vf",
-                    (
-                        f"fps={fps:g},scale={dense_max_edge}:{dense_max_edge}:"
-                        "force_original_aspect_ratio=decrease"
-                    ),
+                    video_filter,
                     "-frames:v",
                     str(frame_limit),
                     "-q:v",
@@ -2438,6 +2649,26 @@ class LuxriotCaptureSession:
                 if not stopped and accepted <= 0 and returncode == 127:
                     self._cancel_live_segment_inflight()
                     return None
+                if (
+                    hw_backend
+                    and hw_device
+                    and not stopped
+                    and accepted <= 0
+                    and (process_error is not None or bool(stderr))
+                ):
+                    fallback_error = (
+                        _safe_error_text(process_error, 240)
+                        or _safe_error_text(stderr, 240)
+                        or f"Intel {hw_backend} ffmpeg exited {returncode} without frames"
+                    )
+                    with self.lock:
+                        self.live_segment_hwaccel_fallback_count += 1
+                        self.live_segment_hwaccel_disabled_for_session = True
+                        self.live_segment_hwaccel_available = False
+                        self.live_segment_hwaccel_probe_error = fallback_error
+                        self.live_segment_decoder = "software"
+                    self._cancel_live_segment_inflight()
+                    return self._run_ffmpeg_live_segment_once(force_software=True)
                 with self.lock:
                     self.active_capture_source = "live_segment"
                     self.live_segment_count += 1 if accepted > 0 else 0
@@ -4705,6 +4936,11 @@ class LuxriotCaptureSession:
             last_live_segment_source_start_timestamp_ms = self.last_live_segment_source_start_timestamp_ms
             last_live_segment_last_source_timestamp_ms = self.last_live_segment_last_source_timestamp_ms
             last_live_segment_timestamp_source = self.last_live_segment_timestamp_source
+            live_segment_decoder = self.live_segment_decoder
+            live_segment_hwaccel_available = self.live_segment_hwaccel_available
+            live_segment_hwaccel_device = self.live_segment_hwaccel_device
+            live_segment_hwaccel_probe_error = self.live_segment_hwaccel_probe_error
+            live_segment_hwaccel_fallback_count = self.live_segment_hwaccel_fallback_count
             live_segment_inflight = self.live_segment_inflight
             live_segment_capture_started_at = self.live_segment_capture_started_at
             live_segment_inflight_target_seconds = self.live_segment_inflight_target_seconds
@@ -4833,6 +5069,11 @@ class LuxriotCaptureSession:
             "last_live_segment_source_start_timestamp_ms": last_live_segment_source_start_timestamp_ms,
             "last_live_segment_last_source_timestamp_ms": last_live_segment_last_source_timestamp_ms,
             "last_live_segment_timestamp_source": last_live_segment_timestamp_source,
+            "live_segment_decoder": live_segment_decoder,
+            "live_segment_hwaccel_available": bool(live_segment_hwaccel_available),
+            "live_segment_hwaccel_device": live_segment_hwaccel_device,
+            "live_segment_hwaccel_probe_error": live_segment_hwaccel_probe_error,
+            "live_segment_hwaccel_fallback_count": int(live_segment_hwaccel_fallback_count),
             "live_segment_inflight": bool(live_segment_inflight),
             "live_segment_capture_started_at": live_segment_capture_started_at,
             "live_segment_inflight_target_seconds": round(float(live_segment_inflight_target_seconds), 3),
@@ -12603,6 +12844,11 @@ class LuxriotManager:
             "last_live_segment_source_start_timestamp_ms",
             "last_live_segment_last_source_timestamp_ms",
             "last_live_segment_timestamp_source",
+            "live_segment_decoder",
+            "live_segment_hwaccel_available",
+            "live_segment_hwaccel_device",
+            "live_segment_hwaccel_probe_error",
+            "live_segment_hwaccel_fallback_count",
             "live_segment_inflight",
             "live_segment_capture_started_at",
             "live_segment_inflight_target_seconds",
@@ -21512,6 +21758,11 @@ class LuxriotManager:
             "last_live_segment_source_start_timestamp_ms",
             "last_live_segment_last_source_timestamp_ms",
             "last_live_segment_timestamp_source",
+            "live_segment_decoder",
+            "live_segment_hwaccel_available",
+            "live_segment_hwaccel_device",
+            "live_segment_hwaccel_probe_error",
+            "live_segment_hwaccel_fallback_count",
             "live_segment_inflight",
             "live_segment_capture_started_at",
             "live_segment_inflight_target_seconds",
