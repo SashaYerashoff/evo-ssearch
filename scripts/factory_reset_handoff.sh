@@ -149,6 +149,7 @@ import sys
 source = Path(sys.argv[1])
 target = Path(sys.argv[2])
 updates = {
+    "EVOSSEARCH_UI_MODE": "react",
     "EVOSSEARCH_LUXRIOT_BASE_URL": "http://127.0.0.1:8080",
     "EVOSSEARCH_LUXRIOT_USERNAME": "",
     "EVOSSEARCH_LUXRIOT_PASSWORD": "",
