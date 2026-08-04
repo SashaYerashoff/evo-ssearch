@@ -1,11 +1,8 @@
-import { IconColorSwatch } from '@tabler/icons-react'
-
 export function TopBar({
-  section, appVersion, onAppearance, onBrand,
+  section, appVersion, onBrand,
 }: {
   section: string
   appVersion: string
-  onAppearance: () => void
   onBrand: () => void
 }) {
   return (
@@ -24,17 +21,6 @@ export function TopBar({
         <div className="top-section">{section}</div>
       </div>
 
-      <div className="top-right">
-        <button
-          className="motion-toggle appearance-toggle"
-          onClick={onAppearance}
-          title="Theme and appearance"
-          aria-label="Open theme and appearance settings"
-        >
-          <IconColorSwatch size={14} />
-          Appearance
-        </button>
-      </div>
     </div>
   )
 }

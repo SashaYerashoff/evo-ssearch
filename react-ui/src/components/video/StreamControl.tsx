@@ -11,6 +11,7 @@ import {
   IconVideo,
 } from '@tabler/icons-react'
 import type { Channel } from '../../api/types'
+import type { ReactNode } from 'react'
 import { Dropdown, type DropOption } from '../shell/Dropdown'
 import { ToolTabs } from '../shell/ToolTabs'
 import type { SummaryPeriod, SummaryResolution } from './summaryView'
@@ -36,6 +37,7 @@ export const RESOLUTIONS: Array<{ v: SummaryResolution; label: string }> = [
 export type VideoWorkspaceTab = 'review' | 'settings'
 
 export function StreamControl(p: {
+  navigation?: ReactNode
   channels: Channel[]
   activeTab: VideoWorkspaceTab
   onTab: (tab: VideoWorkspaceTab) => void
@@ -85,11 +87,11 @@ export function StreamControl(p: {
       ]}
       active={p.activeTab}
       onSelect={(id) => p.onTab(id as VideoWorkspaceTab)}
+      leading={p.navigation}
     >
       {p.activeTab === 'settings' ? (
         <div className="vid-settings-toolbar">
           <section className="vid-control-group source">
-            <div className="vid-control-group-title">Stream source</div>
             <div className="wfield ch"><label>Channel</label>
               <div className="vid-row">
                 <Dropdown value={String(p.settingsChannelId ?? '')} onChange={(v) => p.onSettingsChannel(Number(v))}
@@ -99,7 +101,6 @@ export function StreamControl(p: {
             </div>
           </section>
           <section className="vid-control-group sampling">
-            <div className="vid-control-group-title">Sampling and batching</div>
             <div className="vid-control-fields">
               <div className="wfield batch"><label>Batch</label>
                 <Dropdown value={p.batch} onChange={p.onBatch} options={BATCHES.map((b) => ({ value: b, label: b }))} />
@@ -110,13 +111,11 @@ export function StreamControl(p: {
             </div>
           </section>
           <section className="vid-control-group inference">
-            <div className="vid-control-group-title">Inference</div>
             <div className="wfield model"><label>Live model</label>
               <Dropdown value={p.model} onChange={p.onModel} options={p.modelOptions} />
             </div>
           </section>
           <section className="vid-control-group actions">
-            <div className="vid-control-group-title">Runtime</div>
             <div className="vid-tb-actions">
               {p.canCapture && (p.capturing
                 ? <>

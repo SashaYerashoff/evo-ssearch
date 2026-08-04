@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from 'react'
 import {
   IconLayoutGrid,
   IconList,
@@ -104,6 +104,7 @@ function probeInputForEnabled(
 }
 
 export function MonitoringScreen({
+  navigation,
   channels,
   drive,
   canOperate,
@@ -111,6 +112,7 @@ export function MonitoringScreen({
   canCreateBookmarks,
   onOpenParentAlert,
 }: {
+  navigation?: ReactNode
   channels: Channel[]
   drive?: ConsoleDrive | null
   canOperate: boolean
@@ -358,6 +360,7 @@ export function MonitoringScreen({
         }]}
         active="probes"
         onSelect={() => {}}
+        leading={navigation}
       >
         <div className="probe-board-toolbar">
           <div className="mon-search" title="Search names, prompts, channels and parent alerts">

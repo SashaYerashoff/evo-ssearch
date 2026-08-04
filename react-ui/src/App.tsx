@@ -14,7 +14,7 @@ import type { Probe } from './api/probes'
 import { api, API_FORBIDDEN_EVENT, AUTH_EXPIRED_EVENT } from './api/client'
 import { TopBar } from './components/shell/TopBar'
 import { StatusConsole } from './components/shell/StatusConsole'
-import { LeftRail, SECTION_LABELS, type SectionId } from './components/shell/LeftRail'
+import { LeftRail, MainMenuButton, SECTION_LABELS, type SectionId } from './components/shell/LeftRail'
 import { AgentEar } from './components/shell/AgentEar'
 import { AgentPanel, type AgentAction } from './components/shell/AgentPanel'
 import { ArchiveScreen } from './components/archive/ArchiveScreen'
@@ -25,7 +25,6 @@ import type { SummaryEntry } from './api/video'
 import { SettingsModal } from './components/settings/SettingsModal'
 import { HomeScreen } from './components/home/HomeScreen'
 import { NeuralBackground } from './components/shell/NeuralBackground'
-import { AppearanceModal } from './components/appearance/AppearanceModal'
 import { useAppearance } from './appearance/AppearanceProvider'
 import type { ConsoleUiEffect } from './ui-effects/consoleEffects'
 
@@ -107,10 +106,10 @@ export default function App() {
   const [section, setSection] = useState<SectionId>('home')
   const [agentOpen, setAgentOpen] = useState(false)
   const [agentFull, setAgentFull] = useState(false)
+  const [menuOpen, setMenuOpen] = useState(false)
   const [agentArchiveColumns, setAgentArchiveColumns] = useState(4)
   const [agentCommittedArchiveColumns, setAgentCommittedArchiveColumns] = useState(4)
   const [settingsOpen, setSettingsOpen] = useState(false)
-  const [appearanceOpen, setAppearanceOpen] = useState(false)
   const [drive, setDrive] = useState<AgentDrive | null>(null)
   const [summaryReview, setSummaryReview] = useState<Detection | null>(null)
   const [similarDrive, setSimilarDrive] = useState<{ detection: Detection; seq: number } | null>(null)
@@ -336,9 +335,12 @@ export default function App() {
   if (!ready) return <div className="loading-state"><div className="spinner" /></div>
   if (!user) return <LoginGate onDone={setUser} />
 
-  async function handleLogout() { await apiLogout(); setUser(null) }
+  async function handleLogout() { await apiLogout(); setMenuOpen(false); setUser(null) }
   const agentPresetGrid = agentOpen && !agentFull
   const noAnim = isMotionReduced
+  const navigation = () => (
+    <MainMenuButton open={menuOpen} onToggle={() => setMenuOpen(true)} />
+  )
 
   return (
     <div className={`shell ${noAnim ? 'no-anim' : ''}`}>
@@ -346,7 +348,6 @@ export default function App() {
       <TopBar
         appVersion={appVersion}
         section={SECTION_LABELS[section]}
-        onAppearance={() => setAppearanceOpen(true)}
         onBrand={() => setSection('home')}
       />
       {forbiddenNotice && <div className="global-notice" role="alert">{forbiddenNotice}</div>}
@@ -363,14 +364,19 @@ export default function App() {
           active={section}
           visibleSections={visibleSections}
           showSettings={settingsAllowed}
+          open={menuOpen}
+          showTrigger={false}
+          onOpenChange={setMenuOpen}
           onNavigate={setSection}
           onSettings={() => setSettingsOpen(true)}
           onLogout={handleLogout}
         />
         <div className="center">
+          {section === 'home' && <div className="home-menu-slot">{navigation()}</div>}
           <HomeScreen active={section === 'home'} serverStartedAtMs={serverStartedAtMs} />
           {section === 'archive' && (
             <ArchiveScreen
+              navigation={navigation()}
               channels={channels}
               drive={drive}
               similarDrive={similarDrive}
@@ -385,6 +391,7 @@ export default function App() {
           )}
           {section === 'monitoring' && (
             <MonitoringScreen
+              navigation={navigation()}
               channels={channels}
               drive={probeDrive}
               canOperate={hasPermission(user, PERMISSION.probesRun) && hasPermission(user, PERMISSION.captureManage)}
@@ -395,6 +402,7 @@ export default function App() {
           )}
           {section === 'video' && (
             <VideoScreen
+              navigation={navigation()}
               channels={channels}
               drive={videoDrive}
               reviewOverlayOpen={!!summaryReview}
@@ -422,7 +430,6 @@ export default function App() {
             onClose={() => setSettingsOpen(false)}
           />
         )}
-        {appearanceOpen && <AppearanceModal onClose={() => setAppearanceOpen(false)} />}
         {summaryReview && (
           <InspectorModal
             d={summaryReview}

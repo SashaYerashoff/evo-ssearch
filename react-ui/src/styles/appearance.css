@@ -160,6 +160,28 @@
   gap: 18px;
 }
 
+.appearance-settings-embedded,
+.appearance-settings-inline {
+  width: 100%;
+  min-height: 100%;
+}
+
+.appearance-settings-inline {
+  display: flex;
+  flex-direction: column;
+}
+
+.appearance-settings-inline .appearance-body {
+  flex: 0 0 auto;
+  overflow: visible;
+  padding: 0 0 18px;
+}
+
+.appearance-settings-inline .appearance-footer {
+  margin-top: auto;
+  padding: 14px 0 0;
+}
+
 .appearance-section {
   display: flex;
   flex-direction: column;
