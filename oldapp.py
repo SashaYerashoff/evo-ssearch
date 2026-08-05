@@ -263,6 +263,8 @@ _audit_db_pool: Optional[PsycopgPool] = None
 _audit_db_pool_lock = Lock()
 _control_plane_db_pool: Optional[PsycopgPool] = None
 _control_plane_db_lock = Lock()
+_archive_db_pool: Optional[PsycopgPool] = None
+_archive_db_pool_lock = Lock()
 _inference_worker_db_pool: Optional[PsycopgPool] = None
 _inference_worker_db_lock = Lock()
 _inference_queue_runtime: Optional[LuxriotInferenceQueueRuntime] = None
@@ -607,6 +609,29 @@ def _get_control_plane_db_pool() -> PsycopgPool:
         return _control_plane_db_pool
 
 
+def _get_archive_db_pool() -> PsycopgPool:
+    """Return the pool reserved for high-volume archive/attention writes.
+
+    IAM and operator requests intentionally remain on the control-plane pool.
+    A stalled camera, retention pass, or semantic snapshot burst must never be
+    able to consume the connection wait queue used to authenticate operators.
+    """
+
+    global _archive_db_pool
+    with _archive_db_pool_lock:
+        if _archive_db_pool is None:
+            base_settings = DatabaseSettings.from_env()
+            _archive_db_pool = PsycopgPool(
+                replace(
+                    base_settings,
+                    pool_min_size=0,
+                    pool_max_size=min(8, base_settings.pool_max_size),
+                    application_name="eva-ai-archive",
+                )
+            )
+        return _archive_db_pool
+
+
 def _archive_store_mode() -> str:
     return "postgres"
 
@@ -678,7 +703,7 @@ def _build_luxriot_runtime_state_store() -> Optional[PostgresRuntimeStateStore]:
         return cast(Any, _UnavailablePostgresStore("runtime_state"))
     try:
         return PostgresRuntimeStateStore(
-            _get_control_plane_db_pool(),
+            _get_archive_db_pool(),
             _archive_tenant_id(),
         )
     except Exception as exc:
@@ -5266,7 +5291,7 @@ def _build_archive_stores() -> Tuple[Any, Any]:
         unavailable = _UnavailablePostgresStore("archive")
         return unavailable, unavailable
     try:
-        pool = _get_control_plane_db_pool()
+        pool = _get_archive_db_pool()
         tenant_id = _archive_tenant_id()
         return (
             PostgresProbesStore(pool, tenant_id),
@@ -5290,7 +5315,7 @@ def _build_incident_store() -> Any:
         return _UnavailablePostgresStore("incidents")
     try:
         return PostgresIncidentStore(
-            _get_control_plane_db_pool(),
+            _get_archive_db_pool(),
             _archive_tenant_id(),
         )
     except Exception as exc:
@@ -5410,7 +5435,7 @@ def _build_attention_writer() -> BufferedAttentionWriter:
     )
     if storage_enabled and _postgres_archive_enabled():
         _attention_store = PostgresAttentionStore(
-            _get_control_plane_db_pool(),
+            _get_archive_db_pool(),
             _archive_tenant_id(),
         )
     else:
@@ -19265,6 +19290,7 @@ def agent_session(session_id: str):
 @atexit.register
 def _shutdown_background_workers() -> None:
     global _audit_db_pool, _audit_reader, _audit_writer, _control_plane_db_pool
+    global _archive_db_pool
     global _identity_repository
     global _inference_queue_runtime, _inference_worker_db_pool
     global _attention_writer, _live_clip_batcher, semantic_snapshot_writer
@@ -19326,6 +19352,12 @@ def _shutdown_background_workers() -> None:
             _audit_db_pool.close()
             _audit_db_pool = None
             _audit_writer = None
+    except Exception:
+        pass
+    try:
+        if _archive_db_pool is not None:
+            _archive_db_pool.close()
+            _archive_db_pool = None
     except Exception:
         pass
     try:
