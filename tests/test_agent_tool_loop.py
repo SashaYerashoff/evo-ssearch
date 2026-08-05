@@ -323,6 +323,11 @@ class AgentToolLoopTests(unittest.TestCase):
         self.assertEqual(call.name, "describe_frame")
         self.assertEqual(call.args["detection_ids"], list(range(101, 109)))
         self.assertIn("sphynx cat", call.args["prompt"])
+        archive["archive_vision_attempted"] = True
+        self.assertIsNone(
+            agent._required_bounded_workflow_tool_call(archive, schemas)
+        )
+        self.assertTrue(agent._bounded_workflow_plan_completed(archive))
 
         incident = _seed_turn_tool_context(
             "Report incident on channel 112 for the last 10 minutes"
@@ -406,6 +411,113 @@ class AgentToolLoopTests(unittest.TestCase):
         )
         self.assertIn("video_research", continued["tool_intents"])
         self.assertEqual(continued["operator_relative_range"], "last 24 hours")
+
+    def test_video_event_followup_retains_trusted_channel_and_window(self):
+        history = [
+            {
+                "role": "tool",
+                "name": "get_video_summaries",
+                "content": json.dumps(
+                    {
+                        "channel_id": 420,
+                        "depth": "L1",
+                        "entries": [
+                            {
+                                "window_start": 1_000.0,
+                                "window_end": 1_060.0,
+                                "summary": (
+                                    "Dublin Road: a red car overtakes another vehicle "
+                                    "near the junction."
+                                ),
+                            }
+                        ],
+                    }
+                ),
+            }
+        ]
+        text = "Look deeper into that Dublin Road overtaking event"
+        context = agent._inherit_followup_tool_context(
+            _seed_turn_tool_context(text),
+            text,
+            history,
+        )
+
+        self.assertEqual(context["channel_id"], 420)
+        self.assertEqual(context["video_candidate_channel_ids"], [420])
+        self.assertEqual(context["time_window"]["from_ts"], 1_000.0)
+        self.assertTrue(context["inherited_video_event_scope"])
+        schemas = _select_relevant_tool_schemas(agent._TOOL_SCHEMAS, context)
+        call = agent._required_video_research_tool_call(context, schemas)
+        self.assertIsNotNone(call)
+        self.assertEqual(call.name, "get_video_summaries")
+        self.assertEqual(call.args["channel_id"], 420)
+
+    def test_video_event_followup_without_timestamp_does_not_broaden_scope(self):
+        history = [
+            {
+                "role": "tool",
+                "name": "get_video_summaries",
+                "content": json.dumps(
+                    {
+                        "channel_id": 420,
+                        "entries": [
+                            {"summary": "Dublin Road overtaking event selected by operator."}
+                        ],
+                    }
+                ),
+            }
+        ]
+        text = "Drill deeper into that Dublin Road overtaking event"
+        context = agent._inherit_followup_tool_context(
+            _seed_turn_tool_context(text),
+            text,
+            history,
+        )
+
+        self.assertEqual(context["channel_id"], 420)
+        self.assertTrue(context["video_event_followup_missing_time"])
+        self.assertEqual(_select_relevant_tool_schemas(agent._TOOL_SCHEMAS, context), [])
+        answer = agent._format_video_event_followup_clarification(
+            context,
+            {"user_query": text},
+        )
+        self.assertIn("CH 420", answer)
+        self.assertIn("approximate event time", answer)
+        self.assertIn("without broadening", answer)
+
+    def test_video_final_rejects_channel_and_alert_counts_absent_from_current_turn(self):
+        ledger = agent._new_turn_signal_ledger("Show latest alerts across all channels")
+        agent._record_turn_signal_ledger(
+            ledger,
+            "list_video_summary_channels",
+            {
+                "active_count": 1,
+                "candidate_channels": [
+                    {"channel_id": 420, "alert_total": 2, "summary_count": 9}
+                ],
+            },
+        )
+
+        self.assertEqual(
+            agent._video_response_grounding_issues(
+                "CH 420 has 2 alerts in the current window.",
+                ledger,
+            ),
+            [],
+        )
+        issues = agent._video_response_grounding_issues(
+            "CH 211 has 0 alerts and CH 420 has 7 alerts.",
+            ledger,
+        )
+        self.assertIn("unsupported_channel:211", issues)
+        self.assertIn("unsupported_alert_count:420:7", issues)
+        self.assertTrue(
+            agent._video_research_response_needs_recovery(
+                "CH 211 has 0 alerts and CH 420 has 7 alerts.",
+                {"tool_intents": ["video_research"]},
+                ledger,
+            )
+        )
 
     def test_protocol_deploy_rehydrates_scope_selection_from_tool_history(self):
         start_result = {
@@ -997,6 +1109,88 @@ class AgentToolLoopTests(unittest.TestCase):
             if event.get("type") == "tool_result"
         ][-1]
         self.assertTrue(duplicate_result["result"]["duplicate_suppressed"])
+
+    def test_failed_required_archive_vision_batch_runs_once_and_returns_unknown(self):
+        class FailingArchiveTools(_FakeTools):
+            def execute(self, name, args, progress_cb=None):
+                self.calls += 1
+                self.call_args.append((name, dict(args)))
+                if name == "search_archive":
+                    return {
+                        "query": "red car",
+                        "count": 8,
+                        "results_returned_to_model": 8,
+                        "lexical_match_count_in_returned": 0,
+                        "vision_candidate_ids": list(range(101, 109)),
+                        "vision_candidate_count": 8,
+                        "results": [],
+                    }
+                if name == "describe_frame":
+                    raise agent.ToolError("synthetic archive VLM failure")
+                raise AssertionError(name)
+
+        runner = AgentRunner.__new__(AgentRunner)
+        runner.store = _FakeStore()
+        runner._lm_client = _FakeLMClient(tool_rounds=0)
+        runner._tools = FailingArchiveTools()
+        runner._ps = object()
+        runner._ds = object()
+        runner._lxm = object()
+
+        events = [
+            json.loads(item.removeprefix("data: ").strip())
+            for item in runner.stream_chat(
+                "session-1",
+                "Search the video-description archive for a red car",
+            )
+            if item.startswith("data: ")
+        ]
+
+        self.assertEqual(
+            [name for name, _args in runner._tools.call_args],
+            ["search_archive", "describe_frame"],
+        )
+        describe_results = [
+            event
+            for event in events
+            if event.get("type") == "tool_result"
+            and event.get("name") == "describe_frame"
+        ]
+        self.assertEqual(len(describe_results), 1)
+        self.assertEqual(describe_results[0]["result"]["status"], "failed")
+        self.assertFalse(describe_results[0]["result"]["retryable_in_turn"])
+        final_text = "".join(
+            event.get("content", "")
+            for event in events
+            if event.get("type") == "text"
+        )
+        self.assertIn("attempted once and failed", final_text)
+        self.assertIn("neither presence nor absence", final_text)
+
+    def test_tool_failure_log_has_correlation_but_no_private_payload(self):
+        with self.assertLogs("agent", level="WARNING") as captured:
+            agent._log_turn_tool_failure(
+                session_id="session-7",
+                request_id="request-9",
+                call_id="call-11",
+                tool_name="describe_frame",
+                args={
+                    "detection_ids": list(range(8)),
+                    "prompt": "PRIVATE OPERATOR QUERY",
+                    "api_key": "PRIVATE SECRET",
+                },
+                error=agent.ToolError("PRIVATE FAILURE BODY"),
+                archive_failure={"status": "failed"},
+            )
+
+        line = "\n".join(captured.output)
+        self.assertIn("request_id=request-9", line)
+        self.assertIn("session_id=session-7", line)
+        self.assertIn("call_id=call-11", line)
+        self.assertIn("tool=describe_frame", line)
+        self.assertIn("candidate_count=8", line)
+        self.assertIn("final_error_class=ToolError", line)
+        self.assertNotIn("PRIVATE", line)
 
     def test_completed_archive_tool_emits_closed_console_effect(self):
         runner = AgentRunner.__new__(AgentRunner)

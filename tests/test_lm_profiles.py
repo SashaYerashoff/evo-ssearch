@@ -273,6 +273,59 @@ class LmProfileRuntimeTests(unittest.TestCase):
             str(payloads[1]["messages"]),
         )
 
+    def test_archive_verdict_json_with_repeated_evidence_skips_prose_retry(self):
+        profile = {
+            "id": "vlm",
+            "kind": "vlm",
+            "base_url": "http://vlm.local/v1",
+            "model": "qwen3-vl-4b",
+            "api_key": "",
+            "timeout": 120,
+        }
+        evidence = (
+            "A red car is clearly visible in the center of the frame, driving on a street with tram tracks."
+        )
+        rows = ",".join(
+            '{"snapshot_index":%d,"verdict":"match","visible_evidence":"%s"}'
+            % (index, evidence)
+            for index in range(1, 9)
+        )
+        verdict_json = '{"verdicts":[' + rows + "]}"
+        payloads = []
+
+        def fake_post(_url, **kwargs):
+            payloads.append(kwargs["json"])
+            return _Response(
+                {
+                    "choices": [
+                        {
+                            "finish_reason": "stop",
+                            "message": {"content": verdict_json},
+                        }
+                    ]
+                }
+            )
+
+        class AdmissionCapture:
+            def admission(self, _resource, **_kwargs):
+                return nullcontext()
+
+        with (
+            patch.object(oldapp, "_resolve_lm_profile", return_value=profile),
+            patch.object(oldapp.requests, "post", fake_post),
+            patch.object(oldapp, "_lm_admission_controller", AdmissionCapture()),
+        ):
+            result = oldapp._call_lm_chat(
+                [{"role": "user", "content": "verify these archive candidates"}],
+                profile_id="vlm",
+                profile_kind="vlm",
+                workload_class="describe",
+            )
+
+        self.assertEqual(result, verdict_json)
+        self.assertEqual(len(payloads), 1)
+        self.assertIsNone(oldapp._lm_repetition_issue(f"```json\n{verdict_json}\n```"))
+
     def test_model_catalog_exposes_profiles_without_api_keys(self):
         profiles = {
             "default": {

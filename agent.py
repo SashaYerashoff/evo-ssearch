@@ -17,6 +17,7 @@ import collections
 import copy
 import hashlib
 import json
+import logging
 import os
 import queue
 import re
@@ -85,6 +86,7 @@ AGENT_VIDEO_SUMMARY_MAX_LEVEL_LIMIT = 2_000
 AGENT_SITE_TIMEZONE = os.getenv("EVOSSEARCH_SITE_TIMEZONE", "UTC").strip() or "UTC"
 TRUSTED_ACTION_RECEIPT_PREFIX = "Trusted server action receipt:"
 AGENT_CHAT_TEMPLATE_KWARGS = {"enable_thinking": False}
+_AGENT_LOG = logging.getLogger(__name__)
 
 
 def _int_env(name: str, default: int, *, minimum: int = 0, maximum: Optional[int] = None) -> int:
@@ -231,6 +233,79 @@ def _normalize_archive_vision_verdict(
     if normalized in {"no_match", "not_match", "no", "absent", "negative", "rejected"}:
         return "no_match"
     return "uncertain"
+
+
+def _validate_archive_vision_contract(
+    value: Any,
+    *,
+    expected_count: int,
+) -> Tuple[str, Dict[int, Dict[str, Any]], List[str], List[str]]:
+    """Validate the bounded archive verdict contract conservatively.
+
+    A malformed contract never becomes positive or negative evidence.  Valid
+    rows may repeat evidence wording across similar snapshots; that is a
+    quality signal, not a transport failure or prose-loop condition.
+    """
+
+    parsed = _extract_first_json_mapping(value)
+    raw_verdicts = parsed.get("verdicts") if isinstance(parsed, Mapping) else None
+    if not isinstance(raw_verdicts, list):
+        return "unparsed", {}, ["missing_verdicts_array"], []
+
+    errors: List[str] = []
+    quality_flags: List[str] = []
+    by_snapshot: Dict[int, Dict[str, Any]] = {}
+    evidence_counts: Dict[str, int] = {}
+    allowed_verdicts = {"match", "no_match", "uncertain"}
+    for row_number, raw in enumerate(raw_verdicts, start=1):
+        if not isinstance(raw, Mapping):
+            errors.append(f"row_{row_number}_not_object")
+            continue
+        snapshot_index = _opt_int(raw.get("snapshot_index"))
+        if snapshot_index is None or not 1 <= snapshot_index <= expected_count:
+            errors.append(f"row_{row_number}_snapshot_index_out_of_range")
+            continue
+        snapshot_index = int(snapshot_index)
+        if snapshot_index in by_snapshot:
+            errors.append(f"duplicate_snapshot_index_{snapshot_index}")
+            continue
+        verdict = str(raw.get("verdict") or "").strip().lower().replace("-", "_")
+        if verdict not in allowed_verdicts:
+            errors.append(f"snapshot_{snapshot_index}_invalid_verdict")
+            continue
+        evidence = re.sub(
+            r"\s+",
+            " ",
+            str(raw.get("visible_evidence") or raw.get("evidence") or "").strip(),
+        )
+        if not evidence:
+            errors.append(f"snapshot_{snapshot_index}_missing_evidence")
+            continue
+        if len(evidence) > 320:
+            quality_flags.append(f"snapshot_{snapshot_index}_evidence_truncated")
+            evidence = evidence[:320]
+        normalized_evidence = evidence.casefold()
+        evidence_counts[normalized_evidence] = evidence_counts.get(normalized_evidence, 0) + 1
+        by_snapshot[snapshot_index] = {
+            "snapshot_index": snapshot_index,
+            "verdict": verdict,
+            "visible_evidence": evidence,
+        }
+
+    missing_indices = sorted(set(range(1, expected_count + 1)) - set(by_snapshot))
+    if missing_indices:
+        errors.append(
+            "missing_snapshot_indices_" + "_".join(str(item) for item in missing_indices)
+        )
+    if len(raw_verdicts) != expected_count:
+        errors.append(
+            f"verdict_count_{len(raw_verdicts)}_expected_{expected_count}"
+        )
+    if any(count > 1 for count in evidence_counts.values()):
+        quality_flags.append("repeated_visible_evidence")
+    if errors:
+        return "invalid", {}, errors[:16], sorted(set(quality_flags))[:16]
+    return "parsed", by_snapshot, [], sorted(set(quality_flags))[:16]
 
 
 _TOOL_SCHEMAS: List[Dict[str, Any]] = [
@@ -6934,17 +7009,12 @@ class AgentTools:
             {"role": "user", "content": content},
         ]
         raw_description = str(self._lm(messages) or "").strip()
-        parsed = _extract_first_json_mapping(raw_description)
-        raw_verdicts = parsed.get("verdicts") if isinstance(parsed, Mapping) else None
-        by_snapshot: Dict[int, Mapping[str, Any]] = {}
-        if isinstance(raw_verdicts, list):
-            for raw in raw_verdicts:
-                if not isinstance(raw, Mapping):
-                    continue
-                snapshot_index = _opt_int(raw.get("snapshot_index"))
-                if snapshot_index is None or not 1 <= snapshot_index <= len(prepared):
-                    continue
-                by_snapshot.setdefault(int(snapshot_index), raw)
+        parse_status, by_snapshot, validation_errors, quality_flags = (
+            _validate_archive_vision_contract(
+                raw_description,
+                expected_count=len(prepared),
+            )
+        )
 
         verdicts: List[Dict[str, Any]] = []
         for index, candidate in enumerate(prepared, start=1):
@@ -6975,7 +7045,9 @@ class AgentTools:
             "source": "archive_candidate_batch",
             "query": prompt,
             "vision_checked": True,
-            "parse_status": "parsed" if isinstance(raw_verdicts, list) else "unparsed",
+            "parse_status": parse_status,
+            "validation_errors": validation_errors,
+            "quality_flags": quality_flags,
             "requested_count": len(requested_ids),
             "candidate_count": len(prepared),
             "detection_ids": [row["detection_id"] for row in prepared],
@@ -10220,6 +10292,12 @@ def _select_relevant_tool_schemas(
         ):
             allowed_names.intersection_update({"apply_deployment_plan"})
 
+    if context.get("video_event_followup_missing_time"):
+        # The prior trusted result identifies the event/channel but has no
+        # drillable timestamp.  Do not let a small head broaden this into a
+        # multi-channel search; the final response must ask for the time.
+        allowed_names.clear()
+
     # A broad video request without a named channel must inventory scope first.
     # Once the inventory result is remembered, detail tools become available in
     # the same turn.
@@ -10459,6 +10537,19 @@ def _inherit_followup_tool_context(
         context["inherited_operator_intent"] = True
         return context
 
+    video_scope = _matched_video_event_followup_scope(user_text, history)
+    if video_scope is not None and "video_research" in (context.get("tool_intents") or ()):
+        context["channel_id"] = video_scope["channel_id"]
+        context["video_candidate_channel_ids"] = [video_scope["channel_id"]]
+        context["inherited_video_event_scope"] = True
+        context["selected_event_query"] = video_scope.get("event_query")
+        if isinstance(video_scope.get("time_window"), Mapping):
+            context["time_window"] = copy.deepcopy(video_scope["time_window"])
+        else:
+            context["video_event_followup_missing_time"] = True
+        context["inherited_operator_intent"] = True
+        return context
+
     if context.get("tool_intents"):
         return context
     repaired = _repair_common_operator_typos(user_text)
@@ -10506,6 +10597,125 @@ def _inherit_followup_tool_context(
         if prior_user_messages >= 4:
             break
     return context
+
+
+def _looks_like_video_event_followup(value: Any) -> bool:
+    text = unicodedata.normalize("NFKC", str(value or "")).casefold()
+    return bool(
+        re.search(
+            r"\b(?:look|dig|drill|go)\s+(?:more\s+)?(?:deep|deeper|into)|"
+            r"\b(?:follow[ -]?up|this|that|the selected)\b.{0,48}\b(?:event|incident|episode)|"
+            r"углуб|разбер.{0,32}(?:событи|эпизод|инцидент)|"
+            r"(?:этот|тот|выбранн\w*)\s+(?:событи|эпизод|инцидент)",
+            text,
+        )
+    )
+
+
+def _video_followup_terms(value: Any) -> set[str]:
+    text = unicodedata.normalize("NFKC", str(value or "")).casefold()
+    stop = {
+        "about", "again", "deeper", "drill", "event", "follow", "into",
+        "look", "more", "please", "that", "the", "this", "with",
+        "давай", "этот", "событие", "эпизод", "инцидент", "глубже", "подробнее",
+    }
+    return {
+        token
+        for token in re.findall(r"[\w-]{4,}", text, flags=re.UNICODE)
+        if token not in stop and not token.isdigit()
+    }
+
+
+def _entry_time_window(entry: Mapping[str, Any], payload: Mapping[str, Any]) -> Optional[Dict[str, Any]]:
+    source = (
+        entry.get("time_window")
+        if isinstance(entry.get("time_window"), Mapping)
+        else payload.get("time_window")
+    )
+    if isinstance(source, Mapping):
+        from_ts = _opt_float(source.get("from_ts"))
+        to_ts = _opt_float(source.get("to_ts"))
+        if from_ts is not None and to_ts is not None and to_ts > from_ts:
+            return {
+                "from_ts": from_ts,
+                "to_ts": to_ts,
+                "since_ms": _opt_int(source.get("since_ms")) or int(from_ts * 1000),
+                "until_ms": _opt_int(source.get("until_ms")) or int(to_ts * 1000),
+                "from_local": source.get("from_local"),
+                "to_local": source.get("to_local"),
+                "duration_sec": _opt_float(source.get("duration_sec")) or (to_ts - from_ts),
+            }
+    from_ts = _opt_float(entry.get("window_start") or entry.get("from_ts"))
+    to_ts = _opt_float(entry.get("window_end") or entry.get("to_ts"))
+    if from_ts is not None and to_ts is not None and to_ts > from_ts:
+        return {
+            "from_ts": from_ts,
+            "to_ts": to_ts,
+            "since_ms": int(from_ts * 1000),
+            "until_ms": int(to_ts * 1000),
+            "duration_sec": to_ts - from_ts,
+        }
+    timestamp_ms = _opt_int(entry.get("timestamp_ms"))
+    if timestamp_ms is not None and timestamp_ms > 0:
+        center = timestamp_ms / 1000.0
+        return {
+            "from_ts": center - 60.0,
+            "to_ts": center + 60.0,
+            "since_ms": timestamp_ms - 60_000,
+            "until_ms": timestamp_ms + 60_000,
+            "duration_sec": 120.0,
+        }
+    return None
+
+
+def _matched_video_event_followup_scope(
+    user_text: Any,
+    history: Sequence[Mapping[str, Any]],
+) -> Optional[Dict[str, Any]]:
+    """Resolve a selected event only from prior trusted video tool results."""
+
+    if not _looks_like_video_event_followup(user_text):
+        return None
+    terms = _video_followup_terms(user_text)
+    matches: List[Dict[str, Any]] = []
+    for message in reversed(list(history)):
+        if not isinstance(message, Mapping):
+            continue
+        tool_name = str(message.get("tool_name") or message.get("name") or "")
+        if tool_name not in {"get_video_summaries", "list_video_summary_channels"}:
+            continue
+        payload = _tool_result_payload(message)
+        if not payload or payload.get("error"):
+            continue
+        channel_id = _opt_int(payload.get("channel_id"))
+        entries = payload.get("entries") if isinstance(payload.get("entries"), list) else []
+        for entry in entries:
+            if not isinstance(entry, Mapping):
+                continue
+            entry_channel = _opt_int(entry.get("channel_id")) or channel_id
+            if entry_channel is None or entry_channel <= 0:
+                continue
+            haystack = " ".join(
+                str(entry.get(key) or "")
+                for key in ("summary", "title", "label", "event", "channel_title")
+            )
+            normalized = unicodedata.normalize("NFKC", haystack).casefold()
+            if terms and not any(term in normalized for term in terms):
+                continue
+            matches.append(
+                {
+                    "channel_id": int(entry_channel),
+                    "event_query": re.sub(r"\s+", " ", haystack).strip()[:400],
+                    "time_window": _entry_time_window(entry, payload),
+                }
+            )
+        if matches:
+            break
+    channel_ids = {int(row["channel_id"]) for row in matches}
+    if len(channel_ids) != 1:
+        return None
+    timed = next((row for row in matches if row.get("time_window")), None)
+    return timed or matches[0]
 
 
 _DEPLOYMENT_TOOL_NAMES = frozenset(
@@ -10942,6 +11152,7 @@ def _required_bounded_workflow_tool_call(
         and context.get("archive_search_completed")
         and context.get("archive_vision_required")
         and not context.get("archive_vision_completed")
+        and not context.get("archive_vision_attempted")
         and "describe_frame" in available
     ):
         detection_ids = [
@@ -11140,6 +11351,7 @@ def _bounded_workflow_plan_completed(context: Mapping[str, Any]) -> bool:
             and (
                 not context.get("archive_vision_required")
                 or context.get("archive_vision_completed")
+                or context.get("archive_vision_attempted")
             )
         )
     )
@@ -11182,7 +11394,10 @@ def _required_video_research_tool_call(
     ]
     if (
         not candidates
-        and context.get("video_overview_request")
+        and (
+            context.get("video_overview_request")
+            or context.get("inherited_video_event_scope")
+        )
         and context.get("channel_id") is not None
         and isinstance(context.get("time_window"), Mapping)
     ):
@@ -11194,7 +11409,10 @@ def _required_video_research_tool_call(
     }
     remaining = [channel_id for channel_id in candidates if channel_id not in completed]
     if (
-        context.get("video_inventory_completed")
+        (
+            context.get("video_inventory_completed")
+            or context.get("channel_id") is not None
+        )
         and not context.get("video_inventory_requires_confirmation")
         and remaining
         and "get_video_summaries" in available
@@ -11548,6 +11766,85 @@ def _apply_turn_tool_context(tool_name: str, args: Dict[str, Any], context: Dict
     return prepared
 
 
+def _remember_turn_tool_failure(
+    tool_name: str,
+    args: Mapping[str, Any],
+    error: Any,
+    context: Dict[str, Any],
+) -> Optional[Dict[str, Any]]:
+    """Latch a failed server-owned archive drill as a terminal unknown result."""
+
+    if (
+        tool_name != "describe_frame"
+        or "archive_research" not in (context.get("tool_intents") or ())
+        or not context.get("archive_search_completed")
+        or not context.get("archive_vision_required")
+    ):
+        return None
+    detection_ids = [
+        int(item)
+        for item in (args.get("detection_ids") or [])[:9]
+        if _opt_int(item) is not None and int(item) > 0
+    ]
+    if not detection_ids:
+        return None
+    error_text = re.sub(r"\s+", " ", str(error or "archive vision failed")).strip()[:500]
+    context["archive_vision_attempted"] = True
+    context["archive_vision_completed"] = False
+    context["archive_vision_failed"] = True
+    context["archive_vision_status"] = "failed"
+    context["archive_vision_parse_status"] = "failed"
+    context["archive_vision_candidate_count"] = len(detection_ids)
+    context["archive_vision_error"] = error_text
+    return {
+        "error": error_text,
+        "source": "archive_candidate_batch",
+        "status": "failed",
+        "vision_checked": False,
+        "parse_status": "failed",
+        "candidate_count": len(detection_ids),
+        "detection_ids": detection_ids,
+        "retryable_in_turn": False,
+        "next_step_hint": (
+            "The bounded visual drill was attempted once and failed. Do not retry "
+            "this batch in the same turn; report the ranked candidates as visually unverified."
+        ),
+    }
+
+
+def _log_turn_tool_failure(
+    *,
+    session_id: Any,
+    request_id: Any,
+    call_id: Any,
+    tool_name: Any,
+    args: Mapping[str, Any],
+    error: BaseException,
+    archive_failure: Optional[Mapping[str, Any]],
+) -> None:
+    """Emit correlation metadata without private arguments or error text."""
+
+    detection_ids = args.get("detection_ids")
+    candidate_count = (
+        len(detection_ids)
+        if isinstance(detection_ids, Sequence)
+        and not isinstance(detection_ids, (str, bytes, bytearray))
+        else 0
+    )
+    _AGENT_LOG.warning(
+        "agent_tool_failed request_id=%s session_id=%s call_id=%s tool=%s "
+        "workload=%s retry_reason=%s final_error_class=%s candidate_count=%s",
+        str(request_id or "unknown")[:96],
+        str(session_id or "unknown")[:96],
+        str(call_id or "unknown")[:96],
+        str(tool_name or "unknown")[:96],
+        "archive_candidate_batch" if archive_failure is not None else "tool_execution",
+        "bounded_drill_terminal" if archive_failure is not None else "tool_execution_failed",
+        type(error).__name__,
+        min(99, max(0, int(candidate_count))),
+    )
+
+
 def _remember_turn_tool_result(tool_name: str, result: Any, context: Dict[str, Any]) -> None:
     if not isinstance(result, Mapping):
         return
@@ -11699,6 +11996,10 @@ def _remember_turn_tool_result(tool_name: str, result: Any, context: Dict[str, A
         context["archive_vision_candidate_ids"] = candidate_ids
         context["archive_vision_required"] = bool(candidate_ids)
         context["archive_vision_completed"] = False
+        context["archive_vision_attempted"] = False
+        context["archive_vision_failed"] = False
+        context["archive_vision_status"] = "pending" if candidate_ids else "not_required"
+        context["archive_vision_error"] = None
         context["archive_vision_parse_status"] = None
         context["archive_vision_match_count"] = None
         time_window = result.get("time_window")
@@ -11707,8 +12008,15 @@ def _remember_turn_tool_result(tool_name: str, result: Any, context: Dict[str, A
         return
 
     if tool_name == "describe_frame" and result.get("source") == "archive_candidate_batch":
+        parse_status = str(result.get("parse_status") or "unparsed")
+        context["archive_vision_attempted"] = True
         context["archive_vision_completed"] = bool(result.get("vision_checked"))
-        context["archive_vision_parse_status"] = result.get("parse_status")
+        context["archive_vision_failed"] = False
+        context["archive_vision_status"] = (
+            "succeeded" if parse_status == "parsed" else parse_status
+        )
+        context["archive_vision_error"] = None
+        context["archive_vision_parse_status"] = parse_status
         context["archive_vision_candidate_count"] = _opt_int(result.get("candidate_count"))
         context["archive_vision_match_count"] = _opt_int(result.get("match_count"))
         context["archive_vision_no_match_count"] = _opt_int(result.get("no_match_count"))
@@ -12597,6 +12905,8 @@ def _video_research_response_needs_recovery(
             normalized,
         )
     )
+    if _video_response_grounding_issues(text, ledger):
+        return True
     if clarification:
         return False
     completed_evidence = any(
@@ -12617,6 +12927,129 @@ def _video_research_response_needs_recovery(
         or bool(re.search(r"\bch\s*#?\s*\d+\b", normalized))
     )
     return factual_claim
+
+
+def _trusted_turn_channel_ids(ledger: Mapping[str, Any]) -> set[int]:
+    trusted: set[int] = set()
+
+    def visit(value: Any, key: str = "") -> None:
+        if isinstance(value, Mapping):
+            for child_key, child in value.items():
+                name = str(child_key)
+                if name == "channel_id":
+                    channel_id = _opt_int(child)
+                    if channel_id is not None and channel_id > 0:
+                        trusted.add(int(channel_id))
+                elif name.endswith("channel_ids") and isinstance(child, Sequence) and not isinstance(child, (str, bytes, bytearray)):
+                    for item in child:
+                        channel_id = _opt_int(item)
+                        if channel_id is not None and channel_id > 0:
+                            trusted.add(int(channel_id))
+                visit(child, name)
+        elif isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
+            for child in value:
+                visit(child, key)
+
+    for section in ("coverage", "summary_findings", "evidence", "semantic_signals", "errors"):
+        visit(ledger.get(section), section)
+    query = str(ledger.get("user_query") or "")
+    trusted.update(
+        int(match)
+        for match in re.findall(
+            r"(?:\bchannel\s*#?|\bch\s*#?|\bканал(?:а|е|у|ом)?\s*#?)(\d{1,9})\b",
+            query,
+            flags=re.IGNORECASE,
+        )
+    )
+    return trusted
+
+
+def _trusted_alert_counts_by_channel(ledger: Mapping[str, Any]) -> Dict[int, set[int]]:
+    counts: Dict[int, set[int]] = {}
+
+    def collect_numbers(value: Any, *, alert_context: bool = False) -> set[int]:
+        found: set[int] = set()
+        if isinstance(value, Mapping):
+            for key, child in value.items():
+                key_alert = alert_context or "alert" in str(key).casefold()
+                found.update(collect_numbers(child, alert_context=key_alert))
+        elif isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
+            for child in value:
+                found.update(collect_numbers(child, alert_context=alert_context))
+        elif alert_context:
+            number = _opt_int(value)
+            if number is not None and number >= 0:
+                found.add(int(number))
+        return found
+
+    rows: List[Mapping[str, Any]] = []
+    for section in ("coverage", "summary_findings"):
+        for row in ledger.get(section) or []:
+            if isinstance(row, Mapping):
+                rows.append(row)
+                nested = row.get("candidate_channels")
+                if isinstance(nested, list):
+                    rows.extend(item for item in nested if isinstance(item, Mapping))
+    for row in rows:
+        channel_id = _opt_int(row.get("channel_id"))
+        if channel_id is None or channel_id <= 0:
+            continue
+        row_counts = collect_numbers(row)
+        if row_counts:
+            counts.setdefault(int(channel_id), set()).update(row_counts)
+    return counts
+
+
+def _video_response_grounding_issues(value: Any, ledger: Mapping[str, Any]) -> List[str]:
+    """Find channel/count claims not supported by a current-turn result."""
+
+    text = unicodedata.normalize("NFKC", str(value or ""))
+    mentioned = {
+        int(match)
+        for match in re.findall(
+            r"(?:\bchannel\s*#?|\bch\s*#?|\bканал(?:а|е|у|ом)?\s*#?)(\d{1,9})\b",
+            text,
+            flags=re.IGNORECASE,
+        )
+    }
+    trusted = _trusted_turn_channel_ids(ledger)
+    issues = [f"unsupported_channel:{channel_id}" for channel_id in sorted(mentioned - trusted)]
+    trusted_counts = _trusted_alert_counts_by_channel(ledger)
+    count_patterns = (
+        r"(?:\bchannel\s*#?|\bch\s*#?|\bканал(?:а|е|у|ом)?\s*#?)(\d{1,9})"
+        r"[^\n.]{0,120}?\b(\d+)\s+(?:alerts?|алерт(?:а|ов|ы)?)\b",
+        r"\b(\d+)\s+(?:alerts?|алерт(?:а|ов|ы)?)\b[^\n.]{0,120}?"
+        r"(?:\bchannel\s*#?|\bch\s*#?|\bканал(?:а|е|у|ом)?\s*#?)(\d{1,9})",
+    )
+    for index, pattern in enumerate(count_patterns):
+        for first, second in re.findall(pattern, text, flags=re.IGNORECASE):
+            channel_id, alert_count = (
+                (int(first), int(second)) if index == 0 else (int(second), int(first))
+            )
+            if alert_count not in trusted_counts.get(channel_id, set()):
+                issues.append(f"unsupported_alert_count:{channel_id}:{alert_count}")
+    return sorted(set(issues))
+
+
+def _format_video_event_followup_clarification(
+    context: Mapping[str, Any],
+    ledger: Mapping[str, Any],
+) -> str:
+    query = str(ledger.get("user_query") or "")
+    russian = bool(re.search(r"[а-яё]", query, flags=re.IGNORECASE))
+    channel_id = _opt_int(context.get("channel_id"))
+    event_query = str(context.get("selected_event_query") or "selected event").strip()[:240]
+    if russian:
+        return (
+            f"Я сохранила выбранный эпизод на CH {channel_id}, но в предыдущем результате нет "
+            f"надёжного таймстемпа для углубления: {event_query}. Укажи примерное время события — "
+            "я проверю только этот канал и соседнее временное окно, не расширяя поиск на другие камеры."
+        )
+    return (
+        f"I retained the selected event on CH {channel_id}, but the prior trusted result has no "
+        f"drillable timestamp for it: {event_query}. Give me the approximate event time and I will "
+        "inspect only that channel and its adjacent window, without broadening to other cameras."
+    )
 
 
 def _archive_research_response_needs_recovery(
@@ -12727,15 +13160,16 @@ def _format_archive_research_fallback(
             (f"- Период сервера: {start} — {end}; {duration} секунд."
              if russian else f"- Server-resolved window: {start} — {end}; {duration} seconds.")
         )
-    lines.append(
-        (
-            f"- SigLIP вернул {count} ранжированных кандидатов; модели показано {shown}. "
-            f"Текстовых совпадений среди возвращённых: {lexical}."
-            if russian
-            else f"- SigLIP returned {count} ranked candidates; {shown} were exposed to the agent. "
-            f"Lexical matches in the returned set: {lexical}."
+    if search_result:
+        lines.append(
+            (
+                f"- SigLIP вернул {count} ранжированных кандидатов; модели показано {shown}. "
+                f"Текстовых совпадений среди возвращённых: {lexical}."
+                if russian
+                else f"- SigLIP returned {count} ranked candidates; {shown} were exposed to the agent. "
+                f"Lexical matches in the returned set: {lexical}."
+            )
         )
-    )
     if scanned is not None or total is not None:
         lines.append(
             (
@@ -12745,7 +13179,31 @@ def _format_archive_research_fallback(
             )
         )
 
-    if vision_result:
+    vision_failed = bool(
+        vision_result
+        and (
+            str(vision_result.get("status") or "") == "failed"
+            or str(vision_result.get("parse_status") or "") == "failed"
+        )
+    )
+    if vision_failed:
+        candidate_count = _opt_int(vision_result.get("candidate_count")) or 0
+        error_text = str(vision_result.get("error") or "visual verification failed")[:500]
+        lines.append(
+            (
+                f"- Vision-проверка {candidate_count} кандидатов была выполнена один раз и завершилась ошибкой: {error_text}"
+                if russian
+                else f"- Vision verification of {candidate_count} candidates was attempted once and failed: {error_text}"
+            )
+        )
+        lines.append(
+            (
+                "- Эти кандидаты остаются визуально непроверенными; по ним нельзя утверждать ни наличие, ни отсутствие события."
+                if russian
+                else "- These candidates remain visually unverified; neither presence nor absence can be concluded from them."
+            )
+        )
+    elif vision_result:
         candidate_count = _opt_int(vision_result.get("candidate_count")) or 0
         match_count = _opt_int(vision_result.get("match_count")) or 0
         no_match_count = _opt_int(vision_result.get("no_match_count")) or 0
@@ -14162,7 +14620,24 @@ class AgentRunner:
                     if research_event is not None:
                         yield _sse({"type": "research_state", **research_event})
                 except (ToolError, ToolGatewayError) as exc:
-                    error_payload = {"error": str(exc)}
+                    archive_failure = _remember_turn_tool_failure(
+                        tc.name,
+                        tc.args,
+                        str(exc),
+                        turn_tool_context,
+                    )
+                    _log_turn_tool_failure(
+                        session_id=session_id,
+                        request_id=(tool_context.request_id if tool_context is not None else None),
+                        call_id=tc.id,
+                        tool_name=tc.name,
+                        args=tc.args,
+                        error=exc,
+                        archive_failure=archive_failure,
+                    )
+                    error_payload = archive_failure or {"error": str(exc)}
+                    if archive_failure is not None:
+                        stop_tool_loop_after_batch = True
                     code = getattr(exc, "code", None)
                     if code:
                         error_payload["code"] = str(code)
@@ -14189,7 +14664,25 @@ class AgentRunner:
                         }
                     )
                 except Exception as exc:
-                    error_payload = {"error": f"Internal tool error: {exc}"}
+                    public_error = f"Internal tool error: {exc}"
+                    archive_failure = _remember_turn_tool_failure(
+                        tc.name,
+                        tc.args,
+                        public_error,
+                        turn_tool_context,
+                    )
+                    _log_turn_tool_failure(
+                        session_id=session_id,
+                        request_id=(tool_context.request_id if tool_context is not None else None),
+                        call_id=tc.id,
+                        tool_name=tc.name,
+                        args=tc.args,
+                        error=exc,
+                        archive_failure=archive_failure,
+                    )
+                    error_payload = archive_failure or {"error": public_error}
+                    if archive_failure is not None:
+                        stop_tool_loop_after_batch = True
                     result_msg = {"role": "tool", "tool_call_id": tc.id, "name": tc.name,
                                   "content": json.dumps(error_payload)}
                     _record_turn_signal_ledger(
@@ -14293,24 +14786,38 @@ class AgentRunner:
                 **final_compaction,
             })
 
-        deterministic_final_text = (
-            _format_deployment_preview_receipt(turn_tool_context)
-            if turn_tool_context.get("deployment_preview_completed")
-            else (
-                _format_deployment_partial_receipt(turn_tool_context)
-                if turn_tool_context.get("deployment_requirements_partial")
-                else (
-                    _format_deployment_requirements_receipt(turn_tool_context)
-                    if turn_tool_context.get("deployment_requirements_pending")
-                    and turn_tool_context.get("deployment_requirements_receipt")
-                    else (
-                        _format_deployment_inventory_receipt(turn_tool_context)
-                        if turn_tool_context.get("deployment_inventory_receipt")
-                        else None
-                    )
-                )
+        deterministic_final_text: Optional[str]
+        if turn_tool_context.get("video_event_followup_missing_time"):
+            deterministic_final_text = _format_video_event_followup_clarification(
+                turn_tool_context,
+                turn_signal_ledger,
             )
-        )
+        elif turn_tool_context.get("archive_vision_status") == "failed":
+            deterministic_final_text = _format_archive_research_fallback(
+                turn_signal_ledger,
+                tool_messages=in_flight,
+            )
+        elif turn_tool_context.get("deployment_preview_completed"):
+            deterministic_final_text = _format_deployment_preview_receipt(
+                turn_tool_context
+            )
+        elif turn_tool_context.get("deployment_requirements_partial"):
+            deterministic_final_text = _format_deployment_partial_receipt(
+                turn_tool_context
+            )
+        elif (
+            turn_tool_context.get("deployment_requirements_pending")
+            and turn_tool_context.get("deployment_requirements_receipt")
+        ):
+            deterministic_final_text = _format_deployment_requirements_receipt(
+                turn_tool_context
+            )
+        elif turn_tool_context.get("deployment_inventory_receipt"):
+            deterministic_final_text = _format_deployment_inventory_receipt(
+                turn_tool_context
+            )
+        else:
+            deterministic_final_text = None
         full_text_parts: List[str] = (
             [deterministic_final_text] if deterministic_final_text else []
         )
@@ -18775,6 +19282,8 @@ def _compact_tool_result_for_model(tool_name: str, result: Any) -> Any:
                 "query": result.get("query"),
                 "vision_checked": bool(result.get("vision_checked")),
                 "parse_status": result.get("parse_status"),
+                "validation_errors": list(result.get("validation_errors") or [])[:16],
+                "quality_flags": list(result.get("quality_flags") or [])[:16],
                 "requested_count": result.get("requested_count"),
                 "candidate_count": result.get("candidate_count"),
                 "missing_detection_ids": list(result.get("missing_detection_ids") or [])[:9],

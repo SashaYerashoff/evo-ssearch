@@ -42,4 +42,34 @@ describe('agent action card structures', () => {
     ])
     expect(tables[0].rows[1][1]).toBe('separate')
   })
+
+  it('surfaces one bounded archive vision batch with candidate count', () => {
+    const tables = actionTables('describe_frame', {
+      source: 'archive_candidate_batch',
+      candidate_count: 8,
+      parse_status: 'parsed',
+      vision_checked: true,
+      verdicts: [
+        { detection_id: 71, verdict: 'match', visible_evidence: 'A person is visibly seated.' },
+        { detection_id: 72, verdict: 'uncertain', visible_evidence: 'The chair is partially occluded.' },
+      ],
+    })
+
+    expect(tables).toHaveLength(1)
+    expect(tables[0].title).toBe('Bounded vision verification · 8 candidates · parsed')
+    expect(tables[0].rows).toHaveLength(2)
+    expect(tables[0].rows[0]).toEqual(['#71', 'match', 'A person is visibly seated.'])
+  })
+
+  it('keeps a failed bounded archive vision step visible', () => {
+    const tables = actionTables('describe_frame', {
+      source: 'archive_candidate_batch',
+      candidate_count: 8,
+      status: 'failed',
+      error: 'Vision request failed',
+    })
+
+    expect(tables[0].title).toBe('Bounded vision verification · 8 candidates · failed')
+    expect(tables[0].rows[0]).toEqual(['—', 'failed', 'Vision request failed'])
+  })
 })

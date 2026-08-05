@@ -22,6 +22,7 @@ from agent import (
     _strip_thumbnails,
     _summary_node_alert_score,
     _tool_result_for_ui,
+    _validate_archive_vision_contract,
     build_system_prompt,
 )
 
@@ -767,6 +768,54 @@ class AgentVideoSummaryToolTests(unittest.TestCase):
         self.assertEqual(result["parse_status"], "unparsed")
         self.assertEqual(result["match_count"], 0)
         self.assertEqual(result["uncertain_detection_ids"], [501, 502])
+
+    def test_archive_vision_contract_accepts_fenced_repeated_evidence_with_flag(self):
+        evidence = "A red car is visible on the road in this snapshot."
+        rows = ",".join(
+            '{"snapshot_index":%d,"verdict":"match","visible_evidence":"%s"}'
+            % (index, evidence)
+            for index in range(1, 9)
+        )
+
+        status, verdicts, errors, flags = _validate_archive_vision_contract(
+            "```json\n" + '{"verdicts":[' + rows + "]}\n```",
+            expected_count=8,
+        )
+
+        self.assertEqual(status, "parsed")
+        self.assertEqual(sorted(verdicts), list(range(1, 9)))
+        self.assertEqual(errors, [])
+        self.assertIn("repeated_visible_evidence", flags)
+
+    def test_archive_vision_contract_rejects_incomplete_duplicate_and_out_of_range_rows(self):
+        invalid_contracts = {
+            "missing": (
+                '{"verdicts":[{"snapshot_index":1,"verdict":"match",'
+                '"visible_evidence":"red car"}]}'
+            ),
+            "duplicate": (
+                '{"verdicts":['
+                '{"snapshot_index":1,"verdict":"match","visible_evidence":"red car"},'
+                '{"snapshot_index":1,"verdict":"no_match","visible_evidence":"empty road"}'
+                "]}"
+            ),
+            "out_of_range": (
+                '{"verdicts":['
+                '{"snapshot_index":1,"verdict":"match","visible_evidence":"red car"},'
+                '{"snapshot_index":3,"verdict":"no_match","visible_evidence":"empty road"}'
+                "]}"
+            ),
+        }
+
+        for name, payload in invalid_contracts.items():
+            with self.subTest(name=name):
+                status, verdicts, errors, _flags = _validate_archive_vision_contract(
+                    payload,
+                    expected_count=2,
+                )
+                self.assertEqual(status, "invalid")
+                self.assertEqual(verdicts, {})
+                self.assertTrue(errors)
 
     def test_archive_vision_candidates_dedupe_one_frame_and_prefer_summary(self):
         rows = [

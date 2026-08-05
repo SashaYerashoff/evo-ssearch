@@ -324,6 +324,23 @@ function DeploymentApprovalCard({ action, onApply, onSend }: {
 export function actionTables(name: string, result: any): ActionTable[] {
   if (!result || typeof result !== 'object') return []
 
+  if (name === 'describe_frame' && result.source === 'archive_candidate_batch') {
+    const verdicts = Array.isArray(result.verdicts) ? result.verdicts : []
+    const candidateCount = Number(result.candidate_count) || verdicts.length
+    const parseStatus = result.parse_status || result.status || (result.vision_checked ? 'checked' : 'failed')
+    const rows = verdicts.slice(0, 9).map((item: any) => row([
+      `#${item.detection_id ?? item.snapshot_index ?? '?'}`,
+      item.verdict,
+      item.visible_evidence || item.evidence,
+    ]))
+    if (!rows.length) rows.push(row(['—', parseStatus, result.error || result.note || 'No verdict rows returned']))
+    return [{
+      title: `Bounded vision verification · ${candidateCount} candidate${candidateCount === 1 ? '' : 's'} · ${parseStatus}`,
+      columns: ['Candidate', 'Verdict', 'Visible evidence'],
+      rows,
+    }]
+  }
+
   if (name === 'list_channels') {
     const rows = Array.isArray(result.channels) ? result.channels : []
     return [{
@@ -451,6 +468,9 @@ export function ActionCard({ action, onThumb, onApply, onSend }: {
   const items = itemsOf(result)
   const isApproval = !!action.applied || !!action.planId || result?.status === 'preview'
   const describeImg = name === 'describe_frame' ? agentImageUrl(result) : ''
+  const actionLabel = name === 'describe_frame' && result?.source === 'archive_candidate_batch'
+    ? 'VISION VERIFICATION BATCH'
+    : label(name)
   const text = result?.description || result?.summary || result?.note || result?.text || result?.message
   const tables = actionTables(name, result)
 
@@ -495,11 +515,11 @@ export function ActionCard({ action, onThumb, onApply, onSend }: {
 
   return (
     <div className="ag-card">
-      <div className="ag-card-head">◆ {label(name)}</div>
+      <div className="ag-card-head">◆ {actionLabel}</div>
       <div className="ag-card-body">
         {error && <div className="ag-card-err">{error}</div>}
         {describeImg && (
-          <div className="ag-thumb solo" onClick={() => onThumb(describeImg, label(name))}>
+          <div className="ag-thumb solo" onClick={() => onThumb(describeImg, actionLabel)}>
             <img src={describeImg} alt="frame" loading="lazy" />
           </div>
         )}

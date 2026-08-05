@@ -11,7 +11,7 @@ another update path:
 - `preflight_patch.sh` captures the read-only baseline;
 - `install_patch.sh` backs up PostgreSQL, env, unit, and code, then copies the
   release and installs wheels with `--no-index`;
-- Alembic performs transactional migrations to `20260614_0006`;
+- Alembic performs transactional migrations to the release bundle's schema head;
 - `verify_patch.sh` checks systemd, `/health`, and `/ready`;
 - `rollback.sh` consumes the recorded backup if the deployment must be reverted.
 
@@ -60,6 +60,24 @@ does not stop a service, does not run migrations, and does not contact a package
 index. The output contains only configuration key status (`[set]`/`[missing]`),
 never passwords, API keys, or DSNs.
 
+Luxriot credentials are treated as opaque site secrets unless they match an
+obvious placeholder such as `changeme` or `admin:123`. Short but legitimate site
+passwords produce a warning rather than blocking installation. If a legitimate
+site password happens to match the placeholder heuristic, add
+`--verify-luxriot-credential`; the installer then permits it only after an HTTP
+Digest request to Evo's read-only channels endpoint succeeds, without logging or
+persisting the password. This optional check performs network I/O in dry-run,
+but does not change Evo state:
+
+```bash
+./scripts/install_eva_083.py \
+  --dry-run \
+  --verify-luxriot-credential \
+  --source-dir "$PWD" \
+  --bundle-dir "$PWD/.." \
+  --env-file /etc/eva-ai/eva-ai.env
+```
+
 Review every `FAIL` and `WARN`. The installer refuses `--apply` while any
 preflight failure remains.
 
@@ -89,6 +107,9 @@ If no env exists, interactive mode asks for:
 - agent LM endpoint and model;
 - VLM endpoint and model.
 
+The migration DSN entered interactively is process-only. It is never appended
+to the generated runtime env file.
+
 ```bash
 ./scripts/install_eva_083.py \
   --dry-run \
@@ -112,6 +133,12 @@ alembic current -> alembic upgrade head -> alembic current
 The existing Alembic environment uses one transaction per migration. A valid,
 non-empty `postgres.dump` is mandatory before `upgrade head`; there is no unsafe
 "skip backup" option.
+
+Before modifying files, stopping the service, or applying a migration, the
+installer opens a transaction using the migration identity and verifies that it
+can read and perform a no-op update of `public.alembic_version`, then rolls the
+transaction back. A role missing schema/table privileges therefore fails while
+the live installation is still untouched.
 
 `EVA_DATABASE_DSN` is intentionally a least-privilege, non-DDL API login. The
 installer never falls back to it for `pg_dump` or Alembic. With migrations
@@ -170,6 +197,12 @@ The apply path is idempotent:
 - Alembic `upgrade head` is safe to repeat;
 - systemd `enable`/`restart` is safe to repeat.
 
+If a failure occurs after the backup is created, the installer automatically
+invokes the recorded rollback: database, code, configuration, and unit are
+restored, followed by the service state that existed before the update. If that
+rollback itself cannot complete, the installer prints the exact backup path and
+manual recovery command instead of reporting a false success.
+
 Apply is serialized by a nonblocking lock at
 `/run/lock/eva-ai-083-installer.lock` (override with `--lock-file`). A second
 apply fails before account/config/code/service mutation. Dry-run never creates
@@ -206,6 +239,9 @@ The installer prints `backup_dir` and an exact rollback command. It also writes
 `offline-installer-state.txt` into that backup, recording whether the app, env,
 and unit existed before installation without recording any secret.
 
+This command is the manual recovery handoff and can also be used after a later
+operator decision to revert a successful update:
+
 For an upgrade rollback:
 
 ```bash
@@ -216,9 +252,11 @@ sudo /opt/eva-ai/evo-ssearch/scripts/rollback.sh \
   --service eva-ai
 ```
 
-Database restore is deliberately separate and destructive. Use
-`--restore-db` only after reviewing the dump and setting the confirmation
-required by `rollback.sh`.
+For a manual rollback, database restore is deliberately explicit and
+destructive. Use `--restore-db` only after reviewing the dump and setting the
+confirmation required by `rollback.sh`. The installer's automatic failure path
+does this from the just-created, validated backup because the update did not
+complete successfully.
 
 For a fresh install (`installation_mode=fresh`), `rollback.sh` restores the
 captured pre-copy tree but intentionally preserves `.venv` and runtime-data

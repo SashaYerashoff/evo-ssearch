@@ -236,3 +236,52 @@ def test_update_runs_reviewed_dry_run_then_apply_without_rewriting_site_profiles
         assert "http://external-vlm:8000/v1" not in row
         assert "qwen-vlm" not in row
     assert (app / ".eva-bundle-commit").read_text(encoding="utf-8").strip() == "a" * 40
+
+
+def test_update_forwards_explicit_live_evo_credential_verification(tmp_path):
+    bundle = tmp_path / "bundle"
+    source = bundle / "repo"
+    scripts = source / "scripts"
+    scripts.mkdir(parents=True)
+    installer = scripts / "install_eva_083.py"
+    installer.write_text("# installer\n", encoding="utf-8")
+    app = tmp_path / "app"
+    app.mkdir()
+    env_file = tmp_path / "eva-ai.env"
+    env_file.write_text(
+        "EVA_MIGRATION_DATABASE_DSN=postgresql://migrator:secret@db/eva\n",
+        encoding="utf-8",
+    )
+    deployment = deploy.ExistingDeployment(
+        service="eva-ai",
+        app_dir=app,
+        env_file=env_file,
+        unit_file=tmp_path / "eva-ai.service",
+        service_user="eva",
+        service_group="eva",
+        base_url="http://127.0.0.1:5000",
+    )
+    commands = []
+
+    def capture_run(argv, **_kwargs):
+        commands.append([str(item) for item in argv])
+        return type("Completed", (), {"returncode": 0})()
+
+    with (
+        patch.object(deploy.os, "geteuid", return_value=0),
+        patch.object(deploy, "DEFAULT_REPORT_ROOT", tmp_path / "reports"),
+        patch.object(deploy, "DEFAULT_BACKUP_ROOT", tmp_path / "backups"),
+        patch.object(deploy, "_run", side_effect=capture_run),
+        patch.object(deploy, "_report"),
+    ):
+        deploy._update(
+            bundle,
+            deployment,
+            assume_yes=True,
+            wait_streams=0,
+            verify_luxriot_credential=True,
+        )
+
+    installer_commands = [row for row in commands if str(installer) in row]
+    assert len(installer_commands) == 2
+    assert all("--verify-luxriot-credential" in row for row in installer_commands)

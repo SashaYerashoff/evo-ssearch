@@ -230,6 +230,20 @@ class SecuritySmokeTests(unittest.TestCase):
         self.assertEqual(result["status"], "ready")
         self.assertEqual(result["allowed_roots_count"], 1)
 
+    def test_realistic_short_evo_password_is_warning_not_placeholder_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            config.SECURE_DEPLOYMENT_REQUIRED = True
+            config.AUTH_COOKIE_SECURE = True
+            config.ALLOWED_ROOTS = [tmp_dir]
+            config.ADMIN_TOKEN = ""
+            config.LUXRIOT_PASSWORD = "SitePass-2026!"
+
+            result = oldapp._check_deployment_security_ready()
+
+        self.assertTrue(result["ok"], result)
+        self.assertEqual(result["issues"], [])
+        self.assertEqual(len(result["warnings"]), 0)
+
     def test_secure_ready_response_hides_component_details(self) -> None:
         config.SECURE_DEPLOYMENT_REQUIRED = True
         config.AUTH_ENABLED = False

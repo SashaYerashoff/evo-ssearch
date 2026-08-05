@@ -300,6 +300,7 @@ def _update(
     *,
     assume_yes: bool,
     wait_streams: int,
+    verify_luxriot_credential: bool = False,
 ) -> None:
     _require_root()
     source = bundle_root / "repo"
@@ -354,6 +355,8 @@ def _update(
         "--base-url",
         deployment.base_url,
     ]
+    if verify_luxriot_credential:
+        common.append("--verify-luxriot-credential")
     print("\nUPDATE PREFLIGHT (read-only)")
     _run((*common, "--dry-run"), env=process_env)
     if not assume_yes:
@@ -423,6 +426,14 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--service", default=DEFAULT_SERVICE)
     parser.add_argument("--yes", action="store_true", help="Accept the final reviewed mutation plan.")
     parser.add_argument(
+        "--verify-luxriot-credential",
+        action="store_true",
+        help=(
+            "For updates, permit an Evo password matched by the placeholder heuristic "
+            "only after a live authenticated read-only /channels check."
+        ),
+    )
+    parser.add_argument(
         "--wait-streams",
         type=int,
         default=180,
@@ -463,6 +474,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 existing,
                 assume_yes=args.yes,
                 wait_streams=max(0, args.wait_streams),
+                verify_luxriot_credential=bool(args.verify_luxriot_credential),
             )
         else:
             if passthrough:

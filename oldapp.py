@@ -4137,11 +4137,45 @@ def _lm_response_text(data: Mapping[str, Any]) -> Tuple[str, str]:
     return content_text, str(choice.get("finish_reason") or "").strip().lower()
 
 
+def _lm_standalone_json_mapping(content: str) -> Optional[Mapping[str, Any]]:
+    """Return a top-level JSON object when the response contains JSON only.
+
+    Bounded VLM tools use standalone machine-readable contracts.  Repeated
+    values inside those contracts are validated by their contract owner and
+    must not be mistaken for a runaway prose loop here.  A small Markdown JSON
+    fence is tolerated, but prose before or after the object is not.
+    """
+
+    text = str(content or "").strip()
+    if not text:
+        return None
+    object_start = text.find("{")
+    if object_start < 0:
+        return None
+    prefix = text[:object_start].strip().lower()
+    if prefix not in {"", "```", "```json", "```jsonc"}:
+        return None
+    try:
+        parsed, end = json.JSONDecoder().raw_decode(text[object_start:])
+    except json.JSONDecodeError:
+        return None
+    suffix = text[object_start + end :].strip()
+    if suffix not in {"", "```"} or not isinstance(parsed, Mapping):
+        return None
+    return parsed
+
+
 def _lm_repetition_issue(content: str) -> Optional[str]:
     """Identify a runaway prose loop without penalizing structured JSON arrays."""
 
     text = str(content or "").strip()
     if len(text) < 400:
+        return None
+    structured = _lm_standalone_json_mapping(text)
+    if isinstance(structured, Mapping) and isinstance(structured.get("verdicts"), list):
+        # Archive verdict rows can legitimately share concise evidence when
+        # adjacent snapshots show the same object.  The archive parser owns
+        # row count, indices, verdict enums, and evidence validation.
         return None
     prose = re.split(
         r"\b(?:BATCH_STATE_JSON|ALERTS_JSON|MEMORY_UPDATE_JSON)\s*:",
@@ -5982,25 +6016,39 @@ def _check_postgres_ready() -> Dict[str, Any]:
         )
 
 
-def _secret_is_weak(value: str) -> bool:
+def _secret_is_obvious_placeholder(value: str) -> bool:
     secret = str(value or "").strip()
     if not secret:
         return False
-    if len(secret) < 32:
-        return True
     lowered = secret.lower()
-    weak_values = {
+    placeholder_values = {
         "123",
         "1234",
         "12345",
+        "123456",
         "admin",
         "password",
         "changeme",
         "change-me",
+        "change_me",
         "secret",
         "unit-token",
+        "placeholder",
+        "replace-me",
+        "replace_me",
     }
-    return lowered in weak_values or len(set(secret)) < 8
+    return lowered in placeholder_values
+
+
+def _secret_is_weak(value: str) -> bool:
+    secret = str(value or "").strip()
+    if not secret:
+        return False
+    return (
+        _secret_is_obvious_placeholder(secret)
+        or len(secret) < 12
+        or len(set(secret)) < 6
+    )
 
 
 def _check_deployment_security_ready() -> Dict[str, Any]:
@@ -6008,6 +6056,7 @@ def _check_deployment_security_ready() -> Dict[str, Any]:
         getattr(config, "SECURE_DEPLOYMENT_REQUIRED", False)
     )
     issues: List[str] = []
+    warnings: List[str] = []
     if not bool(getattr(config, "AUTH_COOKIE_SECURE", False)):
         issues.append("EVOSSEARCH_AUTH_COOKIE_SECURE=true is required behind TLS")
     if not config.ALLOWED_ROOTS:
@@ -6022,8 +6071,14 @@ def _check_deployment_security_ready() -> Dict[str, Any]:
             issues.append("ALLOWED_ROOTS contains missing paths: " + ", ".join(invalid_roots[:3]))
     if _secret_is_weak(getattr(config, "ADMIN_TOKEN", "")):
         issues.append("EVOSSEARCH_ADMIN_TOKEN is set but weak; rotate or unset under named auth")
-    if _secret_is_weak(getattr(config, "LUXRIOT_PASSWORD", "")):
-        issues.append("EVOSSEARCH_LUXRIOT_PASSWORD appears to be a placeholder")
+    luxriot_password = str(getattr(config, "LUXRIOT_PASSWORD", "") or "")
+    if _secret_is_obvious_placeholder(luxriot_password):
+        issues.append("EVOSSEARCH_LUXRIOT_PASSWORD is an obvious placeholder")
+    elif _secret_is_weak(luxriot_password):
+        warnings.append(
+            "EVOSSEARCH_LUXRIOT_PASSWORD is shorter or less diverse than recommended; "
+            "Evo connectivity is checked separately"
+        )
 
     ok = not secure_required or not issues
     return _component_result(
@@ -6031,6 +6086,7 @@ def _check_deployment_security_ready() -> Dict[str, Any]:
         "ready" if ok else "misconfigured",
         required=secure_required,
         issues=issues,
+        warnings=warnings,
         secure_deployment_required=secure_required,
         auth_cookie_secure=bool(getattr(config, "AUTH_COOKIE_SECURE", False)),
         allowed_roots_count=len(config.ALLOWED_ROOTS),
