@@ -181,8 +181,56 @@ class ProbeBuffer:
                 self.meta = self.meta[excess:]
                 removed_uids = [uid for uid in (_to_optional_int(item.get("uid")) for item in removed) if uid is not None]
                 self._prune_roi_cache_uids(removed_uids)
-        self._rebuild_index()
+        # Query and P/N/M scoring below operate on a bounded dense matrix and do
+        # not consume ``self.index``. Rebuilding a complete FAISS index for every
+        # one-Hz append was therefore pure O(n) work performed under the global
+        # ProbeManager lock, blocking every channel and the L0 scorer. Keep the
+        # legacy attribute invalidated for callers that inspect it; a future
+        # large-buffer ANN path can rebuild lazily when it actually uses FAISS.
+        self.index = None
         return frame_uid
+
+    def read_snapshot(self, *, include_roi_cache: bool = False) -> "ProbeBuffer":
+        """Return a stable, zero-copy vector snapshot for lock-free scoring."""
+
+        snapshot = ProbeBuffer(self.max_frames, self.thumb_edge)
+        snapshot.embeddings = list(self.embeddings)
+        snapshot.meta = [dict(row) for row in self.meta]
+        snapshot.next_uid = int(self.next_uid)
+        if include_roi_cache:
+            snapshot.roi_cache = {
+                key: dict(cache)
+                for key, cache in self.roi_cache.items()
+            }
+            snapshot.roi_cache_order = list(self.roi_cache_order)
+        return snapshot
+
+    def cache_roi_embedding(
+        self,
+        roi_norm: Tuple[float, float, float, float],
+        frame_uid: int,
+        embedding: np.ndarray,
+    ) -> None:
+        key = self._roi_key(roi_norm)
+        cache = self.roi_cache.setdefault(key, {})
+        cache[int(frame_uid)] = self._normalize_vec(embedding)
+        self._remember_roi_key(key)
+
+    def merge_roi_cache_from(self, snapshot: "ProbeBuffer") -> None:
+        valid_uids = {int(row.get("uid") or 0) for row in self.meta}
+        for key, snapshot_cache in snapshot.roi_cache.items():
+            if not snapshot_cache:
+                continue
+            cache = self.roi_cache.setdefault(key, {})
+            cache.update(
+                {
+                    int(uid): vector
+                    for uid, vector in snapshot_cache.items()
+                    if int(uid) in valid_uids
+                }
+            )
+            if cache:
+                self._remember_roi_key(key)
 
     def score(
         self,
@@ -319,6 +367,7 @@ class ProbeBuffer:
         roi_norm: Optional[Tuple[float, float, float, float]],
         embed_image_fn: Optional[Callable[[Image.Image], np.ndarray]],
         roi_padding: float,
+        roi_embedding_budget: Optional[int] = None,
     ) -> Tuple[np.ndarray, List[Dict[str, Any]]]:
         if not self.embeddings:
             return np.zeros((0, 0), dtype=np.float32), []
@@ -330,20 +379,38 @@ class ProbeBuffer:
             selected_idx.append(idx)
         if not selected_idx:
             return np.zeros((0, 0), dtype=np.float32), []
-        selected_meta = [self.meta[idx] for idx in selected_idx]
         if roi_norm is None or embed_image_fn is None:
+            selected_meta = [self.meta[idx] for idx in selected_idx]
             mat = np.stack([self.embeddings[idx] for idx in selected_idx], axis=0).astype(np.float32)
             return mat, selected_meta
 
         roi_key = self._roi_key(roi_norm)
         cache = self.roi_cache.setdefault(roi_key, {})
         self._remember_roi_key(roi_key)
+        missing_indices = [
+            idx
+            for idx in selected_idx
+            if int(self.meta[idx].get("uid") or 0) not in cache
+        ]
+        if roi_embedding_budget is None:
+            allowed_missing = set(missing_indices)
+        else:
+            budget = max(0, int(roi_embedding_budget))
+            # Fresh evidence is more useful than cold historical backfill. The
+            # cache accumulates across daemon passes, so older rows can still be
+            # filled gradually without flooding the shared SigLIP batcher.
+            allowed_missing = set(missing_indices[-budget:] if budget else [])
         vectors: List[np.ndarray] = []
-        for idx, row in zip(selected_idx, selected_meta):
+        selected_meta: List[Dict[str, Any]] = []
+        for idx in selected_idx:
+            row = self.meta[idx]
             uid = int(row.get("uid") or 0)
             cached = cache.get(uid)
             if cached is not None:
                 vectors.append(cached)
+                selected_meta.append(row)
+                continue
+            if idx not in allowed_missing:
                 continue
             embedded = self._embed_roi_thumb(
                 str(row.get("thumb") or ""),
@@ -351,9 +418,13 @@ class ProbeBuffer:
                 embed_image_fn=embed_image_fn,
                 roi_padding=roi_padding,
             )
-            vec = embedded if embedded is not None else self.embeddings[idx]
-            cache[uid] = vec
-            vectors.append(vec)
+            if embedded is None:
+                continue
+            cache[uid] = embedded
+            vectors.append(embedded)
+            selected_meta.append(row)
+        if not vectors:
+            return np.zeros((0, 0), dtype=np.float32), []
         mat = np.stack(vectors, axis=0).astype(np.float32)
         return mat, selected_meta
 
@@ -368,6 +439,7 @@ class ProbeBuffer:
         roi_norm: Optional[Tuple[float, float, float, float]] = None,
         embed_image_fn: Optional[Callable[[Image.Image], np.ndarray]] = None,
         roi_padding: float = 0.05,
+        roi_embedding_budget: Optional[int] = None,
     ) -> List[Dict[str, Any]]:
         if not self.embeddings:
             return []
@@ -376,6 +448,7 @@ class ProbeBuffer:
             roi_norm=roi_norm,
             embed_image_fn=embed_image_fn,
             roi_padding=roi_padding,
+            roi_embedding_budget=roi_embedding_budget,
         )
         if mat.size == 0 or not meta:
             return []
@@ -445,6 +518,7 @@ class ProbeManager:
             Callable[[Image.Image], Tuple[np.ndarray, Mapping[str, Any]]]
         ] = None,
         embedding_space_fn: Optional[Callable[[], Mapping[str, Any]]] = None,
+        embed_texts_fn: Optional[Callable[[Sequence[str]], np.ndarray]] = None,
     ) -> None:
         self.buffers: Dict[int, ProbeBuffer] = {}
         self.lock = threading.Lock()
@@ -453,12 +527,23 @@ class ProbeManager:
         self.embed_image_fn = embed_image_fn
         self.embed_image_with_metadata_fn = embed_image_with_metadata_fn
         self.embedding_space_fn = embedding_space_fn
+        self.embed_texts_fn = embed_texts_fn
         self._buffer_embedding_fingerprints: Dict[int, str] = {}
+        self._embedding_space_fingerprint = ""
+        self._embedding_space_fingerprint_lock = threading.Lock()
         self.embed_text_fn = embed_text_fn
         self.jpeg_encoder = jpeg_encoder
         self._text_embedding_cache: Dict[str, np.ndarray] = {}
         self._text_embedding_cache_lock = threading.Lock()
+        self._text_embedding_encode_lock = threading.Lock()
         self._text_embedding_cache_limit = 512
+        try:
+            roi_query_budget = int(
+                getattr(config, "PROBE_ROI_QUERY_EMBED_BUDGET", 2)
+            )
+        except (TypeError, ValueError):
+            roi_query_budget = 2
+        self.roi_query_embed_budget = max(0, min(16, roi_query_budget))
 
     @staticmethod
     def _space_fingerprint(value: Any) -> str:
@@ -467,12 +552,33 @@ class ProbeManager:
         return embedding_space_fingerprint(value)
 
     def _current_space_fingerprint(self) -> str:
+        # A cache hit must not wait for the image encoder. SigLIP image and text
+        # inference share one lifecycle lock, and one-Hz archive indexing can
+        # otherwise starve L0 probe scoring even though all text vectors are
+        # already cached. ``clear_all`` resets this identity whenever the
+        # embedding runtime changes; ``add_frame`` refreshes it from encoder
+        # metadata captured with the actual image vector.
+        with self._embedding_space_fingerprint_lock:
+            cached = self._embedding_space_fingerprint
+        if cached:
+            return cached
         if self.embedding_space_fn is None:
             return ""
         try:
-            return self._space_fingerprint(self.embedding_space_fn())
+            fingerprint = self._space_fingerprint(self.embedding_space_fn())
         except Exception:
             return ""
+        if fingerprint:
+            with self._embedding_space_fingerprint_lock:
+                self._embedding_space_fingerprint = fingerprint
+        return fingerprint
+
+    def _remember_space_fingerprint(self, fingerprint: str) -> None:
+        normalized = str(fingerprint or "").strip()
+        if not normalized:
+            return
+        with self._embedding_space_fingerprint_lock:
+            self._embedding_space_fingerprint = normalized
 
     def _buffer_matches_current_space(self, channel_id: int) -> bool:
         current = self._current_space_fingerprint()
@@ -507,6 +613,7 @@ class ProbeManager:
         else:
             emb = self.embed_image_fn(pil_image)
         frame_fingerprint = self._space_fingerprint(embedding_space)
+        self._remember_space_fingerprint(frame_fingerprint)
         thumb = self.jpeg_encoder(pil_image, max_edge=self.thumb_edge, quality=70)
         with self.lock:
             previous_fingerprint = self._buffer_embedding_fingerprints.get(
@@ -541,34 +648,83 @@ class ProbeManager:
         }
 
     def _embed_texts(self, texts: Sequence[str]) -> np.ndarray:
-        embs = []
-        for t in texts:
-            normalized = " ".join(str(t or "").split())
-            if not normalized:
-                continue
-            cache_key = (
-                f"{self._current_space_fingerprint()}:{normalized.casefold()}"
-            )
-            with self._text_embedding_cache_lock:
-                cached = self._text_embedding_cache.get(cache_key)
-            if cached is None:
-                cached = np.asarray(
-                    self.embed_text_fn(normalized),
-                    dtype=np.float32,
-                ).flatten()
-                norm = max(float(np.linalg.norm(cached)), 1e-8)
-                cached = cached / norm
+        prepared = [
+            " ".join(str(text or "").split())
+            for text in texts
+            if " ".join(str(text or "").split())
+        ]
+        if not prepared:
+            return np.zeros((0, 0), dtype=np.float32)
+        space_fingerprint = self._current_space_fingerprint()
+
+        def cache_key(text: str) -> str:
+            return f"{space_fingerprint}:{text.casefold()}"
+
+        unique_missing: List[str] = []
+        with self._text_embedding_cache_lock:
+            for text in prepared:
+                key = cache_key(text)
+                if key not in self._text_embedding_cache and text not in unique_missing:
+                    unique_missing.append(text)
+
+        if unique_missing:
+            # Single-flight cold text encoding across simultaneous channel
+            # summaries. Recheck after taking the lock because another channel
+            # may have populated the same probe phrases while we waited.
+            with self._text_embedding_encode_lock:
                 with self._text_embedding_cache_lock:
-                    self._text_embedding_cache[cache_key] = cached
-                    while len(self._text_embedding_cache) > self._text_embedding_cache_limit:
-                        oldest = next(iter(self._text_embedding_cache))
-                        self._text_embedding_cache.pop(oldest, None)
-            embs.append(cached)
+                    missing = [
+                        text
+                        for text in unique_missing
+                        if cache_key(text) not in self._text_embedding_cache
+                    ]
+                if missing:
+                    if self.embed_texts_fn is not None:
+                        matrix = np.asarray(
+                            self.embed_texts_fn(missing),
+                            dtype=np.float32,
+                        )
+                        if matrix.ndim == 1 and len(missing) == 1:
+                            matrix = matrix.reshape(1, -1)
+                        if matrix.ndim != 2 or int(matrix.shape[0]) != len(missing):
+                            raise ValueError(
+                                "Batch text embedder returned an invalid matrix shape"
+                            )
+                        encoded = [matrix[index].flatten() for index in range(len(missing))]
+                    else:
+                        encoded = [
+                            np.asarray(self.embed_text_fn(text), dtype=np.float32).flatten()
+                            for text in missing
+                        ]
+                    with self._text_embedding_cache_lock:
+                        for text, vector in zip(missing, encoded):
+                            norm = max(float(np.linalg.norm(vector)), 1e-8)
+                            self._text_embedding_cache[cache_key(text)] = vector / norm
+                        while len(self._text_embedding_cache) > self._text_embedding_cache_limit:
+                            oldest = next(iter(self._text_embedding_cache))
+                            self._text_embedding_cache.pop(oldest, None)
+
+        with self._text_embedding_cache_lock:
+            embs = [self._text_embedding_cache[cache_key(text)] for text in prepared]
         if not embs:
             return np.zeros((0, 0), dtype=np.float32)
         mat = np.stack(embs, axis=0).astype(np.float32)
         mat /= np.linalg.norm(mat, axis=1, keepdims=True) + 1e-8
         return mat
+
+    def prewarm_texts(self, texts: Sequence[str]) -> int:
+        """Encode all unique probe phrases in one model call when possible."""
+
+        unique = list(
+            dict.fromkeys(
+                " ".join(str(text or "").split())
+                for text in texts
+                if " ".join(str(text or "").split())
+            )
+        )
+        if unique:
+            self._embed_texts(unique)
+        return len(unique)
 
     def score_current_frame(
         self,
@@ -609,6 +765,12 @@ class ProbeManager:
             if cropped is None:
                 return {"error": "Current ROI frame could not be embedded."}
             vector = cropped
+            self._remember_roi_frame_embedding(
+                int(channel_id),
+                int(timestamp_ms),
+                roi_norm,
+                vector,
+            )
         pos_embs = self._embed_texts(pos_texts)
         neg_embs = self._embed_texts(neg_texts)
         if pos_embs.size == 0 or int(pos_embs.shape[1]) != int(vector.shape[0]):
@@ -627,6 +789,29 @@ class ProbeManager:
             },
             "scoring_embedding": vector,
         }
+
+    def _remember_roi_frame_embedding(
+        self,
+        channel_id: int,
+        timestamp_ms: int,
+        roi_norm: Tuple[float, float, float, float],
+        embedding: np.ndarray,
+    ) -> bool:
+        """Attach a realtime ROI crop to the matching one-Hz buffer row."""
+
+        with self.lock:
+            buffer = self.buffers.get(int(channel_id))
+            if buffer is None:
+                return False
+            for row in reversed(buffer.meta):
+                if int(row.get("timestamp_ms") or 0) != int(timestamp_ms):
+                    continue
+                frame_uid = int(row.get("uid") or 0)
+                if frame_uid <= 0:
+                    return False
+                buffer.cache_roi_embedding(roi_norm, frame_uid, embedding)
+                return True
+        return False
 
     def score_frames(
         self,
@@ -653,23 +838,44 @@ class ProbeManager:
         pos_embs = self._embed_texts(pos_texts)
         neg_embs = self._embed_texts(neg_texts)
         with self.lock:
-            buf = self.buffers.get(int(channel_id))
-            if buf is None:
+            live_buffer = self.buffers.get(int(channel_id))
+            if live_buffer is None:
                 return {"results": [], "frames_indexed": 0}
-            try:
-                results = buf.score(
+            if roi_norm is None:
+                scoring_buffer = live_buffer.read_snapshot()
+                status = live_buffer.status()
+            else:
+                scoring_buffer = live_buffer
+                status = live_buffer.status()
+        try:
+            if roi_norm is None:
+                results = scoring_buffer.score(
                     pos_embs,
                     neg_embs,
                     min_ts_ms=min_ts_ms,
                     max_ts_ms=max_ts_ms,
-                    roi_norm=roi_norm,
-                    embed_image_fn=self.embed_image_fn if roi_norm is not None else None,
-                    roi_padding=roi_padding,
                 )
-            except ValueError as exc:
-                buf.clear()
-                return {"error": str(exc), "frames_indexed": 0}
-            status = buf.status()
+            else:
+                # ROI vectors are cached on the live buffer; retain the lock for
+                # that uncommon path until ROI embedding receives its own
+                # immutable cache generation.
+                with self.lock:
+                    results = scoring_buffer.score(
+                        pos_embs,
+                        neg_embs,
+                        min_ts_ms=min_ts_ms,
+                        max_ts_ms=max_ts_ms,
+                        roi_norm=roi_norm,
+                        embed_image_fn=self.embed_image_fn,
+                        roi_padding=roi_padding,
+                    )
+                    status = scoring_buffer.status()
+        except ValueError as exc:
+            with self.lock:
+                current = self.buffers.get(int(channel_id))
+                if current is live_buffer:
+                    current.clear()
+            return {"error": str(exc), "frames_indexed": 0}
         return {
             "results": results,
             "status": status,
@@ -696,6 +902,7 @@ class ProbeManager:
         image_probe: Optional[Dict[str, Any]] = None,
         roi_norm: Optional[Tuple[float, float, float, float]] = None,
         roi_padding: float = 0.05,
+        roi_embedding_budget: Optional[int] = None,
     ) -> Dict[str, Any]:
         if not self._buffer_matches_current_space(channel_id):
             return {
@@ -744,25 +951,44 @@ class ProbeManager:
         if window_sec and window_sec > 0:
             min_ts_ms = int((time.time() - float(window_sec)) * 1000)
         with self.lock:
-            buf = self.buffers.get(channel_id)
-            if not buf:
+            live_buffer = self.buffers.get(channel_id)
+            if not live_buffer:
                 return {"results": [], "frames_indexed": 0}
-            try:
-                results = buf.query(
-                    pos_embs,
-                    neg_embs,
-                    pos_floor,
-                    margin_thr,
-                    top_k,
-                    min_ts_ms=min_ts_ms,
-                    roi_norm=roi_norm,
-                    embed_image_fn=self.embed_image_fn,
-                    roi_padding=roi_padding,
-                )
-            except ValueError as exc:
-                buf.clear()
-                return {"error": str(exc), "frames_indexed": 0}
-            status = buf.status()
+            query_buffer = live_buffer.read_snapshot(
+                include_roi_cache=roi_norm is not None
+            )
+            status = live_buffer.status()
+        try:
+            effective_roi_budget = (
+                self.roi_query_embed_budget
+                if roi_embedding_budget is None
+                else max(0, int(roi_embedding_budget))
+            )
+            results = query_buffer.query(
+                pos_embs,
+                neg_embs,
+                pos_floor,
+                margin_thr,
+                top_k,
+                min_ts_ms=min_ts_ms,
+                roi_norm=roi_norm,
+                embed_image_fn=self.embed_image_fn,
+                roi_padding=roi_padding,
+                roi_embedding_budget=(
+                    effective_roi_budget if roi_norm is not None else None
+                ),
+            )
+            if roi_norm is not None:
+                with self.lock:
+                    current = self.buffers.get(channel_id)
+                    if current is live_buffer:
+                        current.merge_roi_cache_from(query_buffer)
+        except ValueError as exc:
+            with self.lock:
+                current = self.buffers.get(channel_id)
+                if current is live_buffer:
+                    current.clear()
+            return {"error": str(exc), "frames_indexed": 0}
         return {"results": results, "status": status, "frames_indexed": status.get("frames", 0)}
 
     def status(self, channel_id: int) -> Dict[str, Any]:
@@ -783,3 +1009,5 @@ class ProbeManager:
             self._buffer_embedding_fingerprints.clear()
         with self._text_embedding_cache_lock:
             self._text_embedding_cache.clear()
+        with self._embedding_space_fingerprint_lock:
+            self._embedding_space_fingerprint = ""

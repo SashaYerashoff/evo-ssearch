@@ -25,6 +25,7 @@ from inference_queue import (
 )
 from archive_store import PostgresRuntimeStateStore
 from attention_policy import AttentionMode, CostBudgetState
+from incident_attention import PromptBudgetError
 from luxriot_connector import LuxriotCaptureSession, LuxriotManager, _intel_hwaccel_for_config
 
 
@@ -607,7 +608,7 @@ class LuxriotCaptureApexDeciderTests(unittest.TestCase):
                 "burst",
             )
 
-    def test_scheduled_rollup_scans_retained_history_with_bounded_target_backfill(self):
+    def test_scheduled_rollup_scans_bounded_recent_history(self):
         with tempfile.TemporaryDirectory() as temp:
             manager = build_manager(Path(temp))
             manager.rollup_scheduler_backfill_windows = 3
@@ -621,11 +622,28 @@ class LuxriotCaptureApexDeciderTests(unittest.TestCase):
 
             self.assertEqual(calls[0]["channel_id"], 7)
             self.assertEqual(calls[0]["target_level"], "L1")
-            self.assertIsNone(calls[0]["start_ts"])
+            self.assertEqual(calls[0]["start_ts"], 0.0)
             self.assertEqual(calls[0]["end_ts"], 3_599.999)
             self.assertIsNone(calls[0]["level_limit"])
             self.assertEqual(calls[0]["synthesize_levels"], {"L1"})
             self.assertEqual(calls[0]["max_new_per_level"], 3)
+
+    def test_scheduled_rollup_lookback_is_bounded_on_long_running_archive(self):
+        with tempfile.TemporaryDirectory() as temp:
+            manager = build_manager(Path(temp))
+            manager.rollup_windows["L1"] = 900
+            manager.rollup_scheduler_backfill_windows = 2
+            calls = []
+            with patch.object(
+                manager,
+                "summary_rollups",
+                side_effect=lambda **kwargs: calls.append(kwargs) or {"levels": {}},
+            ):
+                manager._run_scheduled_rollup(7, "L1", 100_001.0)
+
+            closed_end = int(100_001.0 // 900) * 900
+            self.assertEqual(calls[0]["start_ts"], float(closed_end - 2_700))
+            self.assertEqual(calls[0]["end_ts"], float(closed_end) - 0.001)
 
     def test_l0_backpressure_ignores_normal_inflight_and_requires_saturated_queue(self):
         class StatusSession:
@@ -681,6 +699,47 @@ class LuxriotCaptureApexDeciderTests(unittest.TestCase):
             self.assertFalse(manager._l0_backpressure_active(7))
             self.assertTrue(manager._l0_backpressure_active())
 
+    def test_l0_bootstrap_gate_waits_for_first_live_summary(self):
+        class StatusSession:
+            def __init__(self, status):
+                self._status = status
+
+            def status(self):
+                return dict(self._status)
+
+        with tempfile.TemporaryDirectory() as temp:
+            manager = build_manager(Path(temp))
+            manager.sessions[7] = StatusSession(
+                {
+                    "running": True,
+                    "summarization_enabled": True,
+                    "run_started_at": 1_000.0,
+                    "summary_max_window_sec": 60.0,
+                    "summary_last_success_at": None,
+                }
+            )
+
+            self.assertTrue(manager._l0_bootstrap_pending(now=1_080.0))
+            manager.sessions[7]._status["summary_last_success_at"] = 1_081.0
+            self.assertFalse(manager._l0_bootstrap_pending(now=1_082.0))
+
+    def test_l0_bootstrap_gate_expires_for_broken_stream(self):
+        class StatusSession:
+            def status(self):
+                return {
+                    "running": True,
+                    "summarization_enabled": True,
+                    "run_started_at": 1_000.0,
+                    "summary_max_window_sec": 60.0,
+                    "summary_last_success_at": None,
+                }
+
+        with tempfile.TemporaryDirectory() as temp:
+            manager = build_manager(Path(temp))
+            manager.sessions[7] = StatusSession()
+
+            self.assertFalse(manager._l0_bootstrap_pending(now=1_120.0))
+
     def test_l0_backpressure_only_blocks_rollups_on_the_same_lm_resource(self):
         class StatusSession:
             def status(self):
@@ -734,8 +793,39 @@ class LuxriotCaptureApexDeciderTests(unittest.TestCase):
             ]
 
             self.assertGreater(len(set(due)), 20)
-            self.assertGreaterEqual(min(due), 1_030.0)
-            self.assertLess(max(due), 1_280.0)
+            self.assertGreaterEqual(min(due), 1_800.0)
+            self.assertLess(max(due), 2_050.0)
+
+    def test_rollup_scheduler_initial_due_uses_next_level_boundary(self):
+        with tempfile.TemporaryDirectory() as temp:
+            manager = build_manager(Path(temp))
+            manager.rollup_scheduler_initial_delay_sec = 30.0
+            manager.rollup_scheduler_spacing_sec = 5.0
+
+            l1_due = manager._rollup_initial_due(7, "L1", 10_000.0, 3)
+            l2_due = manager._rollup_initial_due(7, "L2", 10_000.0, 3)
+
+            self.assertGreaterEqual(l1_due, 10_800.0)
+            self.assertLess(l1_due, 10_860.0)
+            self.assertGreaterEqual(l2_due, 10_800.0)
+            self.assertLess(l2_due, 10_860.0)
+
+    def test_rollup_scheduler_ignores_history_only_channels(self):
+        with tempfile.TemporaryDirectory() as temp:
+            manager = build_manager(Path(temp))
+            manager.summary_history[41] = [{"summary": "old stopped stream"}]
+            manager.sessions[42] = object()
+            with patch.object(
+                manager,
+                "_load_desired_live_sessions",
+                return_value={
+                    43: {"enabled": True},
+                    44: {"enabled": False},
+                },
+            ):
+                channels = manager._rollup_scheduler_channels()
+
+            self.assertEqual(channels, [42, 43])
 
     def test_rollup_scheduler_recurring_due_aligns_to_window_boundary(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -911,8 +1001,9 @@ class LuxriotSummaryBackpressureTests(unittest.TestCase):
             session.manager.set_summary_dispatcher(slow_dispatcher)
             session.summary_worker_thread.start()
             try:
-                # First batch goes inflight into the blocked dispatcher; the
-                # next two fill the queue; the fourth forces backpressure.
+                # First batch goes inflight into the blocked dispatcher. Every
+                # later window is folded into one fresh representative batch
+                # instead of forming a stale FIFO behind it.
                 session.frames = self._frames(100.0, 4)
                 self.assertTrue(session._enqueue_summary_batch())
                 self.assertTrue(started.wait(timeout=2.0))
@@ -928,16 +1019,17 @@ class LuxriotSummaryBackpressureTests(unittest.TestCase):
                         (list(frames), dict(meta))
                         for frames, _workload, meta in session.summary_queue
                     ]
-                self.assertEqual(session.summary_coalesced_batches, 1)
+                self.assertEqual(len(queue_snapshot), 1)
+                self.assertEqual(session.summary_coalesced_batches, 2)
                 self.assertEqual(session.queue_dropped_batches, 0)
                 merged_frames, merged_meta = queue_snapshot[0]
-                self.assertEqual(merged_meta["coalesced"]["batches"], 2)
-                self.assertEqual(merged_meta["coalesced"]["omitted_frames"], 4)
+                self.assertEqual(merged_meta["coalesced"]["batches"], 3)
+                self.assertEqual(merged_meta["coalesced"]["omitted_frames"], 8)
                 self.assertEqual(len(merged_frames), 4)
                 spans = [frame["captured_at"] for frame in merged_frames]
                 self.assertLess(min(spans), 116.0)
-                self.assertGreater(max(spans), 123.0)
-                self.assertEqual(session.status()["summary_coalesced_batches"], 1)
+                self.assertGreater(max(spans), 135.0)
+                self.assertEqual(session.status()["summary_coalesced_batches"], 2)
             finally:
                 release.set()
                 session.stop_event.set()
@@ -969,6 +1061,23 @@ class LuxriotSummaryBackpressureTests(unittest.TestCase):
         self.assertEqual(omitted, 7)
         self.assertEqual([frame["captured_at"] for frame in kept], [107.0])
 
+    def test_coalescing_preserves_the_strongest_workload_lane(self):
+        with tempfile.TemporaryDirectory() as temp:
+            _manager, session = self._make_session(temp, queue_max=2)
+            for first, second in (("heartbeat", "event"), ("alert", "heartbeat")):
+                session.summary_queue = [
+                    (self._frames(100.0, 4), first, {"batch_size": 4}),
+                    (self._frames(112.0, 4), second, {"batch_size": 4}),
+                ]
+                self.assertTrue(session._coalesce_oldest_queued_batches_locked())
+                self.assertEqual(
+                    session.summary_queue[0][1],
+                    max(
+                        (first, second),
+                        key=session._summary_workload_priority,
+                    ),
+                )
+
     def test_exhausted_coalescing_leaves_an_explicit_coverage_gap(self):
         with tempfile.TemporaryDirectory() as temp:
             manager, session = self._make_session(temp, queue_max=2)
@@ -983,7 +1092,8 @@ class LuxriotSummaryBackpressureTests(unittest.TestCase):
             manager.set_summary_dispatcher(slow_dispatcher)
             session.summary_worker_thread.start()
             try:
-                # Batch 1 goes inflight; batches 2 and 3 fill the queue.
+                # Batch 1 goes inflight; batches 2 and 3 become one pending
+                # representative batch.
                 session.frames = self._frames(100.0, 4)
                 self.assertTrue(session._enqueue_summary_batch())
                 self.assertTrue(started.wait(timeout=2.0))
@@ -991,8 +1101,8 @@ class LuxriotSummaryBackpressureTests(unittest.TestCase):
                 self.assertTrue(session._enqueue_summary_batch())
                 session.frames = self._frames(124.0, 4)
                 self.assertTrue(session._enqueue_summary_batch())
-                # Poison the queued batches as already fully coalesced so the
-                # merge path refuses and the drop-with-gap path runs.
+                # Poison the pending batch as already fully coalesced so the
+                # next window replaces it and records an explicit gap.
                 with session.lock:
                     poisoned = []
                     for frames, workload, meta in session.summary_queue:
@@ -1011,7 +1121,8 @@ class LuxriotSummaryBackpressureTests(unittest.TestCase):
                 self.assertEqual(gap["gap_reason"], "lm_backpressure_dropped_batch")
                 self.assertIn("coverage gap", gap["summary"])
                 self.assertEqual(gap["batch_start_ms"], 112_000)
-                self.assertEqual(gap["batch_end_ms"], 115_000)
+                self.assertEqual(gap["batch_end_ms"], 127_000)
+                self.assertEqual(gap["frame_count"], 8)
             finally:
                 release.set()
                 session.stop_event.set()
@@ -1179,6 +1290,64 @@ class LuxriotIncidentFocusRuntimeTests(unittest.TestCase):
                 manager.l0_cost_budget_status()["waiting_channel_ids"],
                 [7, 8],
             )
+
+    def test_runtime_keeps_eight_hot_but_only_four_in_the_vlm_prompt(self):
+        with tempfile.TemporaryDirectory() as temp:
+            manager = build_manager(Path(temp))
+            for index in range(10):
+                manager.start_incident_focus(
+                    f"incident-{index}",
+                    [7],
+                    level="follow",
+                    ttl_seconds=30,
+                    context=json.dumps({"title": f"Incident {index}"}),
+                )
+
+            batch = manager.create_summary_batch(
+                channel_id=7,
+                run_id="run-7",
+                batch_size=2,
+                prompt="Describe activity.",
+                model_hint=None,
+                interval_sec=5.0,
+                frames=sample_frames(),
+            )
+
+            focus_json = batch["system_prompt"].split(
+                "INCIDENT_FOCUS_JSON:\n", 1
+            )[1].splitlines()[0]
+            focus = json.loads(focus_json)
+            self.assertEqual(len(focus["incident_ids"]), 4)
+            self.assertEqual(focus["hot_unresolved_count"], 8)
+            self.assertEqual(focus["omitted_incident_count"], 6)
+            telemetry = batch["llm_input_stats"]["incident_context_budget"]
+            self.assertEqual(telemetry["prompt_incident_count"], 4)
+            self.assertEqual(telemetry["hot_count"], 8)
+            status = manager.incident_focus_status()
+            self.assertEqual(status["attention_policy"]["hot_unresolved_limit"], 8)
+            self.assertEqual(
+                status["prompt_budget"]["context_window_tokens"], 16384
+            )
+
+    def test_vision_budget_fails_before_sending_an_oversized_batch(self):
+        with tempfile.TemporaryDirectory() as temp:
+            manager = build_manager(
+                Path(temp),
+                config_overrides={
+                    "LUXRIOT_L0_VISION_BUDGET_TOKENS": 512,
+                    "LUXRIOT_L0_VISION_TOKENS_PER_IMAGE_ESTIMATE": 300,
+                },
+            )
+            with self.assertRaisesRegex(PromptBudgetError, "vision-token budget"):
+                manager.create_summary_batch(
+                    channel_id=7,
+                    run_id="run-7",
+                    batch_size=2,
+                    prompt="Describe activity.",
+                    model_hint=None,
+                    interval_sec=5.0,
+                    frames=sample_frames(),
+                )
 
 
 class LuxriotCaptureAttentionSignalTests(unittest.TestCase):
@@ -1576,6 +1745,44 @@ class LuxriotCaptureDispatchTests(unittest.TestCase):
             self.assertIsNone(session.summary_last_error)
             self.assertIsNone(session.last_error)
             self.assertIsNotNone(session.summary_last_success_at)
+
+    def test_accepted_l0_batch_emits_one_replay_safe_incident_heartbeat(self):
+        with tempfile.TemporaryDirectory() as temp:
+            manager = build_manager(Path(temp))
+            received = []
+            manager.set_incident_observation_callback(
+                lambda channel_id, payload: received.append(
+                    (channel_id, dict(payload))
+                )
+                or {"inserted": 1}
+            )
+            entry = {
+                "channel_id": 7,
+                "run_id": "run-7",
+                "batch_id": "vlm-stable-batch",
+                "summary": "Person remains at the gate.",
+                "frame_count": 2,
+                "created_at": 110.0,
+                "batch_start_ms": 100_000,
+                "batch_end_ms": 110_000,
+                "batch_state": {
+                    "version": 2,
+                    "events": [],
+                    "routines": [],
+                    "observed_states": [],
+                    "alerts": [],
+                },
+            }
+
+            accepted = manager.accept_summary_entry(entry)
+
+            self.assertEqual(len(received), 1)
+            self.assertEqual(received[0][0], 7)
+            self.assertEqual(received[0][1]["batch_id"], "vlm-stable-batch")
+            self.assertEqual(received[0][1]["batch_end_ms"], 110_000)
+            self.assertEqual(
+                accepted["incident_observation_admission"], {"inserted": 1}
+            )
 
     def test_channel_false_and_zero_overrides_persist_without_inheriting_defaults(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -3910,6 +4117,53 @@ class LuxriotCaptureDispatchTests(unittest.TestCase):
             self.assertEqual(vector_signal["health"]["road_cv_low_fps_suppressed_frames"], 3)
             self.assertNotIn("road_cv_cues", vector_signal)
             self.assertEqual(vector_signal["road_episodes"][0]["event_type"], "drift_burnout_candidate")
+
+    def test_quiet_low_confidence_channel_idles_expensive_road_cv_ray(self):
+        with tempfile.TemporaryDirectory() as temp:
+            manager = build_manager(
+                Path(temp),
+                config_overrides={"LUXRIOT_ROAD_SCENE_CALIBRATION_SAMPLES": 4},
+            )
+            manager.road_scene_calibrations[7] = {
+                "confidence": "medium",
+                "sample_count": 4,
+            }
+            frames = [
+                {
+                    "thumbnail": f"frame-{index}",
+                    "captured_at": 100.0 + index,
+                    "capture_selection": {
+                        "selection_mode": "quiet",
+                        "activity_x": 0.4,
+                    },
+                }
+                for index in range(4)
+            ]
+
+            with patch.object(
+                manager,
+                "_decode_frame_thumbnail_to_rgb_array",
+            ) as decode:
+                road_cues, frame_scores, road_scene, camera_scene, health = (
+                    manager._road_cv_vector_signals(
+                        7,
+                        frames,
+                    )
+                )
+
+            decode.assert_not_called()
+            self.assertEqual(road_cues, [])
+            self.assertEqual(frame_scores, [])
+            self.assertEqual(road_scene, {})
+            self.assertEqual(camera_scene, {})
+            self.assertEqual(
+                health["road_cv_status"],
+                "homeostatic_idle",
+            )
+            self.assertEqual(
+                health["road_cv_calibration_sample_count"],
+                4,
+            )
 
     def test_sync_fallback_archives_batch_frame_anchors(self):
         archived = []
@@ -7100,6 +7354,375 @@ class LuxriotCaptureDispatchTests(unittest.TestCase):
                     l3[0],
                 ),
             )
+
+    def test_routine_boundaries_split_parallel_incidents_and_coverage_does_not(self):
+        with tempfile.TemporaryDirectory() as temp:
+            manager = build_manager(Path(temp))
+            base_ms = 1_781_683_200_000
+
+            def log(
+                offset_ms,
+                *,
+                events=(),
+                routines=(),
+                coverage_gap=False,
+            ):
+                timestamp_ms = base_ms + offset_ms
+                return {
+                    "channel_id": 7,
+                    "run_id": "run-7",
+                    "summary": "Structured temporal evidence.",
+                    "frame_count": 0 if coverage_gap else 8,
+                    "created_at": timestamp_ms / 1000.0,
+                    "batch_start_ms": timestamp_ms,
+                    "batch_end_ms": timestamp_ms + 10_000,
+                    "coverage_gap": coverage_gap,
+                    "gap_reason": "camera_transition" if coverage_gap else "",
+                    "batch_state": {
+                        "version": 2,
+                        "events": list(events),
+                        "routines": list(routines),
+                        "observed_states": [],
+                        "alerts": [],
+                    },
+                }
+
+            logs = [
+                log(
+                    0,
+                    events=(
+                        {
+                            "event_id": "fire_response",
+                            "label": "Fire response remains active",
+                            "state": "new",
+                            "snapshot_indices": [2],
+                            "summary": "Smoke response begins.",
+                            "novelty": "novel",
+                            "pass_up": True,
+                        },
+                        {
+                            "event_id": "bag_theft",
+                            "label": "Brief bag theft",
+                            "state": "new",
+                            "snapshot_indices": [4],
+                            "summary": "A bag is taken during the response.",
+                            "novelty": "novel",
+                            "pass_up": True,
+                        },
+                    ),
+                ),
+                log(
+                    60_000,
+                    events=(
+                        {
+                            "event_id": "fire_response",
+                            "label": "Fire response remains active",
+                            "state": "continuing",
+                            "snapshot_indices": [3],
+                            "summary": "Response continues.",
+                            "novelty": "continuing",
+                            "pass_up": True,
+                        },
+                    ),
+                    routines=(
+                        {
+                            "key": "ordinary_bag_area",
+                            "label": "Bag area returned to routine",
+                            "state": "returned",
+                            "snapshot_indices": [8],
+                            "applies_to_event_keys": ["bag_theft"],
+                        },
+                    ),
+                ),
+                log(120_000, coverage_gap=True),
+                log(
+                    180_000,
+                    events=(
+                        {
+                            "event_id": "fire_response",
+                            "label": "Fire response remains active",
+                            "state": "continuing",
+                            "snapshot_indices": [5],
+                            "summary": "Response is still visible after coverage returns.",
+                            "novelty": "continuing",
+                            "pass_up": True,
+                        },
+                    ),
+                ),
+                log(
+                    240_000,
+                    routines=(
+                        {
+                            "key": "ordinary_port_state",
+                            "label": "Scene returned to ordinary operation",
+                            "state": "returned",
+                            "snapshot_indices": [7, 8],
+                            "applies_to_event_keys": ["fire_response"],
+                        },
+                    ),
+                ),
+            ]
+
+            l0 = manager._l0_nodes_from_logs(7, logs)
+            l1 = manager._build_rollup_level(
+                7, "L1", "L0", 900, l0, synthesize=False
+            )
+
+            self.assertEqual(len(l1), 1)
+            episodes = {
+                item["semantic_key"]: item for item in l1[0]["incident_ledger"]
+            }
+            self.assertEqual(set(episodes), {"scene fire_smoke", "object take_object"})
+            self.assertEqual(
+                episodes["object take_object"]["status"], "ended_by_routine"
+            )
+            self.assertEqual(
+                episodes["scene fire_smoke"]["status"], "ended_by_routine"
+            )
+            self.assertEqual(
+                len(episodes["scene fire_smoke"]["coverage_gap_ids"]), 1
+            )
+            self.assertEqual(episodes["object take_object"]["coverage_gap_ids"], [])
+            self.assertEqual(
+                len(l1[0]["incident_dispositions"]),
+                len(l1[0]["temporal_observations"]),
+            )
+            self.assertTrue(
+                all(
+                    item["scale_disposition"] == "routine_at_this_scale"
+                    for item in episodes.values()
+                )
+            )
+
+            l2 = manager._build_rollup_level(
+                7, "L2", "L1", 3600, l1, synthesize=False
+            )
+            l3 = manager._build_rollup_level(
+                7, "L3", "L2", 28800, l2, synthesize=False
+            )
+            self.assertEqual(len(l2), 1)
+            self.assertEqual(len(l3), 1)
+            for node in (l2[0], l3[0]):
+                higher = {
+                    item["semantic_key"]: item
+                    for item in node["incident_ledger"]
+                }
+                self.assertEqual(
+                    set(higher),
+                    {"scene fire_smoke", "object take_object"},
+                )
+                self.assertEqual(
+                    higher["object take_object"]["status"],
+                    "ended_by_routine",
+                )
+                self.assertEqual(
+                    len(higher["object take_object"]["observation_ids"]),
+                    1,
+                )
+                self.assertEqual(
+                    len(higher["scene fire_smoke"]["coverage_gap_ids"]),
+                    1,
+                )
+                self.assertEqual(
+                    len(node["incident_dispositions"]),
+                    len(node["temporal_observations"]),
+                )
+
+    def test_isolated_lower_scale_routine_becomes_long_incident_candidate(self):
+        children = [
+            {
+                "rollup_id": f"l1-{index}",
+                "coverage_gap": False,
+                "routine_ledger": (
+                    [
+                        {
+                            "semantic_key": "person_away_from_desk",
+                            "label": "Person remains away from desk",
+                            "support_windows": 1,
+                            "unknown_windows": 0,
+                            "returned_count": 0,
+                            "source_ids": ["l0-source"],
+                        }
+                    ]
+                    if index == 0
+                    else []
+                ),
+            }
+            for index in range(4)
+        ]
+
+        ledger = LuxriotManager._aggregate_routine_ledger(children, level="L2")
+
+        self.assertEqual(len(ledger), 1)
+        self.assertEqual(ledger[0]["state"], "isolated")
+        self.assertEqual(
+            ledger[0]["scale_disposition"], "long_incident_candidate"
+        )
+
+    def test_temporal_memory_rejects_routine_micro_motion_incidents(self):
+        observations = LuxriotManager._l0_temporal_observations(
+            channel_id=112,
+            source_batch_id="vlm-room-1",
+            batch_state={
+                "events": [
+                    {
+                        "event_id": "person_head_movement_112_000001",
+                        "label": "Person adjusts gaze and turns head slightly",
+                        "state": "new",
+                        "novelty": "novel",
+                        "pass_up": True,
+                        "snapshot_indices": [3],
+                    },
+                    {
+                        "event_id": "person_entry_112_20260805",
+                        "label": "Person enters from the right doorway",
+                        "state": "new",
+                        "novelty": "novel",
+                        "pass_up": True,
+                        "snapshot_indices": [5, 6],
+                    },
+                ],
+                "routines": [],
+            },
+            batch_start_ms=1_000,
+            batch_end_ms=2_000,
+        )
+
+        events = [row for row in observations if row["kind"] == "event"]
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0]["label"], "Person enters from the right doorway")
+        self.assertEqual(events[0]["semantic_key"], "person enter")
+
+    def test_temporal_memory_rejects_generic_person_movement(self):
+        observations = LuxriotManager._l0_temporal_observations(
+            channel_id=112,
+            source_batch_id="vlm-room-2",
+            batch_state={
+                "events": [
+                    {
+                        "event_id": "person_movement_212108",
+                        "label": "person moving",
+                        "state": "new",
+                        "novelty": "novel",
+                        "pass_up": True,
+                        "snapshot_indices": [1, 2, 3],
+                    }
+                ]
+            },
+            batch_start_ms=1_000,
+            batch_end_ms=2_000,
+        )
+
+        self.assertEqual(observations, [])
+
+    def test_temporal_memory_preserves_structured_alert_without_event_duplicate(self):
+        observations = LuxriotManager._l0_temporal_observations(
+            channel_id=112,
+            source_batch_id="vlm-room-alert-1",
+            batch_state={
+                "events": [],
+                "alerts": [
+                    {
+                        "title": "Person collapse near desk",
+                        "description": "Person visibly falls from the chair.",
+                        "severity": "high",
+                        "state": "new",
+                        "snapshot_indices": [3, 4],
+                    }
+                ],
+            },
+            batch_start_ms=1_000,
+            batch_end_ms=2_000,
+        )
+
+        self.assertEqual(len(observations), 1)
+        self.assertEqual(observations[0]["semantic_key"], "person fall")
+        self.assertEqual(
+            observations[0]["evidence_refs"],
+            ["vlm-room-alert-1:snapshot:3", "vlm-room-alert-1:snapshot:4"],
+        )
+
+    def test_temporal_keys_ignore_generated_ids_and_preserve_parallel_events(self):
+        first = LuxriotManager._l0_temporal_observations(
+            channel_id=112,
+            source_batch_id="vlm-room-1",
+            batch_state={
+                "events": [
+                    {
+                        "event_id": "cat_leap_112_000001",
+                        "label": "Sphynx cat leaps from the shelf",
+                        "state": "new",
+                        "novelty": "novel",
+                        "pass_up": True,
+                    },
+                    {
+                        "event_id": "person_entry_112_20260805_210000",
+                        "label": "Person enters the room",
+                        "state": "new",
+                        "novelty": "novel",
+                        "pass_up": True,
+                    },
+                ]
+            },
+            batch_start_ms=1_000,
+            batch_end_ms=2_000,
+        )
+        second = LuxriotManager._l0_temporal_observations(
+            channel_id=112,
+            source_batch_id="vlm-room-2",
+            batch_state={
+                "events": [
+                    {
+                        "event_id": "cat_jumping_frame_8",
+                        "label": "The cat jumps down from the shelf",
+                        "state": "continuing",
+                        "novelty": "continuing",
+                        "pass_up": True,
+                    }
+                ]
+            },
+            batch_start_ms=3_000,
+            batch_end_ms=4_000,
+        )
+
+        self.assertEqual(
+            {row["semantic_key"] for row in first},
+            {"cat jump_climb", "person enter"},
+        )
+        self.assertEqual(second[0]["semantic_key"], "cat jump_climb")
+        memory = LuxriotManager._aggregate_temporal_memory(
+            [
+                {"temporal_observations": first},
+                {"temporal_observations": second},
+            ],
+            level="L1",
+        )
+        episodes = {
+            row["semantic_key"]: row for row in memory["incident_ledger"]
+        }
+        self.assertEqual(set(episodes), {"cat jump_climb", "person enter"})
+        self.assertEqual(
+            len(episodes["cat jump_climb"]["observation_ids"]),
+            2,
+        )
+
+    def test_temporal_keys_merge_reworded_vehicle_drift(self):
+        keys = {
+            LuxriotManager._temporal_event_semantic_key(
+                {
+                    "event_id": "drift_smoke_vehicle",
+                    "label": "vehicle drifting with smoke",
+                }
+            ),
+            LuxriotManager._temporal_event_semantic_key(
+                {
+                    "event_id": "drift_and_pedestrian_presence",
+                    "label": "Orange car drifting with smoke, pedestrians standing",
+                }
+            ),
+        }
+
+        self.assertEqual(keys, {"vehicle maneuver"})
 
     def test_rollup_event_ledger_drops_static_pass_up_noise(self):
         ledger = LuxriotManager._l0_event_ledger(

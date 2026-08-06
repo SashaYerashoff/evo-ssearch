@@ -56,6 +56,12 @@ AUDIT_HASH_CHAIN_MIGRATION = ROOT / "migrations" / "versions" / (
 INCIDENTS_MIGRATION = ROOT / "migrations" / "versions" / (
     "20260801_0011_incidents.py"
 )
+INCIDENT_TEMPORAL_MEMORY_MIGRATION = ROOT / "migrations" / "versions" / (
+    "20260805_0012_incident_temporal_memory.py"
+)
+ARCHIVE_SOURCE_CHANNEL_INDEX_MIGRATION = ROOT / "migrations" / "versions" / (
+    "20260805_0013_archive_source_channel_page_index.py"
+)
 
 
 class DatabaseSettingsTests(unittest.TestCase):
@@ -532,7 +538,7 @@ class MigrationContentTests(unittest.TestCase):
         )
         incidents_source = INCIDENTS_MIGRATION.read_text(encoding="utf-8")
         self.assertIn(
-            f'revision: str = "{CURRENT_SCHEMA_REVISION}"',
+            'revision: str = "20260801_0011"',
             incidents_source,
         )
         self.assertIn(
@@ -549,6 +555,35 @@ class MigrationContentTests(unittest.TestCase):
         self.assertIn(
             "ALTER TABLE iam.role_permissions FORCE ROW LEVEL SECURITY",
             incidents_source,
+        )
+        temporal_source = INCIDENT_TEMPORAL_MEMORY_MIGRATION.read_text(
+            encoding="utf-8"
+        )
+        self.assertIn(
+            'revision: str = "20260805_0012"',
+            temporal_source,
+        )
+        self.assertIn(
+            'down_revision: str | None = "20260801_0011"',
+            temporal_source,
+        )
+        self.assertIn("CREATE TABLE archive.incident_observations", temporal_source)
+        self.assertIn("CREATE TABLE archive.incident_episodes", temporal_source)
+        self.assertIn("CREATE TABLE archive.incident_relations", temporal_source)
+        archive_index_source = ARCHIVE_SOURCE_CHANNEL_INDEX_MIGRATION.read_text(
+            encoding="utf-8"
+        )
+        self.assertIn(
+            f'revision: str = "{CURRENT_SCHEMA_REVISION}"',
+            archive_index_source,
+        )
+        self.assertIn(
+            'down_revision: str | None = "20260805_0012"',
+            archive_index_source,
+        )
+        self.assertIn(
+            "ix_archive_detections_source_channel_event_id",
+            archive_index_source,
         )
         self.assertIn(
             "ALTER TABLE iam.roles NO FORCE ROW LEVEL SECURITY",

@@ -1143,6 +1143,45 @@ class IncidentDraftAssembler:
             for row in intervals
             if _text(row.get("state"), 24) in {"motion", "mixed"}
         ]
+        active_intervals = [
+            row
+            for row in intervals
+            if _text(row.get("state"), 24) in {"motion", "mixed"}
+        ]
+        activity_values = [
+            _float(row.get("activity_x_max"))
+            for row in active_intervals
+        ]
+        elevated = sorted(
+            (
+                _int(row.get("started_at_ms") or row.get("peak_at_ms")),
+                _int(row.get("ended_at_ms") or row.get("peak_at_ms") or row.get("started_at_ms")),
+                _float(row.get("activity_x_max")),
+                _int(row.get("peak_at_ms") or row.get("started_at_ms")),
+            )
+            for row in active_intervals
+            if _float(row.get("activity_x_max")) >= 3.0
+        )
+        burst_count = 0
+        previous_end = -1
+        for started_at_ms, ended_at_ms, _activity, _peak_at_ms in elevated:
+            if burst_count == 0 or started_at_ms - previous_end > 1_500:
+                burst_count += 1
+            previous_end = max(previous_end, ended_at_ms)
+        apex_index = max(
+            range(len(active_intervals)),
+            key=lambda index: _float(active_intervals[index].get("activity_x_max")),
+            default=-1,
+        )
+        apex_at_ms = (
+            _int(
+                active_intervals[apex_index].get("peak_at_ms")
+                or active_intervals[apex_index].get("started_at_ms")
+            )
+            if apex_index >= 0
+            else None
+        )
+        final_elevated_end_ms = max((item[1] for item in elevated), default=0)
         return {
             "ground_truth": False,
             "interpretation": "attention signals only",
@@ -1152,6 +1191,21 @@ class IncidentDraftAssembler:
             "motion_interval_count": len(motion_values),
             "motion_p95_max": max(motion_values, default=0.0),
             "motion_p95_mean": statistics.fmean(motion_values) if motion_values else 0.0,
+            "motion_profile": {
+                "activity_x_max": max(activity_values, default=0.0),
+                "activity_x_mean": statistics.fmean(activity_values) if activity_values else 0.0,
+                "apex_at_ms": apex_at_ms,
+                "elevated_duration_ms": sum(
+                    max(0, ended_at_ms - started_at_ms)
+                    for started_at_ms, ended_at_ms, _activity, _peak_at_ms in elevated
+                ),
+                "burst_count": burst_count,
+                "settling_ms": (
+                    max(0, final_elevated_end_ms - apex_at_ms)
+                    if apex_at_ms is not None and final_elevated_end_ms > 0
+                    else 0
+                ),
+            },
             "attention_status": dict(attention_status or {}),
         }
 
@@ -1281,23 +1335,41 @@ class IncidentDraftAssembler:
 
 def incident_report_markdown(incident: Mapping[str, Any]) -> str:
     bounds = _mapping(incident.get("time_bounds"))
+    synopsis = _mapping(incident.get("synopsis"))
+    summary = _text(
+        incident.get("summary") or synopsis.get("description"),
+        4000,
+    )
+    homeostasis = _mapping(incident.get("homeostasis") or synopsis.get("homeostasis"))
+    follow_result = _mapping(incident.get("follow_result") or synopsis.get("follow_result"))
+    temporal = _mapping(incident.get("temporal_memory"))
     lines = [
         f"# EVA incident report — {_text(incident.get('title'), 300) or 'Untitled incident'}",
         "",
         f"- Incident ID: `{_text(incident.get('id'), 120) or 'draft'}`",
         f"- State: `{_text(incident.get('state'), 40) or 'draft'}`",
+        f"- Perception: `{_text(incident.get('perception_state'), 40) or 'unknown'}`",
+        f"- Risk: `{_text(incident.get('risk_state'), 40) or 'unknown'}`",
+        f"- Case: `{_text(incident.get('case_state'), 40) or 'unknown'}`",
+        f"- Attention: `{_text(incident.get('attention_state'), 40) or 'unknown'}`",
         f"- Severity: `{_text(incident.get('severity'), 40) or 'info'}`",
         f"- Channels: {', '.join(str(item) for item in _sequence(incident.get('channel_ids')))}",
         f"- Observed start: {_timestamp_label(bounds.get('observed_start_ms')) or 'unknown'}",
         f"- Apex: {_timestamp_label(bounds.get('apex_ms')) or 'unknown'}",
         f"- Observed end: {_timestamp_label(bounds.get('observed_end_ms')) or 'open/unknown'}",
         "",
-        "## Timeline",
+        "## Operator synopsis",
+        "",
+        summary or "No grounded visual synopsis is available; operator review is required.",
+        "",
+        "## Key moments",
         "",
         "| Time (UTC) | Key | Observation | Source | Confidence |",
         "|---|---|---|---|---|",
     ]
-    for raw in _sequence(incident.get("timeline")):
+    key_moments = _sequence(incident.get("key_moments"))
+    source_moments = key_moments or _sequence(incident.get("timeline"))
+    for raw in source_moments[:12]:
         if not isinstance(raw, Mapping):
             continue
         cell = lambda value: _text(value, 600).replace("|", "\\|").replace("\n", " ")
@@ -1314,6 +1386,74 @@ def incident_report_markdown(incident: Mapping[str, Any]) -> str:
             )
             + " |"
         )
+    if not any(isinstance(raw, Mapping) for raw in source_moments[:12]):
+        lines.append("| n/a | n/a | No grounded semantic milestone recovered | n/a | low |")
+
+    lines.extend(["", "## Homeostatic attention", ""])
+    lines.append(
+        "- Motion: "
+        f"mean p95={_float(homeostasis.get('motion_p95_mean')):.4f}, "
+        f"max p95={_float(homeostasis.get('motion_p95_max')):.4f}; "
+        f"bursts={_int(homeostasis.get('burst_count'))}."
+    )
+    lines.append(
+        "- Activity: "
+        f"mean={_float(homeostasis.get('activity_x_mean')):.2f}x, "
+        f"max={_float(homeostasis.get('activity_x_max')):.2f}x; "
+        f"elevated={_int(homeostasis.get('elevated_duration_ms'))} ms."
+    )
+    lines.append(
+        "- Probes: "
+        f"{_int(homeostasis.get('probe_hits'))} hits / "
+        f"{_int(homeostasis.get('probe_samples'))} samples across "
+        f"{_int(homeostasis.get('probe_count'))} probes."
+    )
+    if follow_result:
+        lines.extend(
+            [
+                "",
+                "## Follow outcome",
+                "",
+                f"- Outcome: `{_text(follow_result.get('outcome'), 80) or 'inconclusive'}`",
+                f"- Observations: {_int(follow_result.get('observation_count'))}",
+                f"- Result: {_text(follow_result.get('description'), 1000) or 'No grounded conclusion.'}",
+            ]
+        )
+
+    episodes = [item for item in _sequence(temporal.get("episodes")) if isinstance(item, Mapping)]
+    series_links = [item for item in _sequence(temporal.get("series_links")) if isinstance(item, Mapping)]
+    lifecycle = [item for item in _sequence(temporal.get("lifecycle_history")) if isinstance(item, Mapping)]
+    lines.extend(["", "## Temporal memory", ""])
+    lines.append(
+        f"Episodes: {int(_int(temporal.get('episode_total'), len(episodes)))}; "
+        f"series links: {len(series_links)}; "
+        f"lifecycle transitions: {int(_int(temporal.get('transition_total'), len(lifecycle)))}."
+    )
+    for episode in episodes[:16]:
+        start = _timestamp_label(episode.get("observed_start_ms") or episode.get("possible_start_ms")) or "unknown"
+        end = _timestamp_label(episode.get("observed_end_ms") or episode.get("possible_end_ms")) or "open"
+        lines.append(
+            f"- Episode `{_text(episode.get('id'), 120)}`: {start} → {end}; "
+            f"track `{_text(episode.get('semantic_key'), 160) or 'unverified'}`; "
+            f"disposition `{_text(episode.get('scale_disposition'), 80) or 'unclassified_keep'}`."
+        )
+    for relation in series_links[:16]:
+        lines.append(
+            f"- Series `{_text(relation.get('relation_state'), 40) or 'candidate'}`: "
+            f"related incident `{_text(relation.get('related_incident_id'), 120)}`; "
+            f"track `{_text(relation.get('semantic_key'), 160)}`; "
+            f"gap {_int(relation.get('gap_ms'))} ms."
+        )
+    if lifecycle:
+        lines.extend(["", "### Lifecycle history", ""])
+        for transition in lifecycle[-24:]:
+            lines.append(
+                f"- {_timestamp_label(transition.get('transitioned_at_ms')) or 'time unknown'} | "
+                f"`{_text(transition.get('axis'), 40)}`: "
+                f"`{_text(transition.get('from_state'), 40) or 'unset'}` → "
+                f"`{_text(transition.get('to_state'), 40) or 'unknown'}` | "
+                f"{_text(transition.get('reason'), 500) or 'no reason recorded'}"
+            )
     lines.extend(["", "## Coverage and uncertainty", ""])
     coverage = _mapping(incident.get("coverage"))
     lines.append(
@@ -1335,7 +1475,16 @@ def incident_report_markdown(incident: Mapping[str, Any]) -> str:
 def incident_report_xml(incident: Mapping[str, Any]) -> bytes:
     root = ET.Element("evaIncidentReport")
     root.set("groundTruthStatus", "operator_review_required")
-    for key in ("id", "state", "title", "severity"):
+    for key in (
+        "id",
+        "state",
+        "perception_state",
+        "risk_state",
+        "case_state",
+        "attention_state",
+        "title",
+        "severity",
+    ):
         node = ET.SubElement(root, key)
         node.text = _text(incident.get(key), 2000)
     channels = ET.SubElement(root, "channels")
@@ -1346,6 +1495,21 @@ def incident_report_xml(incident: Mapping[str, Any]) -> bytes:
     for key, value in _mapping(incident.get("time_bounds")).items():
         node = ET.SubElement(bounds_node, str(key))
         node.text = str(value or "")
+    synopsis_node = ET.SubElement(root, "operatorSynopsis")
+    synopsis_node.text = _text(
+        incident.get("summary") or _mapping(incident.get("synopsis")).get("description"),
+        8000,
+    )
+    homeostasis_node = ET.SubElement(root, "homeostaticAttention")
+    for key, value in _mapping(incident.get("homeostasis")).items():
+        node = ET.SubElement(homeostasis_node, str(key))
+        node.text = str(value if value is not None else "")
+    follow = _mapping(incident.get("follow_result"))
+    if follow:
+        follow_node = ET.SubElement(root, "followOutcome")
+        for key in ("outcome", "description", "observation_count", "started_at_ms", "ended_at_ms"):
+            node = ET.SubElement(follow_node, key)
+            node.text = str(follow.get(key) if follow.get(key) is not None else "")
     timeline_node = ET.SubElement(root, "timeline")
     for raw in _sequence(incident.get("timeline")):
         if not isinstance(raw, Mapping):
@@ -1375,6 +1539,44 @@ def incident_report_xml(incident: Mapping[str, Any]) -> bytes:
     for value in _sequence(incident.get("uncertainties")):
         node = ET.SubElement(uncertainties, "uncertainty")
         node.text = _text(value, 2000)
+    temporal = _mapping(incident.get("temporal_memory"))
+    temporal_node = ET.SubElement(root, "temporalMemory")
+    temporal_node.set("episodeTotal", str(_int(temporal.get("episode_total"))))
+    temporal_node.set("transitionTotal", str(_int(temporal.get("transition_total"))))
+    episodes_node = ET.SubElement(temporal_node, "episodes")
+    for raw in _sequence(temporal.get("episodes"))[:16]:
+        if not isinstance(raw, Mapping):
+            continue
+        item = ET.SubElement(episodes_node, "episode")
+        for key in (
+            "id", "perception_state", "semantic_key", "possible_start_ms",
+            "observed_start_ms", "observed_end_ms", "possible_end_ms",
+            "scale_disposition", "evidence_count",
+        ):
+            node = ET.SubElement(item, key)
+            node.text = str(raw.get(key) if raw.get(key) is not None else "")
+    series_node = ET.SubElement(temporal_node, "seriesLinks")
+    for raw in _sequence(temporal.get("series_links"))[:16]:
+        if not isinstance(raw, Mapping):
+            continue
+        item = ET.SubElement(series_node, "seriesLink")
+        for key in (
+            "relation_id", "relation_state", "related_incident_id", "semantic_key",
+            "series_key", "gap_ms", "confidence",
+        ):
+            node = ET.SubElement(item, key)
+            node.text = str(raw.get(key) if raw.get(key) is not None else "")
+    lifecycle_node = ET.SubElement(temporal_node, "lifecycleHistory")
+    for raw in _sequence(temporal.get("lifecycle_history"))[-24:]:
+        if not isinstance(raw, Mapping):
+            continue
+        item = ET.SubElement(lifecycle_node, "transition")
+        for key in (
+            "id", "axis", "from_state", "to_state", "incident_revision",
+            "transitioned_at_ms", "reason", "source_kind",
+        ):
+            node = ET.SubElement(item, key)
+            node.text = str(raw.get(key) if raw.get(key) is not None else "")
     return ET.tostring(root, encoding="utf-8", xml_declaration=True)
 
 

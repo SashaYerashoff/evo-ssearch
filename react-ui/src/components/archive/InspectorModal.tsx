@@ -539,6 +539,7 @@ export function InspectorModal({
         <IncidentModal
           draftInput={incidentDraft}
           canExport={canExport}
+          canManage={canReportIncidents}
           onClose={() => setIncidentDraft(null)}
         />
       )}

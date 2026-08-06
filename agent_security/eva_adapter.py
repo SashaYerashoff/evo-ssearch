@@ -52,6 +52,7 @@ _PREVIEW_ONLY_TOOLS = frozenset(
         "apply_deployment_plan",
         "draft_incident",
         "follow_incident",
+        "review_incident",
         "stop_incident_follow",
     }
 )
@@ -125,6 +126,7 @@ _TOOL_PERMISSIONS: dict[str, Permission] = {
     "get_incident": Permission.REPORTS_VIEW,
     "draft_incident": Permission.INCIDENTS_MANAGE,
     "follow_incident": Permission.INCIDENTS_MANAGE,
+    "review_incident": Permission.INCIDENTS_MANAGE,
     "stop_incident_follow": Permission.INCIDENTS_MANAGE,
 }
 
@@ -146,6 +148,7 @@ _CHANNEL_REQUIRED_TOOLS = frozenset(
         "get_incident",
         "draft_incident",
         "follow_incident",
+        "review_incident",
         "stop_incident_follow",
     }
 )
@@ -215,8 +218,9 @@ class EvaAgentToolAdapter:
             if name in {
                 "get_incident",
                 "draft_incident",
-                "follow_incident",
-                "stop_incident_follow",
+        "follow_incident",
+        "review_incident",
+        "stop_incident_follow",
             }:
                 # Ownership/revision/digest bindings are resolved by the
                 # adapter and never entrusted to the model.
@@ -355,6 +359,7 @@ class EvaAgentToolAdapter:
             "get_incident": 32_000,
             "draft_incident": 32_000,
             "follow_incident": 8_000,
+            "review_incident": 8_000,
             "stop_incident_follow": 8_000,
         }.get(name, 96_000)
 
@@ -653,6 +658,7 @@ class EvaAgentToolAdapter:
             "get_incident",
             "draft_incident",
             "follow_incident",
+            "review_incident",
             "stop_incident_follow",
         }:
             required = _TOOL_PERMISSIONS[name].value
@@ -952,6 +958,7 @@ class EvaAgentToolAdapter:
             "get_incident",
             "draft_incident",
             "follow_incident",
+            "review_incident",
             "stop_incident_follow",
         }:
             return
@@ -1025,7 +1032,7 @@ class EvaAgentToolAdapter:
                 "incident has no channel ownership metadata"
             )
         arguments["channel_ids"] = channel_ids
-        if name in {"follow_incident", "stop_incident_follow"}:
+        if name in {"follow_incident", "review_incident", "stop_incident_follow"}:
             revision = incident.get("revision")
             try:
                 revision = int(revision)
@@ -1038,6 +1045,40 @@ class EvaAgentToolAdapter:
                     "incident has no valid optimistic revision"
                 )
             arguments["expected_revision"] = revision
+        if name == "review_incident":
+            action = str(arguments.get("action") or "").strip().lower()
+            allowed_actions = {
+                "confirm",
+                "resolve",
+                "dismiss",
+                "false_positive",
+                "reopen",
+                "confirm_series",
+                "reject_series",
+            }
+            if action not in allowed_actions:
+                raise InvalidToolArgumentsError(
+                    "review_incident action is not supported"
+                )
+            if action in {"confirm_series", "reject_series"}:
+                relation_id = str(arguments.get("relation_id") or "").strip()
+                if not relation_id:
+                    raise InvalidToolArgumentsError(
+                        "relation_id is required for series review"
+                    )
+                temporal = service.temporal_context(incident)
+                candidate_ids = {
+                    str(item.get("relation_id") or "")
+                    for item in temporal.get("series_links") or []
+                    if isinstance(item, Mapping)
+                    and str(item.get("relation_state") or "") == "candidate"
+                }
+                if relation_id not in candidate_ids:
+                    raise InvalidToolArgumentsError(
+                        "relation_id is not an active candidate series link"
+                    )
+            else:
+                arguments.pop("relation_id", None)
 
     def _resolve_update_probe_channel(self, arguments: dict[str, Any]) -> None:
         probes = self._legacy_tools._ps.list_probes()

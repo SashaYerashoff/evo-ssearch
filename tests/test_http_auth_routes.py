@@ -505,6 +505,69 @@ class HttpAuthRouteTests(unittest.TestCase):
             )
         )
 
+    def test_incident_id_routes_enforce_resolved_channel_scope(self) -> None:
+        self.repository.identity = _Identity(
+            permissions=frozenset(
+                {
+                    Permission.DATA_EXPORT.value,
+                    Permission.INCIDENTS_MANAGE.value,
+                    Permission.REPORTS_VIEW.value,
+                }
+            ),
+            allowed_channel_ids=frozenset({7}),
+        )
+        self.repository.users[USER_ID] = self.repository.identity
+        _, csrf_token = self._login()
+
+        incident_id = "00000000-0000-0000-0000-000000000117"
+        foreign_store = SimpleNamespace(
+            get_incident=lambda requested_id: (
+                {
+                    "id": incident_id,
+                    "primary_channel_id": 8,
+                    "channel_ids": [8],
+                }
+                if requested_id == incident_id
+                else None
+            )
+        )
+        requests = (
+            ("get", f"/incidents/{incident_id}", {}),
+            ("get", f"/incidents/{incident_id}/observations", {}),
+            ("get", f"/incidents/{incident_id}/temporal", {}),
+            ("get", f"/incidents/{incident_id}/export?format=md", {}),
+            (
+                "post",
+                f"/incidents/{incident_id}/follow",
+                {"json": {"mode": "follow", "ttl_seconds": 300}},
+            ),
+            ("post", f"/incidents/{incident_id}/stop-follow", {"json": {}}),
+            (
+                "post",
+                f"/incidents/{incident_id}/review",
+                {"json": {"action": "confirm"}},
+            ),
+            (
+                "post",
+                f"/incidents/{incident_id}/series/"
+                "00000000-0000-0000-0000-000000000118/review",
+                {"json": {"action": "confirm"}},
+            ),
+        )
+        with patch.object(oldapp, "incident_store", foreign_store):
+            for method, path, kwargs in requests:
+                if method == "post":
+                    kwargs = {
+                        **kwargs,
+                        "headers": {"X-CSRF-Token": csrf_token},
+                    }
+                response = getattr(self.client, method)(path, **kwargs)
+                self.assertEqual(
+                    response.status_code,
+                    403,
+                    (path, response.get_json(silent=True)),
+                )
+
     def test_probe_cast_checks_every_selected_channel(self) -> None:
         _, csrf_token = self._login()
 
@@ -1098,7 +1161,14 @@ class HttpAuthRouteTests(unittest.TestCase):
 
         missing_scope = self.client.get("/detections/list")
         forbidden_scope = self.client.get("/detections/list?channel_id=8")
-        allowed_scope = self.client.get("/detections/list?channel_id=7")
+        # PostgreSQL archive storage intentionally fails closed when the test
+        # environment has no database. Isolate this authorization contract
+        # from storage availability for the authorized request.
+        with patch(
+            "oldapp.detections_store.list_detections",
+            return_value=([], 0),
+        ):
+            allowed_scope = self.client.get("/detections/list?channel_id=7")
 
         self.assertEqual(missing_scope.status_code, 403)
         self.assertEqual(forbidden_scope.status_code, 403)

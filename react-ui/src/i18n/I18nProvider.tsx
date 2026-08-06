@@ -92,6 +92,18 @@ const EN = {
   'video.summaries': 'Stream summaries',
   'video.noChannel': 'No channel',
   'video.noSummaries': 'No summaries yet for this channel.',
+  'incident.review': 'Incident review',
+  'incident.tabSummary': 'Active · needs review · history',
+  'incident.tabHelp': 'Review concurrent incident lifecycles without loading their full evidence until opened.',
+  'incident.reviewHelp': 'Current focus, unresolved cases, and closed incident history across selected streams.',
+  'incident.active': 'Active',
+  'incident.needsReview': 'Needs review',
+  'incident.history': 'History',
+  'incident.allChannels': 'All channels',
+  'incident.last24h': 'Last 24 hours',
+  'incident.allTime': 'All time',
+  'incident.loading': 'Loading incident ledger…',
+  'incident.empty': 'No incidents in this queue for the selected scope.',
 } as const
 
 type TranslationKey = keyof typeof EN
@@ -183,6 +195,18 @@ const LV: Record<TranslationKey, string> = {
   'video.summaries': 'Straumju kopsavilkumi',
   'video.noChannel': 'Kanāls nav izvēlēts',
   'video.noSummaries': 'Šim kanālam vēl nav kopsavilkumu.',
+  'incident.review': 'Incidentu pārskats',
+  'incident.tabSummary': 'Aktīvi · jāpārskata · vēsture',
+  'incident.tabHelp': 'Pārskatiet vienlaicīgu incidentu dzīves ciklus, pilnos pierādījumus ielādējot tikai pēc atvēršanas.',
+  'incident.reviewHelp': 'Aktīvais fokuss, neatrisinātie gadījumi un slēgto incidentu vēsture izvēlētajās straumēs.',
+  'incident.active': 'Aktīvi',
+  'incident.needsReview': 'Jāpārskata',
+  'incident.history': 'Vēsture',
+  'incident.allChannels': 'Visi kanāli',
+  'incident.last24h': 'Pēdējās 24 stundas',
+  'incident.allTime': 'Viss periods',
+  'incident.loading': 'Ielādē incidentu žurnālu…',
+  'incident.empty': 'Šajā rindā izvēlētajam tvērumam nav incidentu.',
 }
 
 interface I18nContextValue {

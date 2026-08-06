@@ -54,11 +54,11 @@ def _expected_version() -> str:
         text = (REPO_ROOT / "VERSION").read_text(encoding="utf-8").strip()
     except OSError:
         text = ""
-    return text or "β 0.8.5"
+    return text or "β 0.8.7"
 
 
 EXPECTED_VERSION = _expected_version()
-EXPECTED_SCHEMA = "20260801_0011"
+EXPECTED_SCHEMA = "20260805_0013"
 DEFAULT_APP_DIR = Path("/opt/eva-ai/evo-ssearch")
 DEFAULT_ENV_FILE = Path("/etc/eva-ai/eva-ai.env")
 DEFAULT_BACKUP_ROOT = Path("/var/backups/eva-ai")
@@ -69,7 +69,9 @@ _ENV_KEY_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 _SECRET_MARKERS = ("PASSWORD", "SECRET", "TOKEN", "API_KEY", "DSN", "DATABASE_URL")
 _VLM_ENDPOINT_RE = re.compile(r"^EVOSSEARCH_LM_PROFILE_(?!AGENT(?:_|$)).+_BASE_URL$")
 _ENV_REFERENCE_RE = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}")
-_INSTALLER_MANAGED_ENV_KEYS = frozenset({"EVOSSEARCH_APP_VERSION"})
+_INSTALLER_MANAGED_ENV_KEYS = frozenset(
+    {"EVOSSEARCH_APP_VERSION", "EVOSSEARCH_UI_MODE"}
+)
 
 
 class InstallerError(RuntimeError):
@@ -329,7 +331,7 @@ def render_env_update(raw: str, updates: Mapping[str, str]) -> str:
     if pending_updates:
         if content:
             content += "\n"
-        content += "# Added by EVA AI 0.8.3 offline installer; existing keys were preserved.\n"
+        content += "# Added by the EVA AI universal offline installer; existing site keys were preserved.\n"
         for key, value in pending_updates.items():
             if not _ENV_KEY_RE.fullmatch(key):
                 raise InstallerError(f"Unsafe environment key: {key!r}")
@@ -458,14 +460,18 @@ def prepare_env_values(
     for key, value in defaults.items():
         add_missing(key, value)
 
-    # The release identity belongs to the installed code, not to site
-    # configuration.  It is the sole reviewed key that an adopt upgrade may
-    # replace; all operational settings remain preserve/append-only.
-    if "EVOSSEARCH_APP_VERSION" in resolution.existing:
-        current_version = str(values.get("EVOSSEARCH_APP_VERSION") or "").strip()
-        if current_version != EXPECTED_VERSION:
-            values["EVOSSEARCH_APP_VERSION"] = EXPECTED_VERSION
-            updates["EVOSSEARCH_APP_VERSION"] = EXPECTED_VERSION
+    # Release identity and the accepted console belong to installed code, not
+    # site topology.  Model endpoints, channels, credentials and tenant values
+    # remain preserve/append-only.  The legacy console remains available at
+    # /?ui=legacy for emergency recovery.
+    managed = {
+        "EVOSSEARCH_APP_VERSION": EXPECTED_VERSION,
+        "EVOSSEARCH_UI_MODE": "react",
+    }
+    for key, expected in managed.items():
+        if str(values.get(key) or "").strip() != expected:
+            values[key] = expected
+            updates[key] = expected
 
     for spec in _PROMPTS:
         if spec.key == "EVOSSEARCH_LM_PROFILE_AGENT_BASE_URL" and _has_agent_endpoint(values):

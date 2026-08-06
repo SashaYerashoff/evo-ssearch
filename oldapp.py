@@ -101,6 +101,7 @@ from incident_service import (
     incident_report_xml,
 )
 from incident_commands import IncidentCommandService
+from incident_maintenance import IncidentMaintenanceWorker
 from incident_store import (
     IncidentRevisionConflict,
     IncidentStoreNotReady,
@@ -345,6 +346,8 @@ _MUTATION_ENDPOINT_PERMISSIONS: Dict[str, Optional[Permission]] = {
     "incident_draft": Permission.INCIDENTS_MANAGE,
     "incident_follow": Permission.INCIDENTS_MANAGE,
     "incident_stop_follow": Permission.INCIDENTS_MANAGE,
+    "incident_review": Permission.INCIDENTS_MANAGE,
+    "incident_series_review": Permission.INCIDENTS_MANAGE,
     "save_settings": Permission.SETTINGS_MANAGE,
     "save_settings_env": Permission.SETTINGS_MANAGE,
 }
@@ -373,7 +376,10 @@ _SENSITIVE_ENDPOINT_PERMISSIONS: Dict[str, Permission] = {
     "alert_feedback": Permission.DETECTIONS_VIEW,
     "false_positive_report": Permission.REPORTS_VIEW,
     "false_positive_report_export": Permission.DATA_EXPORT,
+    "incident_list": Permission.REPORTS_VIEW,
     "incident_detail": Permission.REPORTS_VIEW,
+    "incident_observations": Permission.REPORTS_VIEW,
+    "incident_temporal_context": Permission.REPORTS_VIEW,
     "incident_export": Permission.DATA_EXPORT,
     "luxriot_channels": Permission.STREAMS_VIEW,
     "luxriot_prompt_settings": Permission.STREAMS_VIEW,
@@ -982,7 +988,11 @@ def _request_channel_ids() -> Set[int]:
         "incident_detail",
         "incident_export",
         "incident_follow",
+        "incident_observations",
+        "incident_review",
+        "incident_series_review",
         "incident_stop_follow",
+        "incident_temporal_context",
     }:
         channel_ids.update(
             _incident_channel_ids_for_request_value(view_args.get("incident_id"))
@@ -2943,7 +2953,7 @@ def _incident_store_not_ready_response(exc: Exception):
                 "migration before reporting incidents."
             ),
             "not_ready": "incident_store",
-            "required_revision": "20260801_0011",
+            "required_revision": "20260805_0012",
         }
     ), 503
 
@@ -2970,6 +2980,88 @@ def _incident_command_service() -> IncidentCommandService:
         _attention_store,
         luxriot_manager,
         draft_assembler_factory=IncidentDraftAssembler,
+    )
+
+
+def _incident_query_values(name: str) -> List[str]:
+    values: List[str] = []
+    for raw in request.args.getlist(name):
+        for item in str(raw or "").split(","):
+            normalized = item.strip()
+            if normalized and normalized not in values:
+                values.append(normalized)
+    return values
+
+
+@app.route('/incidents', methods=['GET'])
+def incident_list():
+    try:
+        view = str(request.args.get("view") or "full").strip().lower()
+        if view not in {"full", "review"}:
+            raise ValueError("view must be full or review")
+        channel_ids = [
+            int(value)
+            for value in _incident_query_values("channel_id")
+            if int(value) > 0
+        ]
+        context = _current_auth_context()
+        scoped_request_without_match = False
+        if context is not None and _is_channel_scoped(context):
+            allowed = {
+                int(value)
+                for value in context.allowed_channel_ids
+                if _to_optional_int(value) is not None and int(value) > 0
+            }
+            if channel_ids:
+                channel_ids = [value for value in channel_ids if value in allowed]
+                scoped_request_without_match = not channel_ids
+            else:
+                channel_ids = sorted(allowed)
+        since_ms = _incident_timestamp_ms(request.args.get("from_ts"), "from_ts")
+        until_ms = _incident_timestamp_ms(request.args.get("to_ts"), "to_ts")
+        limit = max(1, min(500, int(request.args.get("limit") or 100)))
+        offset = max(0, int(request.args.get("offset") or 0))
+        if scoped_request_without_match:
+            records, total = [], 0
+        else:
+            records, total = incident_store.list_incidents(
+                channel_ids=channel_ids or None,
+                states=_incident_query_values("state") or None,
+                perception_states=_incident_query_values("perception_state") or None,
+                risk_states=_incident_query_values("risk_state") or None,
+                case_states=_incident_query_values("case_state") or None,
+                attention_states=_incident_query_values("attention_state") or None,
+                since_ms=since_ms,
+                until_ms=until_ms,
+                limit=limit,
+                offset=offset,
+            )
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
+    except (IncidentStoreNotReady, ArchiveStoreNotReady) as exc:
+        return _incident_store_not_ready_response(exc)
+    except Exception:
+        app.logger.exception(
+            "Incident list failed request_id=%s", getattr(g, "request_id", "")
+        )
+        return jsonify({"error": "incident_list_failed"}), 500
+    service = _incident_command_service()
+    records = [service.reconcile_expired_follow(record) for record in records]
+    public_records = [
+        service.public_review_record(record) if view == "review" else service.public_record(record)
+        for record in records
+    ]
+    return jsonify(
+        {
+            "success": True,
+            "view": view,
+            "incidents": public_records,
+            "total": int(total),
+            "limit": limit,
+            "offset": offset,
+            "attention": luxriot_manager.incident_focus_status(),
+            "maintenance": incident_maintenance.status(),
+        }
     )
 
 
@@ -3027,7 +3119,8 @@ def incident_draft():
 @app.route('/incidents/<incident_id>', methods=['GET'])
 def incident_detail(incident_id: str):
     try:
-        incident = _incident_command_service().get(incident_id)
+        service = _incident_command_service()
+        incident = service.reconcile_expired_follow(service.get(incident_id))
     except ValueError as exc:
         return jsonify({"error": str(exc)}), 400
     except LookupError:
@@ -3038,6 +3131,68 @@ def incident_detail(incident_id: str):
         app.logger.exception("Incident load failed request_id=%s", getattr(g, "request_id", ""))
         return jsonify({"error": "incident_load_failed"}), 500
     return jsonify({"success": True, "incident": _incident_command_service().public_record(incident)})
+
+
+@app.route('/incidents/<incident_id>/observations', methods=['GET'])
+def incident_observations(incident_id: str):
+    try:
+        service = _incident_command_service()
+        incident = service.reconcile_expired_follow(service.get(incident_id))
+        limit = max(1, min(2000, int(request.args.get("limit") or 250)))
+        offset = max(0, int(request.args.get("offset") or 0))
+        since_ms = _incident_timestamp_ms(request.args.get("from_ts"), "from_ts")
+        until_ms = _incident_timestamp_ms(request.args.get("to_ts"), "to_ts")
+        observations, total = incident_store.list_observations(
+            incident_id,
+            since_ms=since_ms,
+            until_ms=until_ms,
+            source_kind=(str(request.args.get("source_kind") or "").strip() or None),
+            limit=limit,
+            offset=offset,
+        )
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
+    except LookupError:
+        return jsonify({"error": "incident_not_found"}), 404
+    except (IncidentStoreNotReady, ArchiveStoreNotReady) as exc:
+        return _incident_store_not_ready_response(exc)
+    except Exception:
+        app.logger.exception(
+            "Incident observations failed request_id=%s",
+            getattr(g, "request_id", ""),
+        )
+        return jsonify({"error": "incident_observations_failed"}), 500
+    return jsonify(
+        {
+            "success": True,
+            "incident_id": str(incident.get("id") or incident_id),
+            "observations": observations,
+            "total": int(total),
+            "limit": limit,
+            "offset": offset,
+        }
+    )
+
+
+@app.route('/incidents/<incident_id>/temporal', methods=['GET'])
+def incident_temporal_context(incident_id: str):
+    try:
+        service = _incident_command_service()
+        incident = service.reconcile_expired_follow(service.get(incident_id))
+        temporal = service.temporal_context(incident)
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
+    except LookupError:
+        return jsonify({"error": "incident_not_found"}), 404
+    except (IncidentStoreNotReady, ArchiveStoreNotReady) as exc:
+        return _incident_store_not_ready_response(exc)
+    except Exception:
+        app.logger.exception(
+            "Incident temporal context failed request_id=%s",
+            getattr(g, "request_id", ""),
+        )
+        return jsonify({"error": "incident_temporal_context_failed"}), 500
+    return jsonify({"success": True, **temporal})
 
 
 @app.route('/incidents/<incident_id>/follow', methods=['POST'])
@@ -3122,6 +3277,107 @@ def incident_stop_follow(incident_id: str):
     return jsonify({"success": True, "incident": _incident_command_service().public_record(updated)})
 
 
+@app.route('/incidents/<incident_id>/review', methods=['POST'])
+def incident_review(incident_id: str):
+    guard = _mutation_guard_error()
+    if guard is not None:
+        return guard
+    data = _json_body()
+    action = str(data.get("action") or "").strip().lower()
+    note = str(data.get("note") or "")
+    try:
+        expected_revision = _to_optional_int(data.get("expected_revision"))
+        updated = _incident_command_service().review_incident(
+            incident_id,
+            actor_id=_feedback_actor_id(),
+            action=action,
+            expected_revision=expected_revision,
+            note=note,
+        )
+        channel_ids = [int(value) for value in updated.get("channel_ids") or []]
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
+    except LookupError:
+        return jsonify({"error": "incident_not_found"}), 404
+    except IncidentRevisionConflict as exc:
+        return jsonify({"error": "incident_revision_conflict", "revision": exc.actual_revision}), 409
+    except (IncidentStoreNotReady, ArchiveStoreNotReady) as exc:
+        return _incident_store_not_ready_response(exc)
+    except Exception:
+        app.logger.exception("Incident review failed request_id=%s", getattr(g, "request_id", ""))
+        return jsonify({"error": "incident_review_failed"}), 500
+    audit_error = _write_completion_audit_or_error(
+        action=f"incident.review.{action}",
+        target_type="incident",
+        target_id=incident_id,
+        channel_id=channel_ids[0] if len(channel_ids) == 1 else None,
+        details={
+            "case_state": str(updated.get("case_state") or "unknown"),
+            "risk_state": str(updated.get("risk_state") or "unknown"),
+            "note_present": bool(note.strip()),
+            **_audit_key_details("channel_ids", channel_ids),
+        },
+    )
+    if audit_error is not None:
+        return audit_error
+    return jsonify({"success": True, "incident": _incident_command_service().public_record(updated)})
+
+
+@app.route('/incidents/<incident_id>/series/<relation_id>/review', methods=['POST'])
+def incident_series_review(incident_id: str, relation_id: str):
+    guard = _mutation_guard_error()
+    if guard is not None:
+        return guard
+    data = _json_body()
+    action = str(data.get("action") or "").strip().lower()
+    note = str(data.get("note") or "")
+    try:
+        service = _incident_command_service()
+        reviewed = service.review_series_relation(
+            incident_id,
+            relation_id,
+            actor_id=_feedback_actor_id(),
+            action=action,
+            note=note,
+        )
+        incident = service.get(incident_id)
+        temporal = service.temporal_context(incident)
+        channel_ids = [int(value) for value in incident.get("channel_ids") or []]
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
+    except LookupError:
+        return jsonify({"error": "incident_relation_not_found"}), 404
+    except (IncidentStoreNotReady, ArchiveStoreNotReady) as exc:
+        return _incident_store_not_ready_response(exc)
+    except Exception:
+        app.logger.exception(
+            "Incident series review failed request_id=%s",
+            getattr(g, "request_id", ""),
+        )
+        return jsonify({"error": "incident_series_review_failed"}), 500
+    audit_error = _write_completion_audit_or_error(
+        action=f"incident.series.{action}",
+        target_type="incident_relation",
+        target_id=relation_id,
+        channel_id=channel_ids[0] if len(channel_ids) == 1 else None,
+        details={
+            "incident_id": incident_id,
+            "relation_state": str(reviewed.get("relation_state") or "unknown"),
+            "note_present": bool(note.strip()),
+            **_audit_key_details("channel_ids", channel_ids),
+        },
+    )
+    if audit_error is not None:
+        return audit_error
+    return jsonify(
+        {
+            "success": True,
+            "relation": reviewed,
+            "temporal": temporal,
+        }
+    )
+
+
 @app.route('/incidents/<incident_id>/export', methods=['GET'])
 def incident_export(incident_id: str):
     export_format = str(request.args.get("format") or "md").strip().lower()
@@ -3138,7 +3394,12 @@ def incident_export(incident_id: str):
     except Exception:
         app.logger.exception("Incident export failed request_id=%s", getattr(g, "request_id", ""))
         return jsonify({"error": "incident_export_failed"}), 500
-    public = _incident_command_service().public_record(incident)
+    service = _incident_command_service()
+    public = service.public_record(incident)
+    # The report is a portable incident record, not merely the original draft.
+    # Include the bounded effective projection of the append-only temporal
+    # ledgers so lifecycle decisions and recurrence review survive export.
+    public["temporal_memory"] = service.temporal_context(incident)
     date_label = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     content = incident_report_xml(public) if export_format == "xml" else incident_report_markdown(public)
     response = Response(
@@ -5172,6 +5433,7 @@ except Exception:
 probe_manager = ProbeManager(
     embed_image_fn=get_probe_image_embedding_from_pil,
     embed_text_fn=get_probe_text_embedding,
+    embed_texts_fn=_clip_text_embeddings,
     jpeg_encoder=_encode_jpeg,
     embed_image_with_metadata_fn=get_probe_image_embedding_with_space,
     embedding_space_fn=get_probe_embedding_space,
@@ -5357,6 +5619,167 @@ def _build_incident_store() -> Any:
 
 
 incident_store = _build_incident_store()
+incident_maintenance = IncidentMaintenanceWorker(
+    incident_store,
+    _incident_command_service,
+    interval_sec=float(getattr(config, "INCIDENT_MAINTENANCE_INTERVAL_SEC", 15.0)),
+    batch_size=int(getattr(config, "LUXRIOT_INCIDENT_TRACKED_LIMIT", 64)),
+)
+if bool(getattr(config, "INCIDENT_MAINTENANCE_ENABLED", True)):
+    incident_maintenance.start()
+
+
+def _append_l0_incident_observations(
+    channel_id: int,
+    heartbeat: Mapping[str, Any],
+) -> Dict[str, Any]:
+    """Persist one replay-safe heartbeat for every followed incident on a channel.
+
+    The heartbeat intentionally keeps perception ``unknown``: a live batch is
+    evidence about the channel, not proof that it depicts each parallel
+    incident. Incident-specific perception changes require grounded episode
+    association or operator review.
+    """
+
+    batch_id = str(heartbeat.get("batch_id") or "").strip()
+    if not batch_id:
+        return {"attempted": 0, "inserted": 0, "skipped": "missing_batch_id"}
+    service = _incident_command_service()
+    automatic: Dict[str, Any]
+    try:
+        temporal_rows = luxriot_manager._l0_temporal_observations(
+            channel_id=int(channel_id),
+            source_batch_id=batch_id,
+            batch_state=(
+                heartbeat.get("batch_state")
+                if isinstance(heartbeat.get("batch_state"), Mapping)
+                else {}
+            ),
+            batch_start_ms=int(heartbeat.get("batch_start_ms") or 0),
+            batch_end_ms=int(heartbeat.get("batch_end_ms") or 0),
+            coverage_gap=bool(heartbeat.get("coverage_gap")),
+        )
+        automatic = service.ingest_l0_temporal_observations(
+            int(channel_id),
+            heartbeat,
+            temporal_rows,
+            max_new_incidents=4,
+            tracked_limit=int(getattr(config, "LUXRIOT_INCIDENT_TRACKED_LIMIT", 64)),
+        )
+    except Exception as exc:
+        automatic = {
+            "supported": True,
+            "created": 0,
+            "associated": 0,
+            "ended": 0,
+            "error": type(exc).__name__,
+        }
+    incidents, total = incident_store.list_incidents(
+        channel_ids=[int(channel_id)],
+        states=["following"],
+        limit=100,
+    )
+    reconciled_incidents = [service.reconcile_expired_follow(incident) for incident in incidents]
+    directive = luxriot_manager.incident_focus_for_channel(int(channel_id))
+    hot_ids = (
+        set(directive.hot_incident_ids)
+        if directive is not None
+        else set()
+    )
+    inserted = 0
+    failures: List[str] = []
+    for incident in reconciled_incidents:
+        incident_id = str(incident.get("id") or "").strip()
+        follow_policy = (
+            incident.get("follow_policy")
+            if isinstance(incident.get("follow_policy"), Mapping)
+            else {}
+        )
+        if (
+            not incident_id
+            or incident_id not in hot_ids
+            or follow_policy.get("active") is not True
+        ):
+            continue
+        association = service.observation_for_heartbeat(incident, heartbeat)
+        vector_signal = (
+            heartbeat.get("vector_signal")
+            if isinstance(heartbeat.get("vector_signal"), Mapping)
+            else {}
+        )
+        capture_attention = (
+            vector_signal.get("capture_attention")
+            if isinstance(vector_signal.get("capture_attention"), Mapping)
+            else {}
+        )
+        seconds = [
+            item
+            for item in capture_attention.get("seconds") or []
+            if isinstance(item, Mapping)
+        ]
+        activity_values = [
+            float(item.get("activity_x"))
+            for item in seconds
+            if _to_optional_float(item.get("activity_x")) is not None
+        ]
+        run_id = str(follow_policy.get("run_id") or "").strip()
+        try:
+            incident_store.append_observation(
+                {
+                    "incident_id": incident_id,
+                    "idempotency_key": f"l0:{batch_id}",
+                    "source_kind": "vlm_l0_heartbeat",
+                    "observed_at_ms": int(
+                        heartbeat.get("batch_end_ms")
+                        or heartbeat.get("batch_start_ms")
+                        or int(time.time() * 1000.0)
+                    ),
+                    "channel_id": int(channel_id),
+                    "perception_state": str(association.get("perception_state") or "unknown"),
+                    "source_ref": {
+                        "batch_id": batch_id,
+                        "batch_start_ms": heartbeat.get("batch_start_ms"),
+                        "batch_end_ms": heartbeat.get("batch_end_ms"),
+                        "follow_run_id": run_id or None,
+                        "follow_relationship": str(follow_policy.get("relationship") or "continuation"),
+                    },
+                    "payload": {
+                        "batch_state": dict(heartbeat.get("batch_state") or {}),
+                        "coverage_gap": bool(heartbeat.get("coverage_gap")),
+                        "gap_reason": str(heartbeat.get("gap_reason") or "")[:160],
+                        "association": str(association.get("association") or "neutral"),
+                        "matched_keys": list(association.get("matched_keys") or [])[:12],
+                        "homeostasis": {
+                            "sample_count": len(seconds),
+                            "activity_x_max": max(activity_values, default=0.0),
+                            "activity_x_mean": (
+                                sum(activity_values) / len(activity_values)
+                                if activity_values else 0.0
+                            ),
+                            "burst_count": sum(
+                                str(item.get("mode") or "").strip().lower() == "burst"
+                                for item in seconds
+                            ),
+                        },
+                    },
+                }
+            )
+            inserted += 1
+        except Exception as exc:
+            failures.append(f"{incident_id}:{type(exc).__name__}")
+    return {
+        "attempted": len(incidents),
+        "inserted": inserted,
+        "matching_incidents": int(total),
+        "hot_eligible": len(hot_ids),
+        "failures": failures[:8],
+        "automatic_candidates": automatic,
+    }
+
+
+luxriot_manager.set_incident_observation_callback(
+    _append_l0_incident_observations
+)
 semantic_snapshot_writer: Optional[SemanticSnapshotArchiveWriter] = None
 if bool(getattr(config, "SEMANTIC_SNAPSHOT_ARCHIVE_ENABLED", True)):
     semantic_snapshot_writer = SemanticSnapshotArchiveWriter(
@@ -10232,6 +10655,9 @@ def _vlm_summary_frame_records(entry: Mapping[str, Any]) -> Tuple[List[Dict[str,
         "batch_cover": batch_cover,
         "latency_trace": dict(entry.get("latency_trace") or {})
         if isinstance(entry.get("latency_trace"), Mapping)
+        else {},
+        "llm_input_stats": dict(entry.get("llm_input_stats") or {})
+        if isinstance(entry.get("llm_input_stats"), Mapping)
         else {},
         "attention_episode_id": str(entry.get("attention_episode_id") or "") or None,
         "attention_phase": str(entry.get("attention_phase") or "") or None,
@@ -15809,20 +16235,30 @@ def luxriot_summary_history():
     if from_ts is not None and to_ts is not None and from_ts > to_ts:
         from_ts, to_ts = to_ts, from_ts
     try:
-        logs, total = detections_store.list_vlm_summary_batches(
+        history_result = detections_store.list_vlm_summary_batches(
             channel_id=channel_id,
             since_ms=int(from_ts * 1000.0) if from_ts is not None else None,
             until_ms=int(to_ts * 1000.0) if to_ts is not None else None,
             limit=limit,
             offset=offset,
+            return_page_info=True,
         )
+        if len(history_result) == 3:
+            logs, total, page_info = history_result
+        else:
+            logs, total = history_result
+            page_info = {
+                'has_more': offset + len(logs) < total,
+                'total_exact': True,
+            }
         return jsonify(
             {
                 'logs': logs,
                 'total': total,
                 'limit': limit,
                 'offset': offset,
-                'has_more': offset + len(logs) < total,
+                'has_more': bool(page_info.get('has_more')),
+                'total_exact': bool(page_info.get('total_exact', True)),
                 'channel_id': channel_id,
                 'from_ts': from_ts,
                 'to_ts': to_ts,
@@ -16750,7 +17186,10 @@ def _probe_channel_group_scope_error(
 
 @app.route('/probes/list', methods=['GET'])
 def probes_list():
-    probes = probes_store.list_probes()
+    try:
+        probes = probes_store.list_probes()
+    except ArchiveStoreNotReady as exc:
+        return _archive_store_not_ready_response(exc)
     context = _current_auth_context()
     if _auth_enabled() and context is not None:
         probes = [
@@ -16778,10 +17217,14 @@ def probes_list():
             continue
         active_probes.append(probe)
     probes = active_probes
+    try:
+        channel_groups = _visible_probe_channel_groups(context)
+    except ArchiveStoreNotReady as exc:
+        return _archive_store_not_ready_response(exc)
     response = jsonify(
         {
             'probes': probes,
-            'channel_groups': _visible_probe_channel_groups(context),
+            'channel_groups': channel_groups,
             'defaults': {
                 'pos_floor': float(config.PROBE_POS_FLOOR_DEFAULT),
                 'margin': float(config.PROBE_MARGIN_DEFAULT),
@@ -19350,6 +19793,10 @@ def _shutdown_background_workers() -> None:
     global _identity_repository
     global _inference_queue_runtime, _inference_worker_db_pool
     global _attention_writer, _live_clip_batcher, semantic_snapshot_writer
+    try:
+        incident_maintenance.stop(timeout=2.0)
+    except Exception:
+        pass
     try:
         realtime_probe_bookmarks.shutdown()
         fast_vlm_alerts.shutdown()

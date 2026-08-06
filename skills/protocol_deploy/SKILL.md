@@ -42,7 +42,9 @@ Tools:
    for the fastest possible setup.
    - Treat its scene fingerprints as provisional visual observations.
    - Do not infer identity, intent, ownership, or a security rule from them.
-5. Ask one compact requirements question covering:
+5. Ask for requirements one configured group at a time; ungrouped channels are
+   individual scopes. The React survey card may send the operator's scope choice
+   back into chat. For the current scope, ask one compact question covering:
    - expected visible routine for each channel/group;
    - concrete visible alert conditions and their severities;
    - response to otherwise-unexpected visible activity:
@@ -53,7 +55,9 @@ Tools:
    - for maritime deployments, whether the reviewed role-specific starter set
      should be included with `starter_policy_mode=shadow`.
 6. Translate only the operator's answer into `requirements` and `quiet_window`,
-   then call `configure_deployment` again.
+   then call `configure_deployment` again. A `requirements_partial` receipt means
+   the accepted scopes are durable: ask only for
+   `missing_requirement_channel_ids`, never repeat channel selection or survey.
    - Alert descriptions belong to VLM Alert Criteria, not the L0 role prompt.
    - CLIP `positive_query` and `contrast_query` must describe two visible
      alternatives. Do not use literal negation such as “no person”.
@@ -62,9 +66,13 @@ Tools:
    - The quiet window is a preferred admission window, not a blind period:
      live L0 monitoring continues, and 9B work is preempted/deferred by active
      incidents or attention debt.
-7. Call `apply_deployment_plan` with `preview=true`,
+7. After every selected channel has a requirement pack (an empty alert list is
+   valid when the operator explicitly chose no defaults), call
+   `apply_deployment_plan` with `preview=true`,
    `commissioning_after_minutes=15`, and the operator's `start_live` choice.
-   Summarize its bounded diff and ask the operator to use the UI Apply action.
+   The React approval card walks scope by scope through VLM Alert Criteria and
+   then its proposed probes/counters. Summarize its bounded diff and ask the
+   operator to use the card's final `Apply deployment` action.
    Never call it with `preview=false`.
 8. After Apply, call `get_deployment_status` when asked for progress. The
    server owns the timer and resumes it after EVA restarts.

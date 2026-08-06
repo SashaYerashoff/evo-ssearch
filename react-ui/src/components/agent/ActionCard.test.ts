@@ -1,7 +1,129 @@
 import { describe, expect, it } from 'vitest'
-import { actionTables } from './ActionCard'
+import { createElement } from 'react'
+import { renderToStaticMarkup } from 'react-dom/server'
+import { ActionCard, actionTables, deploymentInventoryChannels, deploymentScopeSelectionMessage } from './ActionCard'
 
 describe('agent action card structures', () => {
+  it('restores the complete authorized deployment picker after history reload', () => {
+    const result = {
+      available_channel_count: 4,
+      available_channel_ids: [11, 12, 13, 14],
+      available_channels: [
+        { id: 11, title: 'Gate' },
+        { id: 12, title: 'Beach' },
+      ],
+    }
+    const channels = deploymentInventoryChannels(result, [
+      { id: 11, title: 'Gate current' },
+      { id: 12, title: 'Beach current' },
+      { id: 13, title: 'Fairway' },
+      { id: 14, title: 'Harbour wall' },
+      { id: 99, title: 'Unauthorized for this inventory' },
+    ])
+
+    expect(channels.map((channel) => channel.id)).toEqual([11, 12, 13, 14])
+    expect(channels.map((channel) => channel.title)).toEqual([
+      'Gate', 'Beach', 'Fairway', 'Harbour wall',
+    ])
+  })
+
+  it('requires closed maritime roles in the deployment inventory card', () => {
+    const markup = renderToStaticMarkup(createElement(ActionCard, {
+        action: {
+          id: 1,
+          name: 'start_deployment',
+          result: {
+            deployment_id: 'deploy-port-1',
+            deployment_profile: 'maritime',
+            stage: 'inventory',
+            target_channel_count: 8,
+            available_channel_ids: [41],
+            available_channels: [{ id: 41, title: 'North gate' }],
+          },
+        },
+        onThumb: () => undefined,
+        onApply: () => undefined,
+        onSend: () => undefined,
+      }))
+
+    expect(markup).toContain('North gate')
+    expect(markup).toContain('A maritime role is required for every selected channel')
+    expect(deploymentScopeSelectionMessage(
+      { deployment_id: 'deploy-port-1', deployment_profile: 'maritime' },
+      [41, 42],
+      { 41: 'gates', 42: 'gates' },
+      {
+        41: { role: 'maritime_gate', location: 'Ventspils north gate' },
+        42: { role: 'maritime_mixed_ptz', location: 'West coast' },
+      },
+    )).toBe(
+      'Continue Protocol Deploy deploy-port-1. Select channels 41, 42; '
+      + 'group gates: 41; group gates: 42; '
+      + 'CH 41 role maritime_gate location "Ventspils north gate"; '
+      + 'CH 42 role maritime_mixed_ptz location "West coast"',
+    )
+  })
+
+  it('requires an explicit maritime starter-watch choice before scope review', () => {
+    const markup = renderToStaticMarkup(createElement(ActionCard, {
+      action: {
+        id: 2,
+        name: 'survey_deployment',
+        result: {
+          deployment_id: 'deploy-port-1',
+          deployment_profile: 'maritime',
+          stage: 'surveyed',
+          selected_channel_ids: [41],
+          groups: [{ name: 'gates', channel_ids: [41] }],
+          surveys: [{ channel_id: 41, title: 'North gate', scene_fingerprint: 'VIEW: port gate' }],
+        },
+      },
+      onThumb: () => undefined,
+      onApply: () => undefined,
+      onSend: () => undefined,
+    }))
+
+    expect(markup).toContain('Role-specific starter watches')
+    expect(markup).toContain('Propose as non-bookmarking shadow probes')
+    expect(markup).toContain('9B consolidation window')
+    expect(markup).toContain('live L0 monitoring and alerts continue')
+    expect(markup).toContain('Draft alerts for this scope')
+  })
+
+  it('returns a partial deployment to only the still-missing scope', () => {
+    const markup = renderToStaticMarkup(createElement(ActionCard, {
+      action: {
+        id: 3,
+        name: 'configure_deployment',
+        result: {
+          deployment_id: 'deploy-port-1',
+          deployment_profile: 'maritime',
+          starter_policy_mode: 'shadow',
+          starter_policy_confirmed: true,
+          stage: 'requirements_partial',
+          selected_channel_ids: [41, 42],
+          missing_requirement_channel_ids: [42],
+          groups: [
+            { name: 'north_gate', channel_ids: [41] },
+            { name: 'west_coast', channel_ids: [42] },
+          ],
+          surveys: [
+            { channel_id: 41, title: 'North gate', scene_fingerprint: 'VIEW: port gate' },
+            { channel_id: 42, title: 'West coast', scene_fingerprint: 'VIEW: coastline' },
+          ],
+        },
+      },
+      onThumb: () => undefined,
+      onApply: () => undefined,
+      onSend: () => undefined,
+    }))
+
+    expect(markup).toContain('west_coast')
+    expect(markup).toContain('West coast')
+    expect(markup).not.toContain('North gate')
+    expect(markup).toContain('value="shadow" selected=""')
+  })
+
   it('renders channel coverage as bounded operator rows', () => {
     const tables = actionTables('list_video_summary_channels', {
       active_count: 1,

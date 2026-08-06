@@ -104,6 +104,9 @@ def test_port_payload_requires_maritime_runtime_and_react_assets():
     assert "Refusing to finalize an uncommitted port client bundle" in finalizer
     assert '"START_EVA_AI.sh"' in finalizer
     assert '"manifest.txt"' in finalizer
+    assert '"format": 2' in finalizer
+    assert '"installation_modes": ["fresh", "update", "report"]' in finalizer
+    assert '"offline-dependencies.json"' in finalizer
 
 
 def test_predeploy_gate_runs_react_tests_and_production_build():
@@ -469,7 +472,8 @@ def test_bootstrap_deb_has_noninteractive_packaging_boundary(tmp_path):
         stdout=subprocess.PIPE,
         text=True,
     )
-    package = tmp_path / "eva-ai-appliance-installer_0.8.5_amd64.deb"
+    version = (ROOT / "VERSION").read_text(encoding="utf-8").strip().removeprefix("β ")
+    package = tmp_path / f"eva-ai-appliance-installer_{version}_amd64.deb"
     assert package.is_file()
     control = subprocess.run(
         ("dpkg-deb", "--field", package),

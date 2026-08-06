@@ -31,6 +31,7 @@ import { renderMarkdown } from '../agent/markdown'
 import { StreamControl, type VideoWorkspaceTab } from './StreamControl'
 import { PromptSettingsModal } from './PromptSettingsModal'
 import { IncidentModal } from '../incidents/IncidentModal'
+import { IncidentReview } from '../incidents/IncidentReview'
 import {
   SUMMARY_SEVERITIES,
   resolveSummaryResolution,
@@ -779,7 +780,7 @@ export function VideoScreen({
   }, [period])
 
   const selectWorkspaceTab = useCallback((nextTab: VideoWorkspaceTab) => {
-    if (nextTab === 'settings') setReviewPreviewOpen(false)
+    if (nextTab !== 'review') setReviewPreviewOpen(false)
     setActiveTab(nextTab)
   }, [])
   const requestSettingsChannel = useCallback((channelId: number, openSettings = false) => {
@@ -963,6 +964,8 @@ export function VideoScreen({
           </div>
           {reviewPreviewOpen && <aside className="vid-review-preview-drawer">{previewCard}</aside>}
         </div>
+      ) : activeTab === 'incidents' ? (
+        <IncidentReview channels={channels} canExport={canExport} canManage={canReportIncidents} />
       ) : (
         <div className="vid-settings-main">
           <section className="vid-settings-preview">
@@ -1058,6 +1061,7 @@ export function VideoScreen({
         <IncidentModal
           draftInput={incidentDraft}
           canExport={canExport}
+          canManage={canReportIncidents}
           onClose={() => setIncidentDraft(null)}
         />
       )}

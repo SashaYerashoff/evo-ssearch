@@ -1,5 +1,6 @@
 import { useMemo, useState } from 'react'
 import { agentImageUrl } from '../../api/agent'
+import type { Channel } from '../../api/types'
 
 export interface ToolAction {
   id: number
@@ -86,14 +87,65 @@ function row(values: unknown[]): string[] {
   return values.map((value) => textValue(value))
 }
 
-function DeploymentInventoryCard({ result, onSend }: { result: any; onSend: (message: string) => void }) {
-  const channels = Array.isArray(result?.ui_available_channels) && result.ui_available_channels.length
+export function deploymentInventoryChannels(result: any, channelCatalog: Channel[] = []): any[] {
+  const primary = Array.isArray(result?.ui_available_channels) && result.ui_available_channels.length
     ? result.ui_available_channels
     : (Array.isArray(result?.available_channels) ? result.available_channels : [])
+  const inventoryIds = Array.isArray(result?.available_channel_ids)
+    ? result.available_channel_ids.map(Number).filter((value: number) => Number.isInteger(value) && value > 0)
+    : []
+  if (!inventoryIds.length) return primary
+  const byId = new Map<number, any>()
+  primary.forEach((channel: any) => {
+    const channelId = Number(channel?.id)
+    if (Number.isInteger(channelId) && channelId > 0) byId.set(channelId, channel)
+  })
+  channelCatalog.forEach((channel) => {
+    const channelId = Number(channel.id)
+    if (inventoryIds.includes(channelId) && !byId.has(channelId)) byId.set(channelId, channel)
+  })
+  return inventoryIds.map((channelId: number) => (
+    byId.get(channelId) || { id: channelId, title: `Channel ${channelId}` }
+  ))
+}
+
+export function deploymentScopeSelectionMessage(
+  result: any,
+  selected: number[],
+  groups: Record<number, string>,
+  roles: Record<number, { role: string; location: string }>,
+): string {
+  const maritime = String(result?.deployment_profile || 'general') === 'maritime'
+  const groupClauses = Object.entries(groups)
+    .map(([channelId, group]) => ({ channelId: Number(channelId), group: group.trim() }))
+    .filter((item) => selected.includes(item.channelId) && item.group)
+    .map((item) => `group ${item.group}: ${item.channelId}`)
+  const roleClauses = maritime
+    ? selected.map((channelId) => {
+      const role = roles[channelId]
+      const location = String(role?.location || '').trim().replace(/["“”]/g, "'")
+      return `CH ${channelId} role ${role.role}${location ? ` location "${location}"` : ''}`
+    })
+    : []
+  return [
+    `Continue Protocol Deploy ${result?.deployment_id || ''}. Select channels ${selected.join(', ')}`,
+    ...groupClauses,
+    ...roleClauses,
+  ].filter(Boolean).join('; ')
+}
+
+function DeploymentInventoryCard({ result, onSend, channelCatalog }: {
+  result: any
+  onSend: (message: string) => void
+  channelCatalog: Channel[]
+}) {
+  const channels = deploymentInventoryChannels(result, channelCatalog)
   const cap = Math.max(1, Math.min(8, Number(result?.target_channel_count) || 8))
+  const maritime = String(result?.deployment_profile || 'general') === 'maritime'
   const [query, setQuery] = useState('')
   const [selected, setSelected] = useState<number[]>([])
   const [groups, setGroups] = useState<Record<number, string>>({})
+  const [roles, setRoles] = useState<Record<number, { role: string; location: string }>>({})
   const filtered = useMemo(() => {
     const needle = query.trim().toLocaleLowerCase()
     if (!needle) return channels
@@ -111,14 +163,8 @@ function DeploymentInventoryCard({ result, onSend }: { result: any; onSend: (mes
 
   function submit() {
     if (!selected.length) return
-    const groupClauses = Object.entries(groups)
-      .map(([channelId, group]) => ({ channelId: Number(channelId), group: group.trim() }))
-      .filter((item) => selected.includes(item.channelId) && item.group)
-      .map((item) => `group ${item.group}: ${item.channelId}`)
-    onSend([
-      `Continue Protocol Deploy ${result?.deployment_id || ''}. Select channels ${selected.join(', ')}`,
-      ...groupClauses,
-    ].filter(Boolean).join('; '))
+    if (maritime && selected.some((channelId) => !roles[channelId]?.role)) return
+    onSend(deploymentScopeSelectionMessage(result, selected, groups, roles))
   }
 
   return (
@@ -136,30 +182,80 @@ function DeploymentInventoryCard({ result, onSend }: { result: any; onSend: (mes
           const channelId = Number(channel?.id)
           const checked = selected.includes(channelId)
           return (
-            <div className={`ag-deploy-channel-row ${checked ? 'selected' : ''}`} key={String(channel?.id)}>
+            <div className={`ag-deploy-channel-row ${checked ? 'selected' : ''} ${maritime ? 'maritime' : ''}`} key={String(channel?.id)}>
               <label>
                 <input type="checkbox" checked={checked} disabled={!checked && selected.length >= cap} onChange={() => toggle(channelId)} />
                 <span><b>#{channelId}</b> {channel?.title || channel?.name || 'Untitled channel'}</span>
               </label>
-              {checked && <input className="ag-deploy-group-input" value={groups[channelId] || ''} onChange={(event) => setGroups((current) => ({ ...current, [channelId]: event.target.value }))} placeholder="optional group" />}
+              {checked && (
+                <div className="ag-deploy-channel-options">
+                  <input className="ag-deploy-group-input" value={groups[channelId] || ''} onChange={(event) => setGroups((current) => ({ ...current, [channelId]: event.target.value }))} placeholder="optional group" />
+                  {maritime && (
+                    <>
+                      <select
+                        aria-label={`Maritime role for channel ${channelId}`}
+                        value={roles[channelId]?.role || ''}
+                        onChange={(event) => setRoles((current) => ({
+                          ...current,
+                          [channelId]: { role: event.target.value, location: current[channelId]?.location || '' },
+                        }))}
+                      >
+                        <option value="">Choose maritime role…</option>
+                        <option value="maritime_gate">Sea / port gate</option>
+                        <option value="maritime_coast">Coastline</option>
+                        <option value="maritime_mixed_ptz">Mixed / PTZ tour</option>
+                      </select>
+                      <input
+                        value={roles[channelId]?.location || ''}
+                        onChange={(event) => setRoles((current) => ({
+                          ...current,
+                          [channelId]: { role: current[channelId]?.role || '', location: event.target.value },
+                        }))}
+                        placeholder="location / view label"
+                      />
+                    </>
+                  )}
+                </div>
+              )}
             </div>
           )
         })}
       </div>
-      <div className="ag-approval-note">Groups are optional. Channels without a group will be commissioned one by one.</div>
-      <div className="ag-approval-foot"><button className="ag-apply" disabled={!selected.length} onClick={submit}>Survey selected channels</button></div>
+      <div className="ag-approval-note">Groups are optional. Channels without a group will be commissioned one by one.{maritime ? ' A maritime role is required for every selected channel; the location label is optional.' : ''}</div>
+      <div className="ag-approval-foot"><button className="ag-apply" disabled={!selected.length || (maritime && selected.some((channelId) => !roles[channelId]?.role))} onClick={submit}>Survey selected channels</button></div>
     </div>
   )
 }
 
 function DeploymentSurveyCard({ result, onSend }: { result: any; onSend: (message: string) => void }) {
+  const maritime = String(result?.deployment_profile || 'general') === 'maritime'
+  const [starterMode, setStarterMode] = useState(
+    maritime
+      ? (result?.starter_policy_confirmed ? String(result?.starter_policy_mode || 'none') : '')
+      : 'none',
+  )
+  const existingQuietWindow = result?.quiet_window && typeof result.quiet_window === 'object'
+    ? result.quiet_window
+    : null
+  const [quietMode, setQuietMode] = useState(
+    result?.quiet_window_confirmed
+      ? (existingQuietWindow?.enabled === false ? 'disabled' : 'scheduled')
+      : '',
+  )
+  const [quietStart, setQuietStart] = useState(String(existingQuietWindow?.start_local || '01:00'))
+  const [quietEnd, setQuietEnd] = useState(String(existingQuietWindow?.end_local || '05:00'))
+  const [quietTimezone, setQuietTimezone] = useState(String(
+    existingQuietWindow?.timezone
+    || Intl.DateTimeFormat().resolvedOptions().timeZone
+    || 'UTC',
+  ))
   const surveys = Array.isArray(result?.surveys) ? result.surveys : []
   const groups = Array.isArray(result?.groups) ? result.groups : []
   const selectedIds = (result?.selected_channel_ids || []).map(Number)
   const groupedIds = new Set<number>(groups.flatMap((group: any) => (
     Array.isArray(group?.channel_ids) ? group.channel_ids.map(Number) : []
   )))
-  const scopes = [
+  const allScopes = [
     ...groups.map((group: any) => ({
       name: String(group?.name || 'group'),
       channelIds: (group?.channel_ids || []).map(Number),
@@ -168,16 +264,37 @@ function DeploymentSurveyCard({ result, onSend }: { result: any; onSend: (messag
       .filter((channelId: number) => !groupedIds.has(channelId))
       .map((channelId: number) => ({ name: `channel_${channelId}`, channelIds: [channelId] })),
   ]
+  const missingIds = new Set<number>(
+    Array.isArray(result?.missing_requirement_channel_ids)
+      ? result.missing_requirement_channel_ids.map(Number)
+      : [],
+  )
+  const scopes = missingIds.size
+    ? allScopes
+      .map((scope) => ({
+        ...scope,
+        channelIds: scope.channelIds.filter((channelId: number) => missingIds.has(channelId)),
+      }))
+      .filter((scope) => scope.channelIds.length > 0)
+    : allScopes
+
+  function quietWindowClause(): string {
+    return quietMode === 'disabled'
+      ? 'Consolidation quiet window disabled'
+      : `Consolidation quiet window ${quietStart}-${quietEnd} timezone ${quietTimezone} every day`
+  }
 
   function requestProposal(scope: { name: string; channelIds: number[] }) {
+    const starterClause = maritime ? ` Starter policy mode ${starterMode}.` : ''
     onSend(
-      `Continue Protocol Deploy ${result?.deployment_id || ''}. Draft grounded default alerts for group ${scope.name}, channels ${scope.channelIds.join(', ')}, using only its recorded scene survey. Include expected routine, visible alert criteria and severity, novelty sensitivity, and only useful optional counters. Do not apply anything yet.`,
+      `Continue Protocol Deploy ${result?.deployment_id || ''}. Draft grounded default alerts for group ${scope.name}, channels ${scope.channelIds.join(', ')}, using only its recorded scene survey. Include expected routine, visible alert criteria and severity, novelty sensitivity, and only useful optional counters.${starterClause} ${quietWindowClause()}. Do not apply anything yet.`,
     )
   }
 
   function chooseNoAlerts(scope: { name: string; channelIds: number[] }) {
     const clauses = scope.channelIds.map((channelId) => `CH ${channelId}: no default alerts`)
-    onSend(`Continue Protocol Deploy ${result?.deployment_id || ''}. ${clauses.join('; ')}. Keep ordinary L0 descriptions and continue to the next scope.`)
+    const starterClause = maritime ? ` Starter policy mode ${starterMode}.` : ''
+    onSend(`Continue Protocol Deploy ${result?.deployment_id || ''}. ${clauses.join('; ')}.${starterClause} ${quietWindowClause()}. Keep ordinary L0 descriptions and continue to the next scope.`)
   }
 
   return (
@@ -193,6 +310,35 @@ function DeploymentSurveyCard({ result, onSend }: { result: any; onSend: (messag
         <b>Good alert description</b>
         <span>“Alert HIGH when a sailing vessel visibly enters the cargo fairway on a converging path; do not alert on ordinary parallel passage or PTZ scene changes.”</span>
       </div>
+      {maritime && (
+        <label className="ag-deploy-starter-mode">
+          <span>Role-specific starter watches</span>
+          <select value={starterMode} onChange={(event) => setStarterMode(event.target.value)}>
+            <option value="">Choose before reviewing scopes…</option>
+            <option value="none">None</option>
+            <option value="shadow">Propose as non-bookmarking shadow probes</option>
+          </select>
+        </label>
+      )}
+      <div className="ag-deploy-quiet-window">
+        <label>
+          <span>9B consolidation window</span>
+          <select value={quietMode} onChange={(event) => setQuietMode(event.target.value)}>
+            <option value="">Choose…</option>
+            <option value="disabled">No preferred window</option>
+            <option value="scheduled">Use a preemptible quiet window</option>
+          </select>
+        </label>
+        {quietMode === 'scheduled' && (
+          <div className="ag-deploy-quiet-fields">
+            <input aria-label="Quiet window start" type="time" value={quietStart} onChange={(event) => setQuietStart(event.target.value)} />
+            <span>to</span>
+            <input aria-label="Quiet window end" type="time" value={quietEnd} onChange={(event) => setQuietEnd(event.target.value)} />
+            <input aria-label="Quiet window timezone" value={quietTimezone} onChange={(event) => setQuietTimezone(event.target.value)} placeholder="Europe/Riga" />
+          </div>
+        )}
+        <small>Only preemptible 9B consolidation is scheduled; live L0 monitoring and alerts continue.</small>
+      </div>
       <div className="ag-deploy-scope-list">
         {scopes.map((scope) => (
           <section className="ag-deploy-scope" key={`${scope.name}-${scope.channelIds.join('-')}`}>
@@ -204,8 +350,8 @@ function DeploymentSurveyCard({ result, onSend }: { result: any; onSend: (messag
               </div>
             ))}
             <div className="ag-deploy-review-actions">
-              <button className="ag-mini-btn" onClick={() => chooseNoAlerts(scope)}>No default alerts</button>
-              <button className="ag-apply" onClick={() => requestProposal(scope)}>Draft alerts for this scope</button>
+              <button className="ag-mini-btn" disabled={!quietMode || (maritime && !starterMode)} onClick={() => chooseNoAlerts(scope)}>No default alerts</button>
+              <button className="ag-apply" disabled={!quietMode || (maritime && !starterMode)} onClick={() => requestProposal(scope)}>Draft alerts for this scope</button>
             </div>
           </section>
         ))}
@@ -458,11 +604,12 @@ export function actionTables(name: string, result: any): ActionTable[] {
   return []
 }
 
-export function ActionCard({ action, onThumb, onApply, onSend }: {
+export function ActionCard({ action, onThumb, onApply, onSend, channelCatalog = [] }: {
   action: ToolAction
   onThumb: (url: string, title: string) => void
   onApply: (a: ToolAction) => void
   onSend: (message: string) => void
+  channelCatalog?: Channel[]
 }) {
   const { name, result, error } = action
   const items = itemsOf(result)
@@ -475,10 +622,14 @@ export function ActionCard({ action, onThumb, onApply, onSend }: {
   const tables = actionTables(name, result)
 
   if (name === 'start_deployment' && result?.stage === 'inventory') {
-    return <DeploymentInventoryCard result={result} onSend={onSend} />
+    return <DeploymentInventoryCard result={result} onSend={onSend} channelCatalog={channelCatalog} />
   }
 
   if (name === 'survey_deployment' && result?.stage === 'surveyed') {
+    return <DeploymentSurveyCard result={result} onSend={onSend} />
+  }
+
+  if (name === 'configure_deployment' && result?.stage === 'requirements_partial') {
     return <DeploymentSurveyCard result={result} onSend={onSend} />
   }
 

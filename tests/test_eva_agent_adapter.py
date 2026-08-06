@@ -44,6 +44,7 @@ class _IncidentCommands:
         self.calls = []
         self.channel_ids = [7]
         self.stored_actor_ids = []
+        self.reviewed = []
 
     def get(self, incident_id):
         self.calls.append(incident_id)
@@ -74,6 +75,36 @@ class _IncidentCommands:
 
     def public_record(self, record):
         return {**record, "incident_id": record.get("id")}
+
+    def temporal_context(self, incident):
+        return {
+            "supported": True,
+            "incident_id": incident["id"],
+            "episodes": [],
+            "episode_total": 0,
+            "series_links": [],
+            "relation_total": 0,
+            "correction_count": 0,
+            "lifecycle_history": [],
+            "transition_total": 0,
+        }
+
+    def review_incident(self, incident_id, *, actor_id, action, expected_revision):
+        self.reviewed.append(
+            {
+                "incident_id": incident_id,
+                "actor_id": actor_id,
+                "action": action,
+                "expected_revision": expected_revision,
+            }
+        )
+        return {
+            "id": incident_id,
+            "revision": expected_revision + 1,
+            "state": "confirmed",
+            "case_state": "confirmed",
+            "channel_ids": list(self.channel_ids),
+        }
 
 
 class _LegacyTools:
@@ -365,6 +396,58 @@ class EvaAgentToolAdapterTests(unittest.TestCase):
         self.assertEqual(applied["status"], "applied")
         self.assertEqual(commands.stored_actor_ids, [self.context.actor_id])
         self.assertEqual(applied["incident"]["channel_ids"], [8])
+
+    def test_incident_review_requires_approval_and_binds_revision_to_durable_state(self):
+        commands = _IncidentCommands()
+        tools = AgentTools(
+            detections_store=_DetectionStore(),
+            probes_store=_ProbeStore(),
+            luxriot_manager=None,
+            embed_text_fn=None,
+            embed_image_fn=None,
+            call_lm_fn=None,
+            encode_jpeg_fn=None,
+            search_indexed_folder_fn=None,
+            search_detections_fn=None,
+            incident_command_service=commands,
+        )
+        adapter = EvaAgentToolAdapter(
+            tools,
+            _TOOL_SCHEMAS,
+            audit_callback=self.audit_events.append,
+        )
+        self.addCleanup(adapter.close)
+
+        preview = adapter.execute(
+            "review_incident",
+            {
+                "incident_id": "00000000-0000-0000-0000-000000000117",
+                "action": "confirm",
+                "preview": True,
+                # Neither a model nor stale UI may choose the write revision.
+                "expected_revision": 999,
+            },
+            self.context,
+        )
+        self.assertEqual(preview["status"], "preview")
+        self.assertEqual(preview["proposed_review"]["action"], "confirm")
+
+        applied = adapter.approve_and_execute(
+            preview["approval"]["plan_id"],
+            self.context,
+        )
+        self.assertEqual(applied["status"], "applied")
+        self.assertEqual(
+            commands.reviewed,
+            [
+                {
+                    "incident_id": "00000000-0000-0000-0000-000000000117",
+                    "actor_id": self.context.actor_id,
+                    "action": "confirm",
+                    "expected_revision": 3,
+                }
+            ],
+        )
 
     def test_lookup_help_real_agent_tools_keeps_permissions_across_executor(self):
         tools = AgentTools(

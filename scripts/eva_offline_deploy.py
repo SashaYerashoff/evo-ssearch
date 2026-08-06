@@ -29,11 +29,19 @@ from pathlib import Path
 from typing import Mapping, Sequence
 
 
+SCRIPT_DIR = Path(__file__).resolve().parent
+if str(SCRIPT_DIR) not in sys.path:
+    sys.path.insert(0, str(SCRIPT_DIR))
+
+from offline_bundle_dependencies import DependencyError, verify_manifest as verify_dependencies
+
+
 DEFAULT_BACKUP_ROOT = Path("/var/backups/eva-ai")
 DEFAULT_REPORT_ROOT = Path("/var/lib/eva-ai-installer")
 DEFAULT_SERVICE = "eva-ai"
-EXPECTED_SCHEMA = "20260801_0011"
+EXPECTED_SCHEMA = "20260805_0013"
 EXPECTED_FLAVOR = "universal-offline"
+PREFLIGHT_STAMP_ENV = "EVA_OFFLINE_BUNDLE_PREFLIGHT_SHA256"
 
 
 class DeployError(RuntimeError):
@@ -114,6 +122,10 @@ def _verify_bundle(root: Path) -> None:
         raise DeployError(f"Offline bundle manifest is missing: {manifest_path}") from exc
     except (OSError, json.JSONDecodeError) as exc:
         raise DeployError(f"Offline bundle manifest is invalid: {exc}") from exc
+    if manifest.get("format") != 2:
+        raise DeployError(
+            f"Unsupported universal bundle format: {manifest.get('format')!r}; expected 2"
+        )
     if str(manifest.get("release_flavor") or "") != EXPECTED_FLAVOR:
         raise DeployError(
             "This entry point requires an EVA AI universal-offline bundle; "
@@ -129,16 +141,23 @@ def _verify_bundle(root: Path) -> None:
         "START_EVA_AI.sh",
         "eva_offline_deploy.py",
         "install_port_appliance.py",
-        "migration-plans/0006-to-0011.sql",
+        "migration-plans/0006-to-0013.sql",
         "apt/Packages.gz",
         "wheelhouse",
+        "offline_bundle_dependencies.py",
+        "offline-dependencies.json",
         "repo/VERSION",
         "repo/react-ui/dist/index.html",
         "repo/migrations/versions/20260801_0011_incidents.py",
+        "repo/migrations/versions/20260805_0012_incident_temporal_memory.py",
+        "repo/migrations/versions/20260805_0013_archive_source_channel_page_index.py",
     )
     missing = [relative for relative in required if not (root / relative).exists()]
     if missing:
         raise DeployError("Offline payload is incomplete: " + ", ".join(missing))
+    modes = manifest.get("installation_modes")
+    if modes != ["fresh", "update", "report"]:
+        raise DeployError("Bundle does not declare the complete fresh/update/report contract")
     critical = manifest.get("critical_sha256")
     if not isinstance(critical, dict) or not critical:
         raise DeployError("Bundle manifest has no critical checksums")
@@ -153,6 +172,10 @@ def _verify_bundle(root: Path) -> None:
                 digest.update(block)
         if digest.hexdigest() != str(expected):
             raise DeployError(f"Checksum mismatch: {relative}")
+    try:
+        verify_dependencies(root, repo_root=root / "repo")
+    except DependencyError as exc:
+        raise DeployError(f"Offline dependency verification failed: {exc}") from exc
 
 
 def _parse_env(path: Path) -> dict[str, str]:
@@ -405,7 +428,13 @@ def _fresh(
     if assume_yes:
         command.append("--yes")
     command.extend(passthrough)
-    _run(command)
+    # The common entry point has just verified every critical/dependency hash.
+    # Carry a content-bound stamp to the child so a normal universal install
+    # does not reread 15+ GiB twice. Direct use of install_port_appliance.py has
+    # no stamp and still performs the complete verification itself.
+    manifest_digest = hashlib.sha256((bundle_root / "manifest.json").read_bytes()).hexdigest()
+    process_env = {**os.environ, PREFLIGHT_STAMP_ENV: manifest_digest}
+    _run(command, env=process_env)
     deployment = detect_existing()
     if deployment is not None:
         DEFAULT_REPORT_ROOT.mkdir(parents=True, exist_ok=True)

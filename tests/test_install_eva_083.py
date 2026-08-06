@@ -129,7 +129,7 @@ class OfflineInstallerUnitTests(unittest.TestCase):
             installer.EXPECTED_VERSION,
             (ROOT / "VERSION").read_text(encoding="utf-8").strip(),
         )
-        self.assertEqual(installer.EXPECTED_SCHEMA, "20260801_0011")
+        self.assertEqual(installer.EXPECTED_SCHEMA, "20260805_0013")
 
     def test_discovers_existing_app_dotenv_before_source_and_preserves_target(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -229,9 +229,17 @@ class OfflineInstallerUnitTests(unittest.TestCase):
         rendered = installer.render_env_update(raw, updates)
 
         self.assertEqual(missing, [])
-        self.assertEqual(updates, {"EVOSSEARCH_APP_VERSION": installer.EXPECTED_VERSION})
+        self.assertEqual(
+            updates,
+            {
+                "EVOSSEARCH_APP_VERSION": installer.EXPECTED_VERSION,
+                "EVOSSEARCH_UI_MODE": "react",
+            },
+        )
         self.assertEqual(values["EVOSSEARCH_APP_VERSION"], installer.EXPECTED_VERSION)
+        self.assertEqual(values["EVOSSEARCH_UI_MODE"], "react")
         self.assertIn(f"EVOSSEARCH_APP_VERSION='{installer.EXPECTED_VERSION}'", rendered)
+        self.assertIn("EVOSSEARCH_UI_MODE='react'", rendered)
         self.assertIn('EVOSSEARCH_HOST="10.20.30.40"', rendered)
 
     def test_noninteractive_configuration_accepts_environment_without_echoing_secrets(self):
@@ -265,6 +273,8 @@ class OfflineInstallerUnitTests(unittest.TestCase):
 
     def test_env_dsn_references_are_resolved_in_memory_but_raw_file_is_preserved(self):
         existing = dict(COMPLETE_ENV)
+        existing["EVOSSEARCH_APP_VERSION"] = installer.EXPECTED_VERSION
+        existing["EVOSSEARCH_UI_MODE"] = "react"
         existing["EVA_API_PASSWORD"] = "expanded-password"
         existing["EVA_DATABASE_DSN"] = "postgresql://api:${EVA_API_PASSWORD}@db.internal/eva"
         raw = env_text(existing, prefix="# keep comments")

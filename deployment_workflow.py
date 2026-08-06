@@ -540,6 +540,11 @@ def compact_deployment_state(state: Mapping[str, Any]) -> Dict[str, Any]:
     selected_channel_ids = [
         int(item) for item in (state.get("selected_channel_ids") or [])
     ]
+    available_channel_ids = [
+        int(item.get("id"))
+        for item in (state.get("available_channels") or [])
+        if isinstance(item, Mapping) and item.get("id") is not None
+    ][:100]
     covered_requirement_ids = {
         int(channel_id)
         for pack in (state.get("requirements") or [])
@@ -558,8 +563,15 @@ def compact_deployment_state(state: Mapping[str, Any]) -> Dict[str, Any]:
         "next_action": _next_action(state),
         "deployment_profile": state.get("deployment_profile") or "general",
         "starter_policy_mode": state.get("starter_policy_mode") or "none",
+        "starter_policy_confirmed": bool(state.get("starter_policy_confirmed")),
+        "quiet_window_confirmed": bool(state.get("quiet_window_confirmed")),
         "target_channel_count": state.get("target_channel_count"),
         "selected_channel_ids": list(state.get("selected_channel_ids") or []),
+        # Keep the complete authorized inventory identity without feeding a
+        # 50+ channel title catalogue to the small agent head.  React uses the
+        # IDs to restore the exact picker scope from its already-authorized
+        # channel catalogue after a chat/history reload.
+        "available_channel_ids": available_channel_ids,
         "channel_roles": copy.deepcopy(list(state.get("channel_roles") or [])),
         "groups": copy.deepcopy(list(state.get("groups") or [])),
         "available_channels": copy.deepcopy(list(state.get("available_channels") or []))[:16],
@@ -750,6 +762,7 @@ class ProtocolDeploymentStore:
             "stage": "inventory",
             "deployment_profile": profile,
             "starter_policy_mode": "none",
+            "starter_policy_confirmed": False,
             "target_channel_count": target,
             "available_channels": channels[:100],
             "selected_channel_ids": [],
@@ -759,6 +772,7 @@ class ProtocolDeploymentStore:
             "requirements": [],
             "requirement_warnings": [],
             "quiet_window": None,
+            "quiet_window_confirmed": False,
             "plan": None,
             "commissioning": {"status": "not_scheduled"},
             "created_at_ms": now_ms,
@@ -838,6 +852,7 @@ class ProtocolDeploymentStore:
             if mode != "none" and str(state.get("deployment_profile") or "general") != "maritime":
                 raise DeploymentWorkflowError("starter shadow policies require maritime deployment")
             state["starter_policy_mode"] = mode
+            state["starter_policy_confirmed"] = True
             state["plan"] = None
             if mode == "shadow" and selected and state.get("surveys"):
                 state["stage"] = "requirements_configured"
@@ -890,6 +905,7 @@ class ProtocolDeploymentStore:
                 state["stage"] = "surveyed"
         if quiet_window is not None:
             state["quiet_window"] = _normalize_quiet_window(quiet_window)
+            state["quiet_window_confirmed"] = True
             state["plan"] = None
         return self.save(state)
 

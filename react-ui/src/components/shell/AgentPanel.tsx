@@ -60,11 +60,13 @@ function ResearchTrace({
   onThumb,
   onApply,
   onSend,
+  channels,
 }: {
   message: Msg
   onThumb: (url: string, title: string) => void
   onApply: (action: ToolAction) => void
   onSend: (message: string) => void
+  channels: Channel[]
 }) {
   // The operator owns this disclosure state. Streaming updates must not force
   // a trace open or closed after the user has touched it.
@@ -78,7 +80,7 @@ function ResearchTrace({
   return (
     <>
       {workflowActions.map((action) => (
-        <ActionCard key={action.id} action={action} onThumb={onThumb} onApply={onApply} onSend={onSend} />
+        <ActionCard key={action.id} action={action} onThumb={onThumb} onApply={onApply} onSend={onSend} channelCatalog={channels} />
       ))}
       {(traceActions.length > 0 || (message.notes?.length ?? 0) > 0) && <details
         className="ag-trace"
@@ -90,7 +92,7 @@ function ResearchTrace({
             <div key={note.id} className="ag-note"><span className="ag-note-badge">In progress</span>{note.message}</div>
           ))}
           {traceActions.map((action) => (
-            <ActionCard key={action.id} action={action} onThumb={onThumb} onApply={onApply} onSend={onSend} />
+            <ActionCard key={action.id} action={action} onThumb={onThumb} onApply={onApply} onSend={onSend} channelCatalog={channels} />
           ))}
         </div>
       </details>}
@@ -559,6 +561,7 @@ export function AgentPanel({
                     onThumb={(url, title) => setLightbox({ url, title })}
                     onApply={applyPlan}
                     onSend={(message) => send(message)}
+                    channels={channels}
                   />
                 )}
                 {m.error && <div className="chat-error"><IconAlertTriangle size={14} /> {m.error}</div>}

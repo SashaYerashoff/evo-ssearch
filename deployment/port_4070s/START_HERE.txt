@@ -1,4 +1,4 @@
-EVA AI 0.8.5 — OFFLINE PORT APPLIANCE
+EVA AI 0.8.7 — OFFLINE PORT APPLIANCE
 ======================================
 
 Target:
@@ -16,7 +16,7 @@ Release flavor:
 
 1. Install Ubuntu Server from this USB.
 2. After the first boot, mount the writable USB partition.
-3. Open a terminal in the EVA-AI-0.8.5-PORT folder.
+3. Open a terminal in the EVA-AI-0.8.7-PORT folder.
 4. Optional integrity check:
 
        sha256sum -c SHA256SUMS

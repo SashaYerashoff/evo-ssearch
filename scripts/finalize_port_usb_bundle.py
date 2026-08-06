@@ -10,6 +10,8 @@ import re
 from datetime import datetime, timezone
 from pathlib import Path
 
+from offline_bundle_dependencies import DependencyError, verify_manifest
+
 
 def digest(path: Path) -> str:
     hasher = hashlib.sha256()
@@ -41,6 +43,10 @@ def main() -> int:
             "Unexpected release flavor in SOURCE_REVISION.json: "
             f"{release_flavor or '[missing]'}"
         )
+    try:
+        dependency_manifest = verify_manifest(root, repo_root=root / "repo")
+    except DependencyError as exc:
+        raise SystemExit(f"Offline dependencies are not releasable: {exc}") from exc
     version_match = re.search(r"\d+(?:\.\d+)+", version)
     if version_match is None:
         raise SystemExit(f"Cannot derive a Debian version from {version!r}")
@@ -53,9 +59,13 @@ def main() -> int:
         "repo/docs/maritime_port_profile.md",
         "repo/react-ui/dist/index.html",
         "repo/migrations/versions/20260801_0011_incidents.py",
+        "repo/migrations/versions/20260805_0012_incident_temporal_memory.py",
+        "repo/migrations/versions/20260805_0013_archive_source_channel_page_index.py",
         "eva_offline_deploy.py",
+        "offline_bundle_dependencies.py",
+        "offline-dependencies.json",
         "START_EVA_AI.sh",
-        *(("migration-plans/0006-to-0011.sql",) if release_flavor == "universal-offline" else ()),
+        *(("migration-plans/0006-to-0013.sql",) if release_flavor == "universal-offline" else ()),
         "models/qwen3-vl-4b-awq/model.safetensors",
         "models/qwen3.5-9b-mtp/Qwen3.5-9B-Q4_K_M.gguf",
         "models/clip/ViT-B-32.pt",
@@ -110,15 +120,22 @@ def main() -> int:
         }
     )
     manifest = {
-        "format": 1,
+        "format": 2,
         "version": version,
-        "schema_head": "20260801_0011",
+        "schema_head": "20260805_0013",
         "release_flavor": release_flavor,
         "source": source,
         "created_at": datetime.now(timezone.utc).isoformat(),
         "target": target,
         "payload_bytes": payload_bytes,
         "minimum_free_bytes": max(45 * 1024**3, payload_bytes + 25 * 1024**3),
+        "installation_modes": ["fresh", "update", "report"],
+        "offline_dependencies": {
+            "manifest": "offline-dependencies.json",
+            "apt_artifacts": len(dependency_manifest["apt"]["artifacts"]),
+            "wheels": len(dependency_manifest["wheelhouse"]["artifacts"]),
+            "target": dependency_manifest["target"],
+        },
         "critical_sha256": critical,
         "models": {
             "live_vlm": "Qwen3-VL-4B-Instruct AWQ / vLLM 0.25.0",

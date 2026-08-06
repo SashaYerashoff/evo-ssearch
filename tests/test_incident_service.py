@@ -361,6 +361,102 @@ def test_incident_exports_keep_timeline_and_grounding_warning():
     assert "gate_crossing" in xml
 
 
+def test_incident_exports_include_bounded_temporal_memory_and_follow_outcome():
+    incident = {
+        "id": "incident-1",
+        "title": "Person enters gate",
+        "summary": "A person entered the monitored gate and later left.",
+        "state": "ended",
+        "perception_state": "ended",
+        "risk_state": "resolved",
+        "case_state": "confirmed",
+        "attention_state": "inactive",
+        "severity": "high",
+        "channel_ids": [112],
+        "time_bounds": {
+            "observed_start_ms": 1_785_000_010_000,
+            "observed_end_ms": 1_785_000_050_000,
+        },
+        "key_moments": [
+            {
+                "timestamp_ms": 1_785_000_010_000,
+                "semantic_key": "person_entry",
+                "label": "Person entered the monitored gate",
+                "source": "vlm_alert",
+                "confidence": "high",
+            }
+        ],
+        "homeostasis": {
+            "motion_p95_mean": 0.2,
+            "motion_p95_max": 0.8,
+            "activity_x_mean": 2.0,
+            "activity_x_max": 6.0,
+            "elevated_duration_ms": 8_000,
+            "burst_count": 2,
+            "probe_count": 1,
+            "probe_hits": 3,
+            "probe_samples": 10,
+        },
+        "follow_result": {
+            "outcome": "resolved",
+            "description": "A grounded return to routine was observed.",
+            "observation_count": 4,
+        },
+        "coverage": {"status": "covered", "summary_rows": 2},
+        "uncertainties": [],
+        "temporal_memory": {
+            "episode_total": 1,
+            "transition_total": 1,
+            "episodes": [
+                {
+                    "id": "episode-1",
+                    "semantic_key": "person_entry",
+                    "observed_start_ms": 1_785_000_010_000,
+                    "observed_end_ms": 1_785_000_050_000,
+                    "scale_disposition": "unclassified_keep",
+                    "evidence_count": 2,
+                }
+            ],
+            "series_links": [
+                {
+                    "relation_id": "relation-1",
+                    "relation_state": "candidate",
+                    "related_incident_id": "incident-0",
+                    "semantic_key": "person_entry",
+                    "series_key": "series-1",
+                    "gap_ms": 120_000,
+                    "confidence": "medium",
+                }
+            ],
+            "lifecycle_history": [
+                {
+                    "id": "transition-1",
+                    "axis": "case",
+                    "from_state": "candidate",
+                    "to_state": "confirmed",
+                    "incident_revision": 2,
+                    "transitioned_at_ms": 1_785_000_060_000,
+                    "reason": "operator confirmed incident",
+                    "source_kind": "operator_review",
+                }
+            ],
+        },
+    }
+
+    markdown = incident_report_markdown(incident)
+    xml = incident_report_xml(incident).decode("utf-8")
+
+    assert "## Operator synopsis" in markdown
+    assert "## Homeostatic attention" in markdown
+    assert "## Follow outcome" in markdown
+    assert "## Temporal memory" in markdown
+    assert "candidate" in markdown
+    assert "operator confirmed incident" in markdown
+    assert "<operatorSynopsis>" in xml
+    assert "<temporalMemory episodeTotal=\"1\" transitionTotal=\"1\">" in xml
+    assert "<followOutcome>" in xml
+
+
 def test_distant_alert_does_not_steal_a_quiet_selected_anchor():
     rows = [
         {

@@ -1,4 +1,5 @@
 import {
+  IconAlertTriangle,
   IconChevronsDown,
   IconChevronsUp,
   IconDroplet,
@@ -43,7 +44,7 @@ const RESOLUTION_LABEL_KEYS: Record<SummaryResolution, TranslationKey> = {
   L2: 'resolution.l2', L3: 'resolution.l3',
 }
 
-export type VideoWorkspaceTab = 'review' | 'settings'
+export type VideoWorkspaceTab = 'review' | 'incidents' | 'settings'
 
 export function StreamControl(p: {
   channels: Channel[]
@@ -93,6 +94,7 @@ export function StreamControl(p: {
     <ToolTabs
       tabs={[
         { id: 'review', icon: <IconFileDescription size={13} />, label: t('video.review'), summary: reviewSummary },
+        { id: 'incidents', icon: <IconAlertTriangle size={13} />, label: t('incident.review'), summary: t('incident.tabSummary') },
         { id: 'settings', icon: <IconVideo size={13} />, label: t('video.settings'), summary: settingsSummary },
       ]}
       active={p.activeTab}
@@ -135,6 +137,11 @@ export function StreamControl(p: {
               {p.settingsDirty && <button className="mon-btn" disabled={p.busy} onClick={p.onDiscardSettings}>{t('video.discard')}</button>}
             </div>
           </section>
+        </div>
+      ) : p.activeTab === 'incidents' ? (
+        <div className="vid-incident-tab-note">
+          <IconAlertTriangle size={16} />
+          <span>{t('incident.tabHelp')}</span>
         </div>
       ) : (
         <div className="vid-lens-stack">

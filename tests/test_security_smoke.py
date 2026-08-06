@@ -311,11 +311,14 @@ class SecuritySmokeTests(unittest.TestCase):
         denied = self.client.post("/probes/delete", json={"id": "missing-probe"})
         self.assertEqual(denied.status_code, 401)
 
-        allowed = self.client.post(
-            "/probes/delete",
-            headers={"X-Admin-Token": "unit-token"},
-            json={"id": "missing-probe"},
-        )
+        # PostgreSQL probe storage is fail-closed when no test database is
+        # configured; this test owns only the legacy admin-token boundary.
+        with patch("oldapp.probes_store.delete_probe", return_value=False):
+            allowed = self.client.post(
+                "/probes/delete",
+                headers={"X-Admin-Token": "unit-token"},
+                json={"id": "missing-probe"},
+            )
         # Route-specific validation after auth guard.
         self.assertEqual(allowed.status_code, 404)
 

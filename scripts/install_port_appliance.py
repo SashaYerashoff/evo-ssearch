@@ -36,8 +36,15 @@ from typing import Iterable, Mapping, Sequence
 from urllib.parse import urlsplit
 
 
-VERSION = "β 0.8.5"
-EXPECTED_SCHEMA = "20260801_0011"
+SCRIPT_DIR = Path(__file__).resolve().parent
+if str(SCRIPT_DIR) not in sys.path:
+    sys.path.insert(0, str(SCRIPT_DIR))
+
+from offline_bundle_dependencies import DependencyError, verify_manifest as verify_dependencies
+
+
+VERSION = "β 0.8.7"
+EXPECTED_SCHEMA = "20260805_0013"
 DEFAULT_ROOT = Path("/opt/eva-ai")
 DEFAULT_DATA = Path("/var/lib/eva-ai")
 DEFAULT_CONFIG = Path("/etc/eva-ai")
@@ -51,6 +58,7 @@ DEFAULT_DEEP_MODEL = "qwen3.5-9b-mtp"
 DEFAULT_SIGLIP2_MODEL = "google/siglip2-base-patch16-224"
 DEFAULT_SIGLIP2_REVISION = "75de2d55ec2d0b4efc50b3e9ad70dba96a7b2fa2"
 MIN_FREE_GIB = 45
+PREFLIGHT_STAMP_ENV = "EVA_OFFLINE_BUNDLE_PREFLIGHT_SHA256"
 
 PORT_ENV = {
     "EVOSSEARCH_APP_VERSION": VERSION,
@@ -148,6 +156,16 @@ PORT_ENV = {
     "EVOSSEARCH_LUXRIOT_ROLLUP_LLM_LEVELS": "L1,L2,L3",
     "EVOSSEARCH_LUXRIOT_ROLLUP_LLM_MODEL": "agent",
     "EVOSSEARCH_LUXRIOT_ROLLUP_CONTEXT_LIMIT_TOKENS": "32768",
+    "EVOSSEARCH_LUXRIOT_INCIDENT_FOREGROUND_LIMIT": "2",
+    "EVOSSEARCH_LUXRIOT_INCIDENT_FOREGROUND_HARD_LIMIT": "4",
+    "EVOSSEARCH_LUXRIOT_INCIDENT_HOT_LIMIT": "8",
+    "EVOSSEARCH_LUXRIOT_INCIDENT_TRACKED_LIMIT": "64",
+    "EVOSSEARCH_LUXRIOT_L0_CONTEXT_WINDOW_TOKENS": "16384",
+    "EVOSSEARCH_LUXRIOT_L0_TEXT_BUDGET_TOKENS": "5000",
+    "EVOSSEARCH_LUXRIOT_L0_VISION_BUDGET_TOKENS": "5500",
+    "EVOSSEARCH_LUXRIOT_L0_OUTPUT_BUDGET_TOKENS": "1536",
+    "EVOSSEARCH_LUXRIOT_L0_INCIDENT_BUDGET_TOKENS": "900",
+    "EVOSSEARCH_LUXRIOT_L0_VISION_TOKENS_PER_IMAGE_ESTIMATE": "300",
     "EVOSSEARCH_LUXRIOT_ROLLUP_L3_DEEP_ENABLED": "true",
     "EVOSSEARCH_LUXRIOT_ROLLUP_L3_DEEP_CONNECT_TIMEOUT_SEC": "5",
     "EVOSSEARCH_LUXRIOT_ROLLUP_L3_DEEP_READ_TIMEOUT_SEC": "600",
@@ -555,6 +573,10 @@ def read_manifest(bundle_root: Path) -> dict:
         raise InstallError(
             f"Bundle version {payload.get('version')!r} does not match installer {VERSION!r}"
         )
+    if payload.get("format") != 2:
+        raise InstallError(
+            f"Unsupported universal bundle format: {payload.get('format')!r}; expected 2"
+        )
     return payload
 
 
@@ -568,7 +590,11 @@ def verify_critical_payload(bundle_root: Path, manifest: Mapping) -> None:
         "repo/docs/maritime_port_profile.md",
         "repo/react-ui/dist/index.html",
         "repo/migrations/versions/20260801_0011_incidents.py",
+        "repo/migrations/versions/20260805_0012_incident_temporal_memory.py",
+        "repo/migrations/versions/20260805_0013_archive_source_channel_page_index.py",
         "wheelhouse",
+        "offline_bundle_dependencies.py",
+        "offline-dependencies.json",
         "apt/Packages.gz",
         "models/qwen3-vl-4b-awq/model.safetensors",
         "models/qwen3.5-9b-mtp/Qwen3.5-9B-Q4_K_M.gguf",
@@ -594,6 +620,13 @@ def verify_critical_payload(bundle_root: Path, manifest: Mapping) -> None:
     missing = [item for item in required if not (bundle_root / item).exists()]
     if missing:
         raise InstallError("Offline payload is incomplete: " + ", ".join(missing))
+    manifest_path = bundle_root / "manifest.json"
+    inherited_stamp = str(os.getenv(PREFLIGHT_STAMP_ENV) or "").strip()
+    if inherited_stamp:
+        actual_stamp = hashlib.sha256(manifest_path.read_bytes()).hexdigest()
+        if secrets.compare_digest(inherited_stamp, actual_stamp):
+            print("Offline payload hashes were verified by the universal entry point.")
+            return
     for relative, expected in dict(manifest.get("critical_sha256") or {}).items():
         path = bundle_root / relative
         digest = hashlib.sha256()
@@ -602,6 +635,10 @@ def verify_critical_payload(bundle_root: Path, manifest: Mapping) -> None:
                 digest.update(block)
         if digest.hexdigest() != expected:
             raise InstallError(f"Checksum mismatch: {relative}")
+    try:
+        verify_dependencies(bundle_root, repo_root=bundle_root / "repo")
+    except DependencyError as exc:
+        raise InstallError(f"Offline dependency verification failed: {exc}") from exc
 
 
 def current_schema() -> str | None:

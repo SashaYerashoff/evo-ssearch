@@ -321,6 +321,120 @@ def test_protocol_deploy_target_is_a_cap_and_mismatched_draft_is_not_resumed():
         store.configure(four["deployment_id"], channel_ids=[1, 2, 3, 4, 5])
 
 
+def test_protocol_deploy_compact_receipt_keeps_full_inventory_ids_for_ui_resume():
+    store = ProtocolDeploymentStore()
+    state = store.start(
+        [
+            {"id": channel_id, "title": f"Camera {channel_id}"}
+            for channel_id in range(1, 54)
+        ],
+        target_channel_count=8,
+        resume_latest=False,
+    )
+
+    compact = compact_deployment_state(state)
+
+    assert compact["available_channel_ids"] == list(range(1, 54))
+    assert len(compact["available_channels"]) == 16
+
+
+def test_maritime_operator_journey_keeps_scope_partial_review_and_apply_bounded():
+    store = ProtocolDeploymentStore()
+    state = store.start(
+        [
+            {"id": channel_id, "title": f"Coast camera {channel_id}"}
+            for channel_id in range(1, 54)
+        ],
+        target_channel_count=8,
+        deployment_profile="maritime",
+        resume_latest=False,
+    )
+    deployment_id = state["deployment_id"]
+    scoped = store.configure(
+        deployment_id,
+        channel_ids=[2, 7, 19, 41],
+        groups=[
+            {"name": "port_gates", "channel_ids": [2, 7]},
+            {"name": "coastline", "channel_ids": [19, 41]},
+        ],
+        channel_roles=[
+            {"channel_id": 2, "role": "maritime_gate", "location": "North gate"},
+            {"channel_id": 7, "role": "maritime_gate", "location": "South gate"},
+            {"channel_id": 19, "role": "maritime_coast", "location": "West beach"},
+            {"channel_id": 41, "role": "maritime_mixed_ptz", "location": "Harbour tour"},
+        ],
+    )
+    assert scoped["stage"] == "scope_configured"
+    assert len(scoped["selected_channel_ids"]) == 4
+
+    surveyed = store.record_survey(
+        deployment_id,
+        {
+            "channels": [
+                {
+                    "channel_id": channel_id,
+                    "title": f"Coast camera {channel_id}",
+                    "sample_count": 4,
+                    "survey": "VIEW: sampled maritime view; CAMERA: steady",
+                }
+                for channel_id in [2, 7, 19, 41]
+            ]
+        },
+    )
+    assert surveyed["stage"] == "surveyed"
+
+    partial = store.configure(
+        deployment_id,
+        quiet_window={
+            "enabled": True,
+            "timezone": "Europe/Riga",
+            "start_local": "01:00",
+            "end_local": "05:00",
+            "days": [0, 1, 2, 3, 4, 5, 6],
+        },
+        requirements=[
+            {
+                "name": "Port gates",
+                "channel_ids": [2, 7],
+                "expected_routine": "ordinary separated vessel passage",
+                "alerts": [
+                    {
+                        "name": "Converging vessel paths",
+                        "description": "two visible vessels converge in the gate",
+                        "severity": "high",
+                        "positive_query": "two vessels on visibly converging paths",
+                        "contrast_query": "vessels passing on separated parallel paths",
+                    }
+                ],
+            }
+        ],
+    )
+    assert partial["stage"] == "requirements_partial"
+    assert partial["quiet_window_confirmed"] is True
+    assert compact_deployment_state(partial)["missing_requirement_channel_ids"] == [19, 41]
+
+    complete = store.configure(
+        deployment_id,
+        requirements=[
+            {
+                "name": "Coastline",
+                "channel_ids": [19, 41],
+                "expected_routine": "ordinary coastline and PTZ patrol views",
+                "alerts": [],
+            }
+        ],
+    )
+    assert complete["stage"] == "requirements_configured"
+
+    preview = store.build_plan(deployment_id)
+    assert preview["stage"] == "plan_ready"
+    assert len(preview["plan"]["channels"]) == 4
+    assert len(preview["plan"]["groups"]) == 2
+    assert len(preview["plan"]["probes"]) == 2
+    applied = store.mark_applied(deployment_id, receipt={"status": "applied"})
+    assert applied["stage"] == "commissioning_pending"
+
+
 def test_protocol_deploy_drops_overlapping_duplicate_requirement_pack():
     store = ProtocolDeploymentStore()
     deployment_id = _configured_state(store)

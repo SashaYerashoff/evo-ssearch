@@ -7,7 +7,7 @@ from types import SimpleNamespace
 from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
 from unittest.mock import patch
 
-from luxriot_connector import LuxriotManager
+from luxriot_connector import DEFAULT_ALERTS_JSON_PROMPT, LuxriotManager
 
 
 def build_manager(directory: Path, alert_parser=None) -> LuxriotManager:
@@ -734,6 +734,23 @@ class VlmAlertPromptContractTests(unittest.TestCase):
                 "evaluate every operator-defined trigger independently",
                 normalized,
             )
+
+    def test_persisted_v1_contract_is_upgraded_without_alert_policy_migration(self):
+        with tempfile.TemporaryDirectory() as temp:
+            manager = build_manager(Path(temp))
+            old_contract = (
+                "Machine-readable current-batch state for EVA memory, navigation, "
+                "and alert actions:\nBATCH_STATE_JSON:\n"
+                '{"version": 1, "events": [], "observed_states": [], '
+                '"routines": [], "memory_pass": [], "alerts": []}'
+            )
+
+            normalized = manager._normalize_json_alert_prompt(old_contract)
+
+            self.assertEqual(normalized, DEFAULT_ALERTS_JSON_PROMPT)
+            self.assertIn('"version": 2', normalized)
+            self.assertIn("state=returned", normalized)
+            self.assertIn('"applies_to_event_keys": []', normalized)
 
     def test_legacy_stream_alert_prompt_returns_migration_suggestion(self):
         with tempfile.TemporaryDirectory() as temp:

@@ -15,16 +15,22 @@ EXPECTED_BRANCH="${EVA_PORT_EXPECTED_BRANCH:-feature/maritime-port-specs}"
 RELEASE_FLAVOR="${EVA_PORT_RELEASE_FLAVOR:-ventspils-maritime-client}"
 SOURCE_BRANCH="$(git -C "${REPO_ROOT}" branch --show-current)"
 SOURCE_COMMIT="$(git -C "${REPO_ROOT}" rev-parse HEAD)"
+SOURCE_DIRTY="$(git -C "${REPO_ROOT}" status --porcelain --untracked-files=normal)"
+WORKTREE_CLEAN=true
 
 if [[ "${SOURCE_BRANCH}" != "${EXPECTED_BRANCH}" && "${EVA_PORT_ALLOW_OTHER_BRANCH:-0}" != "1" ]]; then
     echo "ERROR: port client bundle must be built from ${EXPECTED_BRANCH}; current branch is ${SOURCE_BRANCH}." >&2
     echo "Set EVA_PORT_ALLOW_OTHER_BRANCH=1 only for an explicitly reviewed recovery build." >&2
     exit 1
 fi
-if [[ -n "$(git -C "${REPO_ROOT}" status --porcelain --untracked-files=normal)" && "${EVA_PORT_ALLOW_DIRTY:-0}" != "1" ]]; then
+if [[ -n "${SOURCE_DIRTY}" && "${EVA_PORT_ALLOW_DIRTY:-0}" != "1" ]]; then
     echo "ERROR: port client bundle requires a clean committed working tree." >&2
     echo "Commit the release candidate, or set EVA_PORT_ALLOW_DIRTY=1 only for a labelled diagnostic build." >&2
     exit 1
+fi
+if [[ -n "${SOURCE_DIRTY}" ]]; then
+    WORKTREE_CLEAN=false
+    echo "WARNING: building a diagnostic payload from a dirty tree; finalization will refuse it." >&2
 fi
 
 for required in \
@@ -96,10 +102,10 @@ rsync -a --delete --delete-excluded \
     "${REPO_ROOT}/" "${STAGING_ROOT}/repo/"
 
 rsync -a --delete "${MODEL_VLM}/" "${STAGING_ROOT}/models/qwen3-vl-4b-awq/"
-install -p -m 0644 \
+rsync -a \
     "${MODEL_9B}/Qwen3.5-9B-Q4_K_M.gguf" \
     "${STAGING_ROOT}/models/qwen3.5-9b-mtp/Qwen3.5-9B-Q4_K_M.gguf"
-install -p -m 0644 "${CLIP_WEIGHT}" "${STAGING_ROOT}/models/clip/ViT-B-32.pt"
+rsync -a "${CLIP_WEIGHT}" "${STAGING_ROOT}/models/clip/ViT-B-32.pt"
 rsync -a --delete \
     "${SIGLIP2_CACHE_REPO}/" \
     "${STAGING_ROOT}/models/huggingface/models--google--siglip2-base-patch16-224/"
@@ -114,6 +120,9 @@ install -p -m 0755 "${SCRIPT_DIR}/install_port_appliance.py" "${STAGING_ROOT}/in
 install -p -m 0755 "${SCRIPT_DIR}/install_port_appliance.sh" "${STAGING_ROOT}/install.sh"
 install -p -m 0755 "${SCRIPT_DIR}/eva_offline_deploy.py" "${STAGING_ROOT}/eva_offline_deploy.py"
 install -p -m 0755 "${SCRIPT_DIR}/eva_offline_deploy.sh" "${STAGING_ROOT}/START_EVA_AI.sh"
+install -p -m 0755 \
+    "${SCRIPT_DIR}/offline_bundle_dependencies.py" \
+    "${STAGING_ROOT}/offline_bundle_dependencies.py"
 install -p -m 0644 \
     "${REPO_ROOT}/deployment/port_4070s/constraints-port-4070s.txt" \
     "${STAGING_ROOT}/constraints-port-4070s.txt"
@@ -132,12 +141,12 @@ install -p -m 0644 \
 install -p -m 0644 \
     "${REPO_ROOT}/deployment/port_4070s/REPOSITORY_BACKUP.txt" \
     "${STAGING_ROOT}/repository-backup/README.txt"
-python3 - "${STAGING_ROOT}/SOURCE_REVISION.json" "${SOURCE_BRANCH}" "${SOURCE_COMMIT}" "${RELEASE_FLAVOR}" <<'PY'
+python3 - "${STAGING_ROOT}/SOURCE_REVISION.json" "${SOURCE_BRANCH}" "${SOURCE_COMMIT}" "${RELEASE_FLAVOR}" "${WORKTREE_CLEAN}" <<'PY'
 import json
 import sys
 from pathlib import Path
 
-target, branch, commit, flavor = sys.argv[1:]
+target, branch, commit, flavor, clean = sys.argv[1:]
 Path(target).write_text(
     json.dumps(
         {
@@ -145,7 +154,7 @@ Path(target).write_text(
             "release_flavor": flavor,
             "branch": branch,
             "commit": commit,
-            "working_tree_clean": True,
+            "working_tree_clean": clean == "true",
         },
         indent=2,
         sort_keys=True,
@@ -162,4 +171,5 @@ python3 "${SCRIPT_DIR}/build_appliance_installer_deb.py" \
 
 echo "Base payload prepared at ${STAGING_ROOT}"
 echo "Universal entry point: ${STAGING_ROOT}/START_EVA_AI.sh"
-echo "Populate wheelhouse/ and apt/, then run scripts/finalize_port_usb_bundle.py."
+echo "Base payload only: populate and validate wheelhouse/ and apt/ before finalization."
+echo "For a complete fresh/update bundle, use scripts/build_universal_usb_bundle.sh."

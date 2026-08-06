@@ -18,7 +18,7 @@ from pathlib import Path
 from typing import Any, Mapping, Sequence
 
 
-EXPECTED_SCHEMA = "20260801_0011"
+EXPECTED_SCHEMA = "20260805_0013"
 DEFAULT_ENV = Path("/etc/eva-ai/eva-ai.env")
 DEFAULT_APP = Path("/opt/eva-ai/evo-ssearch")
 

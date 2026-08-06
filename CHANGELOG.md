@@ -6,6 +6,29 @@ Format loosely follows Keep a Changelog.
 
 ## Unreleased
 
+- None.
+
+## β 0.8.7 — 2026-08-06 release candidate (temporal incidents and field hardening)
+
+- **Temporal incident memory:** EVA now keeps server-owned observation,
+  episode, incident and recurrence-series identities across L0–L3. Covered
+  high-signal L0 events can open bounded review candidates; exact semantic
+  tracks continue without merging parallel incidents, explicit routine
+  boundaries end only the perceptual episode, and coverage gaps never prove
+  resolution. The 2/4/8 allocator bounds prompt cognition while overflow stays
+  durable and retrievable.
+- **Independent lifecycle and review:** perception, risk, case and attention
+  states have an append-only transition ledger with optimistic revisions.
+  Operators can confirm, resolve, dismiss, mark false-positive or reopen a
+  case, and confirm/reject candidate recurrence links without merging incident
+  IDs. The secured agent exposes the same mutations through preview/apply
+  approval with server-resolved channel, revision and relation bindings.
+- **Incident operations:** Follow produces a durable human-readable outcome;
+  Incident Review separates active, needs-review and historical queues; detail
+  shows evidence covers, temporal episodes, candidate series and lifecycle
+  history. Markdown/XML reports lead with an operator synopsis and compressed
+  homeostatic response instead of dumping every low-level event.
+
 - **Reliable Protocol Deploy on 4B heads:** active deployment drafts are now
   rehydrated from compact trusted tool receipts across chat turns. Operator
   channel/group selections deterministically advance through scope
@@ -36,7 +59,14 @@ Format loosely follows Keep a Changelog.
   card offers per-group alert drafting or an explicit no-alert choice, and the
   final card reviews VLM policies and P/N probes/counters scope by scope before
   revealing the sole atomic Apply action. Explicit probe rejection rebuilds the
-  draft without discarding its VLM alert policy.
+  draft without discarding its VLM alert policy. The full authorized channel-ID
+  inventory now survives chat-history reloads even when only the first 16 titles
+  are exposed to the 4B head, and the maritime picker requires an explicit
+  closed role for every selected channel before survey; the agent cannot invent
+  a port/coast/PTZ role to advance the draft. Partial configuration returns a
+  fresh review card containing only the still-missing scopes, and the operator's
+  explicit `none`/`shadow` starter choice plus preemptible 9B quiet window survive
+  reloads instead of being inferred by the model.
 - **Operator-mode boundary:** `Operator OFF` now suppresses all agent-chat
   console-driving effects server-side, with a React-side mixed-version guard.
   Read-only research and chat answers remain available; explicit operator Apply
@@ -65,6 +95,19 @@ Format loosely follows Keep a Changelog.
   clicks change their disclosure state. Appearance can save, recall, overwrite,
   and delete up to twelve named browser-local custom presets after contrast
   validation.
+- **Database and verification:** schema head is `20260805_0013`; `0012` adds
+  incident lifecycle and temporal ledgers, while `0013` repairs archive
+  source/channel paging on upgraded databases. Full release verification:
+  1227 backend tests passed (23 skipped, 169 subtests) after the release fixes;
+  83 React tests passed and the production UI build completed.
+- **Universal offline deployment:** one `START_EVA_AI.sh` now detects fresh
+  versus update deployments without Git or internet access. Bundle manifest v2
+  covers fresh/update/report, refuses dirty source snapshots, inventories and
+  verifies every APT package and Python wheel, proves the CPython 3.12 + vLLM
+  dependency solve, carries the `0006 → 0013` SQL plan, backs up before update,
+  automatically rolls back a failed apply and emits a secret-free acceptance
+  report. The accepted React UI is release-managed while all site inference,
+  channel, tenant, retention and Luxriot settings remain preserved.
 
 ## β 0.8.5 — 2026-07-27 release candidate (adaptive attention and memory)
 

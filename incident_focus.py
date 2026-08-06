@@ -14,6 +14,15 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import Callable, Iterable
 
+from incident_attention import (
+    AttentionTier,
+    IncidentAttentionCandidate,
+    IncidentAttentionPolicy,
+    IncidentRankDecision,
+    allocate_incident_attention,
+    compact_incident_context,
+)
+
 
 class FocusLevel(str, Enum):
     FOLLOW = "follow"
@@ -33,6 +42,9 @@ class FocusLease:
     updated_at_ms: int
     expires_at_ms: int
     context: str = ""
+    operator_selected: bool = True
+    unresolved: bool = True
+    resolution_debt: int = 0
 
     def remaining_ms(self, now_ms: int) -> int:
         return max(0, int(self.expires_at_ms) - int(now_ms))
@@ -44,6 +56,10 @@ class FocusDirective:
     incident_ids: tuple[str, ...]
     expires_at_ms: int
     contexts: tuple[str, ...] = ()
+    foreground_incident_ids: tuple[str, ...] = ()
+    hot_incident_ids: tuple[str, ...] = ()
+    parked_incident_ids: tuple[str, ...] = ()
+    ranking: tuple[IncidentRankDecision, ...] = ()
 
 
 class IncidentFocusLeaseManager:
@@ -55,6 +71,8 @@ class IncidentFocusLeaseManager:
         max_leases: int = 64,
         max_channels_per_lease: int = 64,
         max_ttl_seconds: float = 8 * 60 * 60,
+        max_context_tokens: int = 800,
+        attention_policy: IncidentAttentionPolicy | None = None,
         clock_ms: Callable[[], int] | None = None,
     ) -> None:
         if int(max_leases) <= 0:
@@ -63,11 +81,22 @@ class IncidentFocusLeaseManager:
             raise ValueError("max_channels_per_lease must be positive")
         if float(max_ttl_seconds) <= 0:
             raise ValueError("max_ttl_seconds must be positive")
+        if int(max_context_tokens) <= 0:
+            raise ValueError("max_context_tokens must be positive")
         self.max_leases = int(max_leases)
         self.max_channels_per_lease = int(max_channels_per_lease)
         self.max_ttl_ms = int(float(max_ttl_seconds) * 1000.0)
+        self.max_context_tokens = int(max_context_tokens)
+        self.attention_policy = attention_policy or IncidentAttentionPolicy(
+            max_tracked_incidents=max(8, self.max_leases),
+        )
+        if self.attention_policy.max_tracked_incidents < self.max_leases:
+            raise ValueError(
+                "attention policy max_tracked_incidents must cover max_leases"
+            )
         self._clock_ms = clock_ms or (lambda: int(time.monotonic() * 1000.0))
         self._leases: dict[str, FocusLease] = {}
+        self._incumbent_tiers_by_channel: dict[int, dict[str, AttentionTier]] = {}
         self._lock = threading.RLock()
 
     def start(
@@ -78,6 +107,9 @@ class IncidentFocusLeaseManager:
         level: FocusLevel | str = FocusLevel.FOLLOW,
         ttl_seconds: float = 5 * 60,
         context: str | None = None,
+        operator_selected: bool | None = None,
+        unresolved: bool | None = None,
+        resolution_debt: int | None = None,
     ) -> FocusLease:
         normalized_id = self._incident_id(incident_id)
         normalized_channels = self._channel_ids(channel_ids)
@@ -103,6 +135,21 @@ class IncidentFocusLeaseManager:
                 context=self._context(
                     previous.context if context is None and previous is not None else context
                 ),
+                operator_selected=(
+                    previous.operator_selected
+                    if operator_selected is None and previous is not None
+                    else True if operator_selected is None else bool(operator_selected)
+                ),
+                unresolved=(
+                    previous.unresolved
+                    if unresolved is None and previous is not None
+                    else True if unresolved is None else bool(unresolved)
+                ),
+                resolution_debt=self._resolution_debt(
+                    previous.resolution_debt
+                    if resolution_debt is None and previous is not None
+                    else resolution_debt
+                ),
             )
             self._leases[normalized_id] = lease
             return lease
@@ -111,7 +158,10 @@ class IncidentFocusLeaseManager:
         normalized_id = self._incident_id(incident_id)
         with self._lock:
             self._expire_locked(self._now_ms())
-            return self._leases.pop(normalized_id, None) is not None
+            stopped = self._leases.pop(normalized_id, None) is not None
+            if stopped:
+                self._remove_incumbent_locked(normalized_id)
+            return stopped
 
     def expire(self) -> int:
         with self._lock:
@@ -133,25 +183,51 @@ class IncidentFocusLeaseManager:
                 if normalized_channel in lease.channel_ids
             ]
             if not matches:
+                self._incumbent_tiers_by_channel.pop(normalized_channel, None)
                 return None
-            strongest = (
-                FocusLevel.CRITICAL
-                if any(lease.level is FocusLevel.CRITICAL for lease in matches)
-                else FocusLevel.FOLLOW
+            incumbent_tiers = self._incumbent_tiers_by_channel.get(
+                normalized_channel,
+                {},
             )
-            relevant = sorted(
-                (lease for lease in matches if lease.level is strongest),
-                key=lambda lease: (lease.expires_at_ms, lease.incident_id),
+            leases_by_id = {lease.incident_id: lease for lease in matches}
+            allocation = allocate_incident_attention(
+                tuple(
+                    IncidentAttentionCandidate(
+                        incident_id=lease.incident_id,
+                        level=lease.level.value,
+                        context=lease.context,
+                        operator_selected=lease.operator_selected,
+                        unresolved=lease.unresolved,
+                        incumbent_tier=incumbent_tiers.get(lease.incident_id),
+                        resolution_debt=lease.resolution_debt,
+                        updated_at_ms=lease.updated_at_ms,
+                        expires_at_ms=lease.expires_at_ms,
+                    )
+                    for lease in matches
+                ),
+                self.attention_policy,
+            )
+            self._incumbent_tiers_by_channel[normalized_channel] = {
+                decision.incident_id: decision.tier
+                for decision in allocation.decisions
+            }
+            ordered = tuple(
+                leases_by_id[incident_id]
+                for incident_id in allocation.all_incident_ids
             )
             return FocusDirective(
-                level=strongest,
-                incident_ids=tuple(lease.incident_id for lease in relevant),
-                expires_at_ms=max(lease.expires_at_ms for lease in relevant),
+                level=FocusLevel(allocation.effective_level),
+                incident_ids=allocation.all_incident_ids,
+                expires_at_ms=max(lease.expires_at_ms for lease in ordered),
                 contexts=tuple(
                     lease.context
-                    for lease in relevant
+                    for lease in ordered
                     if lease.context
-                )[:4],
+                ),
+                foreground_incident_ids=allocation.foreground_incident_ids,
+                hot_incident_ids=allocation.hot_incident_ids,
+                parked_incident_ids=allocation.parked_incident_ids,
+                ranking=allocation.decisions,
             )
 
     def compact_digest(self, *, incident_limit: int = 16) -> dict[str, object]:
@@ -197,7 +273,17 @@ class IncidentFocusLeaseManager:
         ]
         for incident_id in expired:
             self._leases.pop(incident_id, None)
+            self._remove_incumbent_locked(incident_id)
         return len(expired)
+
+    def _remove_incumbent_locked(self, incident_id: str) -> None:
+        empty_channels: list[int] = []
+        for channel_id, tiers in self._incumbent_tiers_by_channel.items():
+            tiers.pop(incident_id, None)
+            if not tiers:
+                empty_channels.append(channel_id)
+        for channel_id in empty_channels:
+            self._incumbent_tiers_by_channel.pop(channel_id, None)
 
     def _now_ms(self) -> int:
         value = int(self._clock_ms())
@@ -256,10 +342,22 @@ class IncidentFocusLeaseManager:
         return ttl_ms
 
     @staticmethod
-    def _context(value: str | None) -> str:
+    def _resolution_debt(value: int | None) -> int:
+        try:
+            normalized = int(value or 0)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("resolution_debt must be a non-negative integer") from exc
+        if normalized < 0:
+            raise ValueError("resolution_debt must be a non-negative integer")
+        return normalized
+
+    def _context(self, value: str | None) -> str:
         # Context is inert, bounded prior evidence carried to the live VLM.
         # It never changes lease routing or attention authority.
-        return " ".join(str(value or "").split())[:2400]
+        return compact_incident_context(
+            value,
+            max_tokens=self.max_context_tokens,
+        )
 
 
 __all__ = [

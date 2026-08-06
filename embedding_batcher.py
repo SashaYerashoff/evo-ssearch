@@ -85,6 +85,12 @@ class ImageEmbeddingBatcher:
         self._counters: Counter[str] = Counter()
         self._batch_size_total = 0
         self._batch_size_max = 0
+        self._batch_compute_ms_total = 0.0
+        self._batch_compute_ms_last = 0.0
+        self._batch_compute_ms_max = 0.0
+        self._batch_queue_wait_ms_total = 0.0
+        self._batch_queue_wait_ms_last = 0.0
+        self._batch_queue_wait_ms_max = 0.0
         self._last_error: Optional[str] = None
         if autostart:
             self.start()
@@ -202,6 +208,26 @@ class ImageEmbeddingBatcher:
                     if completed_batches
                     else 0.0
                 ),
+                "average_batch_compute_ms": (
+                    round(self._batch_compute_ms_total / completed_batches, 3)
+                    if completed_batches
+                    else 0.0
+                ),
+                "last_batch_compute_ms": round(self._batch_compute_ms_last, 3),
+                "max_batch_compute_ms": round(self._batch_compute_ms_max, 3),
+                "average_batch_queue_wait_ms": (
+                    round(self._batch_queue_wait_ms_total / completed_batches, 3)
+                    if completed_batches
+                    else 0.0
+                ),
+                "last_batch_queue_wait_ms": round(
+                    self._batch_queue_wait_ms_last,
+                    3,
+                ),
+                "max_batch_queue_wait_ms": round(
+                    self._batch_queue_wait_ms_max,
+                    3,
+                ),
                 "largest_batch_size": self._batch_size_max,
                 "last_error": self._last_error,
                 "counters": dict(sorted(self._counters.items())),
@@ -234,7 +260,14 @@ class ImageEmbeddingBatcher:
                 self._inflight += len(batch)
 
             try:
+                batch_started = time.monotonic()
                 raw = self.embed_many([request.image for request in batch])
+                batch_compute_ms = (time.monotonic() - batch_started) * 1000.0
+                oldest_wait_ms = max(
+                    0.0,
+                    (batch_started - min(request.submitted_at for request in batch))
+                    * 1000.0,
+                )
                 metadata: Mapping[str, Any] = {}
                 if isinstance(raw, EmbeddingBatchOutput):
                     metadata = dict(raw.metadata)
@@ -258,6 +291,18 @@ class ImageEmbeddingBatcher:
                     self._counters["batches_total"] += 1
                     self._batch_size_total += len(batch)
                     self._batch_size_max = max(self._batch_size_max, len(batch))
+                    self._batch_compute_ms_total += batch_compute_ms
+                    self._batch_compute_ms_last = batch_compute_ms
+                    self._batch_compute_ms_max = max(
+                        self._batch_compute_ms_max,
+                        batch_compute_ms,
+                    )
+                    self._batch_queue_wait_ms_total += oldest_wait_ms
+                    self._batch_queue_wait_ms_last = oldest_wait_ms
+                    self._batch_queue_wait_ms_max = max(
+                        self._batch_queue_wait_ms_max,
+                        oldest_wait_ms,
+                    )
                     self._last_error = None
             except BaseException as exc:
                 for request in batch:

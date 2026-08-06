@@ -396,9 +396,14 @@ class ApiDataflowSmokeTests(unittest.TestCase):
             # The production React client builds these paths through its typed
             # incidents API rather than direct fetch() calls in the legacy bundle.
             "/incidents/draft",
+            "/incidents",
             "/incidents/<incident_id>",
+            "/incidents/<incident_id>/observations",
+            "/incidents/<incident_id>/temporal",
             "/incidents/<incident_id>/follow",
             "/incidents/<incident_id>/stop-follow",
+            "/incidents/<incident_id>/review",
+            "/incidents/<incident_id>/series/<relation_id>/review",
             "/incidents/<incident_id>/export",
             "/js/app.js",
             "/lm/admission",
@@ -978,6 +983,28 @@ class ApiDataflowSmokeTests(unittest.TestCase):
         self.assertEqual(payload["logs"][0]["summary"], "A person crossed the road.")
         self.assertEqual(captured["since_ms"], 1000)
         self.assertEqual(captured["until_ms"], 2000)
+        self.assertTrue(captured["return_page_info"])
+        self.assertTrue(payload["total_exact"])
+
+    def test_luxriot_history_exposes_lower_bound_without_claiming_exact_total(self) -> None:
+        class Store:
+            def list_vlm_summary_batches(self, **_kwargs):
+                return ([{"channel_id": 7, "summary": "Newest batch"}], 2, {
+                    "has_more": True,
+                    "total_exact": False,
+                    "scanned_rows": 256,
+                })
+
+        with patch("oldapp.detections_store", Store()):
+            response = self.client.get(
+                "/luxriot/history?channel_id=7&limit=1&offset=0"
+            )
+
+        self.assertEqual(response.status_code, 200, response.get_json())
+        payload = response.get_json()
+        self.assertEqual(payload["total"], 2)
+        self.assertTrue(payload["has_more"])
+        self.assertFalse(payload["total_exact"])
 
     def test_luxriot_rollup_api_never_exposes_internal_memory_or_signal_digest(self) -> None:
         rollup_payload = {
@@ -1554,7 +1581,7 @@ class ApiDataflowSmokeTests(unittest.TestCase):
             ("GET", "/comments", {}, {400}),
             ("POST", "/commented_images", {"json": {}}, {400}),
             ("POST", "/segment_from_point", {"json": {}}, {400}),
-            ("GET", "/probes/list", {}, {200}),
+            ("GET", "/probes/list", {}, {200, 503}),
             ("GET", "/probes/status", {}, {200}),
             ("GET", "/luxriot/session", {}, {200}),
         ]

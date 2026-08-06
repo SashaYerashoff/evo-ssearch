@@ -595,6 +595,162 @@ class AgentToolLoopTests(unittest.TestCase):
         call = agent._required_bounded_workflow_tool_call(context, schemas)
         self.assertEqual(call.name, "survey_deployment")
 
+        numeric_only = agent._inherit_followup_tool_context(
+            _seed_turn_tool_context("112, 118"),
+            "112, 118",
+            [
+                {
+                    "role": "tool",
+                    "tool_name": "start_deployment",
+                    "tool_result": json.dumps(start_result),
+                }
+            ],
+        )
+        self.assertEqual(numeric_only["tool_intents"], ["deployment"])
+        self.assertEqual(numeric_only["deployment_selected_channel_ids"], [112, 118])
+
+    def test_maritime_scope_requires_operator_roles_and_carries_closed_ui_values(self):
+        start_result = {
+            "deployment_id": "deploy-port-1",
+            "deployment_profile": "maritime",
+            "target_channel_count": 8,
+            "stage": "inventory",
+            "available_channel_ids": [41, 42],
+            "available_channels": [
+                {"id": 41, "title": "North gate"},
+                {"id": 42, "title": "West coast"},
+            ],
+            "selected_channel_ids": [],
+            "groups": [],
+            "channel_roles": [],
+        }
+        history = [{
+            "role": "tool",
+            "tool_name": "start_deployment",
+            "tool_result": json.dumps(start_result),
+        }]
+        compact = agent._compact_tool_result_for_model(
+            "start_deployment",
+            start_result,
+        )
+        self.assertEqual(compact["deployment_profile"], "maritime")
+        self.assertEqual(compact["available_channel_ids"], [41, 42])
+        survey_compact = agent._compact_tool_result_for_model(
+            "survey_deployment",
+            {
+                **start_result,
+                "stage": "surveyed",
+                "starter_policy_mode": "shadow",
+                "starter_policy_confirmed": True,
+                "selected_channel_ids": [41, 42],
+                "groups": [{"name": "gates", "channel_ids": [41, 42]}],
+                "channel_roles": [
+                    {"channel_id": 41, "role": "maritime_gate"},
+                    {"channel_id": 42, "role": "maritime_mixed_ptz"},
+                ],
+                "surveys": [
+                    {"channel_id": 41, "scene_fingerprint": "VIEW: port gate"},
+                    {"channel_id": 42, "scene_fingerprint": "VIEW: mixed"},
+                ],
+            },
+        )
+        self.assertEqual(survey_compact["deployment_profile"], "maritime")
+        self.assertTrue(survey_compact["starter_policy_confirmed"])
+        self.assertEqual(survey_compact["groups"][0]["name"], "gates")
+        self.assertEqual(len(survey_compact["surveys"]), 2)
+
+        incomplete = agent._inherit_followup_tool_context(
+            _seed_turn_tool_context("41, 42"),
+            "41, 42",
+            history,
+        )
+        self.assertTrue(incomplete["deployment_maritime_roles_pending"])
+        self.assertTrue(agent._bounded_workflow_plan_completed(incomplete))
+        self.assertEqual(
+            _select_relevant_tool_schemas(agent._TOOL_SCHEMAS, incomplete),
+            [],
+        )
+        self.assertIn(
+            "No channel role will be guessed",
+            agent._format_deployment_maritime_roles_pending(incomplete),
+        )
+
+        text = (
+            'Select channels 41, 42; group gates: 41, 42; '
+            'CH 41 role maritime_gate location "Ventspils north gate"; '
+            'CH 42 role maritime_mixed_ptz location "West coastline tour"'
+        )
+        complete = agent._inherit_followup_tool_context(
+            _seed_turn_tool_context(text),
+            text,
+            history,
+        )
+        self.assertNotIn("deployment_maritime_roles_pending", complete)
+        self.assertEqual(
+            complete["deployment_channel_roles"],
+            [
+                {
+                    "channel_id": 41,
+                    "role": "maritime_gate",
+                    "location": "Ventspils north gate",
+                },
+                {
+                    "channel_id": 42,
+                    "role": "maritime_mixed_ptz",
+                    "location": "West coastline tour",
+                },
+            ],
+        )
+        schemas = _select_relevant_tool_schemas(agent._TOOL_SCHEMAS, complete)
+        call = agent._required_bounded_workflow_tool_call(complete, schemas)
+        self.assertEqual(call.name, "configure_deployment")
+        self.assertEqual(call.args["channel_roles"], complete["deployment_channel_roles"])
+
+        supplied = _apply_turn_tool_context(
+            "configure_deployment",
+            {
+                "deployment_id": "invented",
+                "requirements": [{"name": "Gates", "channel_ids": [41, 42]}],
+                "starter_policy_mode": "shadow",
+            },
+            {
+                **complete,
+                "deployment_stage": "surveyed",
+                "deployment_starter_policy_mode": "none",
+            },
+        )
+        self.assertEqual(supplied["starter_policy_mode"], "none")
+        self.assertEqual(
+            agent._deployment_starter_policy_mode_from_text(
+                "Starter policy mode shadow"
+            ),
+            "shadow",
+        )
+        quiet_window = agent._deployment_quiet_window_from_text(
+            "Consolidation quiet window 01:00-05:00 timezone Europe/Riga every day"
+        )
+        self.assertEqual(
+            quiet_window,
+            {
+                "enabled": True,
+                "start_local": "01:00",
+                "end_local": "05:00",
+                "timezone": "Europe/Riga",
+                "days": list(range(7)),
+            },
+        )
+        quiet_prepared = _apply_turn_tool_context(
+            "configure_deployment",
+            {"quiet_window": {"enabled": True, "timezone": "Invented/Zone"}},
+            {
+                **complete,
+                "deployment_stage": "surveyed",
+                "deployment_quiet_window_confirmed": True,
+                "deployment_quiet_window": quiet_window,
+            },
+        )
+        self.assertEqual(quiet_prepared["quiet_window"], quiet_window)
+
     def test_protocol_deploy_inventory_turn_stops_for_operator_scope(self):
         context = _seed_turn_tool_context("Protocol Deploy, target 8 channels")
         context.update(
@@ -2331,6 +2487,7 @@ class AgentToolLoopTests(unittest.TestCase):
                 "get_incident",
                 "draft_incident",
                 "follow_incident",
+                "review_incident",
                 "stop_incident_follow",
             },
         )

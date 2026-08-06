@@ -129,6 +129,16 @@ class CompactAttentionSignalTests(unittest.TestCase):
             {item["snapshot_index"] for item in prompt_view["clip_snapshot_scores"]},
             {1, 2, 3},
         )
+        self.assertEqual(len(prompt_view["clip_probe_legend"]), 4)
+        self.assertTrue(
+            all(
+                set(item).issuperset({"snapshot_index", "probe_ref", "p", "n", "m"})
+                for item in prompt_view["clip_snapshot_scores"]
+            )
+        )
+        self.assertTrue(
+            all("probe_id" not in item for item in prompt_view["clip_snapshot_scores"])
+        )
         self.assertNotIn("clip_frame_scores", prompt_view)
         self.assertLess(len(str(prompt_view)), 8_000)
         self.assertEqual(prompt_view["motion_digest"]["interval_count"], 16)

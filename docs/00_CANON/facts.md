@@ -7,25 +7,25 @@ fact changes, change it here first.
 Markers: `[FIELD]` = client-specific, filled only in the internal field-rollout
 doc, never in shareable docs. `[VERIFY]` = confirm before relying on it.
 
-Last reviewed: 2026-07-27 (β 0.8.5)
+Last reviewed: 2026-08-06 (β 0.8.7)
 
 ## Product & version
 
 | Fact | Value |
 |---|---|
 | Product | Luxriot EVA AI |
-| Current version | `β 0.8.5` |
+| Current version | `β 0.8.7` |
 | Release class | Production-pilot beta (supervised, closed network) |
 | Version source of truth | `VERSION` file; `EVOSSEARCH_APP_VERSION` overrides only if set |
-| Previous baseline | `β 0.8.4` |
+| Previous baseline | `β 0.8.5` |
 
 ## Database
 
 | Fact | Value |
 |---|---|
 | Control plane | PostgreSQL (required in secure deployment) |
-| Alembic schema head | `20260801_0011` |
-| Code-expected revision | `CURRENT_SCHEMA_REVISION` in `eva_db/settings.py` = `20260801_0011` |
+| Alembic schema head | `20260805_0013` |
+| Code-expected revision | `CURRENT_SCHEMA_REVISION` in `eva_db/settings.py` = `20260805_0013` |
 | Migration needed for this working tree | **Yes**: run `alembic upgrade head` |
 | Archive store | PostgreSQL, forced in secure mode (`EVOSSEARCH_ARCHIVE_STORE=postgres`) |
 | Row-level security | Enabled and forced on `iam`, `agent`, `audit`, `archive` schemas |

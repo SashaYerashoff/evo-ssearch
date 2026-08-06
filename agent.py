@@ -428,6 +428,41 @@ _TOOL_SCHEMAS: List[Dict[str, Any]] = [
     {
         "type": "function",
         "function": {
+            "name": "review_incident",
+            "description": (
+                "Preview an operator lifecycle decision for a known incident, or "
+                "confirm/reject one candidate recurrence link. This is a MUT preview: "
+                "copy IDs from prior compact results, choose only a closed action, and "
+                "leave application to the UI approval plan."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "incident_id": {
+                        "type": "string",
+                        "description": "Exact server-issued incident ID copied from operator text or a prior tool result.",
+                    },
+                    "action": {
+                        "type": "string",
+                        "enum": [
+                            "confirm", "resolve", "dismiss", "false_positive", "reopen",
+                            "confirm_series", "reject_series",
+                        ],
+                        "description": "Closed operator-review decision.",
+                    },
+                    "relation_id": {
+                        "type": "string",
+                        "description": "Exact candidate relation ID from get_incident; required only for series actions.",
+                    },
+                    "preview": {"type": "boolean", "description": "Must be true for model calls."},
+                },
+                "required": ["incident_id", "action", "preview"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "search_archive",
             "description": (
                 "Semantic text search over either an indexed folder (CLIP/FAISS) or "
@@ -2932,6 +2967,7 @@ class AgentTools:
             "draft_incident":       self._draft_incident,
             "follow_incident":      self._follow_incident,
             "stop_incident_follow": self._stop_incident_follow,
+            "review_incident":      self._review_incident,
             "search_archive":       self._search_archive,
             "get_visual_window_signals": self._get_visual_window_signals,
             "calibrate_probe_from_archive": self._calibrate_probe_from_archive,
@@ -2991,6 +3027,9 @@ class AgentTools:
                 "status": "ok",
                 "incident": _compact_incident_for_model(
                     service.public_record(record)
+                ),
+                "temporal": _compact_incident_temporal_for_model(
+                    service.temporal_context(record)
                 ),
             }
         except (LookupError, ValueError) as exc:
@@ -3142,6 +3181,84 @@ class AgentTools:
         except IncidentRevisionConflict as exc:
             raise ToolError(
                 f"Incident changed to revision {exc.actual_revision}; prepare a fresh stop preview."
+            ) from exc
+        except (LookupError, ValueError) as exc:
+            raise ToolError(str(exc)) from exc
+
+    def _review_incident(self, args: Dict[str, Any]) -> Dict[str, Any]:
+        service = self._require_incident_commands()
+        incident_id = str(args.get("incident_id") or "").strip()
+        action = str(args.get("action") or "").strip().lower()
+        relation_id = str(args.get("relation_id") or "").strip()
+        lifecycle_actions = {"confirm", "resolve", "dismiss", "false_positive", "reopen"}
+        series_actions = {"confirm_series": "confirm", "reject_series": "reject"}
+        if action not in lifecycle_actions | set(series_actions):
+            raise ToolError("Unsupported incident review action.")
+        if action in series_actions and not relation_id:
+            raise ToolError("relation_id is required for a series review action.")
+        try:
+            current = service.get(incident_id)
+            temporal = service.temporal_context(current)
+            if action in series_actions:
+                candidates = {
+                    str(item.get("relation_id") or "")
+                    for item in temporal.get("series_links") or []
+                    if isinstance(item, Mapping)
+                    and str(item.get("relation_state") or "") == "candidate"
+                }
+                if relation_id not in candidates:
+                    raise ToolError("relation_id is not an active candidate series link.")
+            if args.get("preview", True) is True:
+                return {
+                    "status": "preview",
+                    "action": "review_incident",
+                    "incident": _compact_incident_for_model(
+                        service.public_record(current),
+                        timeline_limit=4,
+                        evidence_limit=2,
+                        uncertainty_limit=4,
+                    ),
+                    "temporal": _compact_incident_temporal_for_model(temporal),
+                    "proposed_review": {
+                        "action": action,
+                        **({"relation_id": relation_id} if relation_id else {}),
+                    },
+                }
+            if action in series_actions:
+                reviewed_relation = service.review_series_relation(
+                    incident_id,
+                    relation_id,
+                    actor_id=self._trusted_actor_id(),
+                    action=series_actions[action],
+                )
+                updated = current
+            else:
+                reviewed_relation = None
+                updated = service.review_incident(
+                    incident_id,
+                    actor_id=self._trusted_actor_id(),
+                    action=action,
+                    expected_revision=_opt_int(args.get("expected_revision")),
+                )
+            return {
+                "status": "applied",
+                "action": "review_incident",
+                "incident": _compact_incident_for_model(
+                    service.public_record(updated),
+                    timeline_limit=4,
+                    evidence_limit=2,
+                    uncertainty_limit=4,
+                ),
+                "temporal": _compact_incident_temporal_for_model(
+                    service.temporal_context(updated)
+                ),
+                **({"relation": dict(reviewed_relation)} if reviewed_relation else {}),
+            }
+        except ToolError:
+            raise
+        except IncidentRevisionConflict as exc:
+            raise ToolError(
+                f"Incident changed to revision {exc.actual_revision}; prepare a fresh review preview."
             ) from exc
         except (LookupError, ValueError) as exc:
             raise ToolError(str(exc)) from exc
@@ -5370,6 +5487,17 @@ class AgentTools:
             raise ToolError(f"Could not configure deployment: {exc}") from exc
         return {
             **compact_deployment_state(state),
+            "surveys": [
+                {
+                    "channel_id": row.get("channel_id"),
+                    "title": row.get("title"),
+                    "sample_count": row.get("sample_count"),
+                    "scene_fingerprint": str(row.get("survey") or "")[:700],
+                    "error": row.get("error"),
+                }
+                for row in (state.get("surveys") or [])
+                if isinstance(row, Mapping)
+            ],
             "instruction": {
                 "scope_configured": (
                     "Call survey_deployment. After the compact scene survey, ask "
@@ -9775,7 +9903,7 @@ def _build_scoped_agent_system_prompt(
             "Incident control route:\n"
             "- For an explicit report/create request, normalize the window and call draft_incident with preview=true.\n"
             "- The server-owned draft spans the event and returns its evidence digest; do not rebuild it with repeated reads.\n"
-            "- Follow/stop are preview-only in chat. Never silently enable focus or apply an incident draft."
+            "- Follow/stop/review are preview-only in chat. Never silently enable focus, apply an incident draft, or change incident lifecycle."
         )
 
     if "deployment" in intents:
@@ -10147,6 +10275,7 @@ _TOOL_INTENT_GROUPS: Dict[str, frozenset[str]] = {
         "get_incident",
         "draft_incident",
         "follow_incident",
+        "review_incident",
         "stop_incident_follow",
     }),
 }
@@ -10187,10 +10316,10 @@ def _classify_tool_intents(user_text: Any, context: Mapping[str, Any]) -> List[s
         add("deployment")
         return intents
     if re.search(
-        r"\b(?:report|create|draft|follow|stop|show|get|open)\s+(?:the\s+|this\s+|an?\s+)?incident\b|"
-        r"\bincident\s+(?:id|draft|follow|focus)\b|"
-        r"(?:созда|состав|оформ|покаж|откро|след|сопровож|останов).{0,28}инцидент|"
-        r"инцидент.{0,28}(?:созда|чернов|покаж|откро|след|сопровож|останов)",
+        r"\b(?:report|create|draft|follow|stop|show|get|open|review|confirm|resolve|dismiss|reopen)\s+(?:the\s+|this\s+|an?\s+)?incident\b|"
+        r"\bincident\s+(?:id|draft|follow|focus|review|series)\b|"
+        r"(?:созда|состав|оформ|покаж|откро|след|сопровож|останов|подтверд|закр|отклон|переоткр).{0,28}инцидент|"
+        r"инцидент.{0,28}(?:созда|чернов|покаж|откро|след|сопровож|останов|подтверд|закр|отклон|переоткр)",
         text,
     ):
         add("incident_control")
@@ -10283,7 +10412,9 @@ def _select_relevant_tool_schemas(
         # Protocol Deploy is a phase machine.  A 4B head gets only the one
         # schema valid for the trusted durable stage, so it cannot narrate an
         # update without writing the draft or skip straight to preview/apply.
-        if context.get("deployment_requirements_supplied"):
+        if context.get("deployment_maritime_roles_pending"):
+            allowed_names.clear()
+        elif context.get("deployment_requirements_supplied"):
             allowed_names.intersection_update({"configure_deployment"})
         elif (
             context.get("deployment_preview_pending")
@@ -10436,6 +10567,12 @@ def _seed_turn_tool_context(user_text: Any) -> Dict[str, Any]:
             normalized_unicode,
         ):
             context["incident_operation"] = "stop"
+        elif re.search(
+            r"\b(?:review|confirm|resolve|dismiss|reopen)\b.{0,24}\bincident\b|"
+            r"(?:подтверд|закр|отклон|переоткр).{0,24}инцидент",
+            normalized_unicode,
+        ):
+            context["incident_operation"] = "review"
         else:
             context["incident_operation"] = "get"
     if "deployment" in context["tool_intents"]:
@@ -10509,22 +10646,48 @@ def _inherit_followup_tool_context(
         return context
 
     deployment = _latest_deployment_context(history)
-    if deployment and _looks_like_deployment_followup(user_text):
+    deployment_selection = (
+        _deployment_channel_selection(
+            user_text,
+            deployment.get("deployment_available_channel_ids") or (),
+        )
+        if deployment
+        else []
+    )
+    if deployment and (
+        _looks_like_deployment_followup(user_text)
+        or (
+            str(deployment.get("deployment_stage") or "") == "inventory"
+            and bool(deployment_selection)
+        )
+    ):
         # Protocol Deploy is a durable, phase-bound workflow.  Keep its compact
         # server-owned state authoritative across turns so a small local head
         # cannot reinterpret a channel selection as generic video research.
         context["tool_intents"] = ["deployment"]
         context.update(deployment)
-        selected = _deployment_channel_selection(
-            user_text,
-            deployment.get("deployment_available_channel_ids") or (),
-        )
+        selected = deployment_selection
         if selected:
             context["deployment_selected_channel_ids"] = selected
             context["deployment_groups"] = _deployment_groups_from_text(
                 user_text,
                 selected,
             )
+            context["deployment_channel_roles"] = _deployment_channel_roles_from_text(
+                user_text,
+                selected,
+            )
+            if (
+                str(context.get("deployment_profile") or "general") == "maritime"
+                and {
+                    int(item.get("channel_id"))
+                    for item in context["deployment_channel_roles"]
+                    if isinstance(item, Mapping)
+                    and _opt_int(item.get("channel_id")) is not None
+                }
+                != set(selected)
+            ):
+                context["deployment_maritime_roles_pending"] = True
         explicit_alert_names = _deployment_explicit_alert_names(user_text)
         if explicit_alert_names:
             context["deployment_explicit_alert_names"] = explicit_alert_names
@@ -10534,6 +10697,13 @@ def _inherit_followup_tool_context(
         no_probe_channel_ids = _deployment_no_probe_channel_ids(user_text)
         if no_probe_channel_ids:
             context["deployment_no_probe_channel_ids"] = no_probe_channel_ids
+        starter_policy_mode = _deployment_starter_policy_mode_from_text(user_text)
+        if starter_policy_mode:
+            context["deployment_starter_policy_mode"] = starter_policy_mode
+        quiet_window = _deployment_quiet_window_from_text(user_text)
+        if quiet_window is not None:
+            context["deployment_quiet_window"] = quiet_window
+            context["deployment_quiet_window_confirmed"] = True
         context["inherited_operator_intent"] = True
         return context
 
@@ -10767,11 +10937,17 @@ def _deployment_context_from_payload(
     stage = str(payload.get("stage") or "").strip()
     if not deployment_id or stage in {"applied", "cancelled", "failed"}:
         return None
-    available = [
+    available_from_rows = [
         int(item.get("id"))
         for item in (payload.get("available_channels") or [])
         if isinstance(item, Mapping) and _opt_int(item.get("id")) is not None
     ]
+    available_from_ids = [
+        int(item)
+        for item in (payload.get("available_channel_ids") or [])
+        if _opt_int(item) is not None
+    ]
+    available = list(dict.fromkeys(available_from_ids or available_from_rows))[:100]
     selected = [
         int(item)
         for item in (payload.get("selected_channel_ids") or [])
@@ -10781,6 +10957,13 @@ def _deployment_context_from_payload(
         "deployment_id": deployment_id,
         "deployment_stage": stage,
         "deployment_profile": str(payload.get("deployment_profile") or "general"),
+        "deployment_starter_policy_mode": str(
+            payload.get("starter_policy_mode") or "none"
+        ),
+        "deployment_quiet_window": copy.deepcopy(payload.get("quiet_window")),
+        "deployment_quiet_window_confirmed": bool(
+            payload.get("quiet_window_confirmed")
+        ),
         "deployment_target_channel_count": max(
             1,
             min(8, int(payload.get("target_channel_count") or 8)),
@@ -10788,6 +10971,7 @@ def _deployment_context_from_payload(
         "deployment_available_channel_ids": available,
         "deployment_selected_channel_ids": selected,
         "deployment_groups": copy.deepcopy(payload.get("groups") or []),
+        "deployment_channel_roles": copy.deepcopy(payload.get("channel_roles") or []),
         "deployment_missing_requirement_channel_ids": [
             int(item)
             for item in (payload.get("missing_requirement_channel_ids") or [])
@@ -11064,6 +11248,83 @@ def _deployment_groups_from_text(
     ][:8]
 
 
+def _deployment_channel_roles_from_text(
+    user_text: Any,
+    selected_channel_ids: Sequence[int],
+) -> List[Dict[str, Any]]:
+    """Parse only the closed role syntax emitted by the deployment UI.
+
+    Roles remain operator-owned: IDs outside the selected inventory and role
+    names outside the closed maritime enum are discarded rather than repaired.
+    """
+
+    selected = {int(item) for item in selected_channel_ids}
+    allowed_roles = {
+        "maritime_gate",
+        "maritime_coast",
+        "maritime_mixed_ptz",
+    }
+    roles: Dict[int, Dict[str, Any]] = {}
+    for match in re.finditer(
+        r"\b(?:ch(?:annel)?|канал)\s*#?(\d{1,9})\s+role\s+"
+        r"(maritime_gate|maritime_coast|maritime_mixed_ptz)"
+        r"(?:\s+location\s+[\"“]([^\"”]{1,160})[\"”])?",
+        unicodedata.normalize("NFKC", str(user_text or "")),
+        flags=re.IGNORECASE,
+    ):
+        channel_id = int(match.group(1))
+        role = str(match.group(2) or "").lower()
+        if channel_id not in selected or role not in allowed_roles:
+            continue
+        row: Dict[str, Any] = {"channel_id": channel_id, "role": role}
+        location = " ".join(str(match.group(3) or "").split())
+        if location:
+            row["location"] = location
+        roles[channel_id] = row
+    return [roles[channel_id] for channel_id in selected_channel_ids if channel_id in roles]
+
+
+def _deployment_starter_policy_mode_from_text(user_text: Any) -> Optional[str]:
+    """Read the closed maritime starter choice emitted by the survey card."""
+
+    match = re.search(
+        r"\bstarter\s+policy\s+mode\s+(none|shadow)\b",
+        unicodedata.normalize("NFKC", str(user_text or "")),
+        flags=re.IGNORECASE,
+    )
+    return str(match.group(1)).lower() if match else None
+
+
+def _deployment_quiet_window_from_text(
+    user_text: Any,
+) -> Optional[Dict[str, Any]]:
+    """Parse the closed consolidation schedule emitted by the survey card."""
+
+    text = unicodedata.normalize("NFKC", str(user_text or ""))
+    if re.search(
+        r"\bconsolidation\s+quiet\s+window\s+disabled\b",
+        text,
+        flags=re.IGNORECASE,
+    ):
+        return {"enabled": False}
+    match = re.search(
+        r"\bconsolidation\s+quiet\s+window\s+"
+        r"(\d{2}:\d{2})-(\d{2}:\d{2})\s+timezone\s+"
+        r"([A-Za-z0-9_+./-]{1,80})\s+every\s+day\b",
+        text,
+        flags=re.IGNORECASE,
+    )
+    if not match:
+        return None
+    return {
+        "enabled": True,
+        "start_local": match.group(1),
+        "end_local": match.group(2),
+        "timezone": match.group(3),
+        "days": list(range(7)),
+    }
+
+
 def _tool_schema_names(schemas: Sequence[Mapping[str, Any]]) -> set[str]:
     return {
         str((schema.get("function") or {}).get("name") or "")
@@ -11255,6 +11516,20 @@ def _required_bounded_workflow_tool_call(
             and selected_channel_ids
             and "configure_deployment" in available
         ):
+            maritime = str(context.get("deployment_profile") or "general") == "maritime"
+            channel_roles = [
+                copy.deepcopy(dict(item))
+                for item in (context.get("deployment_channel_roles") or [])
+                if isinstance(item, Mapping)
+                and _opt_int(item.get("channel_id")) in selected_channel_ids
+            ]
+            if maritime and {
+                int(item["channel_id"])
+                for item in channel_roles
+            } != set(selected_channel_ids):
+                # The role is an operator-owned control value. Never let the
+                # model invent one just to advance the maritime workflow.
+                return None
             return _ToolCall(
                 id=f"required-deploy-configure-{uuid.uuid4().hex[:12]}",
                 name="configure_deployment",
@@ -11262,6 +11537,7 @@ def _required_bounded_workflow_tool_call(
                     "deployment_id": deployment_id,
                     "channel_ids": selected_channel_ids,
                     "groups": copy.deepcopy(context.get("deployment_groups") or []),
+                    **({"channel_roles": channel_roles} if maritime else {}),
                 },
             )
         if (
@@ -11339,6 +11615,7 @@ def _bounded_workflow_plan_completed(context: Mapping[str, Any]) -> bool:
         or context.get("deployment_requirements_pending")
         or context.get("deployment_requirements_partial")
         or context.get("deployment_preview_completed")
+        or context.get("deployment_maritime_roles_pending")
         or (
             "deployment" in (context.get("tool_intents") or ())
             and context.get("deployment_id")
@@ -11548,6 +11825,31 @@ def _apply_turn_tool_context(tool_name: str, args: Dict[str, Any], context: Dict
             # general-purpose heads sometimes invent them from traffic words.
             prepared.pop("channel_roles", None)
             prepared.pop("starter_policy_mode", None)
+        elif tool_name == "configure_deployment":
+            trusted_roles = [
+                copy.deepcopy(dict(item))
+                for item in (context.get("deployment_channel_roles") or [])
+                if isinstance(item, Mapping)
+            ]
+            if trusted_roles:
+                prepared["channel_roles"] = trusted_roles
+            else:
+                prepared.pop("channel_roles", None)
+            starter_policy_mode = str(
+                context.get("deployment_starter_policy_mode") or "none"
+            )
+            prepared["starter_policy_mode"] = (
+                starter_policy_mode
+                if starter_policy_mode in {"none", "shadow"}
+                else "none"
+            )
+        if tool_name == "configure_deployment":
+            if context.get("deployment_quiet_window_confirmed"):
+                prepared["quiet_window"] = copy.deepcopy(
+                    context.get("deployment_quiet_window") or {"enabled": False}
+                )
+            else:
+                prepared.pop("quiet_window", None)
         explicit_alert_names = {
             str(item).strip().casefold()
             for item in (context.get("deployment_explicit_alert_names") or [])
@@ -11732,7 +12034,7 @@ def _apply_turn_tool_context(tool_name: str, args: Dict[str, Any], context: Dict
     if tool_name == "prepare_probe_calibration_batch" and not prepared.get("job_id") and context.get("workflow_job_id"):
         prepared["job_id"] = context.get("workflow_job_id")
 
-    if tool_name in {"draft_incident", "follow_incident", "stop_incident_follow"}:
+    if tool_name in {"draft_incident", "follow_incident", "review_incident", "stop_incident_follow"}:
         # Chat may only prepare a MUT preview.  Application remains the trusted
         # UI approval path even when the operator says "apply" in prose.
         prepared["preview"] = True
@@ -11855,6 +12157,7 @@ def _remember_turn_tool_result(tool_name: str, result: Any, context: Dict[str, A
         "get_incident",
         "draft_incident",
         "follow_incident",
+        "review_incident",
         "stop_incident_follow",
     }:
         incident = result.get("incident")
@@ -11898,6 +12201,10 @@ def _remember_turn_tool_result(tool_name: str, result: Any, context: Dict[str, A
             ]
         if result.get("groups") is not None:
             context["deployment_groups"] = copy.deepcopy(result.get("groups") or [])
+        if result.get("channel_roles") is not None:
+            context["deployment_channel_roles"] = copy.deepcopy(
+                result.get("channel_roles") or []
+            )
         if result.get("requirement_warnings") is not None:
             context["deployment_requirement_warnings"] = list(
                 result.get("requirement_warnings") or []
@@ -12280,6 +12587,7 @@ def _record_turn_signal_ledger(
         "get_incident",
         "draft_incident",
         "follow_incident",
+        "review_incident",
         "stop_incident_follow",
     }:
         incident = result.get("incident") if isinstance(result.get("incident"), Mapping) else {}
@@ -13277,6 +13585,25 @@ def _format_deployment_inventory_receipt(context: Mapping[str, Any]) -> str:
     return "\n".join(lines)
 
 
+def _format_deployment_maritime_roles_pending(context: Mapping[str, Any]) -> str:
+    """Ask for closed maritime controls without allowing model invention."""
+
+    selected = [
+        int(item)
+        for item in (context.get("deployment_selected_channel_ids") or [])
+        if _opt_int(item) is not None
+    ]
+    return "\n".join(
+        [
+            "Protocol Deploy has not changed live settings.",
+            f"- Selected channels: {selected}",
+            "- A maritime role is required for every selected channel before scene survey.",
+            "Choose in the deployment card: `Sea / port gate`, `Coastline`, or `Mixed / PTZ tour`. The location/view label is optional.",
+            "No channel role will be guessed by the agent.",
+        ]
+    )
+
+
 def _format_deployment_requirements_receipt(context: Mapping[str, Any]) -> str:
     """Show the survey and ask for explicit per-channel policy requirements."""
 
@@ -13959,9 +14286,44 @@ class AgentRunner:
                             user_text,
                             selected,
                         )
+                        turn_tool_context["deployment_channel_roles"] = (
+                            _deployment_channel_roles_from_text(user_text, selected)
+                        )
+                        if (
+                            str(
+                                durable_context.get("deployment_profile")
+                                or "general"
+                            )
+                            == "maritime"
+                            and {
+                                int(item.get("channel_id"))
+                                for item in turn_tool_context[
+                                    "deployment_channel_roles"
+                                ]
+                                if isinstance(item, Mapping)
+                                and _opt_int(item.get("channel_id")) is not None
+                            }
+                            != set(selected)
+                        ):
+                            turn_tool_context[
+                                "deployment_maritime_roles_pending"
+                            ] = True
                     no_probe_channel_ids = _deployment_no_probe_channel_ids(
                         user_text
                     )
+                    starter_policy_mode = (
+                        _deployment_starter_policy_mode_from_text(user_text)
+                    )
+                    if starter_policy_mode:
+                        turn_tool_context["deployment_starter_policy_mode"] = (
+                            starter_policy_mode
+                        )
+                    quiet_window = _deployment_quiet_window_from_text(user_text)
+                    if quiet_window is not None:
+                        turn_tool_context["deployment_quiet_window"] = quiet_window
+                        turn_tool_context[
+                            "deployment_quiet_window_confirmed"
+                        ] = True
                     if no_probe_channel_ids:
                         turn_tool_context["deployment_no_probe_channel_ids"] = (
                             no_probe_channel_ids
@@ -14796,6 +15158,10 @@ class AgentRunner:
             deterministic_final_text = _format_archive_research_fallback(
                 turn_signal_ledger,
                 tool_messages=in_flight,
+            )
+        elif turn_tool_context.get("deployment_maritime_roles_pending"):
+            deterministic_final_text = _format_deployment_maritime_roles_pending(
+                turn_tool_context
             )
         elif turn_tool_context.get("deployment_preview_completed"):
             deterministic_final_text = _format_deployment_preview_receipt(
@@ -17848,6 +18214,7 @@ def _tool_result_for_ui(tool_name: str, result: Any) -> Any:
             "get_incident",
             "draft_incident",
             "follow_incident",
+            "review_incident",
             "stop_incident_follow",
         }
         and isinstance(result, dict)
@@ -18167,6 +18534,10 @@ def _compact_incident_for_model(
         "incident_id": value.get("incident_id") or value.get("id"),
         "revision": value.get("revision"),
         "state": value.get("state"),
+        "perception_state": value.get("perception_state"),
+        "risk_state": value.get("risk_state"),
+        "case_state": value.get("case_state"),
+        "attention_state": value.get("attention_state"),
         "title": _compact_signal_value(value.get("title"), 240),
         "channel_ids": list(channels)[:8] if isinstance(channels, list) else [],
         "severity": value.get("severity"),
@@ -18224,6 +18595,71 @@ def _compact_incident_for_model(
     return {key: item for key, item in compact.items() if item not in (None, [], {})}
 
 
+def _compact_incident_temporal_for_model(value: Any) -> Dict[str, Any]:
+    if not isinstance(value, Mapping):
+        return {}
+    return {
+        "supported": bool(value.get("supported")),
+        "episode_total": int(value.get("episode_total") or 0),
+        "episodes": [
+            {
+                key: item.get(key)
+                for key in (
+                    "episode_key",
+                    "perception_state",
+                    "semantic_key",
+                    "possible_start_ms",
+                    "observed_start_ms",
+                    "observed_end_ms",
+                    "possible_end_ms",
+                    "scale_disposition",
+                    "operator_review_required",
+                )
+                if item.get(key) is not None
+            }
+            for item in list(value.get("episodes") or [])[:4]
+            if isinstance(item, Mapping)
+        ],
+        "series_links": [
+            {
+                key: item.get(key)
+                for key in (
+                    "relation_id",
+                    "relation_state",
+                    "confidence",
+                    "related_incident_id",
+                    "direction",
+                    "semantic_key",
+                    "gap_ms",
+                    "operator_review_required",
+                )
+                if item.get(key) is not None
+            }
+            for item in list(value.get("series_links") or [])[:4]
+            if isinstance(item, Mapping)
+        ],
+        "lifecycle_history": [
+            {
+                key: item.get(key)
+                for key in (
+                    "axis",
+                    "from_state",
+                    "to_state",
+                    "incident_revision",
+                    "transitioned_at_ms",
+                    "reason",
+                    "source_kind",
+                )
+                if item.get(key) is not None
+            }
+            for item in list(value.get("lifecycle_history") or [])[-8:]
+            if isinstance(item, Mapping)
+        ],
+        "correction_count": int(value.get("correction_count") or 0),
+        "transition_total": int(value.get("transition_total") or 0),
+    }
+
+
 def _compact_tool_result_for_model(tool_name: str, result: Any) -> Any:
     if not isinstance(result, dict):
         return result
@@ -18232,6 +18668,7 @@ def _compact_tool_result_for_model(tool_name: str, result: Any) -> Any:
         "get_incident",
         "draft_incident",
         "follow_incident",
+        "review_incident",
         "stop_incident_follow",
     }:
         compact = {
@@ -18240,6 +18677,8 @@ def _compact_tool_result_for_model(tool_name: str, result: Any) -> Any:
             "draft_digest": result.get("draft_digest"),
             "incident": _compact_incident_for_model(result.get("incident")),
             "proposed_follow": dict(result.get("proposed_follow") or {}),
+            "proposed_review": dict(result.get("proposed_review") or {}),
+            "temporal": _compact_incident_temporal_for_model(result.get("temporal")),
             "runtime_lease_removed": result.get("runtime_lease_removed"),
             "action_receipt": result.get("action_receipt"),
         }
@@ -18263,9 +18702,16 @@ def _compact_tool_result_for_model(tool_name: str, result: Any) -> Any:
             "version": result.get("version"),
             "stage": result.get("stage"),
             "next_action": result.get("next_action"),
+            "deployment_profile": result.get("deployment_profile") or "general",
+            "starter_policy_mode": result.get("starter_policy_mode") or "none",
+            "starter_policy_confirmed": bool(result.get("starter_policy_confirmed")),
             "target_channel_count": result.get("target_channel_count"),
             "selected_channel_ids": result.get("selected_channel_ids"),
+            "available_channel_ids": list(
+                result.get("available_channel_ids") or []
+            )[:100],
             "groups": list(result.get("groups") or [])[:8],
+            "channel_roles": list(result.get("channel_roles") or [])[:8],
             "available_channels": [
                 {
                     "id": row.get("id"),
@@ -18278,11 +18724,32 @@ def _compact_tool_result_for_model(tool_name: str, result: Any) -> Any:
             "survey_count": result.get("survey_count"),
             "surveyed_channel_ids": result.get("surveyed_channel_ids"),
             "requirement_pack_count": result.get("requirement_pack_count"),
+            "missing_requirement_channel_ids": list(
+                result.get("missing_requirement_channel_ids") or []
+            )[:8],
+            "requirement_warnings": list(
+                result.get("requirement_warnings") or []
+            )[:8],
             "quiet_window": result.get("quiet_window"),
+            "quiet_window_confirmed": bool(result.get("quiet_window_confirmed")),
             "plan_summary": result.get("plan_summary"),
             "commissioning": result.get("commissioning"),
             "instruction": result.get("instruction"),
         }
+        if tool_name == "configure_deployment" and result.get("surveys"):
+            compact_deployment["surveys"] = [
+                {
+                    "channel_id": row.get("channel_id"),
+                    "title": row.get("title"),
+                    "sample_count": row.get("sample_count"),
+                    "scene_fingerprint": str(
+                        row.get("scene_fingerprint") or ""
+                    )[:700],
+                    "error": row.get("error"),
+                }
+                for row in (result.get("surveys") or [])[:8]
+                if isinstance(row, Mapping)
+            ]
         if tool_name == "get_deployment_status":
             compact_deployment["commissioning_l1_reviews"] = [
                 {
@@ -18322,7 +18789,17 @@ def _compact_tool_result_for_model(tool_name: str, result: Any) -> Any:
             "deployment_id": result.get("deployment_id"),
             "stage": result.get("stage"),
             "next_action": result.get("next_action"),
+            "deployment_profile": result.get("deployment_profile") or "general",
+            "starter_policy_mode": result.get("starter_policy_mode") or "none",
+            "starter_policy_confirmed": bool(result.get("starter_policy_confirmed")),
+            "quiet_window": result.get("quiet_window"),
+            "quiet_window_confirmed": bool(result.get("quiet_window_confirmed")),
             "selected_channel_ids": result.get("selected_channel_ids"),
+            "groups": list(result.get("groups") or [])[:8],
+            "channel_roles": list(result.get("channel_roles") or [])[:8],
+            "missing_requirement_channel_ids": list(
+                result.get("missing_requirement_channel_ids") or []
+            )[:8],
             "survey_count": result.get("survey_count"),
             "surveys": [
                 {
