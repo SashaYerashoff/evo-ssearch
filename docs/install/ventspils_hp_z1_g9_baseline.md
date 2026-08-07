@@ -151,4 +151,3 @@ a security blind spot: urgent live VLM work remains on the RTX model.
    14 CPU threads during long prefill.
 6. Compare the source revision and active environment with this baseline before
    tuning thresholds or changing models.
-

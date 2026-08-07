@@ -1,8 +1,8 @@
 # Luxriot EVA AI β 0.8.7 Release Notes
 
-Release date: release candidate prepared 2026-08-06  
-Previous baseline: `β 0.8.5`  
-Schema head: `20260805_0013`  
+Release date: release candidate prepared 2026-08-06
+Previous baseline: `β 0.8.5`
+Schema head: `20260805_0013`
 Database migration: **required**
 
 `β 0.8.7` closes the first complete incident lifecycle over EVA's adaptive
@@ -81,6 +81,6 @@ with the β 0.8.7 tree.
 ## Verification
 
 - Backend: 1227 passed, 23 skipped, 169 subtests passed.
-- React: 83 tests passed; TypeScript/Vite production build completed.
+- React: 87 tests passed; TypeScript/Vite production build completed.
 - Alembic: one head, `20260805_0013`.
 - Documentation drift and whitespace checks: clean.

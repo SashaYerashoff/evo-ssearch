@@ -193,6 +193,7 @@ APT_PACKAGES = (
     "postgresql",
     "postgresql-contrib",
     "python3",
+    "python3-dev",
     "python3-pip",
     "python3-venv",
     "rsync",
@@ -1782,7 +1783,12 @@ def configure_nginx(answers: Answers, runner: Runner) -> None:
     runner.run(("ln", "-sfn", site, "/etc/nginx/sites-enabled/eva-ai"))
     runner.run(("rm", "-f", "/etc/nginx/sites-enabled/default"))
     runner.run(("nginx", "-t"))
-    runner.run(("systemctl", "enable", "--now", "nginx"))
+    runner.run(("systemctl", "enable", "nginx"))
+    # ``enable --now`` is a no-op for an already running service and can leave
+    # the pre-install worker serving the old port-80 configuration.  A restart
+    # is intentional here: nginx -t has already validated the generated TLS
+    # site, so the live process must be replaced before readiness is checked.
+    runner.run(("systemctl", "restart", "nginx"))
 
 
 def _wait_for_json_endpoint(

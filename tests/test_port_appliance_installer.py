@@ -298,6 +298,34 @@ def test_offline_apt_can_explicitly_filter_nvidia_driver(tmp_path, capsys):
     assert "nvidia-driver-590-open" not in commands
 
 
+def test_offline_bundle_includes_python_headers_for_native_wheels():
+    package_input = (
+        ROOT / "deployment" / "port_4070s" / "apt-packages-ubuntu-24.04.txt"
+    ).read_text(encoding="utf-8").splitlines()
+
+    assert "python3-dev" in installer.APT_PACKAGES
+    assert "python3-dev" in package_input
+
+
+def test_nginx_configuration_restarts_an_existing_process(tmp_path, capsys):
+    answers = installer.Answers(
+        install_root=tmp_path / "opt",
+        data_root=tmp_path / "data",
+        config_root=tmp_path / "etc",
+        evo_url="http://evo.local",
+        evo_username="operator",
+        evo_password="secret",
+    )
+
+    installer.configure_nginx(answers, installer.Runner(dry_run=True))
+
+    commands = capsys.readouterr().out
+    assert "+ nginx -t" in commands
+    assert "+ systemctl enable nginx" in commands
+    assert "+ systemctl restart nginx" in commands
+    assert "systemctl enable --now nginx" not in commands
+
+
 def test_external_vlm_still_requires_nvidia_for_local_siglip2_cuda(tmp_path):
     answers = installer.Answers(
         install_root=tmp_path / "opt",

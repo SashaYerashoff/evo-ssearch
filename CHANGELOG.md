@@ -6,7 +6,15 @@ Format loosely follows Keep a Changelog.
 
 ## Unreleased
 
-- None.
+- **Office installer follow-up:** the Ubuntu 24.04 offline package input now
+  includes `python3-dev`, so native Python dependencies have the matching
+  `Python.h` headers on a clean appliance. After validating the generated TLS
+  site with `nginx -t`, the installer explicitly restarts Nginx instead of
+  relying on `enable --now`, which does not reload an already-running
+  pre-install process.
+- The checksummed 0.8.7 USB payload must be rebuilt and finalized to carry this
+  dependency change; released bundles remain immutable and reject in-place
+  edits by design.
 
 ## β 0.8.7 — 2026-08-06 release candidate (temporal incidents and field hardening)
 
