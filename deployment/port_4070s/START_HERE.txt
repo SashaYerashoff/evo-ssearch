@@ -1,4 +1,4 @@
-EVA AI 0.8.5 — OFFLINE PORT APPLIANCE
+EVA AI 0.8.7 — OFFLINE PORT APPLIANCE
 ======================================
 
 Target:
@@ -8,9 +8,15 @@ Target:
   64 GB RAM
   up to 8 homeostatically regulated video channels
 
+Release flavor:
+  ventspils-maritime-client
+  Source branch: feature/maritime-port-specs (recorded with the exact commit
+  in SOURCE_REVISION.json and manifest.json)
+  React is the default operator console. Emergency fallback: /?ui=legacy
+
 1. Install Ubuntu Server from this USB.
 2. After the first boot, mount the writable USB partition.
-3. Open a terminal in the EVA-AI-0.8.5-PORT folder.
+3. Open a terminal in the EVA-AI-0.8.7-PORT folder.
 4. Optional integrity check:
 
        sha256sum -c SHA256SUMS
@@ -54,8 +60,8 @@ The 9B endpoint is proposal-only and its quiet window can be enabled or changed
 later in EVA.
 
 Backup note:
-  repo/ is the exact deployable working-tree snapshot packaged for this field
-  build, including current uncommitted and untracked source files (except local
-  caches, environments, runtime data, and large review PDFs).
+  repo/ is the exact clean committed source snapshot recorded in
+  SOURCE_REVISION.json and packaged for this client build (except local caches,
+  environments, runtime data, and large review PDFs).
   repository-backup/evo-ssearch-all-refs.bundle contains all committed Git refs
   and history. See repository-backup/README.txt for restoration commands.

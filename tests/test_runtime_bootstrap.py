@@ -1,6 +1,47 @@
 from unittest.mock import patch
 
 import oldapp
+from eva_db import DatabaseSettings
+
+
+def test_archive_pool_is_bounded_and_isolated_from_operator_control_plane():
+    original_archive = oldapp._archive_db_pool
+    original_control = oldapp._control_plane_db_pool
+    base = DatabaseSettings(
+        dsn="postgresql://eva-runtime@database/eva",
+        pool_min_size=1,
+        pool_max_size=10,
+        application_name="eva-ai",
+    )
+    created = []
+
+    def build(settings):
+        pool = object()
+        created.append((pool, settings))
+        return pool
+
+    try:
+        oldapp._archive_db_pool = None
+        oldapp._control_plane_db_pool = None
+        with (
+            patch.object(oldapp.DatabaseSettings, "from_env", return_value=base),
+            patch.object(oldapp, "PsycopgPool", side_effect=build),
+        ):
+            archive_pool = oldapp._get_archive_db_pool()
+            control_pool = oldapp._get_control_plane_db_pool()
+
+        assert archive_pool is not control_pool
+        assert len(created) == 2
+        archive_settings = created[0][1]
+        control_settings = created[1][1]
+        assert archive_settings.application_name == "eva-ai-archive"
+        assert archive_settings.pool_min_size == 0
+        assert archive_settings.pool_max_size == 8
+        assert control_settings.application_name == "eva-ai"
+        assert control_settings.pool_max_size == 10
+    finally:
+        oldapp._archive_db_pool = original_archive
+        oldapp._control_plane_db_pool = original_control
 
 
 def test_runtime_services_start_only_from_explicit_idempotent_bootstrap():

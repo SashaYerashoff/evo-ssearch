@@ -18,9 +18,13 @@ protected agent/alert/rollup slot; L0 may borrow it only while protected work is
 not waiting. At larger scale, separate the agent endpoint so operator questions
 do not compete with the description firehose.
 
-The appliance starts vLLM at `gpu_memory_utilization=0.75`, leaving headroom for
-the in-process FP16 SigLIP2 base encoder. CPU SigLIP2 is a degraded fallback and
-cannot sustain eight channels at the default one embedding per second cadence.
+The appliance starts vLLM at `gpu_memory_utilization=0.72` with four concurrent
+sequences. On the measured 12 GiB 4070S-class profile this keeps one full 32k
+sequence available while leaving roughly 1.2 GiB for the in-process FP16
+SigLIP2 base encoder and CUDA/runtime variance. CPU SigLIP2 is a degraded
+fallback and cannot sustain eight channels at the default one embedding per
+second cadence. EVA admission remains lower than the vLLM sequence limit so
+agent and rollup work cannot be buried by one synchronized L0 wave.
 
 ## Profiles
 

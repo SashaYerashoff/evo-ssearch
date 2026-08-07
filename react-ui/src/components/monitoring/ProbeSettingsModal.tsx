@@ -11,6 +11,7 @@ import {
   probesApi,
   type Probe,
   type ProbeInput,
+  type ProbeThresholdDefaults,
   type RoiNorm,
 } from '../../api/probes'
 import { recentFrameUrl } from '../../api/video'
@@ -46,7 +47,7 @@ function normRoi(raw: any): RoiNorm | null {
   return { x: Math.max(0, x), y: Math.max(0, y), w: Math.min(1, w), h: Math.min(1, h) }
 }
 
-function fromProbe(p: Probe | null, channels: Channel[]): Draft {
+function fromProbe(p: Probe | null, channels: Channel[], defaults: ProbeThresholdDefaults): Draft {
   // positives[]/negatives[] are authoritative — zip them into editable pairs
   const pos = p?.positives || []
   const neg = p?.negatives || []
@@ -58,8 +59,8 @@ function fromProbe(p: Probe | null, channels: Channel[]): Draft {
     channel_id: p?.channel_id ?? channels[0]?.id,
     enabled: p?.enabled ?? true,
     pairs,
-    pos_floor: p?.pos_floor ?? 0.2,
-    margin: p?.margin ?? 0.05,
+    pos_floor: p?.pos_floor ?? defaults.pos_floor,
+    margin: p?.margin ?? defaults.margin,
     bookmark: p?.bookmark ?? false,
     severity: p?.severity || 'info',
     cooldown: p?.bookmark_cooldown_sec ?? 8,
@@ -75,24 +76,28 @@ function fromProbe(p: Probe | null, channels: Channel[]): Draft {
 
 const pct = (v: number) => `${Math.round(v * 100)}%`
 
-export function ProbeSettingsModal({ probe, channels, busy, canControlCapture, canCreateBookmarks, onClose, onSave, onCasted }: {
+export function ProbeSettingsModal({ probe, channels, busy, canControlCapture, canCreateBookmarks, defaults, onClose, onSave, onCasted }: {
   probe: Probe | null
   channels: Channel[]
   busy: boolean
   canControlCapture: boolean
   canCreateBookmarks: boolean
+  defaults: ProbeThresholdDefaults
   onClose: () => void
   onSave: (input: ProbeInput) => void
   onCasted?: () => void
 }) {
-  const [d, setD] = useState<Draft>(() => fromProbe(probe, channels))
+  const [d, setD] = useState<Draft>(() => fromProbe(probe, channels, defaults))
   const bookmarkMutationBlocked = probeMutationRequiresBookmarkPermission(probe, canCreateBookmarks)
   const set = (p: Partial<Draft>) => setD((x) => ({ ...x, ...p }))
   const setPair = (i: number, p: Partial<{ pos: string; neg: string }>) =>
     setD((x) => ({ ...x, pairs: x.pairs.map((pr, j) => (j === i ? { ...pr, ...p } : pr)) }))
 
   // pre-open a collapsed section when it already holds non-default settings (editing)
-  const [openTuning] = useState(() => (probe?.pos_floor ?? 0.2) !== 0.2 || (probe?.margin ?? 0.05) !== 0.05)
+  const [openTuning] = useState(() => (
+    (probe?.pos_floor ?? defaults.pos_floor) !== defaults.pos_floor
+    || (probe?.margin ?? defaults.margin) !== defaults.margin
+  ))
   const [openImage] = useState(() => !!probe?.image_probe?.data)
   // the two bottom dropdowns are controlled: their toggle sits OUTSIDE the scroll area and
   // never moves — the panel opens into the reserved space above it, so nothing jumps.
@@ -219,7 +224,7 @@ export function ProbeSettingsModal({ probe, channels, busy, canControlCapture, c
     <div className="scrim" onClick={onClose}>
       <div className="modal probe-modal" onClick={(e) => e.stopPropagation()}>
         <div className="modal-head">
-          <div className="modal-title">{d.id ? 'CLIP probe settings' : 'New CLIP probe'}</div>
+          <div className="modal-title">{d.id ? 'Semantic probe settings' : 'New semantic probe'}</div>
           <button className="modal-close" onClick={onClose}><IconX size={18} /></button>
         </div>
 
@@ -303,6 +308,10 @@ export function ProbeSettingsModal({ probe, channels, busy, canControlCapture, c
             <div className="probe-panel">
               <div className="probe-sub">
                 <div className="probe-block-head">Detection tuning</div>
+                <div className="mon-help">
+                  Active {defaults.embedding_backend || 'embedding'} defaults: P {defaults.pos_floor} · M {defaults.margin}
+                  {defaults.embedding_model ? ` · ${defaults.embedding_model}` : ''}
+                </div>
                 <div className="wgrid">
                   <div className="wfield"><label>Positive floor</label>
                     <input type="number" step="0.01" value={d.pos_floor} onChange={(e) => set({ pos_floor: Number(e.target.value) })} />

@@ -2,23 +2,29 @@ import { useEffect, useMemo, useState } from 'react'
 import {
   IconCheck,
   IconColorSwatch,
+  IconDeviceFloppy,
   IconRestore,
+  IconTrash,
   IconTypography,
   IconX,
 } from '@tabler/icons-react'
 import {
   DEFAULT_APPEARANCE,
+  CUSTOM_APPEARANCE_PRESETS_STORAGE_KEY,
   THEME_PRESETS,
   contrastRatio,
   contrastText,
   getThemePreset,
   hasCustomColors,
   normalizeHex,
+  normalizeSavedAppearancePresets,
   resolveThemePalette,
   type AppearancePreferences,
   type CustomColorKey,
+  type SavedAppearancePreset,
 } from '../../appearance/appearance'
 import { useAppearance } from '../../appearance/AppearanceProvider'
+import { useI18n, type UiLanguage } from '../../i18n/I18nProvider'
 
 const COLOR_FIELDS: ReadonlyArray<{ key: CustomColorKey; label: string; help: string }> = [
   { key: 'canvas', label: 'Canvas', help: 'Application background' },
@@ -28,7 +34,16 @@ const COLOR_FIELDS: ReadonlyArray<{ key: CustomColorKey; label: string; help: st
   { key: 'accent', label: 'Accent', help: 'Primary actions and focus' },
 ]
 
+function readCustomPresets(): SavedAppearancePreset[] {
+  try {
+    return normalizeSavedAppearancePresets(JSON.parse(window.localStorage.getItem(CUSTOM_APPEARANCE_PRESETS_STORAGE_KEY) || '[]'))
+  } catch {
+    return []
+  }
+}
+
 export function AppearanceModal({ onClose, embedded = false }: { onClose: () => void; embedded?: boolean }) {
+  const { language, setLanguage, t } = useI18n()
   const {
     savedPreferences,
     previewPreferences,
@@ -39,6 +54,8 @@ export function AppearanceModal({ onClose, embedded = false }: { onClose: () => 
     ...savedPreferences,
     overrides: { ...savedPreferences.overrides },
   }))
+  const [customPresets, setCustomPresets] = useState<SavedAppearancePreset[]>(readCustomPresets)
+  const [customPresetName, setCustomPresetName] = useState('')
   const palette = useMemo(() => resolveThemePalette(draft), [draft])
   const contrastWarnings = useMemo(() => {
     const warnings: string[] = []
@@ -93,6 +110,35 @@ export function AppearanceModal({ onClose, embedded = false }: { onClose: () => 
     update({ ...draft, overrides: {} })
   }
 
+  function persistCustomPresets(next: SavedAppearancePreset[]) {
+    const normalized = normalizeSavedAppearancePresets(next)
+    setCustomPresets(normalized)
+    try {
+      window.localStorage.setItem(CUSTOM_APPEARANCE_PRESETS_STORAGE_KEY, JSON.stringify(normalized))
+    } catch {
+      // Presets remain available for this browser session when storage is locked.
+    }
+  }
+
+  function saveCustomPreset() {
+    const name = customPresetName.replace(/\s+/g, ' ').trim().slice(0, 48)
+    if (!name || contrastWarnings.length) return
+    const existing = customPresets.find((preset) => preset.name.toLocaleLowerCase() === name.toLocaleLowerCase())
+    const saved: SavedAppearancePreset = {
+      id: existing?.id || `custom-${Date.now().toString(36)}`,
+      name,
+      preferences: { ...draft, overrides: { ...draft.overrides } },
+    }
+    persistCustomPresets(existing
+      ? customPresets.map((preset) => preset.id === existing.id ? saved : preset)
+      : [...customPresets, saved])
+    setCustomPresetName('')
+  }
+
+  function loadCustomPreset(preset: SavedAppearancePreset) {
+    update({ ...preset.preferences, overrides: { ...preset.preferences.overrides } })
+  }
+
   return (
     <div
       className={embedded ? 'appearance-settings-embedded' : 'scrim appearance-scrim'}
@@ -107,7 +153,7 @@ export function AppearanceModal({ onClose, embedded = false }: { onClose: () => 
       >
         {!embedded && <div className="modal-head appearance-head">
           <div>
-            <div className="modal-title" id="appearance-title">Appearance</div>
+            <div className="modal-title" id="appearance-title">{t('appearance.title')}</div>
             <div className="brand-sub">Choose a balanced preset, then tune its operational palette.</div>
           </div>
           <button className="modal-close" onClick={closeWithoutSaving} aria-label="Close appearance settings">
@@ -116,6 +162,24 @@ export function AppearanceModal({ onClose, embedded = false }: { onClose: () => 
         </div>}
 
         <div className="appearance-body">
+          <section className="appearance-section">
+            <div className="appearance-section-head">
+              <div>
+                <h3>{t('appearance.language')}</h3>
+                <p>{t('appearance.languageHelp')}</p>
+              </div>
+            </div>
+            <OptionGroup
+              label={t('appearance.language')}
+              value={language}
+              options={[
+                { value: 'en', label: t('appearance.english') },
+                { value: 'lv', label: t('appearance.latvian') },
+              ]}
+              onChange={(value) => setLanguage(value as UiLanguage)}
+            />
+          </section>
+
           <section className="appearance-section">
             <div className="appearance-section-head">
               <div>
@@ -145,6 +209,30 @@ export function AppearanceModal({ onClose, embedded = false }: { onClose: () => 
                   {draft.preset === preset.id && <IconCheck className="theme-preset-check" size={17} />}
                 </button>
               ))}
+            </div>
+            <div className="appearance-custom-presets">
+              <div className="appearance-custom-save">
+                <input
+                  value={customPresetName}
+                  maxLength={48}
+                  placeholder="Custom preset name"
+                  onChange={(event) => setCustomPresetName(event.target.value)}
+                  onKeyDown={(event) => { if (event.key === 'Enter') saveCustomPreset() }}
+                />
+                <button className="btn" disabled={!customPresetName.trim() || contrastWarnings.length > 0} onClick={saveCustomPreset}>
+                  <IconDeviceFloppy size={14} /> Save custom preset
+                </button>
+              </div>
+              {customPresets.length > 0 && (
+                <div className="appearance-custom-list">
+                  {customPresets.map((preset) => (
+                    <div key={preset.id}>
+                      <button onClick={() => loadCustomPreset(preset)}>{preset.name}</button>
+                      <button className="appearance-custom-delete" onClick={() => persistCustomPresets(customPresets.filter((item) => item.id !== preset.id))} aria-label={`Delete ${preset.name}`}><IconTrash size={13} /></button>
+                    </div>
+                  ))}
+                </div>
+              )}
             </div>
           </section>
 

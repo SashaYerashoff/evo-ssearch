@@ -459,16 +459,26 @@ class ProbeCaptureWarmupTests(unittest.TestCase):
         self.assertFalse(result["capture_warming_up"])
 
     def test_new_probe_defaults_are_conservative_and_centralized(self) -> None:
-        payload = oldapp._build_probe_payload(
-            {
-                "channel_id": 7,
-                "name": "person",
-                "positives": ["a person"],
-            }
-        )
+        embedding_space = {
+            "backend": "siglip2",
+            "model": "google/siglip2-base-patch16-224",
+            "revision": "test-revision",
+        }
+        with patch(
+            "oldapp.get_probe_embedding_space",
+            return_value=embedding_space,
+        ):
+            payload = oldapp._build_probe_payload(
+                {
+                    "channel_id": 7,
+                    "name": "person",
+                    "positives": ["a person"],
+                }
+            )
 
         self.assertEqual(payload["pos_floor"], config.PROBE_POS_FLOOR_DEFAULT)
         self.assertEqual(payload["margin"], config.PROBE_MARGIN_DEFAULT)
+        self.assertEqual(payload["embedding_space"], embedding_space)
 
 
 if __name__ == "__main__":

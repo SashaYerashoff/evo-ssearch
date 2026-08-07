@@ -31,6 +31,9 @@ class SecuritySmokeTests(unittest.TestCase):
         )
         self._orig_allowed_roots = list(getattr(config, "ALLOWED_ROOTS", []))
         self._orig_luxriot_password = getattr(config, "LUXRIOT_PASSWORD", "")
+        self._orig_lm_profiles = config.LM_PROFILES
+        self._orig_lm_vlm_profile_id = config.LM_VLM_PROFILE_ID
+        self._orig_lm_agent_profile_id = config.LM_AGENT_PROFILE_ID
         self._orig_db_strict_runtime_roles = getattr(
             config,
             "DB_STRICT_RUNTIME_ROLES",
@@ -53,6 +56,9 @@ class SecuritySmokeTests(unittest.TestCase):
         config.AUTH_COOKIE_SECURE = self._orig_auth_cookie_secure
         config.ALLOWED_ROOTS = self._orig_allowed_roots
         config.LUXRIOT_PASSWORD = self._orig_luxriot_password
+        config.LM_PROFILES = self._orig_lm_profiles
+        config.LM_VLM_PROFILE_ID = self._orig_lm_vlm_profile_id
+        config.LM_AGENT_PROFILE_ID = self._orig_lm_agent_profile_id
         config.DB_STRICT_RUNTIME_ROLES = self._orig_db_strict_runtime_roles
         config.OFFLINE_VIDEO_ENABLED = self._orig_offline_video_enabled
         config.PROBE_SNAP_ENABLED = self._orig_probe_snap_enabled
@@ -88,6 +94,41 @@ class SecuritySmokeTests(unittest.TestCase):
         settings = payload.get("settings", {})
         self.assertEqual(settings.get("luxriotPassword"), "")
         self.assertIn("luxriotPasswordSet", settings)
+        self.assertEqual(settings.get("vlmApiKey"), "")
+        self.assertIn("vlmApiKeySet", settings)
+        self.assertEqual(settings.get("agentApiKey"), "")
+        self.assertIn("agentApiKeySet", settings)
+
+    def test_settings_persists_separate_vlm_and_agent_profiles_without_returning_keys(self) -> None:
+        config.ADMIN_TOKEN = "settings-test-token"
+        config.SETTINGS_LOCAL_ONLY = False
+        headers = {"X-Admin-Token": "settings-test-token"}
+        response = self.client.get("/settings", headers=headers)
+        payload = response.get_json()["settings"]
+        payload.update({
+            "vlmBaseUrl": "http://vlm.example/v1",
+            "vlmModel": "vision-model",
+            "vlmApiKey": "vlm-secret-new",
+            "agentBaseUrl": "http://agent.example/v1",
+            "agentModel": "agent-model",
+            "agentApiKey": "agent-secret-new",
+        })
+        written = []
+        with (
+            patch("oldapp._write_env_file_atomic", side_effect=lambda text: written.append(text)),
+            patch("oldapp._preserve_additional_env_lines", return_value=""),
+            patch("oldapp.warm_start_embedder", return_value=None),
+            patch("oldapp._env_values_different_from_started_process", return_value=[]),
+            patch("oldapp._env_precedence_report", return_value={"declared_file_matches_project": True}),
+        ):
+            saved = self.client.post("/settings", json=payload, headers=headers)
+
+        self.assertEqual(saved.status_code, 200)
+        self.assertTrue(saved.get_json().get("success"))
+        self.assertEqual(config.LM_PROFILES[config.LM_VLM_PROFILE_ID]["base_url"], "http://vlm.example/v1")
+        self.assertEqual(config.LM_PROFILES[config.LM_AGENT_PROFILE_ID]["model"], "agent-model")
+        self.assertIn("EVOSSEARCH_LM_PROFILE_VLM_API_KEY=vlm-secret-new", written[0])
+        self.assertIn("EVOSSEARCH_LM_PROFILE_AGENT_API_KEY=agent-secret-new", written[0])
 
     def test_env_editor_redacts_and_preserves_secrets(self) -> None:
         current = {
@@ -189,6 +230,20 @@ class SecuritySmokeTests(unittest.TestCase):
         self.assertEqual(result["status"], "ready")
         self.assertEqual(result["allowed_roots_count"], 1)
 
+    def test_realistic_short_evo_password_is_warning_not_placeholder_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            config.SECURE_DEPLOYMENT_REQUIRED = True
+            config.AUTH_COOKIE_SECURE = True
+            config.ALLOWED_ROOTS = [tmp_dir]
+            config.ADMIN_TOKEN = ""
+            config.LUXRIOT_PASSWORD = "SitePass-2026!"
+
+            result = oldapp._check_deployment_security_ready()
+
+        self.assertTrue(result["ok"], result)
+        self.assertEqual(result["issues"], [])
+        self.assertEqual(len(result["warnings"]), 0)
+
     def test_secure_ready_response_hides_component_details(self) -> None:
         config.SECURE_DEPLOYMENT_REQUIRED = True
         config.AUTH_ENABLED = False
@@ -256,11 +311,14 @@ class SecuritySmokeTests(unittest.TestCase):
         denied = self.client.post("/probes/delete", json={"id": "missing-probe"})
         self.assertEqual(denied.status_code, 401)
 
-        allowed = self.client.post(
-            "/probes/delete",
-            headers={"X-Admin-Token": "unit-token"},
-            json={"id": "missing-probe"},
-        )
+        # PostgreSQL probe storage is fail-closed when no test database is
+        # configured; this test owns only the legacy admin-token boundary.
+        with patch("oldapp.probes_store.delete_probe", return_value=False):
+            allowed = self.client.post(
+                "/probes/delete",
+                headers={"X-Admin-Token": "unit-token"},
+                json={"id": "missing-probe"},
+            )
         # Route-specific validation after auth guard.
         self.assertEqual(allowed.status_code, 404)
 

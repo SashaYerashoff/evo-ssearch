@@ -27,11 +27,11 @@ import {
   type StreamsStatus,
   type SummaryEntry,
 } from '../../api/video'
-import type { DropOption } from '../shell/Dropdown'
 import { renderMarkdown } from '../agent/markdown'
 import { StreamControl, type VideoWorkspaceTab } from './StreamControl'
 import { PromptSettingsModal } from './PromptSettingsModal'
 import { IncidentModal } from '../incidents/IncidentModal'
+import { IncidentReview } from '../incidents/IncidentReview'
 import {
   SUMMARY_SEVERITIES,
   resolveSummaryResolution,
@@ -46,6 +46,7 @@ import {
   type SummaryPeriodBounds,
   type SummaryResolution,
 } from './summaryView'
+import { useI18n } from '../../i18n/I18nProvider'
 
 function asTimestampMs(value: unknown): number | null {
   const number = Number(value)
@@ -53,10 +54,10 @@ function asTimestampMs(value: unknown): number | null {
   return number > 1e12 ? number : number * 1000
 }
 
-function fmtTimestamp(value: unknown): string {
+function fmtTimestamp(value: unknown, locale: string): string {
   const ms = asTimestampMs(value)
   if (!ms) return '—'
-  return new Date(ms).toLocaleString([], {
+  return new Date(ms).toLocaleString(locale, {
     month: 'short',
     day: 'numeric',
     hour: '2-digit',
@@ -112,20 +113,20 @@ function initialChannelId(channels: Channel[], storageKey: string): number | nul
   return channels[0]?.id ?? null
 }
 
-function summaryRange(entry: SummaryEntry): string {
+function summaryRange(entry: SummaryEntry, locale: string): string {
   const start = asTimestampMs(entry.batch_start_ms ?? entry.window_start)
   const end = asTimestampMs(entry.batch_end_ms ?? entry.window_end)
-  if (!start || !end || end <= start) return fmtTimestamp(entry.created_at ?? entry.window_end)
+  if (!start || !end || end <= start) return fmtTimestamp(entry.created_at ?? entry.window_end, locale)
   const startDate = new Date(start)
   const endDate = new Date(end)
   const sameDay = startDate.toDateString() === endDate.toDateString()
-  const startLabel = startDate.toLocaleString([], {
+  const startLabel = startDate.toLocaleString(locale, {
     month: 'short',
     day: 'numeric',
     hour: '2-digit',
     minute: '2-digit',
   })
-  const endLabel = endDate.toLocaleString([], sameDay
+  const endLabel = endDate.toLocaleString(locale, sameDay
     ? { hour: '2-digit', minute: '2-digit' }
     : { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' })
   return `${startLabel}–${endLabel}`
@@ -159,6 +160,7 @@ function SummaryCard({
   onToggle,
   onImage,
   onReportIncident,
+  locale,
 }: {
   entry: SummaryEntry
   selectedDepth: string
@@ -169,12 +171,17 @@ function SummaryCard({
   onToggle: () => void
   onImage: (src: string, title: string) => void
   onReportIncident: (input: IncidentDraftInput) => void
+  locale: string
 }) {
+  const { t } = useI18n()
   const [bookmarkState, setBookmarkState] = useState<'idle' | 'saving' | 'saved' | 'failed'>('idle')
   const level = summaryLevel(entry, selectedDepth)
   const alerts = summaryAlertCounts(entry)
   const burst = summaryBurst(entry)
   const semantic = summarySemanticStatus(entry)
+  const cameraScene = entry.vector_signal?.camera_scene
+  const cameraMotion = String(cameraScene?.camera_motion || '').trim().toLowerCase()
+  const cameraCoverage = String(cameraScene?.coverage_status || '').trim().toLowerCase()
   const parts = splitSummaryMachineJson(entry.summary)
   const thumbnailId = Number(entry.thumbnail_detection_id)
   const thumbnailSrc = Number.isInteger(thumbnailId) && thumbnailId > 0
@@ -229,7 +236,7 @@ function SummaryCard({
             <span className={`vid-semantic ${semantic.tone}`} title={semantic.title}>{semantic.label}</span>
           )}
           <span className="vid-channel-pill">#{entry.channel_id ?? '?'}</span>
-          <span className="vid-sum-ts">{summaryRange(entry)}</span>
+          <span className="vid-sum-ts">{summaryRange(entry, locale)}</span>
           {contentStats.length > 0 && <span className="vid-sum-stats">{contentStats.join(' · ')}</span>}
           {coalesced > 1 && <span className="vid-meta-chip">coalesced ×{coalesced}</span>}
           {burst && (
@@ -244,6 +251,19 @@ function SummaryCard({
             <span className="vid-meta-chip transition">{entry.state_transition_total} transitions</span>
           )}
           {entry.coverage_gap && <span className="vid-meta-chip gap">coverage gap</span>}
+          {cameraMotion && cameraMotion !== 'steady' && (
+            <span
+              className="vid-meta-chip gap"
+              title={`Camera scene epoch ${Number(cameraScene?.scene_epoch || 0)} · object absence is not evaluated while this view is unavailable`}
+            >
+              PTZ {cameraMotion.replace(/_/g, ' ')}
+            </span>
+          )}
+          {cameraMotion === 'steady' && cameraCoverage === 'unknown_view' && (
+            <span className="vid-meta-chip" title="Spatial probes remain unconfirmed for this PTZ view">
+              view unconfirmed
+            </span>
+          )}
           {SUMMARY_SEVERITIES.filter((severity) => Number(alerts[severity] || 0) > 0).map((severity) => (
             <span key={severity} className={`vid-sev sev-${severity}`}>
               {severity} <strong>{alerts[severity]}</strong>
@@ -252,11 +272,11 @@ function SummaryCard({
         </button>
         <div className="vid-sum-actions">
           <button className="btn compact" onClick={() => copySummary(entry)} disabled={!entry.summary}>
-            <IconCopy size={13} /> Copy
+            <IconCopy size={13} /> {t('common.copy')}
           </button>
           {canExport && (
             <button className="btn compact" onClick={() => exportSummary(entry, level)} disabled={!entry.summary}>
-              <IconDownload size={13} /> Export
+              <IconDownload size={13} /> {t('common.export')}
             </button>
           )}
           {canCreateBookmarks && level === 'L0' && !entry.coverage_gap && (
@@ -268,17 +288,17 @@ function SummaryCard({
             >
               <IconBookmark size={13} />
               {bookmarkState === 'saving'
-                ? 'Saving…'
+                ? t('common.saving')
                 : bookmarkState === 'saved'
-                  ? 'Bookmarked'
+                  ? t('common.bookmarked')
                   : bookmarkState === 'failed'
-                    ? 'Retry bookmark'
-                    : 'Bookmark'}
+                    ? t('common.retry')
+                    : t('common.bookmark')}
             </button>
           )}
           {canReportIncidents && incidentInput && (
             <button className="btn compact" onClick={() => onReportIncident(incidentInput)}>
-              <IconFileDescription size={13} /> Report incident
+              <IconFileDescription size={13} /> {t('common.reportIncident')}
             </button>
           )}
         </div>
@@ -289,7 +309,7 @@ function SummaryCard({
           {thumbnailSrc && (
             <button
               className="vid-sum-thumbnail"
-              onClick={() => onImage(thumbnailSrc, `${level} · ${summaryRange(entry)}`)}
+              onClick={() => onImage(thumbnailSrc, `${level} · ${summaryRange(entry, locale)}`)}
               title={String(entry.cover_reason || 'Open the representative VLM input')}
             >
               <img src={thumbnailSrc} alt="Representative VLM input" loading="lazy" />
@@ -350,6 +370,7 @@ export function VideoScreen({
   canExport: boolean
   onReviewSummary?: (entry: SummaryEntry) => void
 }) {
+  const { locale, t } = useI18n()
   const [activeTab, setActiveTab] = useState<VideoWorkspaceTab>('review')
   const [reviewChannelId, setReviewChannelId] = useState<number | null>(() => initialChannelId(channels, REVIEW_CHANNEL_STORAGE_KEY))
   const [settingsChannelId, setSettingsChannelId] = useState<number | null>(() => initialChannelId(channels, SETTINGS_CHANNEL_STORAGE_KEY))
@@ -357,7 +378,6 @@ export function VideoScreen({
   const [feed, setFeed] = useState<SummaryEntry[]>([])
   const [batch, setBatch] = useState('12')
   const [every, setEvery] = useState('5')
-  const [model, setModel] = useState('auto')
   const [period, setPeriod] = useState<SummaryPeriod>('live')
   const [resolution, setResolution] = useState<SummaryResolution>('AUTO')
   const [customFrom, setCustomFrom] = useState('')
@@ -381,7 +401,6 @@ export function VideoScreen({
   const [reviewPreviewOpen, setReviewPreviewOpen] = useState(false)
   const [settingsDirty, setSettingsDirty] = useState(false)
   const [pendingSettingsSwitch, setPendingSettingsSwitch] = useState<{ channelId: number; openSettings: boolean } | null>(null)
-  const [modelOptions, setModelOptions] = useState<DropOption[]>([{ value: 'auto', label: 'Auto (balance)' }])
   const [collapsedSummaries, setCollapsedSummaries] = useState<Set<string>>(new Set())
   const [summaryImage, setSummaryImage] = useState<{ src: string; title: string } | null>(null)
   const [incidentDraft, setIncidentDraft] = useState<IncidentDraftInput | null>(null)
@@ -536,7 +555,6 @@ export function VideoScreen({
     hydratedSettingsChannelRef.current = null
     setBatch('12')
     setEvery('5')
-    setModel('auto')
     setSettingsDirty(false)
   }, [settingsChannelId])
   useEffect(() => {
@@ -546,21 +564,9 @@ export function VideoScreen({
     const nextEvery = Number(settingsRt.video?.interval_sec)
     setBatch(Number.isFinite(nextBatch) && nextBatch > 0 ? String(nextBatch) : '12')
     setEvery(Number.isFinite(nextEvery) && nextEvery > 0 ? String(nextEvery) : '5')
-    setModel(String(settingsRt.video?.model || 'auto'))
     hydratedSettingsChannelRef.current = settingsChannelId
     setSettingsDirty(false)
   }, [settingsChannelId, settingsRt])
-
-  // available VLM models for the "Live model" selector (matches the original /lm/models)
-  useEffect(() => {
-    videoApi.lmModels().then((cat) => {
-      const autoVal = cat.auto_model_selector || 'auto'
-      const opts: DropOption[] = [{ value: autoVal, label: cat.auto_model_label || 'Auto (balance)' }]
-      for (const m of cat.models || []) if (m && m !== autoVal) opts.push({ value: m, label: m })
-      setModelOptions(opts)
-      setModel((cur) => (cur === 'auto' ? autoVal : cur))
-    }).catch(() => {})
-  }, [])
 
   // poll streams (runtime) every 4s
   useEffect(() => { const t = window.setInterval(loadStreams, 4000); return () => window.clearInterval(t) }, [loadStreams])
@@ -697,7 +703,7 @@ export function VideoScreen({
     if (settingsChannelId == null) return
     setBusy(true); setError(null)
     try {
-      const r = await videoApi.startCapture(buildCaptureInput(settingsChannelId, { batch, every, model }))
+      const r = await videoApi.startCapture(buildCaptureInput(settingsChannelId, { batch, every }))
       if (!r.success) throw new Error(r.error || 'Start failed')
       hydratedSettingsChannelRef.current = settingsChannelId
       setSettingsDirty(false)
@@ -776,7 +782,7 @@ export function VideoScreen({
   }, [period])
 
   const selectWorkspaceTab = useCallback((nextTab: VideoWorkspaceTab) => {
-    if (nextTab === 'settings') setReviewPreviewOpen(false)
+    if (nextTab !== 'review') setReviewPreviewOpen(false)
     setActiveTab(nextTab)
   }, [])
   const requestSettingsChannel = useCallback((channelId: number, openSettings = false) => {
@@ -808,18 +814,13 @@ export function VideoScreen({
     setEvery(value)
     setSettingsDirty(true)
   }, [])
-  const updateModel = useCallback((value: string) => {
-    setModel(value)
-    setSettingsDirty(true)
-  }, [])
   const discardSettingsDraft = useCallback(() => {
     const nextBatch = Number(settingsRt?.video?.batch_size)
     const nextEvery = Number(settingsRt?.video?.interval_sec)
     setBatch(Number.isFinite(nextBatch) && nextBatch > 0 ? String(nextBatch) : '12')
     setEvery(Number.isFinite(nextEvery) && nextEvery > 0 ? String(nextEvery) : '5')
-    setModel(String(settingsRt?.video?.model || modelOptions[0]?.value || 'auto'))
     setSettingsDirty(false)
-  }, [modelOptions, settingsRt])
+  }, [settingsRt])
 
   const previewCard = (
     <div className="vid-preview-card">
@@ -903,7 +904,7 @@ export function VideoScreen({
         settingsChannelId={settingsChannelId} onSettingsChannel={(channelId) => requestSettingsChannel(channelId)}
         reviewChannelId={reviewChannelId} onReviewChannel={setReviewChannelId}
         onReload={reloadChannels}
-        batch={batch} onBatch={updateBatch} every={every} onEvery={updateEvery} model={model} onModel={updateModel} modelOptions={modelOptions}
+        batch={batch} onBatch={updateBatch} every={every} onEvery={updateEvery}
         canCapture={canCapture} canManagePrompts={canManagePrompts}
         capturing={capturing} busy={busy} onStart={start} onStop={stop} onFlush={flush}
         onPromptSettings={() => setPromptOpen(true)}
@@ -923,9 +924,9 @@ export function VideoScreen({
           <div className="vid-feed-card vid-review-feed">
           <div className="vid-feed-heading">
             <div>
-              <div className="mon-panel-title">Stream summaries</div>
+              <div className="mon-panel-title">{t('video.summaries')}</div>
               <div className="vid-feed-meta">
-                {channelName(reviewChannelId ?? -1) || 'No channel'} · #{reviewChannelId ?? '—'} · {resolution === 'AUTO' ? `Auto → ${renderedDepth}` : renderedDepth} · {feed.length} summaries
+                {channelName(reviewChannelId ?? -1) || t('video.noChannel')} · #{reviewChannelId ?? '—'} · {resolution === 'AUTO' ? `${t('resolution.auto')} → ${renderedDepth}` : renderedDepth} · {feed.length} summaries
                 {live ? ' · following live' : ' · fixed view'}
               </div>
             </div>
@@ -935,7 +936,7 @@ export function VideoScreen({
             {feed.length === 0 && (
               <div className="vid-feed-empty">
                 {noFrame && <div className="vid-feed-note"><IconAlertTriangle size={16} /> No fresh EVA frame is available for this channel yet.</div>}
-                <div className="empty-state">No summaries yet for this channel.</div>
+                <div className="empty-state">{t('video.noSummaries')}</div>
               </div>
             )}
             {feed.map((entry, index) => {
@@ -958,6 +959,7 @@ export function VideoScreen({
                     }
                   }}
                   onReportIncident={setIncidentDraft}
+                  locale={locale}
                 />
               )
             })}
@@ -965,6 +967,8 @@ export function VideoScreen({
           </div>
           {reviewPreviewOpen && <aside className="vid-review-preview-drawer">{previewCard}</aside>}
         </div>
+      ) : activeTab === 'incidents' ? (
+        <IncidentReview channels={channels} canExport={canExport} canManage={canReportIncidents} />
       ) : (
         <div className="vid-settings-main">
           <section className="vid-settings-preview">
@@ -996,7 +1000,7 @@ export function VideoScreen({
                 <div><span>Draft</span><b className={settingsDirty ? 'bad' : 'good'}>{settingsDirty ? 'not applied' : 'in sync'}</b></div>
               </div>
               <div className="vid-sel-list">
-                <div><span>Live model</span><b>{String(settingsRt?.video?.model || model || 'auto')}</b></div>
+                <div><span>Active VLM profile</span><b>{String(settingsRt?.video?.model || 'configured default')}</b></div>
                 <div><span>Frame selector</span><b>{selectorLabel}</b></div>
                 <div>
                   <span>Summary queue</span>
@@ -1024,7 +1028,7 @@ export function VideoScreen({
           <div className="modal usr-confirm" onClick={(event) => event.stopPropagation()}>
             <div className="usr-confirm-title"><IconAlertTriangle size={16} /> Unsaved stream settings</div>
             <p>
-              Batch, cadence, or model changes for <b>{channelName(settingsChannelId ?? -1) || `#${settingsChannelId}`}</b> have not been applied.
+              Batch or cadence changes for <b>{channelName(settingsChannelId ?? -1) || `#${settingsChannelId}`}</b> have not been applied.
               Discard them and open <b>{channelName(pendingSettingsSwitch.channelId) || `#${pendingSettingsSwitch.channelId}`}</b>?
             </p>
             <div className="usr-confirm-actions">
@@ -1060,6 +1064,7 @@ export function VideoScreen({
         <IncidentModal
           draftInput={incidentDraft}
           canExport={canExport}
+          canManage={canReportIncidents}
           onClose={() => setIncidentDraft(null)}
         />
       )}

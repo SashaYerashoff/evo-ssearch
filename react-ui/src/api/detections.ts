@@ -250,6 +250,55 @@ export function falsePositiveExportUrl(
   return `/reports/false-positives/export?${params.toString()}`
 }
 
+export interface ArchivePlaybackWindow {
+  startMs: number
+  durationSec: number
+  evidenceMs: number
+  batchStartMs: number | null
+  batchEndMs: number | null
+}
+
+function positiveMs(value: unknown): number | null {
+  const parsed = Number(value)
+  return Number.isSafeInteger(parsed) && parsed > 0 ? parsed : null
+}
+
+/** A compact recorder window around the exact evidence frame, not inference completion. */
+export function archivePlaybackWindow(detection: Detection): ArchivePlaybackWindow | null {
+  const payload = detection.raw?.payload || {}
+  const evidenceMs = positiveMs(payload.anchor_frame_timestamp_ms)
+    ?? positiveMs(payload.frame_timestamp_ms)
+    ?? positiveMs(detection.tsMs)
+  const channelId = positiveMs(detection.channelId)
+  if (!evidenceMs || !channelId) return null
+  const rawStart = positiveMs(payload.batch_start_ms ?? detection.raw?.batch_start_ms)
+  const rawEnd = positiveMs(payload.batch_end_ms ?? detection.raw?.batch_end_ms)
+  const batchStartMs = rawStart != null && rawEnd != null ? Math.min(rawStart, rawEnd) : rawStart
+  const batchEndMs = rawStart != null && rawEnd != null ? Math.max(rawStart, rawEnd) : rawEnd
+  // Eight seconds retains useful before/after context while avoiding the very
+  // expensive 15-second WebM assembly observed on low-power Evo recorders.
+  const desiredStart = evidenceMs - 3_000
+  const desiredEnd = evidenceMs + 5_000
+  const startMs = Math.max(batchStartMs ?? desiredStart, desiredStart)
+  const boundedEnd = Math.min(batchEndMs != null ? batchEndMs + 1_000 : desiredEnd, desiredEnd)
+  const durationSec = Math.max(1, Math.min(8, Math.ceil(Math.max(1_000, boundedEnd - startMs) / 1_000)))
+  return { startMs, durationSec, evidenceMs, batchStartMs, batchEndMs }
+}
+
+export function archivePlaybackUrl(detection: Detection): string | null {
+  const window = archivePlaybackWindow(detection)
+  if (!window || detection.channelId == null) return null
+  const params = new URLSearchParams({
+    stream: 'mainStream',
+    time_ms: String(window.startMs),
+    duration_sec: String(window.durationSec),
+  })
+  // Feed recorder media straight to the browser. Chromium can reject a large
+  // fetch().blob() with an opaque `Failed to fetch` even when the same complete
+  // same-origin WebM response is accepted by its native media stack.
+  return `/luxriot/media/archive/${detection.channelId}?${params.toString()}`
+}
+
 export async function findParentAlert(
   parentAlertId: string,
   channelId: number,

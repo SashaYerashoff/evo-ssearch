@@ -9,16 +9,20 @@ from agent import (
     _compact_prompt_settings_for_model,
     _compact_tool_result_for_model,
     _compact_vector_signal_for_model,
+    _archive_research_response_needs_recovery,
     _format_epoch_minute,
+    _format_archive_research_fallback,
     _format_turn_signal_ledger_message,
     _new_turn_signal_ledger,
     _record_turn_signal_ledger,
     _remember_turn_tool_result,
+    _select_archive_vision_candidates,
     _seed_turn_tool_context,
     _safe_detection,
     _strip_thumbnails,
     _summary_node_alert_score,
     _tool_result_for_ui,
+    _validate_archive_vision_contract,
     build_system_prompt,
 )
 
@@ -690,6 +694,274 @@ class AgentVideoSummaryToolTests(unittest.TestCase):
         self.assertEqual(ui_result["image_url"], "/detections/thumbnail/501")
         self.assertNotIn("snapshot_b64", ui_result)
         self.assertIn("snapshot_b64", result)
+
+    def test_describe_frame_batches_ranked_candidates_in_one_vision_call(self):
+        captured = []
+
+        def call_lm(messages):
+            captured.append(messages)
+            return (
+                '{"verdicts": ['
+                '{"snapshot_index": 1, "verdict": "match", '
+                '"visible_evidence": "A hairless cat is visible on the shelf."},'
+                '{"snapshot_index": 2, "verdict": "no_match", '
+                '"visible_evidence": "Only an empty shelf is visible."}'
+                ']}'
+            )
+
+        store = _DetectionStore(
+            [
+                {
+                    "id": 501,
+                    "channel_id": 7,
+                    "timestamp_ms": 1_000,
+                    "source": "vlm_summary",
+                    "thumbnail": "ZmFrZS0x",
+                },
+                {
+                    "id": 502,
+                    "channel_id": 7,
+                    "timestamp_ms": 2_000,
+                    "source": "semantic_snapshot",
+                    "thumbnail": "ZmFrZS0y",
+                },
+            ]
+        )
+        tools = _tools(detections_store=store, call_lm_fn=call_lm)
+
+        result = tools._describe_frame(
+            {
+                "detection_ids": [501, 502],
+                "prompt": "sphynx cat",
+            }
+        )
+
+        self.assertEqual(len(captured), 1)
+        image_parts = [
+            part
+            for part in captured[0][1]["content"]
+            if part.get("type") == "image_url"
+        ]
+        self.assertEqual(len(image_parts), 2)
+        self.assertEqual(result["source"], "archive_candidate_batch")
+        self.assertEqual(result["parse_status"], "parsed")
+        self.assertEqual(result["matched_detection_ids"], [501])
+        self.assertEqual(result["no_match_detection_ids"], [502])
+        self.assertEqual(result["uncertain_count"], 0)
+
+    def test_describe_frame_batch_treats_unparsed_output_as_uncertain(self):
+        store = _DetectionStore(
+            [
+                {"id": 501, "channel_id": 7, "thumbnail": "ZmFrZS0x"},
+                {"id": 502, "channel_id": 7, "thumbnail": "ZmFrZS0y"},
+            ]
+        )
+        tools = _tools(
+            detections_store=store,
+            call_lm_fn=lambda _messages: "The first image probably contains a cat.",
+        )
+
+        result = tools._describe_frame(
+            {"detection_ids": [501, 502], "prompt": "sphynx cat"}
+        )
+
+        self.assertEqual(result["parse_status"], "unparsed")
+        self.assertEqual(result["match_count"], 0)
+        self.assertEqual(result["uncertain_detection_ids"], [501, 502])
+
+    def test_archive_vision_contract_accepts_fenced_repeated_evidence_with_flag(self):
+        evidence = "A red car is visible on the road in this snapshot."
+        rows = ",".join(
+            '{"snapshot_index":%d,"verdict":"match","visible_evidence":"%s"}'
+            % (index, evidence)
+            for index in range(1, 9)
+        )
+
+        status, verdicts, errors, flags = _validate_archive_vision_contract(
+            "```json\n" + '{"verdicts":[' + rows + "]}\n```",
+            expected_count=8,
+        )
+
+        self.assertEqual(status, "parsed")
+        self.assertEqual(sorted(verdicts), list(range(1, 9)))
+        self.assertEqual(errors, [])
+        self.assertIn("repeated_visible_evidence", flags)
+
+    def test_archive_vision_contract_rejects_incomplete_duplicate_and_out_of_range_rows(self):
+        invalid_contracts = {
+            "missing": (
+                '{"verdicts":[{"snapshot_index":1,"verdict":"match",'
+                '"visible_evidence":"red car"}]}'
+            ),
+            "duplicate": (
+                '{"verdicts":['
+                '{"snapshot_index":1,"verdict":"match","visible_evidence":"red car"},'
+                '{"snapshot_index":1,"verdict":"no_match","visible_evidence":"empty road"}'
+                "]}"
+            ),
+            "out_of_range": (
+                '{"verdicts":['
+                '{"snapshot_index":1,"verdict":"match","visible_evidence":"red car"},'
+                '{"snapshot_index":3,"verdict":"no_match","visible_evidence":"empty road"}'
+                "]}"
+            ),
+        }
+
+        for name, payload in invalid_contracts.items():
+            with self.subTest(name=name):
+                status, verdicts, errors, _flags = _validate_archive_vision_contract(
+                    payload,
+                    expected_count=2,
+                )
+                self.assertEqual(status, "invalid")
+                self.assertEqual(verdicts, {})
+                self.assertTrue(errors)
+
+    def test_archive_vision_candidates_dedupe_one_frame_and_prefer_summary(self):
+        rows = [
+            {
+                "detection_id": 101,
+                "channel_id": 7,
+                "timestamp_ms": 1_000,
+                "source": "vlm_alert",
+            },
+            {
+                "detection_id": 102,
+                "channel_id": 7,
+                "timestamp_ms": 1_000,
+                "source": "vlm_summary",
+            },
+            {
+                "detection_id": 103,
+                "channel_id": 7,
+                "timestamp_ms": 2_000,
+                "source": "semantic_snapshot",
+            },
+        ]
+
+        selected = _select_archive_vision_candidates(rows, limit=8)
+
+        self.assertEqual([row["detection_id"] for row in selected], [102, 103])
+
+    def test_archive_search_compaction_preserves_text_and_candidate_limits(self):
+        result = {
+            "scope": "detections",
+            "query": "sphynx cat",
+            "count": 12,
+            "match_semantics": "ranked_candidates_not_binary_matches",
+            "time_window": {"duration_sec": 86_400},
+            "lexical_match_count_in_returned": 1,
+            "vision_candidate_ids": [101, 102],
+            "vision_candidate_count": 2,
+            "vision_verification_required": True,
+            "coverage": {"scanned_candidates": 20_000, "truncated": True},
+            "results": [
+                {
+                    "detection_id": index,
+                    "channel_id": 7,
+                    "timestamp_ms": index * 1_000,
+                    "source": "vlm_summary",
+                    "score": 0.8,
+                    "image_url": f"/detections/thumbnail/{index}",
+                    "text_evidence_excerpt": (
+                        "A Sphynx cat is perched atop the fridge."
+                        if index == 101
+                        else "Person at desk"
+                    ),
+                    "lexical_match": index == 101,
+                    "lexical_match_kind": "exact_phrase" if index == 101 else "none",
+                }
+                for index in range(101, 113)
+            ],
+        }
+
+        compact = _compact_tool_result_for_model("search_archive", result)
+
+        self.assertEqual(compact["results_returned_to_model"], 8)
+        self.assertEqual(compact["results_omitted_from_model"], 4)
+        self.assertEqual(compact["vision_candidate_ids"], [101, 102])
+        self.assertIn("Sphynx cat", compact["results"][0]["text_evidence_excerpt"])
+        self.assertEqual(
+            compact["results"][0]["score_semantics"],
+            "semantic_retrieval_ranking_not_probability",
+        )
+
+    def test_archive_negative_claim_requires_parsed_vision_and_no_match(self):
+        context = {
+            "tool_intents": ["archive_research"],
+            "archive_search_completed": True,
+            "archive_vision_required": True,
+            "archive_vision_completed": False,
+        }
+        claim = 'No "sphynx cat" detected in the archive.'
+
+        self.assertTrue(_archive_research_response_needs_recovery(claim, context))
+
+        context.update(
+            {
+                "archive_vision_completed": True,
+                "archive_vision_parse_status": "parsed",
+                "archive_vision_match_count": 1,
+                "archive_vision_no_match_count": 0,
+                "archive_vision_uncertain_count": 0,
+            }
+        )
+        self.assertTrue(_archive_research_response_needs_recovery(claim, context))
+
+        context["archive_vision_match_count"] = 0
+        context["archive_vision_no_match_count"] = 8
+        self.assertFalse(_archive_research_response_needs_recovery(claim, context))
+
+        context["archive_vision_uncertain_count"] = 1
+        self.assertTrue(_archive_research_response_needs_recovery(claim, context))
+
+        positive = "Visual evidence was found for a sphynx cat."
+        context["archive_vision_uncertain_count"] = 0
+        self.assertTrue(_archive_research_response_needs_recovery(positive, context))
+        context["archive_vision_match_count"] = 1
+        self.assertFalse(_archive_research_response_needs_recovery(positive, context))
+
+    def test_archive_fallback_states_bounded_vision_scope(self):
+        search = {
+            "query": "sphynx cat",
+            "count": 24,
+            "results_returned_to_model": 8,
+            "lexical_match_count_in_returned": 1,
+            "time_window": {
+                "from_local": "2026-08-02T20:00:00+03:00",
+                "to_local": "2026-08-03T20:00:00+03:00",
+                "duration_sec": 86_400,
+            },
+            "coverage": {"scanned_candidates": 20_000, "total_candidates": 20_953},
+        }
+        vision = {
+            "source": "archive_candidate_batch",
+            "candidate_count": 8,
+            "match_count": 1,
+            "no_match_count": 6,
+            "uncertain_count": 1,
+            "parse_status": "parsed",
+            "verdicts": [
+                {
+                    "detection_id": 501,
+                    "verdict": "match",
+                    "visible_evidence": "A hairless cat is visible on the shelf.",
+                }
+            ],
+        }
+        tool_messages = [
+            {"role": "tool", "name": "search_archive", "content": __import__("json").dumps(search)},
+            {"role": "tool", "name": "describe_frame", "content": __import__("json").dumps(vision)},
+        ]
+
+        text = _format_archive_research_fallback(
+            {"user_query": "find sphynx cat"},
+            tool_messages=tool_messages,
+        )
+
+        self.assertIn("Vision batch: reviewed 8", text)
+        self.assertIn("#501 — match", text)
+        self.assertIn("not proof of absence across the whole archive", text)
 
     def test_turn_context_carries_time_channel_and_vlm_evidence_defaults(self):
         context = _seed_turn_tool_context(

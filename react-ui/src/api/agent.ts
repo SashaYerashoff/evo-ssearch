@@ -94,7 +94,7 @@ export async function streamAgent(
       message,
       session_id: opts.sessionId || undefined,
       image_b64: opts.imageB64 || undefined,
-      operator_mode: opts.operatorMode || undefined,
+      operator_mode: Boolean(opts.operatorMode),
       console_context: opts.consoleContext,
     }),
   })

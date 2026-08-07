@@ -20,6 +20,13 @@ from collections.abc import Mapping, Sequence
 from typing import Any, Dict, List, Optional
 
 from rollup_deep_review import QuietWindowSchedule
+from maritime_profiles import (
+    MARITIME_CHANNEL_ROLES,
+    MARITIME_L0_PROMPT,
+    MARITIME_ROLLUP_PROMPTS,
+    maritime_requirement,
+    maritime_role_label,
+)
 
 
 DEPLOYMENT_STATE_VERSION = 1
@@ -32,6 +39,8 @@ MAX_REQUIREMENT_PACKS = 16
 MAX_ALERTS_PER_PACK = 6
 _SEVERITIES = frozenset({"ignore", "log", "info", "low", "normal", "high", "critical"})
 _NOVELTY = frozenset({"low", "balanced", "high"})
+_DEPLOYMENT_PROFILES = frozenset({"general", "maritime"})
+_STARTER_POLICY_MODES = frozenset({"none", "shadow"})
 _COUNTER_MODES = frozenset(
     {"none", "count_transitions", "measure_duration", "count_and_duration"}
 )
@@ -176,6 +185,14 @@ def _normalize_alert(raw: Mapping[str, Any], index: int) -> Dict[str, Any]:
     counter_mode = str(raw.get("counter_mode") or "none").strip().lower()
     if counter_mode not in _COUNTER_MODES:
         raise DeploymentWorkflowError(f"unsupported counter_mode: {counter_mode}")
+    if (
+        counter_mode == "count_transitions"
+        and raw.get("duration_state") is not None
+    ):
+        # Small heads often encode “count transitions and duration” as a
+        # transition counter plus an explicit duration_state.  Preserve both
+        # operator intents instead of silently discarding dwell time.
+        counter_mode = "count_and_duration"
     count_transition = str(
         raw.get("count_transition") or "positive_to_negative"
     ).strip().lower()
@@ -308,6 +325,115 @@ def _normalize_requirements(
     return normalized
 
 
+def _dedupe_requirement_packs(
+    requirements: Sequence[Mapping[str, Any]],
+) -> tuple[List[Dict[str, Any]], List[str]]:
+    """Drop model-duplicated policy packs without merging channel scopes."""
+
+    accepted: List[Dict[str, Any]] = []
+    seen: List[tuple[tuple[tuple[str, str, str], ...], frozenset[int]]] = []
+    warnings: List[str] = []
+    for raw in requirements:
+        pack = copy.deepcopy(dict(raw))
+        name_key = str(pack.get("name") or "").strip().casefold().replace("_", " ")
+        if name_key in {"quiet window", "consolidation window"}:
+            warnings.append(
+                f"ignored requirement pack {pack.get('name')!r}: quiet window is a separate field"
+            )
+            continue
+        signature = tuple(
+            sorted(
+                (
+                    str(alert.get("name") or "").strip().casefold(),
+                    str(alert.get("positive_query") or "").strip().casefold(),
+                    str(alert.get("contrast_query") or "").strip().casefold(),
+                )
+                for alert in (pack.get("alerts") or [])
+                if isinstance(alert, Mapping)
+            )
+        )
+        scope = frozenset(int(item) for item in (pack.get("channel_ids") or []))
+        duplicate = bool(
+            signature
+            and any(
+                signature == prior_signature and bool(scope & prior_scope)
+                for prior_signature, prior_scope in seen
+            )
+        )
+        if duplicate:
+            warnings.append(
+                f"ignored duplicated requirement pack {pack.get('name')!r} with overlapping channel scope"
+            )
+            continue
+        accepted.append(pack)
+        if signature:
+            seen.append((signature, scope))
+    return accepted, warnings
+
+
+def _merge_requirement_corrections(
+    existing: Sequence[Mapping[str, Any]],
+    updates: Sequence[Mapping[str, Any]],
+) -> List[Dict[str, Any]]:
+    """Merge corrections by pack scope/name and alert name, preserving siblings."""
+
+    merged = [copy.deepcopy(dict(pack)) for pack in existing]
+    for raw_update in updates:
+        update = copy.deepcopy(dict(raw_update))
+        update_scope = tuple(sorted(int(item) for item in update.get("channel_ids") or []))
+        update_name = str(update.get("name") or "").strip().casefold()
+        update_alert_names = {
+            str(alert.get("name") or "").strip().casefold()
+            for alert in (update.get("alerts") or [])
+            if isinstance(alert, Mapping)
+        }
+        match_index: Optional[int] = None
+        for index, current in enumerate(merged):
+            current_scope = tuple(
+                sorted(int(item) for item in current.get("channel_ids") or [])
+            )
+            current_name = str(current.get("name") or "").strip().casefold()
+            current_alert_names = {
+                str(alert.get("name") or "").strip().casefold()
+                for alert in (current.get("alerts") or [])
+                if isinstance(alert, Mapping)
+            }
+            if current_scope == update_scope and (
+                current_name == update_name
+                or bool(current_alert_names & update_alert_names)
+            ):
+                match_index = index
+                break
+        if match_index is None:
+            merged.append(update)
+            continue
+        current = merged[match_index]
+        alerts_by_name = {
+            str(alert.get("name") or "").strip().casefold(): copy.deepcopy(dict(alert))
+            for alert in (current.get("alerts") or [])
+            if isinstance(alert, Mapping)
+        }
+        for alert in (update.get("alerts") or []):
+            if not isinstance(alert, Mapping):
+                continue
+            alerts_by_name[str(alert.get("name") or "").strip().casefold()] = (
+                copy.deepcopy(dict(alert))
+            )
+        combined = copy.deepcopy(current)
+        for key in (
+            "name",
+            "channel_ids",
+            "expected_routine",
+            "unexpected_severity",
+            "novelty_sensitivity",
+        ):
+            if update.get(key) not in (None, "", []):
+                combined[key] = copy.deepcopy(update.get(key))
+        combined["alerts"] = list(alerts_by_name.values())
+        merged[match_index] = combined
+    return merged
+
+
 def _normalize_quiet_window(value: Any) -> Optional[Dict[str, Any]]:
     if value in (None, {}):
         return None
@@ -343,12 +469,58 @@ def _normalize_quiet_window(value: Any) -> Optional[Dict[str, Any]]:
         raise DeploymentWorkflowError(str(exc)) from exc
 
 
+def _normalize_deployment_profile(value: Any) -> str:
+    profile = str(value or "general").strip().lower()
+    if profile not in _DEPLOYMENT_PROFILES:
+        raise DeploymentWorkflowError(f"unsupported deployment_profile: {profile}")
+    return profile
+
+
+def _normalize_channel_roles(
+    value: Any,
+    *,
+    selected_channel_ids: Sequence[int],
+    deployment_profile: str,
+) -> List[Dict[str, Any]]:
+    if value in (None, []):
+        return []
+    if deployment_profile != "maritime":
+        raise DeploymentWorkflowError("channel_roles require deployment_profile=maritime")
+    if not isinstance(value, Sequence) or isinstance(value, (str, bytes, bytearray)):
+        raise DeploymentWorkflowError("channel_roles must be a list")
+    selected = set(int(channel_id) for channel_id in selected_channel_ids)
+    roles: List[Dict[str, Any]] = []
+    seen = set()
+    for raw in value:
+        if not isinstance(raw, Mapping):
+            raise DeploymentWorkflowError("each channel role must be an object")
+        channel_id = _positive_int(raw.get("channel_id"), "channel_id")
+        if channel_id not in selected:
+            raise DeploymentWorkflowError("channel role is outside the selected scope")
+        if channel_id in seen:
+            raise DeploymentWorkflowError("each selected channel may have only one role")
+        role = str(raw.get("role") or "").strip().lower()
+        if role not in MARITIME_CHANNEL_ROLES:
+            raise DeploymentWorkflowError(f"unsupported maritime channel role: {role}")
+        seen.add(channel_id)
+        roles.append(
+            {
+                "channel_id": channel_id,
+                "role": role,
+                "label": _bounded_text(raw.get("label") or maritime_role_label(role), 100),
+                "location": _bounded_text(raw.get("location"), 160),
+            }
+        )
+    return roles
+
+
 def _next_action(state: Mapping[str, Any]) -> str:
     stage = str(state.get("stage") or "inventory")
     return {
         "inventory": "configure_scope",
         "scope_configured": "survey",
         "surveyed": "collect_requirements",
+        "requirements_partial": "collect_requirements",
         "requirements_configured": "preview_plan",
         "plan_ready": "apply_in_ui",
         "applied": "wait_for_commissioning",
@@ -365,13 +537,42 @@ def compact_deployment_state(state: Mapping[str, Any]) -> Dict[str, Any]:
         if isinstance(state.get("commissioning"), Mapping)
         else {}
     )
+    selected_channel_ids = [
+        int(item) for item in (state.get("selected_channel_ids") or [])
+    ]
+    available_channel_ids = [
+        int(item.get("id"))
+        for item in (state.get("available_channels") or [])
+        if isinstance(item, Mapping) and item.get("id") is not None
+    ][:100]
+    covered_requirement_ids = {
+        int(channel_id)
+        for pack in (state.get("requirements") or [])
+        if isinstance(pack, Mapping)
+        for channel_id in (pack.get("channel_ids") or [])
+    }
+    missing_requirement_ids = [
+        channel_id
+        for channel_id in selected_channel_ids
+        if channel_id not in covered_requirement_ids
+    ]
     return {
         "deployment_id": state.get("deployment_id"),
         "version": state.get("version"),
         "stage": state.get("stage"),
         "next_action": _next_action(state),
+        "deployment_profile": state.get("deployment_profile") or "general",
+        "starter_policy_mode": state.get("starter_policy_mode") or "none",
+        "starter_policy_confirmed": bool(state.get("starter_policy_confirmed")),
+        "quiet_window_confirmed": bool(state.get("quiet_window_confirmed")),
         "target_channel_count": state.get("target_channel_count"),
         "selected_channel_ids": list(state.get("selected_channel_ids") or []),
+        # Keep the complete authorized inventory identity without feeding a
+        # 50+ channel title catalogue to the small agent head.  React uses the
+        # IDs to restore the exact picker scope from its already-authorized
+        # channel catalogue after a chat/history reload.
+        "available_channel_ids": available_channel_ids,
+        "channel_roles": copy.deepcopy(list(state.get("channel_roles") or [])),
         "groups": copy.deepcopy(list(state.get("groups") or [])),
         "available_channels": copy.deepcopy(list(state.get("available_channels") or []))[:16],
         "survey_count": len(surveys),
@@ -381,6 +582,8 @@ def compact_deployment_state(state: Mapping[str, Any]) -> Dict[str, Any]:
             if isinstance(row, Mapping) and row.get("channel_id") is not None
         ],
         "requirement_pack_count": len(state.get("requirements") or []),
+        "missing_requirement_channel_ids": missing_requirement_ids,
+        "requirement_warnings": list(state.get("requirement_warnings") or [])[:8],
         "quiet_window": copy.deepcopy(state.get("quiet_window")),
         "plan_summary": {
             "channel_count": len(plan.get("channels") or []),
@@ -478,11 +681,22 @@ class ProtocolDeploymentStore:
             raise DeploymentWorkflowError("deployment was not found")
         return copy.deepcopy(dict(state))
 
-    def latest_unfinished(self) -> Optional[Dict[str, Any]]:
+    def latest_unfinished(
+        self,
+        deployment_profile: Optional[str] = None,
+    ) -> Optional[Dict[str, Any]]:
+        requested_profile = (
+            _normalize_deployment_profile(deployment_profile)
+            if deployment_profile is not None
+            else None
+        )
         with self._lock:
             for deployment_id in self._index_ids():
                 state = self._load_raw(self._key(deployment_id))
                 if not isinstance(state, Mapping):
+                    continue
+                state_profile = str(state.get("deployment_profile") or "general")
+                if requested_profile is not None and state_profile != requested_profile:
                     continue
                 if str(state.get("stage") or "") not in {"commissioned", "cancelled"}:
                     return copy.deepcopy(dict(state))
@@ -503,11 +717,21 @@ class ProtocolDeploymentStore:
         *,
         target_channel_count: int = MAX_DEPLOYMENT_CHANNELS,
         resume_latest: bool = True,
+        deployment_profile: str = "general",
     ) -> Dict[str, Any]:
+        profile = _normalize_deployment_profile(deployment_profile)
         target = max(1, min(MAX_DEPLOYMENT_CHANNELS, int(target_channel_count or 8)))
         if resume_latest:
-            existing = self.latest_unfinished()
-            if existing is not None:
+            existing = self.latest_unfinished(profile)
+            # A target supplied by the operator describes the new scope cap.
+            # Never silently resume a draft that was created for a different
+            # cap: this is especially confusing when a previous two-channel
+            # dry run is followed by a four/eight-channel commissioning run.
+            if (
+                existing is not None
+                and int(existing.get("target_channel_count") or MAX_DEPLOYMENT_CHANNELS)
+                == target
+            ):
                 return existing
         channels: List[Dict[str, Any]] = []
         seen = set()
@@ -536,13 +760,19 @@ class ProtocolDeploymentStore:
             "version": DEPLOYMENT_STATE_VERSION,
             "deployment_id": f"deploy-{uuid.uuid4().hex[:12]}",
             "stage": "inventory",
+            "deployment_profile": profile,
+            "starter_policy_mode": "none",
+            "starter_policy_confirmed": False,
             "target_channel_count": target,
             "available_channels": channels[:100],
             "selected_channel_ids": [],
             "groups": [],
+            "channel_roles": [],
             "surveys": [],
             "requirements": [],
+            "requirement_warnings": [],
             "quiet_window": None,
+            "quiet_window_confirmed": False,
             "plan": None,
             "commissioning": {"status": "not_scheduled"},
             "created_at_ms": now_ms,
@@ -558,11 +788,20 @@ class ProtocolDeploymentStore:
         groups: Optional[Sequence[Mapping[str, Any]]] = None,
         requirements: Optional[Sequence[Mapping[str, Any]]] = None,
         quiet_window: Optional[Mapping[str, Any]] = None,
+        channel_roles: Optional[Sequence[Mapping[str, Any]]] = None,
+        starter_policy_mode: Optional[str] = None,
     ) -> Dict[str, Any]:
         state = self.load(deployment_id)
         selected = list(state.get("selected_channel_ids") or [])
         if channel_ids is not None:
-            selected = _normalize_channel_ids(channel_ids)
+            target = max(
+                1,
+                min(
+                    MAX_DEPLOYMENT_CHANNELS,
+                    int(state.get("target_channel_count") or MAX_DEPLOYMENT_CHANNELS),
+                ),
+            )
+            selected = _normalize_channel_ids(channel_ids, maximum=target)
             available = {
                 int(item.get("id"))
                 for item in (state.get("available_channels") or [])
@@ -584,6 +823,8 @@ class ProtocolDeploymentStore:
                 and int(row.get("channel_id") or 0) in set(selected)
             ]
             state["requirements"] = []
+            state["requirement_warnings"] = []
+            state["channel_roles"] = []
             state["plan"] = None
             state["stage"] = "scope_configured"
         elif groups is not None:
@@ -595,21 +836,76 @@ class ProtocolDeploymentStore:
             )
             state["plan"] = None
 
+        if channel_roles is not None:
+            if not selected:
+                raise DeploymentWorkflowError("configure channel scope first")
+            state["channel_roles"] = _normalize_channel_roles(
+                channel_roles,
+                selected_channel_ids=selected,
+                deployment_profile=str(state.get("deployment_profile") or "general"),
+            )
+            state["plan"] = None
+        if starter_policy_mode is not None:
+            mode = str(starter_policy_mode or "none").strip().lower()
+            if mode not in _STARTER_POLICY_MODES:
+                raise DeploymentWorkflowError(f"unsupported starter_policy_mode: {mode}")
+            if mode != "none" and str(state.get("deployment_profile") or "general") != "maritime":
+                raise DeploymentWorkflowError("starter shadow policies require maritime deployment")
+            state["starter_policy_mode"] = mode
+            state["starter_policy_confirmed"] = True
+            state["plan"] = None
+            if mode == "shadow" and selected and state.get("surveys"):
+                state["stage"] = "requirements_configured"
+
         if requirements is not None:
             if not selected:
                 raise DeploymentWorkflowError("configure channel scope first")
-            state["requirements"] = _normalize_requirements(
+            normalized_requirements = _normalize_requirements(
                 requirements,
                 selected_channel_ids=selected,
             )
-            state["plan"] = None
-            state["stage"] = (
-                "requirements_configured"
-                if state["requirements"]
-                else "surveyed"
+            normalized_requirements, warnings = _dedupe_requirement_packs(
+                normalized_requirements
             )
+            if (
+                str(state.get("stage") or "")
+                in {
+                    "requirements_partial",
+                    "requirements_configured",
+                    "plan_ready",
+                }
+                and state.get("requirements")
+            ):
+                merged_requirements = _merge_requirement_corrections(
+                    [
+                        pack
+                        for pack in (state.get("requirements") or [])
+                        if isinstance(pack, Mapping)
+                    ],
+                    normalized_requirements,
+                )
+                normalized_requirements, merge_warnings = _dedupe_requirement_packs(
+                    merged_requirements
+                )
+                warnings = list(state.get("requirement_warnings") or []) + warnings + merge_warnings
+            state["requirements"] = normalized_requirements
+            state["requirement_warnings"] = list(dict.fromkeys(warnings))[:16]
+            state["plan"] = None
+            covered = {
+                int(channel_id)
+                for pack in state["requirements"]
+                for channel_id in (pack.get("channel_ids") or [])
+            }
+            missing = [channel_id for channel_id in selected if channel_id not in covered]
+            if state["requirements"] and not missing:
+                state["stage"] = "requirements_configured"
+            elif state["requirements"]:
+                state["stage"] = "requirements_partial"
+            else:
+                state["stage"] = "surveyed"
         if quiet_window is not None:
             state["quiet_window"] = _normalize_quiet_window(quiet_window)
+            state["quiet_window_confirmed"] = True
             state["plan"] = None
         return self.save(state)
 
@@ -650,15 +946,63 @@ class ProtocolDeploymentStore:
         *,
         start_live: bool = True,
         commissioning_after_minutes: int = 15,
+        probe_pos_floor: float = 0.05,
+        probe_margin: float = 0.02,
+        probe_embedding_space: Optional[Mapping[str, Any]] = None,
     ) -> Dict[str, Any]:
         state = self.load(deployment_id)
         selected = [int(item) for item in state.get("selected_channel_ids") or []]
         requirements = list(state.get("requirements") or [])
+        deployment_profile = str(state.get("deployment_profile") or "general")
+        channel_roles = {
+            int(row.get("channel_id")): dict(row)
+            for row in (state.get("channel_roles") or [])
+            if isinstance(row, Mapping) and row.get("channel_id") is not None
+        }
         if not selected:
             raise DeploymentWorkflowError("deployment has no selected channels")
+        if deployment_profile == "maritime":
+            missing_roles = [channel_id for channel_id in selected if channel_id not in channel_roles]
+            if missing_roles:
+                raise DeploymentWorkflowError(
+                    "assign a maritime role to every selected channel: "
+                    + ", ".join(str(channel_id) for channel_id in missing_roles)
+                )
+            if str(state.get("starter_policy_mode") or "none") == "shadow":
+                starter_requirements: List[Dict[str, Any]] = []
+                for channel_id in selected:
+                    starter = maritime_requirement(
+                        str(channel_roles[channel_id].get("role") or ""),
+                        channel_id,
+                    )
+                    normalized = _normalize_requirements(
+                        [starter],
+                        selected_channel_ids=selected,
+                    )[0]
+                    normalized["starter_policy"] = True
+                    starter_requirements.append(normalized)
+                # Operator-authored requirements win the four-probe budget;
+                # starter watches fill only the remaining slots.
+                requirements.extend(starter_requirements)
         if not requirements:
             raise DeploymentWorkflowError(
                 "collect operator alert/routine requirements before preview"
+            )
+        covered_requirement_ids = {
+            int(channel_id)
+            for pack in requirements
+            if isinstance(pack, Mapping)
+            for channel_id in (pack.get("channel_ids") or [])
+        }
+        missing_requirement_ids = [
+            channel_id
+            for channel_id in selected
+            if channel_id not in covered_requirement_ids
+        ]
+        if missing_requirement_ids:
+            raise DeploymentWorkflowError(
+                "collect requirements for every selected channel before preview: "
+                + ", ".join(str(item) for item in missing_requirement_ids)
             )
         requirement_by_channel: Dict[int, List[Dict[str, Any]]] = {
             channel_id: [] for channel_id in selected
@@ -673,6 +1017,7 @@ class ProtocolDeploymentStore:
         channel_plans: List[Dict[str, Any]] = []
         probes: List[Dict[str, Any]] = []
         counted_states: List[Dict[str, Any]] = []
+        channel_probe_counts: Dict[int, int] = {channel_id: 0 for channel_id in selected}
         for channel_id in selected:
             packs = requirement_by_channel.get(channel_id) or []
             lines = [
@@ -698,7 +1043,11 @@ class ProtocolDeploymentStore:
                     positive = str(alert.get("positive_query") or "").strip()
                     contrast = str(alert.get("contrast_query") or "").strip()
                     probe_payload: Optional[Dict[str, Any]] = None
-                    if positive and contrast:
+                    if (
+                        positive
+                        and contrast
+                        and channel_probe_counts.get(channel_id, 0) < 4
+                    ):
                         probe_name = (
                             f"{_slug(alert.get('name'))} [{deployment_id[-6:]}]"
                         )
@@ -707,17 +1056,26 @@ class ProtocolDeploymentStore:
                             "channel_id": channel_id,
                             "positives": [positive],
                             "negatives": [contrast],
-                            "pos_floor": 0.20,
-                            "margin": 0.05,
+                            "pos_floor": float(probe_pos_floor),
+                            "margin": max(0.0, float(probe_margin)),
                             "top_k": 6,
                             "window_sec": 300.0,
                             "severity": str(alert.get("severity") or "normal"),
                             "bookmark": False,
                             "enabled": True,
                             "origin": "agent",
+                            "attention_only": bool(pack.get("starter_policy")),
+                            "starter_policy": bool(pack.get("starter_policy")),
                             "deployment_id": deployment_id,
                         }
+                        if probe_embedding_space:
+                            probe_payload["embedding_space"] = copy.deepcopy(
+                                dict(probe_embedding_space)
+                            )
                         probes.append(probe_payload)
+                        channel_probe_counts[channel_id] = (
+                            channel_probe_counts.get(channel_id, 0) + 1
+                        )
                     counter_mode = str(alert.get("counter_mode") or "none")
                     if counter_mode != "none":
                         metric_id = _stable_metric_id(
@@ -771,11 +1129,10 @@ class ProtocolDeploymentStore:
                             f"duration={metric['duration_state']}; unknown/no-coverage "
                             "must remain separate."
                         )
-            channel_plans.append(
-                {
-                    "channel_id": channel_id,
-                    "alert_policy_prompt": "\n".join(lines),
-                    "novelty_profiles": [
+            channel_plan: Dict[str, Any] = {
+                "channel_id": channel_id,
+                "alert_policy_prompt": "\n".join(lines),
+                "novelty_profiles": [
                         {
                             "name": pack.get("name"),
                             "sensitivity": pack.get("novelty_sensitivity"),
@@ -785,11 +1142,31 @@ class ProtocolDeploymentStore:
                         }
                         for pack in packs
                     ],
-                }
-            )
+            }
+            if deployment_profile == "maritime":
+                role = channel_roles[channel_id]
+                role_name = str(role.get("role") or "")
+                location = str(role.get("location") or "").strip()
+                role_card = (
+                    f"\n\nChannel operating card: role={role_name}; "
+                    f"location={location or 'operator confirmation pending'}. "
+                    "PTZ presets and spatial zones are separate scene epochs and must not share absence claims."
+                )
+                channel_plan.update(
+                    {
+                        "channel_role": role_name,
+                        "channel_location": location,
+                        "stream_system_prompt": MARITIME_L0_PROMPT + role_card,
+                        "rollup_prompts": copy.deepcopy(MARITIME_ROLLUP_PROMPTS),
+                        "coverage_contract": "ptz_scene_epoch_v1",
+                    }
+                )
+            channel_plans.append(channel_plan)
         plan = {
             "version": 1,
             "deployment_id": deployment_id,
+            "deployment_profile": deployment_profile,
+            "starter_policy_mode": state.get("starter_policy_mode") or "none",
             "channels": channel_plans,
             "groups": copy.deepcopy(list(state.get("groups") or [])),
             "probes": probes[: MAX_DEPLOYMENT_CHANNELS * 4],

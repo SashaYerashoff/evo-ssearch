@@ -31,6 +31,12 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable, Iterable, Mapping, MutableMapping, Sequence
 from urllib.parse import urlsplit
+from urllib.request import (
+    HTTPDigestAuthHandler,
+    HTTPPasswordMgrWithDefaultRealm,
+    Request,
+    build_opener,
+)
 
 
 SCRIPT_PATH = Path(__file__).resolve()
@@ -48,11 +54,11 @@ def _expected_version() -> str:
         text = (REPO_ROOT / "VERSION").read_text(encoding="utf-8").strip()
     except OSError:
         text = ""
-    return text or "β 0.8.5"
+    return text or "β 0.8.7"
 
 
 EXPECTED_VERSION = _expected_version()
-EXPECTED_SCHEMA = "20260801_0011"
+EXPECTED_SCHEMA = "20260805_0013"
 DEFAULT_APP_DIR = Path("/opt/eva-ai/evo-ssearch")
 DEFAULT_ENV_FILE = Path("/etc/eva-ai/eva-ai.env")
 DEFAULT_BACKUP_ROOT = Path("/var/backups/eva-ai")
@@ -63,7 +69,9 @@ _ENV_KEY_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 _SECRET_MARKERS = ("PASSWORD", "SECRET", "TOKEN", "API_KEY", "DSN", "DATABASE_URL")
 _VLM_ENDPOINT_RE = re.compile(r"^EVOSSEARCH_LM_PROFILE_(?!AGENT(?:_|$)).+_BASE_URL$")
 _ENV_REFERENCE_RE = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}")
-_INSTALLER_MANAGED_ENV_KEYS = frozenset({"EVOSSEARCH_APP_VERSION"})
+_INSTALLER_MANAGED_ENV_KEYS = frozenset(
+    {"EVOSSEARCH_APP_VERSION", "EVOSSEARCH_UI_MODE"}
+)
 
 
 class InstallerError(RuntimeError):
@@ -127,6 +135,7 @@ class InstallerOptions:
     start: bool
     verify: bool
     adopt_existing_config: bool = False
+    verify_luxriot_credential: bool = False
 
 
 @dataclass
@@ -322,7 +331,7 @@ def render_env_update(raw: str, updates: Mapping[str, str]) -> str:
     if pending_updates:
         if content:
             content += "\n"
-        content += "# Added by EVA AI 0.8.3 offline installer; existing keys were preserved.\n"
+        content += "# Added by the EVA AI universal offline installer; existing site keys were preserved.\n"
         for key, value in pending_updates.items():
             if not _ENV_KEY_RE.fullmatch(key):
                 raise InstallerError(f"Unsafe environment key: {key!r}")
@@ -451,14 +460,18 @@ def prepare_env_values(
     for key, value in defaults.items():
         add_missing(key, value)
 
-    # The release identity belongs to the installed code, not to site
-    # configuration.  It is the sole reviewed key that an adopt upgrade may
-    # replace; all operational settings remain preserve/append-only.
-    if "EVOSSEARCH_APP_VERSION" in resolution.existing:
-        current_version = str(values.get("EVOSSEARCH_APP_VERSION") or "").strip()
-        if current_version != EXPECTED_VERSION:
-            values["EVOSSEARCH_APP_VERSION"] = EXPECTED_VERSION
-            updates["EVOSSEARCH_APP_VERSION"] = EXPECTED_VERSION
+    # Release identity and the accepted console belong to installed code, not
+    # site topology.  Model endpoints, channels, credentials and tenant values
+    # remain preserve/append-only.  The legacy console remains available at
+    # /?ui=legacy for emergency recovery.
+    managed = {
+        "EVOSSEARCH_APP_VERSION": EXPECTED_VERSION,
+        "EVOSSEARCH_UI_MODE": "react",
+    }
+    for key, expected in managed.items():
+        if str(values.get(key) or "").strip() != expected:
+            values[key] = expected
+            updates[key] = expected
 
     for spec in _PROMPTS:
         if spec.key == "EVOSSEARCH_LM_PROFILE_AGENT_BASE_URL" and _has_agent_endpoint(values):
@@ -530,11 +543,10 @@ def prepare_migration_dsn(
         if not migration_dsn and not non_interactive:
             migration_dsn = getpass.getpass(
                 "Privileged PostgreSQL migration DSN "
-                "(stored as EVA_MIGRATION_DATABASE_DSN): "
+                "(used only by this installer run): "
             ).strip()
             if migration_dsn:
-                values["EVA_MIGRATION_DATABASE_DSN"] = migration_dsn
-                updates["EVA_MIGRATION_DATABASE_DSN"] = migration_dsn
+                source = "interactive process-only value"
     if not migration_dsn:
         return None, None, (
             "EVA_INSTALL_MIGRATION_DSN (process-only) or "
@@ -614,6 +626,38 @@ def _valid_postgres_dsn(value: str) -> bool:
         return urlsplit(text).scheme.lower() in {"postgres", "postgresql"}
     except ValueError:
         return False
+
+
+def _verify_luxriot_credential(
+    values: Mapping[str, str],
+    *,
+    timeout_sec: float = 5.0,
+) -> tuple[bool, str]:
+    """Verify a heuristic-matched site credential without exposing the secret.
+
+    Evo uses HTTP Digest authentication.  This read-only inventory request is
+    deliberately opt-in: a credential that merely *looks* like a placeholder
+    may be accepted only when the configured endpoint authenticates it.
+    """
+
+    base_url = str(values.get("EVOSSEARCH_LUXRIOT_BASE_URL") or "").strip().rstrip("/")
+    username = str(values.get("EVOSSEARCH_LUXRIOT_USERNAME") or "").strip()
+    password = str(values.get("EVOSSEARCH_LUXRIOT_PASSWORD") or "")
+    if not base_url or not username or not password:
+        return False, "missing_config"
+    if not _valid_http_url(base_url):
+        return False, "invalid_url"
+    target = f"{base_url}/channels?health=0"
+    password_manager = HTTPPasswordMgrWithDefaultRealm()
+    password_manager.add_password(None, base_url + "/", username, password)
+    opener = build_opener(HTTPDigestAuthHandler(password_manager))
+    request = Request(target, headers={"Accept": "application/json"})
+    try:
+        with opener.open(request, timeout=max(1.0, float(timeout_sec))) as response:
+            status = int(getattr(response, "status", response.getcode()))
+    except Exception as exc:
+        return False, type(exc).__name__
+    return 200 <= status < 400, f"http_{status}"
 
 
 def _wheelhouse_files(bundle_dir: Path) -> list[Path]:
@@ -728,6 +772,20 @@ def collect_preflight(
                     "WARN",
                     f"{key} looks like a placeholder but is preserved by verified code-only adopt",
                 )
+            elif key == "EVOSSEARCH_LUXRIOT_PASSWORD" and options.verify_luxriot_credential:
+                verified, status = _verify_luxriot_credential(values)
+                if verified:
+                    add(
+                        "WARN",
+                        "EVOSSEARCH_LUXRIOT_PASSWORD matched the placeholder heuristic "
+                        "but was accepted after an authenticated read-only Evo /channels check",
+                    )
+                else:
+                    add(
+                        "FAIL",
+                        "EVOSSEARCH_LUXRIOT_PASSWORD matched the placeholder heuristic and "
+                        f"the authenticated Evo check failed ({status})",
+                    )
             else:
                 add("FAIL", f"{key} contains an obvious placeholder value")
 
@@ -797,8 +855,13 @@ def collect_preflight(
             add("FAIL", f"user {options.service_user!r} is absent and useradd is unavailable")
     if options.migrate and shutil.which("pg_dump") is None:
         add("FAIL", "pg_dump is required before migrations; no unsafe skip is provided")
+    if options.migrate and shutil.which("psql") is None:
+        add("FAIL", "psql is required to prove migration-table access before apply")
     if options.dry_run:
-        add("OK", "dry-run mode: no filesystem, database, service, or network state will change")
+        detail = "dry-run mode: no filesystem, database, or service state will change"
+        if options.verify_luxriot_credential:
+            detail += "; Luxriot credential verification uses a read-only network request"
+        add("OK", detail)
     else:
         if os.geteuid() != 0:
             add("FAIL", "--apply requires root (run with sudo)")
@@ -851,7 +914,12 @@ def build_plan(prepared: PreparedInstall) -> list[PlanAction]:
         ),
         PlanAction(
             "preflight",
-            "run existing scripts/preflight_patch.sh without stopping the service",
+            (
+                "prove privileged PostgreSQL access to public.alembic_version, then run "
+                "scripts/preflight_patch.sh without stopping the service"
+                if options.migrate
+                else "run existing scripts/preflight_patch.sh without stopping the service"
+            ),
         ),
         PlanAction(
             "install",
@@ -1034,6 +1102,83 @@ def _migration_environment(prepared: PreparedInstall) -> dict[str, str]:
     return env
 
 
+def _verify_migration_capability(
+    runner: CommandRunner,
+    migration_dsn: str,
+) -> None:
+    """Exercise Alembic's revision-table privileges without lasting mutation."""
+
+    sql = (
+        "BEGIN; "
+        "SELECT version_num FROM public.alembic_version LIMIT 1; "
+        "UPDATE public.alembic_version SET version_num = version_num; "
+        "ROLLBACK;"
+    )
+    try:
+        runner.run((
+            "psql",
+            "--no-psqlrc",
+            "--set", "ON_ERROR_STOP=1",
+            "--dbname", migration_dsn,
+            "--command", sql,
+        ))
+    except InstallerError as exc:
+        raise InstallerError(
+            "privileged migration DSN cannot read and update "
+            "public.alembic_version; live files and service were not changed"
+        ) from exc
+
+
+def _automatic_rollback(
+    prepared: PreparedInstall,
+    runner: CommandRunner,
+    backup_dir: Path,
+) -> bool:
+    """Restore the last runnable snapshot after any post-backup apply failure."""
+
+    options = prepared.options
+    command: list[str | Path] = [
+        options.source_dir / "scripts" / "rollback.sh",
+        "--backup-dir", backup_dir,
+        "--backup-root", options.backup_root,
+        "--app-dir", options.app_dir,
+        "--env-file", prepared.env.target,
+        "--service", options.service_name,
+        "--base-url", options.base_url,
+        "--no-verify",
+    ]
+    rollback_env = dict(os.environ)
+    if options.migrate:
+        command.append("--restore-db")
+        rollback_env["EVA_PATCH_CONFIRM_DB_RESTORE"] = "yes"
+        if prepared.migration_dsn:
+            rollback_env["EVA_PATCH_PG_DSN"] = prepared.migration_dsn
+    if not options.start:
+        command.append("--no-start")
+    try:
+        runner.run(command, env=rollback_env)
+    except Exception as exc:
+        print(
+            "AUTOMATIC ROLLBACK FAILED: previous code/database could not be fully "
+            f"restored ({type(exc).__name__}); backup_dir={backup_dir}",
+            file=sys.stderr,
+        )
+        if options.start:
+            subprocess.run(
+                ("systemctl", "start", options.service_name + ".service"),
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                check=False,
+            )
+        return False
+    print(
+        "AUTOMATIC ROLLBACK COMPLETE: previous code, configuration and database "
+        f"were restored from {backup_dir}",
+        file=sys.stderr,
+    )
+    return True
+
+
 def _latest_backup(backup_root: Path) -> Path:
     latest = backup_root / "LATEST"
     if not latest.is_file():
@@ -1046,6 +1191,17 @@ def _latest_backup(backup_root: Path) -> Path:
     if not backup.is_dir():
         raise InstallerError(f"Recorded backup directory is missing: {backup}")
     return backup
+
+
+def _latest_backup_marker(backup_root: Path) -> str:
+    latest = backup_root / "LATEST"
+    if not latest.is_file():
+        return ""
+    try:
+        raw = latest.read_text(encoding="utf-8").strip()
+        return str(Path(raw).resolve(strict=False)) if raw else ""
+    except OSError:
+        return ""
 
 
 @contextmanager
@@ -1092,8 +1248,14 @@ def apply_install(prepared: PreparedInstall) -> Path:
     env_preexisted = prepared.env.target.exists()
     unit_preexisted = options.unit_file.exists()
     env_preinstall_backup: Path | None = None
+    latest_before_apply = _latest_backup_marker(options.backup_root)
 
     try:
+        # This must precede even the env staging below.  Alembic itself needs
+        # access to its revision row before migration scripts can SET ROLE.
+        if options.migrate:
+            _verify_migration_capability(runner, migration_dsn)
+
         # A code-only adopt upgrade must not silently replace the site's
         # reviewed service identity or hardening.  Existing units are preserved;
         # the installer account/template are only for a fresh service.
@@ -1219,7 +1381,9 @@ def apply_install(prepared: PreparedInstall) -> Path:
             latest = options.backup_root / "LATEST"
             if latest.is_file():
                 try:
-                    backup_dir = _latest_backup(options.backup_root)
+                    candidate = _latest_backup(options.backup_root)
+                    if str(candidate) != latest_before_apply:
+                        backup_dir = candidate
                 except InstallerError:
                     backup_dir = None
         # If install_patch never established a rollback snapshot, undo the
@@ -1242,7 +1406,10 @@ def apply_install(prepared: PreparedInstall) -> Path:
                 stderr=subprocess.DEVNULL,
                 check=False,
             )
+        rollback_succeeded = False
         if backup_dir is not None:
+            rollback_succeeded = _automatic_rollback(prepared, runner, backup_dir)
+        if backup_dir is not None and not rollback_succeeded:
             print(
                 "ROLLBACK HANDOFF: sudo "
                 f"{shlex.quote(str(options.source_dir / 'scripts' / 'rollback.sh'))} "
@@ -1294,6 +1461,14 @@ def _parser() -> argparse.ArgumentParser:
             "VERSION, and --no-migrate; intended for a live-verified orchestrator."
         ),
     )
+    parser.add_argument(
+        "--verify-luxriot-credential",
+        action="store_true",
+        help=(
+            "When the Evo password matches the placeholder heuristic, accept it only "
+            "after an authenticated read-only Digest /channels check."
+        ),
+    )
     parser.add_argument("--no-start", action="store_true", help="Install but leave the service stopped.")
     parser.add_argument("--no-verify", action="store_true", help="Skip post-start /health and /ready checks.")
     return parser
@@ -1325,6 +1500,7 @@ def _options(args: argparse.Namespace) -> InstallerOptions:
         start=not bool(args.no_start),
         verify=not bool(args.no_verify) and not bool(args.no_start),
         adopt_existing_config=bool(args.verified_adopt_existing_config),
+        verify_luxriot_credential=bool(args.verify_luxriot_credential),
     )
 
 

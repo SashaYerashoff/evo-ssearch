@@ -1,4 +1,6 @@
+import { useMemo, useState } from 'react'
 import { agentImageUrl } from '../../api/agent'
+import type { Channel } from '../../api/types'
 
 export interface ToolAction {
   id: number
@@ -20,6 +22,8 @@ const LABELS: Record<string, string> = {
   track_visual_state_transitions: 'State transitions', create_bookmark: 'Bookmark', generate_report: 'Report',
   normalize_time_window: 'Time window', build_research_batch: 'Research batch',
   get_prompt_settings: 'VLM prompt layers', update_prompt_settings: 'Update VLM prompts',
+  start_deployment: 'Protocol Deploy inventory', configure_deployment: 'Protocol Deploy draft',
+  survey_deployment: 'Protocol Deploy survey', apply_deployment_plan: 'Protocol Deploy approval',
 }
 
 function label(name: string) { return (LABELS[name] || name.replace(/_/g, ' ')).toUpperCase() }
@@ -83,9 +87,405 @@ function row(values: unknown[]): string[] {
   return values.map((value) => textValue(value))
 }
 
+export function deploymentInventoryChannels(result: any, channelCatalog: Channel[] = []): any[] {
+  const primary = Array.isArray(result?.ui_available_channels) && result.ui_available_channels.length
+    ? result.ui_available_channels
+    : (Array.isArray(result?.available_channels) ? result.available_channels : [])
+  const inventoryIds = Array.isArray(result?.available_channel_ids)
+    ? result.available_channel_ids.map(Number).filter((value: number) => Number.isInteger(value) && value > 0)
+    : []
+  if (!inventoryIds.length) return primary
+  const byId = new Map<number, any>()
+  primary.forEach((channel: any) => {
+    const channelId = Number(channel?.id)
+    if (Number.isInteger(channelId) && channelId > 0) byId.set(channelId, channel)
+  })
+  channelCatalog.forEach((channel) => {
+    const channelId = Number(channel.id)
+    if (inventoryIds.includes(channelId) && !byId.has(channelId)) byId.set(channelId, channel)
+  })
+  return inventoryIds.map((channelId: number) => (
+    byId.get(channelId) || { id: channelId, title: `Channel ${channelId}` }
+  ))
+}
+
+export function deploymentScopeSelectionMessage(
+  result: any,
+  selected: number[],
+  groups: Record<number, string>,
+  roles: Record<number, { role: string; location: string }>,
+): string {
+  const maritime = String(result?.deployment_profile || 'general') === 'maritime'
+  const groupClauses = Object.entries(groups)
+    .map(([channelId, group]) => ({ channelId: Number(channelId), group: group.trim() }))
+    .filter((item) => selected.includes(item.channelId) && item.group)
+    .map((item) => `group ${item.group}: ${item.channelId}`)
+  const roleClauses = maritime
+    ? selected.map((channelId) => {
+      const role = roles[channelId]
+      const location = String(role?.location || '').trim().replace(/["“”]/g, "'")
+      return `CH ${channelId} role ${role.role}${location ? ` location "${location}"` : ''}`
+    })
+    : []
+  return [
+    `Continue Protocol Deploy ${result?.deployment_id || ''}. Select channels ${selected.join(', ')}`,
+    ...groupClauses,
+    ...roleClauses,
+  ].filter(Boolean).join('; ')
+}
+
+function DeploymentInventoryCard({ result, onSend, channelCatalog }: {
+  result: any
+  onSend: (message: string) => void
+  channelCatalog: Channel[]
+}) {
+  const channels = deploymentInventoryChannels(result, channelCatalog)
+  const cap = Math.max(1, Math.min(8, Number(result?.target_channel_count) || 8))
+  const maritime = String(result?.deployment_profile || 'general') === 'maritime'
+  const [query, setQuery] = useState('')
+  const [selected, setSelected] = useState<number[]>([])
+  const [groups, setGroups] = useState<Record<number, string>>({})
+  const [roles, setRoles] = useState<Record<number, { role: string; location: string }>>({})
+  const filtered = useMemo(() => {
+    const needle = query.trim().toLocaleLowerCase()
+    if (!needle) return channels
+    return channels.filter((channel: any) => (
+      String(channel?.id ?? '').includes(needle)
+      || String(channel?.title || channel?.name || '').toLocaleLowerCase().includes(needle)
+    ))
+  }, [channels, query])
+
+  function toggle(channelId: number) {
+    setSelected((current) => current.includes(channelId)
+      ? current.filter((item) => item !== channelId)
+      : current.length < cap ? [...current, channelId] : current)
+  }
+
+  function submit() {
+    if (!selected.length) return
+    if (maritime && selected.some((channelId) => !roles[channelId]?.role)) return
+    onSend(deploymentScopeSelectionMessage(result, selected, groups, roles))
+  }
+
+  return (
+    <div className="ag-deploy-inventory">
+      <div className="ag-approval-head">
+        <div>
+          <div className="ag-approval-kick">Protocol Deploy · channel scope</div>
+          <div className="ag-approval-title">Choose up to {cap} of {result?.available_channel_count ?? channels.length} visible channels</div>
+        </div>
+        <span className="ag-approval-status">{selected.length}/{cap}</span>
+      </div>
+      <div className="ag-deploy-search"><input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="Filter by channel ID or name…" /></div>
+      <div className="ag-deploy-channel-list">
+        {filtered.map((channel: any) => {
+          const channelId = Number(channel?.id)
+          const checked = selected.includes(channelId)
+          return (
+            <div className={`ag-deploy-channel-row ${checked ? 'selected' : ''} ${maritime ? 'maritime' : ''}`} key={String(channel?.id)}>
+              <label>
+                <input type="checkbox" checked={checked} disabled={!checked && selected.length >= cap} onChange={() => toggle(channelId)} />
+                <span><b>#{channelId}</b> {channel?.title || channel?.name || 'Untitled channel'}</span>
+              </label>
+              {checked && (
+                <div className="ag-deploy-channel-options">
+                  <input className="ag-deploy-group-input" value={groups[channelId] || ''} onChange={(event) => setGroups((current) => ({ ...current, [channelId]: event.target.value }))} placeholder="optional group" />
+                  {maritime && (
+                    <>
+                      <select
+                        aria-label={`Maritime role for channel ${channelId}`}
+                        value={roles[channelId]?.role || ''}
+                        onChange={(event) => setRoles((current) => ({
+                          ...current,
+                          [channelId]: { role: event.target.value, location: current[channelId]?.location || '' },
+                        }))}
+                      >
+                        <option value="">Choose maritime role…</option>
+                        <option value="maritime_gate">Sea / port gate</option>
+                        <option value="maritime_coast">Coastline</option>
+                        <option value="maritime_mixed_ptz">Mixed / PTZ tour</option>
+                      </select>
+                      <input
+                        value={roles[channelId]?.location || ''}
+                        onChange={(event) => setRoles((current) => ({
+                          ...current,
+                          [channelId]: { role: current[channelId]?.role || '', location: event.target.value },
+                        }))}
+                        placeholder="location / view label"
+                      />
+                    </>
+                  )}
+                </div>
+              )}
+            </div>
+          )
+        })}
+      </div>
+      <div className="ag-approval-note">Groups are optional. Channels without a group will be commissioned one by one.{maritime ? ' A maritime role is required for every selected channel; the location label is optional.' : ''}</div>
+      <div className="ag-approval-foot"><button className="ag-apply" disabled={!selected.length || (maritime && selected.some((channelId) => !roles[channelId]?.role))} onClick={submit}>Survey selected channels</button></div>
+    </div>
+  )
+}
+
+function DeploymentSurveyCard({ result, onSend }: { result: any; onSend: (message: string) => void }) {
+  const maritime = String(result?.deployment_profile || 'general') === 'maritime'
+  const [starterMode, setStarterMode] = useState(
+    maritime
+      ? (result?.starter_policy_confirmed ? String(result?.starter_policy_mode || 'none') : '')
+      : 'none',
+  )
+  const existingQuietWindow = result?.quiet_window && typeof result.quiet_window === 'object'
+    ? result.quiet_window
+    : null
+  const [quietMode, setQuietMode] = useState(
+    result?.quiet_window_confirmed
+      ? (existingQuietWindow?.enabled === false ? 'disabled' : 'scheduled')
+      : '',
+  )
+  const [quietStart, setQuietStart] = useState(String(existingQuietWindow?.start_local || '01:00'))
+  const [quietEnd, setQuietEnd] = useState(String(existingQuietWindow?.end_local || '05:00'))
+  const [quietTimezone, setQuietTimezone] = useState(String(
+    existingQuietWindow?.timezone
+    || Intl.DateTimeFormat().resolvedOptions().timeZone
+    || 'UTC',
+  ))
+  const surveys = Array.isArray(result?.surveys) ? result.surveys : []
+  const groups = Array.isArray(result?.groups) ? result.groups : []
+  const selectedIds = (result?.selected_channel_ids || []).map(Number)
+  const groupedIds = new Set<number>(groups.flatMap((group: any) => (
+    Array.isArray(group?.channel_ids) ? group.channel_ids.map(Number) : []
+  )))
+  const allScopes = [
+    ...groups.map((group: any) => ({
+      name: String(group?.name || 'group'),
+      channelIds: (group?.channel_ids || []).map(Number),
+    })),
+    ...selectedIds
+      .filter((channelId: number) => !groupedIds.has(channelId))
+      .map((channelId: number) => ({ name: `channel_${channelId}`, channelIds: [channelId] })),
+  ]
+  const missingIds = new Set<number>(
+    Array.isArray(result?.missing_requirement_channel_ids)
+      ? result.missing_requirement_channel_ids.map(Number)
+      : [],
+  )
+  const scopes = missingIds.size
+    ? allScopes
+      .map((scope) => ({
+        ...scope,
+        channelIds: scope.channelIds.filter((channelId: number) => missingIds.has(channelId)),
+      }))
+      .filter((scope) => scope.channelIds.length > 0)
+    : allScopes
+
+  function quietWindowClause(): string {
+    return quietMode === 'disabled'
+      ? 'Consolidation quiet window disabled'
+      : `Consolidation quiet window ${quietStart}-${quietEnd} timezone ${quietTimezone} every day`
+  }
+
+  function requestProposal(scope: { name: string; channelIds: number[] }) {
+    const starterClause = maritime ? ` Starter policy mode ${starterMode}.` : ''
+    onSend(
+      `Continue Protocol Deploy ${result?.deployment_id || ''}. Draft grounded default alerts for group ${scope.name}, channels ${scope.channelIds.join(', ')}, using only its recorded scene survey. Include expected routine, visible alert criteria and severity, novelty sensitivity, and only useful optional counters.${starterClause} ${quietWindowClause()}. Do not apply anything yet.`,
+    )
+  }
+
+  function chooseNoAlerts(scope: { name: string; channelIds: number[] }) {
+    const clauses = scope.channelIds.map((channelId) => `CH ${channelId}: no default alerts`)
+    const starterClause = maritime ? ` Starter policy mode ${starterMode}.` : ''
+    onSend(`Continue Protocol Deploy ${result?.deployment_id || ''}. ${clauses.join('; ')}.${starterClause} ${quietWindowClause()}. Keep ordinary L0 descriptions and continue to the next scope.`)
+  }
+
+  return (
+    <div className="ag-deploy-survey">
+      <div className="ag-approval-head">
+        <div>
+          <div className="ag-approval-kick">Protocol Deploy · scene survey</div>
+          <div className="ag-approval-title">Choose alert policy scope by scope</div>
+        </div>
+        <span className="ag-approval-status">{surveys.length} sampled</span>
+      </div>
+      <div className="ag-deploy-survey-example">
+        <b>Good alert description</b>
+        <span>“Alert HIGH when a sailing vessel visibly enters the cargo fairway on a converging path; do not alert on ordinary parallel passage or PTZ scene changes.”</span>
+      </div>
+      {maritime && (
+        <label className="ag-deploy-starter-mode">
+          <span>Role-specific starter watches</span>
+          <select value={starterMode} onChange={(event) => setStarterMode(event.target.value)}>
+            <option value="">Choose before reviewing scopes…</option>
+            <option value="none">None</option>
+            <option value="shadow">Propose as non-bookmarking shadow probes</option>
+          </select>
+        </label>
+      )}
+      <div className="ag-deploy-quiet-window">
+        <label>
+          <span>9B consolidation window</span>
+          <select value={quietMode} onChange={(event) => setQuietMode(event.target.value)}>
+            <option value="">Choose…</option>
+            <option value="disabled">No preferred window</option>
+            <option value="scheduled">Use a preemptible quiet window</option>
+          </select>
+        </label>
+        {quietMode === 'scheduled' && (
+          <div className="ag-deploy-quiet-fields">
+            <input aria-label="Quiet window start" type="time" value={quietStart} onChange={(event) => setQuietStart(event.target.value)} />
+            <span>to</span>
+            <input aria-label="Quiet window end" type="time" value={quietEnd} onChange={(event) => setQuietEnd(event.target.value)} />
+            <input aria-label="Quiet window timezone" value={quietTimezone} onChange={(event) => setQuietTimezone(event.target.value)} placeholder="Europe/Riga" />
+          </div>
+        )}
+        <small>Only preemptible 9B consolidation is scheduled; live L0 monitoring and alerts continue.</small>
+      </div>
+      <div className="ag-deploy-scope-list">
+        {scopes.map((scope) => (
+          <section className="ag-deploy-scope" key={`${scope.name}-${scope.channelIds.join('-')}`}>
+            <div className="ag-deploy-scope-head"><b>{scope.name}</b><span>CH {scope.channelIds.join(', ')}</span></div>
+            {surveys.filter((survey: any) => scope.channelIds.includes(Number(survey?.channel_id))).map((survey: any) => (
+              <div className="ag-deploy-fingerprint" key={String(survey?.channel_id)}>
+                <b>#{survey?.channel_id} {survey?.title || ''}</b>
+                <span>{survey?.error || survey?.scene_fingerprint || 'No usable scene fingerprint yet.'}</span>
+              </div>
+            ))}
+            <div className="ag-deploy-review-actions">
+              <button className="ag-mini-btn" disabled={!quietMode || (maritime && !starterMode)} onClick={() => chooseNoAlerts(scope)}>No default alerts</button>
+              <button className="ag-apply" disabled={!quietMode || (maritime && !starterMode)} onClick={() => requestProposal(scope)}>Draft alerts for this scope</button>
+            </div>
+          </section>
+        ))}
+      </div>
+      <div className="ag-approval-note">You can also describe the desired alerts in chat. EVA keeps every scope as a draft until the final deployment card is applied.</div>
+    </div>
+  )
+}
+
+function DeploymentApprovalCard({ action, onApply, onSend }: {
+  action: ToolAction
+  onApply: (action: ToolAction) => void
+  onSend: (message: string) => void
+}) {
+  const result = action.result || {}
+  const diff = result.diff || {}
+  const channels = Array.isArray(result.per_channel) ? result.per_channel : []
+  const groups = Array.isArray(result.groups) ? result.groups : []
+  const probes = Array.isArray(result.proposed_probes) ? result.proposed_probes : []
+  const counters = Array.isArray(result.proposed_counted_states) ? result.proposed_counted_states : []
+  const groupedIds = new Set<number>(groups.flatMap((group: any) => (
+    Array.isArray(group?.channel_ids) ? group.channel_ids.map(Number) : []
+  )))
+  const scopes = [
+    ...groups.map((group: any) => ({
+      name: String(group?.name || 'group'),
+      channelIds: (group?.channel_ids || []).map(Number),
+    })),
+    ...channels
+      .map((channel: any) => Number(channel?.channel_id))
+      .filter((channelId: number) => !groupedIds.has(channelId))
+      .map((channelId: number) => ({ name: `channel_${channelId}`, channelIds: [channelId] })),
+  ]
+  const reviewSteps = scopes.flatMap((scope) => [
+    { kind: 'policy' as const, scope },
+    { kind: 'probes' as const, scope },
+  ])
+  const [stepIndex, setStepIndex] = useState(0)
+  const finalStep = stepIndex >= reviewSteps.length
+  const step = finalStep ? null : reviewSteps[stepIndex]
+  const scopeChannels = new Set(step?.scope.channelIds || [])
+  const scopePolicies = channels.filter((channel: any) => scopeChannels.has(Number(channel?.channel_id)))
+  const scopeProbes = probes.filter((probe: any) => scopeChannels.has(Number(probe?.channel_id)))
+  const scopeCounters = counters.filter((counter: any) => scopeChannels.has(Number(counter?.channel_id)))
+
+  function removeScopeProbes() {
+    const ids = step?.scope.channelIds || []
+    onSend(
+      `Continue Protocol Deploy ${result.deployment_id}. For channels ${ids.join(', ')}, keep the proposed VLM alert policies but remove all attention probes and counters; regenerate preview.`,
+    )
+  }
+
+  return (
+    <div className="ag-approval ag-deployment-approval">
+      <div className="ag-approval-head">
+        <div>
+          <div className="ag-approval-kick">Operator review required</div>
+          <div className="ag-approval-title">PROTOCOL DEPLOY · {result.deployment_id || 'draft'}</div>
+        </div>
+        <span className={`ag-approval-status ${action.applied ? 'ok' : ''}`}>{action.applied ? 'Applied' : finalStep ? 'Ready to apply' : `${stepIndex + 1}/${reviewSteps.length}`}</span>
+      </div>
+      {!finalStep && step && (
+        <div className="ag-deploy-review-step">
+          <div className="ag-deploy-review-title">{step.scope.name} · channels {step.scope.channelIds.join(', ')}</div>
+          {step.kind === 'policy' ? (
+            <>
+              <div className="ag-approval-kick">Proposed VLM alert policy</div>
+              {scopePolicies.map((channel: any) => (
+                <details className="ag-deployment-channel" open key={String(channel?.channel_id)}>
+                  <summary>CH {channel?.channel_id}</summary>
+                  <pre>{String(channel?.alert_policy_preview || 'No default alert policy proposed.')}</pre>
+                </details>
+              ))}
+              <div className="ag-approval-note">If the wording or severity is wrong, describe the correction in chat. EVA will invalidate this card and generate a new one.</div>
+            </>
+          ) : (
+            <>
+              <div className="ag-approval-kick">Proposed attention probes and counters</div>
+              {!scopeProbes.length && !scopeCounters.length && <div className="ag-approval-note">No vector probes or counted-state metrics are proposed for this scope.</div>}
+              {scopeProbes.map((probe: any) => (
+                <div className="ag-deploy-proposal" key={`${probe.channel_id}-${probe.name}`}>
+                  <b>CH {probe.channel_id} · {probe.name}</b>
+                  <span>P: {textValue(probe.positives)} · N: {textValue(probe.negatives)} · floor {textValue(probe.pos_floor)} · margin {textValue(probe.margin)} · {probe.embedding_backend || 'embedding space pending'} · {probe.severity || 'normal'}</span>
+                </div>
+              ))}
+              {scopeCounters.map((counter: any) => (
+                <div className="ag-deploy-proposal" key={String(counter.id)}><b>Counter · {counter.name}</b><span>{counter.counter_mode} · {counter.count_transition} · duration {counter.duration_state}</span></div>
+              ))}
+            </>
+          )}
+          <div className="ag-approval-foot ag-deploy-review-actions">
+            <button className="ag-mini-btn" disabled={stepIndex === 0} onClick={() => setStepIndex((value) => Math.max(0, value - 1))}>Back</button>
+            {step.kind === 'probes' && (scopeProbes.length > 0 || scopeCounters.length > 0) && <button className="ag-mini-btn" onClick={removeScopeProbes}>Reject probes</button>}
+            <button className="ag-apply" onClick={() => setStepIndex((value) => value + 1)}>{step.kind === 'policy' ? 'Policy looks right' : 'Accept and continue'}</button>
+          </div>
+        </div>
+      )}
+      {finalStep && (
+        <>
+          <div className="ag-fields">
+            <div className="ag-field"><span className="ag-field-k">Channels</span><span className="ag-field-v">{textValue(diff.channel_ids)}</span></div>
+            <div className="ag-field"><span className="ag-field-k">Policies</span><span className="ag-field-v">{textValue(diff.alert_policy_count)}</span></div>
+            <div className="ag-field"><span className="ag-field-k">Attention probes</span><span className="ag-field-v">{textValue(diff.probe_count)}</span></div>
+            <div className="ag-field"><span className="ag-field-k">Counters</span><span className="ag-field-v">{textValue(diff.counted_state_count)}</span></div>
+          </div>
+          <div className="ag-approval-note">This is the only mutating step. Nothing changes until Apply deployment succeeds.</div>
+          {action.error && <div className="ag-card-err">{action.error}</div>}
+          {!action.applied && action.planId && <div className="ag-approval-foot ag-deploy-review-actions"><button className="ag-mini-btn" onClick={() => setStepIndex(Math.max(0, reviewSteps.length - 1))}>Back</button><button className="ag-apply" disabled={action.applying} onClick={() => onApply(action)}>{action.applying ? 'Applying deployment…' : 'Apply deployment'}</button></div>}
+        </>
+      )}
+    </div>
+  )
+}
+
 /** Closed, bounded renderers for the high-volume EVA tools used in ordinary operator flows. */
 export function actionTables(name: string, result: any): ActionTable[] {
   if (!result || typeof result !== 'object') return []
+
+  if (name === 'describe_frame' && result.source === 'archive_candidate_batch') {
+    const verdicts = Array.isArray(result.verdicts) ? result.verdicts : []
+    const candidateCount = Number(result.candidate_count) || verdicts.length
+    const parseStatus = result.parse_status || result.status || (result.vision_checked ? 'checked' : 'failed')
+    const rows = verdicts.slice(0, 9).map((item: any) => row([
+      `#${item.detection_id ?? item.snapshot_index ?? '?'}`,
+      item.verdict,
+      item.visible_evidence || item.evidence,
+    ]))
+    if (!rows.length) rows.push(row(['—', parseStatus, result.error || result.note || 'No verdict rows returned']))
+    return [{
+      title: `Bounded vision verification · ${candidateCount} candidate${candidateCount === 1 ? '' : 's'} · ${parseStatus}`,
+      columns: ['Candidate', 'Verdict', 'Visible evidence'],
+      rows,
+    }]
+  }
 
   if (name === 'list_channels') {
     const rows = Array.isArray(result.channels) ? result.channels : []
@@ -204,19 +604,39 @@ export function actionTables(name: string, result: any): ActionTable[] {
   return []
 }
 
-export function ActionCard({ action, onThumb, onApply }: {
+export function ActionCard({ action, onThumb, onApply, onSend, channelCatalog = [] }: {
   action: ToolAction
   onThumb: (url: string, title: string) => void
   onApply: (a: ToolAction) => void
+  onSend: (message: string) => void
+  channelCatalog?: Channel[]
 }) {
   const { name, result, error } = action
   const items = itemsOf(result)
   const isApproval = !!action.applied || !!action.planId || result?.status === 'preview'
   const describeImg = name === 'describe_frame' ? agentImageUrl(result) : ''
+  const actionLabel = name === 'describe_frame' && result?.source === 'archive_candidate_batch'
+    ? 'VISION VERIFICATION BATCH'
+    : label(name)
   const text = result?.description || result?.summary || result?.note || result?.text || result?.message
   const tables = actionTables(name, result)
 
+  if (name === 'start_deployment' && result?.stage === 'inventory') {
+    return <DeploymentInventoryCard result={result} onSend={onSend} channelCatalog={channelCatalog} />
+  }
+
+  if (name === 'survey_deployment' && result?.stage === 'surveyed') {
+    return <DeploymentSurveyCard result={result} onSend={onSend} />
+  }
+
+  if (name === 'configure_deployment' && result?.stage === 'requirements_partial') {
+    return <DeploymentSurveyCard result={result} onSend={onSend} />
+  }
+
   if (isApproval) {
+    if (name === 'apply_deployment_plan' && result?.status === 'preview') {
+      return <DeploymentApprovalCard action={action} onApply={onApply} onSend={onSend} />
+    }
     const fields = entriesOf(result?.approval || result?.preview || result)
     return (
       <div className="ag-approval">
@@ -246,11 +666,11 @@ export function ActionCard({ action, onThumb, onApply }: {
 
   return (
     <div className="ag-card">
-      <div className="ag-card-head">◆ {label(name)}</div>
+      <div className="ag-card-head">◆ {actionLabel}</div>
       <div className="ag-card-body">
         {error && <div className="ag-card-err">{error}</div>}
         {describeImg && (
-          <div className="ag-thumb solo" onClick={() => onThumb(describeImg, label(name))}>
+          <div className="ag-thumb solo" onClick={() => onThumb(describeImg, actionLabel)}>
             <img src={describeImg} alt="frame" loading="lazy" />
           </div>
         )}

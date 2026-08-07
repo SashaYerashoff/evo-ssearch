@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Interactive offline installer for the EVA AI eight-channel appliance.
+"""Interactive offline installer for a single-node EVA AI appliance.
 
 The script is intentionally standard-library-only.  It is copied to the root
 of the field USB and can therefore run on a fresh Ubuntu Server 24.04 host
@@ -36,8 +36,15 @@ from typing import Iterable, Mapping, Sequence
 from urllib.parse import urlsplit
 
 
-VERSION = "β 0.8.5"
-EXPECTED_SCHEMA = "20260801_0011"
+SCRIPT_DIR = Path(__file__).resolve().parent
+if str(SCRIPT_DIR) not in sys.path:
+    sys.path.insert(0, str(SCRIPT_DIR))
+
+from offline_bundle_dependencies import DependencyError, verify_manifest as verify_dependencies
+
+
+VERSION = "β 0.8.7"
+EXPECTED_SCHEMA = "20260805_0013"
 DEFAULT_ROOT = Path("/opt/eva-ai")
 DEFAULT_DATA = Path("/var/lib/eva-ai")
 DEFAULT_CONFIG = Path("/etc/eva-ai")
@@ -51,15 +58,17 @@ DEFAULT_DEEP_MODEL = "qwen3.5-9b-mtp"
 DEFAULT_SIGLIP2_MODEL = "google/siglip2-base-patch16-224"
 DEFAULT_SIGLIP2_REVISION = "75de2d55ec2d0b4efc50b3e9ad70dba96a7b2fa2"
 MIN_FREE_GIB = 45
+PREFLIGHT_STAMP_ENV = "EVA_OFFLINE_BUNDLE_PREFLIGHT_SHA256"
 
 PORT_ENV = {
     "EVOSSEARCH_APP_VERSION": VERSION,
     "EVOSSEARCH_HOST": "127.0.0.1",
     "EVOSSEARCH_PORT": "5000",
     "EVOSSEARCH_DEBUG": "false",
-    # Keep the mature console as the appliance default until React parity is
-    # accepted. Operators can pilot React at /?ui=react without a restart.
-    "EVOSSEARCH_UI_MODE": "legacy",
+    # Client releases ship the accepted React console.
+    # The mature legacy console remains available as an emergency per-request
+    # fallback at /?ui=legacy without changing service configuration.
+    "EVOSSEARCH_UI_MODE": "react",
     "EVOSSEARCH_GUNICORN_WORKERS": "1",
     "EVOSSEARCH_GUNICORN_THREADS": "8",
     "EVOSSEARCH_GUNICORN_TIMEOUT": "240",
@@ -82,8 +91,8 @@ PORT_ENV = {
     "EVOSSEARCH_PROBE_MARGIN_DEFAULT": "0.02",
     "EVOSSEARCH_DINO_SEGMENTS_ENABLED": "false",
     "EVOSSEARCH_M2F_ENABLED": "false",
-    # SigLIP2 base needs GPU placement to sustain the eight-channel 1 Hz
-    # semantic archive. It shares the 4070 Super with vLLM under a bounded
+    # SigLIP2 base needs GPU placement to sustain the single-node 1 Hz
+    # semantic archive. It shares the NVIDIA GPU with vLLM under a bounded
     # vLLM allocation; CPU is an explicit fallback profile, not the default.
     "CUDA_VISIBLE_DEVICES": "0",
     "EVOSSEARCH_ARCHIVE_STORE": "postgres",
@@ -99,6 +108,8 @@ PORT_ENV = {
     "EVOSSEARCH_INFERENCE_WORKER_COUNT": "1",
     "EVOSSEARCH_LM_VIDEO_REPETITION_PENALTY": "1.08",
     "EVOSSEARCH_LUXRIOT_CAPTURE_SOURCE": "live_segment",
+    "EVOSSEARCH_LUXRIOT_FFMPEG_HWACCEL": "auto",
+    "EVOSSEARCH_LUXRIOT_FFMPEG_INTEL_DEVICE": "",
     "EVOSSEARCH_LUXRIOT_LIVE_SEGMENT_SECONDS": "60",
     "EVOSSEARCH_LUXRIOT_LIVE_SEGMENT_FPS": "4",
     "EVOSSEARCH_LUXRIOT_SUMMARY_MAX_BATCH_FRAMES": "16",
@@ -145,6 +156,16 @@ PORT_ENV = {
     "EVOSSEARCH_LUXRIOT_ROLLUP_LLM_LEVELS": "L1,L2,L3",
     "EVOSSEARCH_LUXRIOT_ROLLUP_LLM_MODEL": "agent",
     "EVOSSEARCH_LUXRIOT_ROLLUP_CONTEXT_LIMIT_TOKENS": "32768",
+    "EVOSSEARCH_LUXRIOT_INCIDENT_FOREGROUND_LIMIT": "2",
+    "EVOSSEARCH_LUXRIOT_INCIDENT_FOREGROUND_HARD_LIMIT": "4",
+    "EVOSSEARCH_LUXRIOT_INCIDENT_HOT_LIMIT": "8",
+    "EVOSSEARCH_LUXRIOT_INCIDENT_TRACKED_LIMIT": "64",
+    "EVOSSEARCH_LUXRIOT_L0_CONTEXT_WINDOW_TOKENS": "16384",
+    "EVOSSEARCH_LUXRIOT_L0_TEXT_BUDGET_TOKENS": "5000",
+    "EVOSSEARCH_LUXRIOT_L0_VISION_BUDGET_TOKENS": "5500",
+    "EVOSSEARCH_LUXRIOT_L0_OUTPUT_BUDGET_TOKENS": "1536",
+    "EVOSSEARCH_LUXRIOT_L0_INCIDENT_BUDGET_TOKENS": "900",
+    "EVOSSEARCH_LUXRIOT_L0_VISION_TOKENS_PER_IMAGE_ESTIMATE": "300",
     "EVOSSEARCH_LUXRIOT_ROLLUP_L3_DEEP_ENABLED": "true",
     "EVOSSEARCH_LUXRIOT_ROLLUP_L3_DEEP_CONNECT_TIMEOUT_SEC": "5",
     "EVOSSEARCH_LUXRIOT_ROLLUP_L3_DEEP_READ_TIMEOUT_SEC": "600",
@@ -552,15 +573,28 @@ def read_manifest(bundle_root: Path) -> dict:
         raise InstallError(
             f"Bundle version {payload.get('version')!r} does not match installer {VERSION!r}"
         )
+    if payload.get("format") != 2:
+        raise InstallError(
+            f"Unsupported universal bundle format: {payload.get('format')!r}; expected 2"
+        )
     return payload
 
 
 def verify_critical_payload(bundle_root: Path, manifest: Mapping) -> None:
     required = (
+        "SOURCE_REVISION.json",
         "repo/VERSION",
         "repo/alembic.ini",
+        "repo/camera_scene.py",
+        "repo/maritime_profiles.py",
+        "repo/docs/maritime_port_profile.md",
+        "repo/react-ui/dist/index.html",
         "repo/migrations/versions/20260801_0011_incidents.py",
+        "repo/migrations/versions/20260805_0012_incident_temporal_memory.py",
+        "repo/migrations/versions/20260805_0013_archive_source_channel_page_index.py",
         "wheelhouse",
+        "offline_bundle_dependencies.py",
+        "offline-dependencies.json",
         "apt/Packages.gz",
         "models/qwen3-vl-4b-awq/model.safetensors",
         "models/qwen3.5-9b-mtp/Qwen3.5-9B-Q4_K_M.gguf",
@@ -586,6 +620,13 @@ def verify_critical_payload(bundle_root: Path, manifest: Mapping) -> None:
     missing = [item for item in required if not (bundle_root / item).exists()]
     if missing:
         raise InstallError("Offline payload is incomplete: " + ", ".join(missing))
+    manifest_path = bundle_root / "manifest.json"
+    inherited_stamp = str(os.getenv(PREFLIGHT_STAMP_ENV) or "").strip()
+    if inherited_stamp:
+        actual_stamp = hashlib.sha256(manifest_path.read_bytes()).hexdigest()
+        if secrets.compare_digest(inherited_stamp, actual_stamp):
+            print("Offline payload hashes were verified by the universal entry point.")
+            return
     for relative, expected in dict(manifest.get("critical_sha256") or {}).items():
         path = bundle_root / relative
         digest = hashlib.sha256()
@@ -594,6 +635,10 @@ def verify_critical_payload(bundle_root: Path, manifest: Mapping) -> None:
                 digest.update(block)
         if digest.hexdigest() != expected:
             raise InstallError(f"Checksum mismatch: {relative}")
+    try:
+        verify_dependencies(bundle_root, repo_root=bundle_root / "repo")
+    except DependencyError as exc:
+        raise InstallError(f"Offline dependency verification failed: {exc}") from exc
 
 
 def current_schema() -> str | None:
@@ -735,7 +780,7 @@ def gather_answers(non_interactive: bool, args: argparse.Namespace) -> Answers:
         config_root = Path(_prompt("Configuration root", str(DEFAULT_CONFIG)))
 
     print("\nInference placement:")
-    print("  Recommended local profile: RTX 4070 Super, Qwen3-VL-4B AWQ/vLLM,")
+    print("  Recommended local profile: NVIDIA GPU with 12+ GB VRAM, Qwen3-VL-4B AWQ/vLLM,")
     print("  32K context, FP8 KV, 4 sequences, 4096 batched tokens, ~10 GB VRAM.")
     local_vlm = _yes_no("Install and run the VLM on this computer?", True)
     if local_vlm:
@@ -906,8 +951,8 @@ def parse_env(path: Path) -> dict[str, str]:
 
 def render_env(values: Mapping[str, str]) -> str:
     lines = [
-        "# EVA AI eight-channel appliance configuration.",
-        "# Generated by the offline port installer; chmod 0600.",
+        "# EVA AI single-node appliance configuration.",
+        "# Generated by the universal offline installer; chmod 0600.",
     ]
     for key in sorted(values):
         lines.append(f"{key}={_env_quote(str(values[key]))}")
@@ -1502,7 +1547,7 @@ def install_systemd_units(answers: Answers, runner: Runner) -> None:
             "Wants=eva-vllm.service\n"
         )
     units[Path("/etc/systemd/system/eva-ai.service")] = f"""[Unit]
-Description=EVA AI eight-channel appliance
+Description=EVA AI single-node appliance
 After=network-online.target postgresql.service
 Wants=network-online.target
 Requires=postgresql.service
@@ -1549,7 +1594,7 @@ Environment=TRANSFORMERS_OFFLINE=1
 Environment=VLLM_USE_FLASHINFER_SAMPLER=0
 Environment=PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 EnvironmentFile={env_file}
-ExecStart={vllm} serve {model} --served-model-name {DEFAULT_VLM_MODEL} --host 127.0.0.1 --port 1234 --max-model-len 32768 --gpu-memory-utilization 0.75 --max-num-seqs 8 --max-num-batched-tokens 4096 --kv-cache-dtype fp8 --attention-backend TRITON_ATTN --mm-encoder-attn-backend FLASH_ATTN --mm-processor-cache-gb 0 --limit-mm-per-prompt.image 16 --limit-mm-per-prompt.video 0 --mm-processor-kwargs.max_pixels 100352 --enable-auto-tool-choice --tool-call-parser hermes
+ExecStart={vllm} serve {model} --served-model-name {DEFAULT_VLM_MODEL} --host 127.0.0.1 --port 1234 --max-model-len 32768 --gpu-memory-utilization 0.72 --max-num-seqs 4 --max-num-batched-tokens 4096 --kv-cache-dtype fp8 --attention-backend TRITON_ATTN --mm-encoder-attn-backend FLASH_ATTN --mm-processor-cache-gb 0 --limit-mm-per-prompt.image 16 --limit-mm-per-prompt.video 0 --mm-processor-kwargs.max_pixels 100352 --enable-auto-tool-choice --tool-call-parser hermes
 ExecStartPost={app_dir}/.venv/bin/python {app_dir}/scripts/wait_openai_endpoint.py --timeout 240
 Restart=on-failure
 RestartSec=10
@@ -2121,13 +2166,13 @@ def apply_install(
     print("\nINSTALLATION COMPLETE")
     print("Open EVA AI at: https://<this-server-ip>/")
     print("The TLS certificate is locally generated; import/trust it on operator workstations.")
-    print("Next: log in, run 'Protocol: Deploy', select up to eight Evo channels,")
+    print("Next: log in, run 'Protocol: Deploy', select the intended Evo channels,")
     print("and configure/confirm the 9B quiet window if it was left disabled.")
 
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Install the EVA AI eight-channel port appliance from an offline USB.",
+        description="Install a single-node EVA AI appliance from an offline USB.",
     )
     parser.add_argument("--bundle-root", type=Path)
     parser.add_argument("--dry-run", action="store_true")
@@ -2164,10 +2209,18 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
     bundle_root = args.bundle_root.resolve() if args.bundle_root else default_bundle_root
     try:
-        print(f"EVA AI {VERSION} offline port-appliance installer")
-        print("Target: RTX 4070 Super, Intel Core i9 14th Gen, 64 GB RAM, Ubuntu 24.04.")
-        validate_target_host()
         manifest = read_manifest(bundle_root)
+        print(f"EVA AI {VERSION} universal offline appliance installer")
+        target = manifest.get("target") if isinstance(manifest.get("target"), Mapping) else {}
+        print(
+            "Target: "
+            + "; ".join(
+                str(target.get(key))
+                for key in ("gpu", "cpu", "ram_gib", "os")
+                if target.get(key) not in (None, "")
+            )
+        )
+        validate_target_host()
         verify_critical_payload(bundle_root, manifest)
         answers = gather_answers(args.non_interactive, args)
         required_gib = max(

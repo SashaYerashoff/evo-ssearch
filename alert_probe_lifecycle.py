@@ -236,8 +236,8 @@ class AlertDerivedProbe:
     def to_store_payload(
         self,
         *,
-        pos_floor: float = 0.2,
-        margin: float = 0.05,
+        pos_floor: float = 0.05,
+        margin: float = 0.02,
         top_k: int = 6,
     ) -> Dict[str, Any]:
         """Return a payload directly consumable by ``probes_store.upsert_probe``.
@@ -319,8 +319,8 @@ class AlertProbeAdmission:
     def store_payloads(
         self,
         *,
-        pos_floor: float = 0.2,
-        margin: float = 0.05,
+        pos_floor: float = 0.05,
+        margin: float = 0.02,
         top_k: int = 6,
     ) -> Tuple[Dict[str, Any], ...]:
         """Return accepted probes in the existing probe-store shape."""

@@ -12,9 +12,10 @@ import subprocess
 import sys
 import urllib.error
 import urllib.request
+from urllib.parse import urlsplit
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Mapping
 
 from validate_appliance_config import parse_env_file, validate
 
@@ -28,6 +29,27 @@ SERVICES = (
     "eva-ai",
     "nginx",
 )
+
+
+def _vllm_tool_calling_contract(unit_text: str) -> dict[str, Any]:
+    """Verify that the installed VLM unit accepts OpenAI native tool calls."""
+    exec_lines = [
+        line.strip()
+        for line in str(unit_text or "").splitlines()
+        if line.strip().startswith("ExecStart=") and "vllm" in line
+    ]
+    command = exec_lines[-1] if exec_lines else ""
+    auto_choice = "--enable-auto-tool-choice" in command
+    parser_match = command.split("--tool-call-parser", 1)
+    parser = ""
+    if len(parser_match) == 2:
+        parser = parser_match[1].strip().split(None, 1)[0] if parser_match[1].strip() else ""
+    return {
+        "ok": bool(command and auto_choice and parser),
+        "unit_exec_start_present": bool(command),
+        "auto_tool_choice": auto_choice,
+        "tool_call_parser": parser or None,
+    }
 
 
 def _command(argv: tuple[str, ...], timeout: int = 15) -> dict[str, Any]:
@@ -114,6 +136,60 @@ def _service_status(service: str) -> dict[str, Any]:
         result.get("ok", False)
         and result["properties"].get("ActiveState") == "active"
     )
+    return result
+
+
+def _vllm_runtime_contract(values: Mapping[str, str]) -> dict[str, Any]:
+    base_url = str(values.get("EVOSSEARCH_LM_PROFILE_VLM_BASE_URL") or "").strip()
+    try:
+        hostname = str(urlsplit(base_url).hostname or "").lower()
+    except ValueError:
+        hostname = ""
+    if hostname and hostname not in {"127.0.0.1", "localhost", "::1"}:
+        return {
+            "ok": True,
+            "status": "external_profile",
+            "local_unit_required": False,
+        }
+    result = _command(("systemctl", "cat", "eva-vllm.service", "--no-pager"))
+    contract = _vllm_tool_calling_contract(str(result.get("output") or ""))
+    if not result.get("ok"):
+        contract["unit_read_error"] = result.get("error") or result.get("returncode")
+        contract["ok"] = False
+    return contract
+
+
+def _intel_qsv_status() -> dict[str, Any]:
+    devices = sorted(Path("/dev/dri").glob("renderD*"))
+    intel_device: Path | None = None
+    for device in devices:
+        vendor_path = Path("/sys/class/drm") / device.name / "device" / "vendor"
+        try:
+            vendor = vendor_path.read_text(encoding="utf-8").strip().lower()
+        except OSError:
+            continue
+        if vendor == "0x8086":
+            intel_device = device
+            break
+    if intel_device is None:
+        return {"ok": False, "status": "Intel DRM render node not found"}
+    if not shutil.which("vainfo"):
+        return {
+            "ok": False,
+            "device": str(intel_device),
+            "status": "vainfo not installed",
+        }
+    result = _command(
+        (
+            "vainfo",
+            "--display",
+            "drm",
+            "--device",
+            str(intel_device),
+        )
+    )
+    result["device"] = str(intel_device)
+    result["status"] = "ready" if result.get("ok") else "driver initialization failed"
     return result
 
 
@@ -221,6 +297,7 @@ def collect(env_file: Path, state_file: Path) -> dict[str, Any]:
             )
             if shutil.which("nvidia-smi")
             else {"ok": False, "error": "nvidia-smi not found"},
+            "intel_qsv": _intel_qsv_status(),
         },
         "installer": _safe_state(state_file),
         "configuration": {
@@ -249,6 +326,9 @@ def collect(env_file: Path, state_file: Path) -> dict[str, Any]:
         },
         "schema": schema,
         "services": {service: _service_status(service) for service in SERVICES},
+        "runtime_contracts": {
+            "vlm_native_tool_calling": _vllm_runtime_contract(values),
+        },
         "endpoints": endpoints,
     }
 
@@ -269,6 +349,7 @@ def main(argv: list[str] | None = None) -> int:
     core_ready = bool(
         report["configuration"]["valid"]
         and report["endpoints"]["eva_ready"].get("ok")
+        and report["runtime_contracts"]["vlm_native_tool_calling"].get("ok")
     )
     return 0 if core_ready else 1
 

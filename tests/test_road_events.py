@@ -67,6 +67,25 @@ def test_motion_analyzer_warms_up_on_first_frame():
     assert sample.cues == ()
 
 
+def test_global_motion_exposes_translation_coherence_and_radial_zoom():
+    analyzer = _analyzer()
+    pan_flow = np.zeros((40, 60, 2), dtype=np.float32)
+    pan_flow[:, :, 0] = 2.0
+    pan = analyzer._global_motion(pan_flow)
+
+    yy, xx = np.mgrid[0:40, 0:60].astype(np.float32)
+    xx -= 29.5
+    yy -= 19.5
+    radius = np.maximum(np.sqrt(xx * xx + yy * yy), 1.0)
+    zoom_flow = np.stack((xx / radius, yy / radius), axis=2) * 1.5
+    zoom = analyzer._global_motion(zoom_flow.astype(np.float32))
+
+    assert pan["magnitude"] > 1.9
+    assert pan["coherence"] > 0.95
+    assert abs(zoom["zoom"]) > 1.3
+    assert zoom["zoom_coherence"] > 0.9
+
+
 def test_motion_analyzer_emits_burst_for_vehicle_motion_in_road_zone():
     analyzer = _analyzer()
     analyzer.analyze_frame(_frame_with_vehicle(20), timestamp_ms=1000, frame_index=1)

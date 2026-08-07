@@ -4681,8 +4681,9 @@
             const channelLabel = getLuxriotChannelLabel(channelId);
             const batchCount = combined.size;
             const pageLabel = luxriotSummaryArchiveHasMore ? ' · more available' : ' · complete period';
+            const totalPrefix = data.total_exact === false ? 'at least ' : '';
             setLuxriotSummaryMeta(withSummaryUpdatedMeta(
-                `${channelLabel} · Observations · ${batchCount} loaded of ${luxriotSummaryArchiveEvidenceTotal} archived batches${pageLabel} · all runs · ${getSummaryRangeLabel()}`
+                `${channelLabel} · Observations · ${batchCount} loaded of ${totalPrefix}${luxriotSummaryArchiveEvidenceTotal} archived batches${pageLabel} · all runs · ${getSummaryRangeLabel()}`
             ));
             setLuxriotStatus(`Loaded ${batchCount} archived description batches`);
             return true;

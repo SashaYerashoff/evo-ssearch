@@ -1,4 +1,5 @@
 export const APPEARANCE_STORAGE_KEY = 'eva.ui.appearance.v1'
+export const CUSTOM_APPEARANCE_PRESETS_STORAGE_KEY = 'eva.ui.appearance.custom-presets.v1'
 
 export type ThemePresetId = 'eva-deep' | 'graphite' | 'day-shift' | 'amber-watch'
 export type ControlShape = 'precise' | 'balanced' | 'soft'
@@ -37,6 +38,12 @@ export interface AppearancePreferences {
   shape: ControlShape
   density: InterfaceDensity
   motion: MotionPreference
+}
+
+export interface SavedAppearancePreset {
+  id: string
+  name: string
+  preferences: AppearancePreferences
 }
 
 export const THEME_PRESETS: readonly ThemePreset[] = [
@@ -178,6 +185,23 @@ export function normalizeAppearance(value: unknown): AppearancePreferences {
       ? candidate.motion as MotionPreference
       : DEFAULT_APPEARANCE.motion,
   }
+}
+
+export function normalizeSavedAppearancePresets(value: unknown): SavedAppearancePreset[] {
+  if (!Array.isArray(value)) return []
+  const seen = new Set<string>()
+  const result: SavedAppearancePreset[] = []
+  for (const item of value) {
+    if (!item || typeof item !== 'object') continue
+    const candidate = item as Partial<SavedAppearancePreset>
+    const name = String(candidate.name || '').replace(/\s+/g, ' ').trim().slice(0, 48)
+    const id = String(candidate.id || '').replace(/[^a-zA-Z0-9_-]/g, '').slice(0, 80)
+    if (!name || !id || seen.has(id)) continue
+    seen.add(id)
+    result.push({ id, name, preferences: normalizeAppearance(candidate.preferences) })
+    if (result.length >= 12) break
+  }
+  return result
 }
 
 export function getThemePreset(id: ThemePresetId): ThemePreset {

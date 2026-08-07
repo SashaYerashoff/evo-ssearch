@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# EVA AI 0.8.5 post-migration adopt upgrade from an unpacked offline bundle.
+# EVA AI 0.8.7 post-migration adopt upgrade from an unpacked offline bundle.
 #
 # Model/server policy: the preflight only *describes* the configured LM
 # topology (remote vLLM for VLM streams, local LM Studio/llama.cpp for the
@@ -9,8 +9,8 @@
 set -Eeuo pipefail
 umask 077
 
-EXPECTED_VERSION="β 0.8.5"
-EXPECTED_SCHEMA="20260801_0011"
+EXPECTED_VERSION="β 0.8.7"
+EXPECTED_SCHEMA="20260805_0013"
 MODE="auto"
 APP_DIR=""
 ENV_FILE=""
@@ -144,9 +144,9 @@ fi
 
 if [[ -z "${BACKUP_ROOT}" ]]; then
   if [[ "${MODE}" == "user" ]]; then
-    BACKUP_ROOT="${HOME}/.local/state/eva-ai/0.8.5-backups"
+    BACKUP_ROOT="${HOME}/.local/state/eva-ai/0.8.7-backups"
   else
-    BACKUP_ROOT="/var/tmp/eva-ai-0.8.5-backups"
+    BACKUP_ROOT="/var/tmp/eva-ai-0.8.7-backups"
   fi
 fi
 

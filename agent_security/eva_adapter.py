@@ -7,7 +7,6 @@ from datetime import datetime, timezone
 from typing import Any
 
 from security import Permission
-
 from .audit import ToolAuditEvent
 from .context import ToolExecutionContext
 from .errors import (
@@ -23,6 +22,7 @@ from .policy import RateLimit, ToolPolicy, ToolRisk
 from .registry import ToolRegistry
 
 
+_DEPLOYMENT_SCOPE_GUARD_ONLY = "_eva_deployment_scope_guard_only"
 _TRUE_ARG_STRINGS = frozenset({"1", "true", "yes", "y", "on"})
 _FALSE_ARG_STRINGS = frozenset({"0", "false", "no", "n", "off"})
 
@@ -52,6 +52,7 @@ _PREVIEW_ONLY_TOOLS = frozenset(
         "apply_deployment_plan",
         "draft_incident",
         "follow_incident",
+        "review_incident",
         "stop_incident_follow",
     }
 )
@@ -125,6 +126,7 @@ _TOOL_PERMISSIONS: dict[str, Permission] = {
     "get_incident": Permission.REPORTS_VIEW,
     "draft_incident": Permission.INCIDENTS_MANAGE,
     "follow_incident": Permission.INCIDENTS_MANAGE,
+    "review_incident": Permission.INCIDENTS_MANAGE,
     "stop_incident_follow": Permission.INCIDENTS_MANAGE,
 }
 
@@ -146,6 +148,7 @@ _CHANNEL_REQUIRED_TOOLS = frozenset(
         "get_incident",
         "draft_incident",
         "follow_incident",
+        "review_incident",
         "stop_incident_follow",
     }
 )
@@ -181,6 +184,11 @@ class EvaAgentToolAdapter:
             allowed_arguments = set(map(str, properties))
             if name in {"delete_probes", "update_probe"}:
                 allowed_arguments.update({"channel_id", "channel_ids"})
+            if name == "describe_frame":
+                # Resolved from detection_id/detection_ids before the generic
+                # gateway performs per-channel authorization. The model never
+                # authors this hidden scope.
+                allowed_arguments.add("channel_ids")
             if name in {
                 "start_deployment",
                 "configure_deployment",
@@ -193,14 +201,26 @@ class EvaAgentToolAdapter:
                 # the model-visible schemas unless channel_ids is a real
                 # configure_deployment input.
                 allowed_arguments.add("channel_ids")
+            if name == "configure_deployment":
+                # Internal marker: channel_ids may be injected only so the
+                # gateway can authorize the durable scope.  The legacy
+                # workflow must not interpret that hidden copy as an operator
+                # request to reset scope and erase groups/surveys.
+                allowed_arguments.add(_DEPLOYMENT_SCOPE_GUARD_ONLY)
+            if name == "apply_deployment_plan":
+                # Bound an approved write to the exact preview the operator
+                # inspected. This value is produced by the server, never the
+                # model-visible schema.
+                allowed_arguments.add("expected_plan_digest")
             if name == "query_counted_state_metric":
                 # Resolved server-side from the durable metric profile.
                 allowed_arguments.add("channel_id")
             if name in {
                 "get_incident",
                 "draft_incident",
-                "follow_incident",
-                "stop_incident_follow",
+        "follow_incident",
+        "review_incident",
+        "stop_incident_follow",
             }:
                 # Ownership/revision/digest bindings are resolved by the
                 # adapter and never entrusted to the model.
@@ -339,6 +359,7 @@ class EvaAgentToolAdapter:
             "get_incident": 32_000,
             "draft_incident": 32_000,
             "follow_incident": 8_000,
+            "review_incident": 8_000,
             "stop_incident_follow": 8_000,
         }.get(name, 96_000)
 
@@ -526,6 +547,13 @@ class EvaAgentToolAdapter:
                     "incident draft preview has no evidence digest"
                 )
             apply_arguments["expected_draft_digest"] = digest
+        if name == "apply_deployment_plan":
+            digest = str(result.get("plan_digest") or "").strip()
+            if not digest:
+                raise InvalidToolArgumentsError(
+                    "deployment preview has no plan digest"
+                )
+            apply_arguments["expected_plan_digest"] = digest
         plan = self.gateway.create_plan(name, apply_arguments, context)
         enriched = dict(result)
         enriched["approval"] = {
@@ -593,9 +621,18 @@ class EvaAgentToolAdapter:
             if callable(set_context):
                 set_context(context)
             try:
+                legacy_arguments = dict(arguments)
+                if (
+                    name == "configure_deployment"
+                    and legacy_arguments.pop(
+                        _DEPLOYMENT_SCOPE_GUARD_ONLY,
+                        False,
+                    )
+                ):
+                    legacy_arguments.pop("channel_ids", None)
                 result = self._legacy_tools.execute(
                     name,
-                    dict(arguments),
+                    legacy_arguments,
                     progress_cb=getattr(self._local, "progress_cb", None),
                 )
                 return self._filter_result(name, result, context)
@@ -621,6 +658,7 @@ class EvaAgentToolAdapter:
             "get_incident",
             "draft_incident",
             "follow_incident",
+            "review_incident",
             "stop_incident_follow",
         }:
             required = _TOOL_PERMISSIONS[name].value
@@ -720,6 +758,8 @@ class EvaAgentToolAdapter:
             "apply_deployment_plan",
             "get_deployment_status",
         }
+        # Never trust a caller-authored internal marker.
+        prepared.pop(_DEPLOYMENT_SCOPE_GUARD_ONLY, None)
         scoped_channels = self._scoped_channels(context)
         if name == "start_deployment":
             if scoped_channels is not None:
@@ -761,6 +801,8 @@ class EvaAgentToolAdapter:
             # Hidden channel_ids makes the generic gateway enforce every
             # selected channel against the authenticated actor grant.
             prepared["channel_ids"] = selected
+            if name == "configure_deployment" and requested is None:
+                prepared[_DEPLOYMENT_SCOPE_GUARD_ONLY] = True
 
             if name == "apply_deployment_plan":
                 required = {
@@ -830,6 +872,61 @@ class EvaAgentToolAdapter:
 
     def _resolve_detection_channel(self, arguments: dict[str, Any]) -> None:
         detection_id = arguments.get("detection_id")
+        raw_detection_ids = arguments.get("detection_ids")
+        if detection_id is not None and raw_detection_ids is not None:
+            raise InvalidToolArgumentsError(
+                "use detection_id or detection_ids, not both"
+            )
+        if raw_detection_ids is not None:
+            if not isinstance(raw_detection_ids, list):
+                raise InvalidToolArgumentsError(
+                    "detection_ids must be an array"
+                )
+            if not 1 <= len(raw_detection_ids) <= 9:
+                raise InvalidToolArgumentsError(
+                    "detection_ids must contain between 1 and 9 IDs"
+                )
+            normalized_ids: list[int] = []
+            for raw_id in raw_detection_ids:
+                try:
+                    normalized_id = int(raw_id)
+                except (TypeError, ValueError) as exc:
+                    raise InvalidToolArgumentsError(
+                        "detection_ids must contain integers"
+                    ) from exc
+                if normalized_id <= 0 or normalized_id in normalized_ids:
+                    if normalized_id <= 0:
+                        raise InvalidToolArgumentsError(
+                            "detection_ids must contain positive integers"
+                        )
+                    continue
+                normalized_ids.append(normalized_id)
+            records = self._legacy_tools._ds.fetch_detections_by_ids(
+                normalized_ids,
+                include_vectors=False,
+            )
+            if len(records) != len(normalized_ids):
+                raise InvalidToolArgumentsError(
+                    "one or more detections do not exist"
+                )
+            channel_ids = {
+                str(record.get("channel_id"))
+                for record in records
+                if record.get("channel_id") is not None
+            }
+            if len(channel_ids) == 0:
+                raise InvalidToolArgumentsError(
+                    "detections have no channel ownership metadata"
+                )
+            if any(record.get("channel_id") is None for record in records):
+                raise InvalidToolArgumentsError(
+                    "one or more detections have no channel ownership metadata"
+                )
+            arguments["detection_ids"] = normalized_ids
+            arguments["channel_ids"] = sorted(channel_ids)
+            if len(channel_ids) == 1:
+                arguments["channel_id"] = next(iter(channel_ids))
+            return
         if detection_id is None:
             return
         try:
@@ -861,6 +958,7 @@ class EvaAgentToolAdapter:
             "get_incident",
             "draft_incident",
             "follow_incident",
+            "review_incident",
             "stop_incident_follow",
         }:
             return
@@ -934,7 +1032,7 @@ class EvaAgentToolAdapter:
                 "incident has no channel ownership metadata"
             )
         arguments["channel_ids"] = channel_ids
-        if name in {"follow_incident", "stop_incident_follow"}:
+        if name in {"follow_incident", "review_incident", "stop_incident_follow"}:
             revision = incident.get("revision")
             try:
                 revision = int(revision)
@@ -947,6 +1045,40 @@ class EvaAgentToolAdapter:
                     "incident has no valid optimistic revision"
                 )
             arguments["expected_revision"] = revision
+        if name == "review_incident":
+            action = str(arguments.get("action") or "").strip().lower()
+            allowed_actions = {
+                "confirm",
+                "resolve",
+                "dismiss",
+                "false_positive",
+                "reopen",
+                "confirm_series",
+                "reject_series",
+            }
+            if action not in allowed_actions:
+                raise InvalidToolArgumentsError(
+                    "review_incident action is not supported"
+                )
+            if action in {"confirm_series", "reject_series"}:
+                relation_id = str(arguments.get("relation_id") or "").strip()
+                if not relation_id:
+                    raise InvalidToolArgumentsError(
+                        "relation_id is required for series review"
+                    )
+                temporal = service.temporal_context(incident)
+                candidate_ids = {
+                    str(item.get("relation_id") or "")
+                    for item in temporal.get("series_links") or []
+                    if isinstance(item, Mapping)
+                    and str(item.get("relation_state") or "") == "candidate"
+                }
+                if relation_id not in candidate_ids:
+                    raise InvalidToolArgumentsError(
+                        "relation_id is not an active candidate series link"
+                    )
+            else:
+                arguments.pop("relation_id", None)
 
     def _resolve_update_probe_channel(self, arguments: dict[str, Any]) -> None:
         probes = self._legacy_tools._ps.list_probes()

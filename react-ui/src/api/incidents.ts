@@ -2,6 +2,7 @@ import { api } from './client'
 
 export type IncidentFollowMode = 'follow' | 'critical'
 export type IncidentExportFormat = 'md' | 'xml'
+export type IncidentReviewAction = 'confirm' | 'resolve' | 'dismiss' | 'false_positive' | 'reopen'
 
 export interface IncidentDraftInput {
   channel_id: number
@@ -13,6 +14,12 @@ export interface IncidentDraftInput {
 export interface IncidentFollowInput {
   mode: IncidentFollowMode
   ttl_seconds: number
+}
+
+export interface IncidentReviewInput {
+  action: IncidentReviewAction
+  expected_revision?: number
+  note?: string
 }
 
 export interface IncidentTimelineEntry {
@@ -42,6 +49,10 @@ export interface Incident {
   id?: string | number
   incident_id?: string | number
   state?: string
+  perception_state?: string
+  risk_state?: string
+  case_state?: string
+  attention_state?: string
   status?: string
   title?: string
   summary?: string
@@ -60,9 +71,130 @@ export interface Incident {
   }
   follow?: IncidentFollowState
   follow_policy?: IncidentFollowState
+  synopsis?: Record<string, unknown>
+  homeostasis?: Record<string, unknown>
+  key_moments?: IncidentTimelineEntry[]
+  follow_result?: Record<string, unknown>
   coverage_gaps?: unknown[]
   uncertainties?: unknown[]
   [key: string]: unknown
+}
+
+export interface IncidentObservation {
+  id: string
+  incident_id: string
+  idempotency_key: string
+  source_kind: string
+  observed_at_ms: number
+  channel_id?: number | null
+  perception_state: string
+  source_ref?: Record<string, unknown>
+  payload?: Record<string, unknown>
+}
+
+export interface IncidentListEnvelope {
+  incidents: Incident[]
+  total: number
+  limit: number
+  offset: number
+  attention?: Record<string, unknown>
+}
+
+export type IncidentReviewState = 'active' | 'needs_review' | 'history'
+
+export interface IncidentReviewRecord extends Incident {
+  incident_id: string
+  review_state: IncidentReviewState
+  severity: string
+  channels: number[]
+  possible_start_ms?: number | null
+  observed_start_ms?: number | null
+  observed_end_ms?: number | null
+  possible_end_ms?: number | null
+  last_evidence_ms?: number | null
+  observed_duration_ms?: number | null
+  case_duration_ms?: number | null
+  evidence_count: number
+  timeline_count: number
+  uncertainty_count: number
+  cover?: {
+    detection_id?: number | null
+    timestamp_ms?: number | null
+    role?: string
+  } | null
+}
+
+export interface IncidentReviewEnvelope extends Omit<IncidentListEnvelope, 'incidents'> {
+  view?: 'review'
+  incidents: IncidentReviewRecord[]
+}
+
+export interface IncidentObservationEnvelope {
+  observations: IncidentObservation[]
+  total: number
+  limit: number
+  offset: number
+}
+
+export interface IncidentTemporalEpisode {
+  id: string
+  episode_key: string
+  perception_state: string
+  semantic_key?: string | null
+  entity_key?: string | null
+  zone_key?: string | null
+  possible_start_ms?: number | null
+  observed_start_ms?: number | null
+  observed_end_ms?: number | null
+  possible_end_ms?: number | null
+  scale_disposition: string
+  operator_review_required: boolean
+  evidence_count: number
+}
+
+export interface IncidentSeriesLink {
+  relation_id: string
+  relation_state: 'candidate' | 'confirmed' | string
+  confidence: string
+  related_incident_id: string
+  direction: 'prior' | 'later' | string
+  series_key: string
+  semantic_key: string
+  gap_ms: number
+  automatic_merge: false
+  operator_review_required: boolean
+  rationale: string
+}
+
+export interface IncidentLifecycleTransition {
+  id: string
+  axis: 'perception' | 'risk' | 'case' | 'attention' | 'legacy' | string
+  from_state?: string | null
+  to_state: string
+  incident_revision?: number | null
+  transitioned_at_ms?: number | null
+  reason: string
+  source_kind: string
+}
+
+export interface IncidentTemporalContext {
+  supported: boolean
+  incident_id: string
+  episodes: IncidentTemporalEpisode[]
+  episode_total: number
+  series_links: IncidentSeriesLink[]
+  relation_total: number
+  correction_count: number
+  lifecycle_history: IncidentLifecycleTransition[]
+  transition_total: number
+}
+
+export type IncidentSeriesReviewAction = 'confirm' | 'reject'
+
+export interface IncidentSeriesReviewEnvelope {
+  success: boolean
+  relation: Record<string, unknown>
+  temporal: IncidentTemporalContext
 }
 
 interface IncidentEnvelope {
@@ -152,6 +284,17 @@ export const incidentsApi = {
   draft: draftIncident,
   get: async (id: string | number): Promise<Incident> =>
     requireIncident(await api.get(incidentPath(id))),
+  list: async (query: Record<string, unknown> = {}): Promise<IncidentListEnvelope> =>
+    api.get('/incidents', query),
+  review: async (query: Record<string, unknown> = {}): Promise<IncidentReviewEnvelope> =>
+    api.get('/incidents', { ...query, view: 'review' }),
+  observations: async (
+    id: string | number,
+    query: Record<string, unknown> = {},
+  ): Promise<IncidentObservationEnvelope> =>
+    api.get(incidentPath(id, '/observations'), query),
+  temporal: async (id: string | number): Promise<IncidentTemporalContext> =>
+    api.get(incidentPath(id, '/temporal')),
   follow: async (
     id: string | number,
     mode: IncidentFollowMode,
@@ -165,4 +308,23 @@ export const incidentsApi = {
       incidentPath(id, '/stop-follow'),
       {},
     )),
+  reviewIncident: async (
+    id: string | number,
+    input: IncidentReviewInput,
+  ): Promise<Incident> => requireIncident(await api.postJson(
+    incidentPath(id, '/review'),
+    input,
+  )),
+  reviewSeries: async (
+    id: string | number,
+    relationId: string,
+    action: IncidentSeriesReviewAction,
+    note = '',
+  ): Promise<IncidentSeriesReviewEnvelope> => api.postJson(
+    incidentPath(
+      id,
+      `/series/${encodeURIComponent(String(relationId || '').trim())}/review`,
+    ),
+    { action, ...(note.trim() ? { note: note.trim() } : {}) },
+  ),
 }

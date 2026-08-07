@@ -15,7 +15,9 @@ from __future__ import annotations
 import base64
 import collections
 import copy
+import hashlib
 import json
+import logging
 import os
 import queue
 import re
@@ -84,6 +86,7 @@ AGENT_VIDEO_SUMMARY_MAX_LEVEL_LIMIT = 2_000
 AGENT_SITE_TIMEZONE = os.getenv("EVOSSEARCH_SITE_TIMEZONE", "UTC").strip() or "UTC"
 TRUSTED_ACTION_RECEIPT_PREFIX = "Trusted server action receipt:"
 AGENT_CHAT_TEMPLATE_KWARGS = {"enable_thinking": False}
+_AGENT_LOG = logging.getLogger(__name__)
 
 
 def _int_env(name: str, default: int, *, minimum: int = 0, maximum: Optional[int] = None) -> int:
@@ -97,6 +100,12 @@ def _int_env(name: str, default: int, *, minimum: int = 0, maximum: Optional[int
     return value
 
 
+AGENT_ARCHIVE_VISION_BATCH_SIZE = _int_env(
+    "EVOSSEARCH_AGENT_ARCHIVE_VISION_BATCH_SIZE",
+    8,
+    minimum=6,
+    maximum=9,
+)
 AGENT_VIDEO_RESEARCH_MAX_TOOL_CALLS = _int_env(
     "EVOSSEARCH_AGENT_VIDEO_RESEARCH_MAX_TOOL_CALLS",
     10,
@@ -196,6 +205,107 @@ def _image_data_url(value: Any, default_mime: str = "image/jpeg") -> Optional[st
     if text.lower().startswith("data:image/"):
         return text
     return f"data:{default_mime};base64,{text}"
+
+
+def _extract_first_json_mapping(value: Any) -> Optional[Dict[str, Any]]:
+    text = str(value or "").strip()
+    if not text:
+        return None
+    decoder = json.JSONDecoder()
+    for index, char in enumerate(text):
+        if char != "{":
+            continue
+        try:
+            parsed, _end = decoder.raw_decode(text[index:])
+        except json.JSONDecodeError:
+            continue
+        if isinstance(parsed, dict):
+            return parsed
+    return None
+
+
+def _normalize_archive_vision_verdict(
+    value: Any,
+) -> str:
+    normalized = re.sub(r"[^a-z_]+", "_", str(value or "").strip().lower()).strip("_")
+    if normalized in {"match", "matched", "yes", "present", "positive", "confirmed"}:
+        return "match"
+    if normalized in {"no_match", "not_match", "no", "absent", "negative", "rejected"}:
+        return "no_match"
+    return "uncertain"
+
+
+def _validate_archive_vision_contract(
+    value: Any,
+    *,
+    expected_count: int,
+) -> Tuple[str, Dict[int, Dict[str, Any]], List[str], List[str]]:
+    """Validate the bounded archive verdict contract conservatively.
+
+    A malformed contract never becomes positive or negative evidence.  Valid
+    rows may repeat evidence wording across similar snapshots; that is a
+    quality signal, not a transport failure or prose-loop condition.
+    """
+
+    parsed = _extract_first_json_mapping(value)
+    raw_verdicts = parsed.get("verdicts") if isinstance(parsed, Mapping) else None
+    if not isinstance(raw_verdicts, list):
+        return "unparsed", {}, ["missing_verdicts_array"], []
+
+    errors: List[str] = []
+    quality_flags: List[str] = []
+    by_snapshot: Dict[int, Dict[str, Any]] = {}
+    evidence_counts: Dict[str, int] = {}
+    allowed_verdicts = {"match", "no_match", "uncertain"}
+    for row_number, raw in enumerate(raw_verdicts, start=1):
+        if not isinstance(raw, Mapping):
+            errors.append(f"row_{row_number}_not_object")
+            continue
+        snapshot_index = _opt_int(raw.get("snapshot_index"))
+        if snapshot_index is None or not 1 <= snapshot_index <= expected_count:
+            errors.append(f"row_{row_number}_snapshot_index_out_of_range")
+            continue
+        snapshot_index = int(snapshot_index)
+        if snapshot_index in by_snapshot:
+            errors.append(f"duplicate_snapshot_index_{snapshot_index}")
+            continue
+        verdict = str(raw.get("verdict") or "").strip().lower().replace("-", "_")
+        if verdict not in allowed_verdicts:
+            errors.append(f"snapshot_{snapshot_index}_invalid_verdict")
+            continue
+        evidence = re.sub(
+            r"\s+",
+            " ",
+            str(raw.get("visible_evidence") or raw.get("evidence") or "").strip(),
+        )
+        if not evidence:
+            errors.append(f"snapshot_{snapshot_index}_missing_evidence")
+            continue
+        if len(evidence) > 320:
+            quality_flags.append(f"snapshot_{snapshot_index}_evidence_truncated")
+            evidence = evidence[:320]
+        normalized_evidence = evidence.casefold()
+        evidence_counts[normalized_evidence] = evidence_counts.get(normalized_evidence, 0) + 1
+        by_snapshot[snapshot_index] = {
+            "snapshot_index": snapshot_index,
+            "verdict": verdict,
+            "visible_evidence": evidence,
+        }
+
+    missing_indices = sorted(set(range(1, expected_count + 1)) - set(by_snapshot))
+    if missing_indices:
+        errors.append(
+            "missing_snapshot_indices_" + "_".join(str(item) for item in missing_indices)
+        )
+    if len(raw_verdicts) != expected_count:
+        errors.append(
+            f"verdict_count_{len(raw_verdicts)}_expected_{expected_count}"
+        )
+    if any(count > 1 for count in evidence_counts.values()):
+        quality_flags.append("repeated_visible_evidence")
+    if errors:
+        return "invalid", {}, errors[:16], sorted(set(quality_flags))[:16]
+    return "parsed", by_snapshot, [], sorted(set(quality_flags))[:16]
 
 
 _TOOL_SCHEMAS: List[Dict[str, Any]] = [
@@ -312,6 +422,41 @@ _TOOL_SCHEMAS: List[Dict[str, Any]] = [
                     "preview": {"type": "boolean", "description": "Must be true for model calls."},
                 },
                 "required": ["incident_id", "preview"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "review_incident",
+            "description": (
+                "Preview an operator lifecycle decision for a known incident, or "
+                "confirm/reject one candidate recurrence link. This is a MUT preview: "
+                "copy IDs from prior compact results, choose only a closed action, and "
+                "leave application to the UI approval plan."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "incident_id": {
+                        "type": "string",
+                        "description": "Exact server-issued incident ID copied from operator text or a prior tool result.",
+                    },
+                    "action": {
+                        "type": "string",
+                        "enum": [
+                            "confirm", "resolve", "dismiss", "false_positive", "reopen",
+                            "confirm_series", "reject_series",
+                        ],
+                        "description": "Closed operator-review decision.",
+                    },
+                    "relation_id": {
+                        "type": "string",
+                        "description": "Exact candidate relation ID from get_incident; required only for series actions.",
+                    },
+                    "preview": {"type": "boolean", "description": "Must be true for model calls."},
+                },
+                "required": ["incident_id", "action", "preview"],
             },
         },
     },
@@ -1234,10 +1379,11 @@ _TOOL_SCHEMAS: List[Dict[str, Any]] = [
         "function": {
             "name": "describe_frame",
             "description": (
-                "Send an image frame to the vision language model for a detailed description. "
+                "Send one image frame or a bounded archive-candidate batch to the vision language model. "
                 "Accepts a live camera snapshot (channel_id), a detection record (detection_id), "
-                "or a filesystem path (image_path). "
-                "Use to understand what is happening on camera right now, or to analyze a past detection."
+                "a copied list of 1-9 detection_ids from a prior archive result, or a filesystem path (image_path). "
+                "Use the batch form to verify top semantic candidates in one multimodal request before "
+                "making either a positive or negative visual claim."
             ),
             "parameters": {
                 "type": "object",
@@ -1260,6 +1406,16 @@ _TOOL_SCHEMAS: List[Dict[str, Any]] = [
                     "detection_id": {
                         "type": "integer",
                         "description": "Detection record ID. The stored thumbnail will be used.",
+                    },
+                    "detection_ids": {
+                        "type": "array",
+                        "items": {"type": "integer"},
+                        "minItems": 1,
+                        "maxItems": 9,
+                        "description": (
+                            "One to nine detection IDs copied from a prior search_archive result. "
+                            "EVA sends all available images in one VLM request and returns per-frame verdicts."
+                        ),
                     },
                     "prompt": {
                         "type": "string",
@@ -1903,6 +2059,11 @@ _TOOL_SCHEMAS.extend(
                             "type": "boolean",
                             "description": "Resume the latest unfinished deployment. Default: true.",
                         },
+                        "deployment_profile": {
+                            "type": "string",
+                            "enum": ["general", "maritime"],
+                            "description": "Closed deployment workflow profile. Use maritime only when the operator requests port/coast monitoring.",
+                        },
                     },
                     "required": [],
                     "additionalProperties": False,
@@ -1945,6 +2106,34 @@ _TOOL_SCHEMAS.extend(
                                 "required": ["name", "channel_ids"],
                                 "additionalProperties": False,
                             },
+                        },
+                        "channel_roles": {
+                            "type": "array",
+                            "maxItems": 8,
+                            "description": "Operator-confirmed maritime role and optional location card for each selected channel.",
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "channel_id": {"type": "integer"},
+                                    "role": {
+                                        "type": "string",
+                                        "enum": [
+                                            "maritime_gate",
+                                            "maritime_coast",
+                                            "maritime_mixed_ptz",
+                                        ],
+                                    },
+                                    "label": {"type": "string"},
+                                    "location": {"type": "string"},
+                                },
+                                "required": ["channel_id", "role"],
+                                "additionalProperties": False,
+                            },
+                        },
+                        "starter_policy_mode": {
+                            "type": "string",
+                            "enum": ["none", "shadow"],
+                            "description": "Install no generic watches or add the operator-reviewed maritime starter set as non-regulatory shadow probes.",
                         },
                         "requirements": {
                             "type": "array",
@@ -2778,6 +2967,7 @@ class AgentTools:
             "draft_incident":       self._draft_incident,
             "follow_incident":      self._follow_incident,
             "stop_incident_follow": self._stop_incident_follow,
+            "review_incident":      self._review_incident,
             "search_archive":       self._search_archive,
             "get_visual_window_signals": self._get_visual_window_signals,
             "calibrate_probe_from_archive": self._calibrate_probe_from_archive,
@@ -2837,6 +3027,9 @@ class AgentTools:
                 "status": "ok",
                 "incident": _compact_incident_for_model(
                     service.public_record(record)
+                ),
+                "temporal": _compact_incident_temporal_for_model(
+                    service.temporal_context(record)
                 ),
             }
         except (LookupError, ValueError) as exc:
@@ -2992,6 +3185,84 @@ class AgentTools:
         except (LookupError, ValueError) as exc:
             raise ToolError(str(exc)) from exc
 
+    def _review_incident(self, args: Dict[str, Any]) -> Dict[str, Any]:
+        service = self._require_incident_commands()
+        incident_id = str(args.get("incident_id") or "").strip()
+        action = str(args.get("action") or "").strip().lower()
+        relation_id = str(args.get("relation_id") or "").strip()
+        lifecycle_actions = {"confirm", "resolve", "dismiss", "false_positive", "reopen"}
+        series_actions = {"confirm_series": "confirm", "reject_series": "reject"}
+        if action not in lifecycle_actions | set(series_actions):
+            raise ToolError("Unsupported incident review action.")
+        if action in series_actions and not relation_id:
+            raise ToolError("relation_id is required for a series review action.")
+        try:
+            current = service.get(incident_id)
+            temporal = service.temporal_context(current)
+            if action in series_actions:
+                candidates = {
+                    str(item.get("relation_id") or "")
+                    for item in temporal.get("series_links") or []
+                    if isinstance(item, Mapping)
+                    and str(item.get("relation_state") or "") == "candidate"
+                }
+                if relation_id not in candidates:
+                    raise ToolError("relation_id is not an active candidate series link.")
+            if args.get("preview", True) is True:
+                return {
+                    "status": "preview",
+                    "action": "review_incident",
+                    "incident": _compact_incident_for_model(
+                        service.public_record(current),
+                        timeline_limit=4,
+                        evidence_limit=2,
+                        uncertainty_limit=4,
+                    ),
+                    "temporal": _compact_incident_temporal_for_model(temporal),
+                    "proposed_review": {
+                        "action": action,
+                        **({"relation_id": relation_id} if relation_id else {}),
+                    },
+                }
+            if action in series_actions:
+                reviewed_relation = service.review_series_relation(
+                    incident_id,
+                    relation_id,
+                    actor_id=self._trusted_actor_id(),
+                    action=series_actions[action],
+                )
+                updated = current
+            else:
+                reviewed_relation = None
+                updated = service.review_incident(
+                    incident_id,
+                    actor_id=self._trusted_actor_id(),
+                    action=action,
+                    expected_revision=_opt_int(args.get("expected_revision")),
+                )
+            return {
+                "status": "applied",
+                "action": "review_incident",
+                "incident": _compact_incident_for_model(
+                    service.public_record(updated),
+                    timeline_limit=4,
+                    evidence_limit=2,
+                    uncertainty_limit=4,
+                ),
+                "temporal": _compact_incident_temporal_for_model(
+                    service.temporal_context(updated)
+                ),
+                **({"relation": dict(reviewed_relation)} if reviewed_relation else {}),
+            }
+        except ToolError:
+            raise
+        except IncidentRevisionConflict as exc:
+            raise ToolError(
+                f"Incident changed to revision {exc.actual_revision}; prepare a fresh review preview."
+            ) from exc
+        except (LookupError, ValueError) as exc:
+            raise ToolError(str(exc)) from exc
+
     # ── search_archive ──────────────────────────────────────────────────────
 
     def _search_archive(self, args: Dict[str, Any]) -> Dict[str, Any]:
@@ -3042,6 +3313,20 @@ class AgentTools:
             coverage_raw = results.get("coverage")
             coverage = dict(coverage_raw) if isinstance(coverage_raw, Mapping) else None
             results = results.get("results") if isinstance(results.get("results"), list) else []
+        annotated_results = [
+            _annotate_archive_query_evidence(result, query)
+            for result in results
+            if isinstance(result, Mapping)
+        ]
+        vision_candidates = _select_archive_vision_candidates(annotated_results)
+        lexical_match_count = sum(
+            1 for result in annotated_results if bool(result.get("lexical_match"))
+        )
+        if coverage is not None:
+            coverage["coverage_semantics"] = (
+                "retrieval coverage over compatible indexed candidates; not proof that the visual event is absent"
+            )
+        time_window = _archive_requested_time_window(since_ms, until_ms)
         # `coverage` is ordered before the (potentially large) `results` list
         # on purpose: the security-layer output sanitizer enforces a shared
         # item budget across the whole dict and stops once it is spent, so a
@@ -3051,11 +3336,22 @@ class AgentTools:
         # class of bug and docs/tuktuk/grammar_review_questions.md.
         return {
             "scope": scope,
+            "query": query,
             "source": source,
             "source_label": _archive_source_label(source),
-            "count": len(results),
+            "count": len(annotated_results),
+            "match_semantics": "ranked_candidates_not_binary_matches",
+            "time_window": time_window,
+            "lexical_match_count_in_returned": lexical_match_count,
+            "vision_candidate_ids": [
+                int(result["detection_id"]) for result in vision_candidates
+            ],
+            "vision_candidate_count": len(vision_candidates),
+            "vision_verification_required": bool(vision_candidates),
             "coverage": coverage,
-            "results": _strip_thumbnails([_annotate_archive_row(result) for result in results]),
+            "results": _strip_thumbnails([
+                _annotate_archive_row(result) for result in annotated_results
+            ]),
         }
 
     # ── get_visual_window_signals ─────────────────────────────────────────────
@@ -5096,7 +5392,9 @@ class AgentTools:
                 ]
             resume_latest = bool(args.get("resume_latest", True))
             if resume_latest and allowed_channel_ids:
-                latest = self._deployment_store.latest_unfinished()
+                latest = self._deployment_store.latest_unfinished(
+                    str(args.get("deployment_profile") or "general")
+                )
                 if isinstance(latest, Mapping):
                     latest_scope = {
                         str(item)
@@ -5121,6 +5419,9 @@ class AgentTools:
                     min(8, int(args.get("target_channel_count") or 8)),
                 ),
                 resume_latest=resume_latest,
+                deployment_profile=str(
+                    args.get("deployment_profile") or "general"
+                ),
             )
         except DeploymentWorkflowError as exc:
             raise ToolError(str(exc)) from exc
@@ -5128,9 +5429,23 @@ class AgentTools:
             raise ToolError(f"Could not start Protocol Deploy: {exc}") from exc
         return {
             **compact_deployment_state(state),
+            "available_channel_count": len(state.get("available_channels") or []),
+            # Kept out of the model envelope by result compaction, but exposed
+            # to the React inventory picker so a 50+ channel Evo remains usable.
+            "ui_available_channels": copy.deepcopy(
+                list(state.get("available_channels") or [])[:100]
+            ),
             "instruction": (
-                "Ask the operator to choose up to 8 channels and optional groups. "
-                "Then call configure_deployment with IDs copied from this inventory."
+                "Ask the operator to choose one or more channels, up to the "
+                f"configured cap of {int(state.get('target_channel_count') or 8)}; "
+                "fewer than the cap is valid. Optional groups may be named now. "
+                + (
+                    "For every selected maritime channel also ask for role "
+                    "maritime_gate, maritime_coast, or maritime_mixed_ptz and an optional location label. "
+                    if str(state.get("deployment_profile") or "general") == "maritime"
+                    else ""
+                )
+                + "Then call configure_deployment with IDs copied from this inventory."
             ),
         }
 
@@ -5155,6 +5470,16 @@ class AgentTools:
                     if "quiet_window" in args
                     else None
                 ),
+                channel_roles=(
+                    args.get("channel_roles")
+                    if "channel_roles" in args
+                    else None
+                ),
+                starter_policy_mode=(
+                    args.get("starter_policy_mode")
+                    if "starter_policy_mode" in args
+                    else None
+                ),
             )
         except DeploymentWorkflowError as exc:
             raise ToolError(str(exc)) from exc
@@ -5162,6 +5487,17 @@ class AgentTools:
             raise ToolError(f"Could not configure deployment: {exc}") from exc
         return {
             **compact_deployment_state(state),
+            "surveys": [
+                {
+                    "channel_id": row.get("channel_id"),
+                    "title": row.get("title"),
+                    "sample_count": row.get("sample_count"),
+                    "scene_fingerprint": str(row.get("survey") or "")[:700],
+                    "error": row.get("error"),
+                }
+                for row in (state.get("surveys") or [])
+                if isinstance(row, Mapping)
+            ],
             "instruction": {
                 "scope_configured": (
                     "Call survey_deployment. After the compact scene survey, ask "
@@ -5170,6 +5506,11 @@ class AgentTools:
                 ),
                 "requirements_configured": (
                     "Call apply_deployment_plan with preview=true."
+                ),
+                "requirements_partial": (
+                    "Do not preview yet. Ask only for the channels listed in "
+                    "missing_requirement_channel_ids, then call configure_deployment "
+                    "again; saved channel requirements remain durable."
                 ),
             }.get(str(state.get("stage") or ""), "Continue from next_action."),
         }
@@ -5188,15 +5529,27 @@ class AgentTools:
         # Keep the vision task literal and shallow for Qwen3-VL-4B.  The
         # language agent receives compact receipts, while full survey text is
         # persisted in the durable deployment state.
-        survey_prompt = (
-            "Inspect only the supplied snapshots. Return four short lines: "
-            "SCENE: fixed physical area and camera viewpoint; "
-            "VISIBLE ROUTINE: repeated people/vehicles/objects only if visible; "
-            "CHANGES: observable motion or scene changes across snapshots; "
-            "CANDIDATE WATCHES: up to three concrete visible states worth asking "
-            "the operator about. Say UNKNOWN for ambiguity. Do not identify people, "
-            "infer intent, or choose alert severity."
-        )
+        if str(state.get("deployment_profile") or "general") == "maritime":
+            survey_prompt = (
+                "Inspect only the supplied maritime snapshots. Return five short lines: "
+                "VIEW: port gate, fairway, coastline, mixed, or UNKNOWN; "
+                "CAMERA: steady, probable PTZ movement/preset change, or UNKNOWN; "
+                "VISIBLE TRAFFIC: coarse vessel classes and directions only when visible; "
+                "COVERAGE: which water/shore areas are visible in these samples; "
+                "CANDIDATE WATCHES: up to three concrete visible states to confirm with the operator. "
+                "Camera movement is not vessel movement. Do not infer vessel identity, intent, distance, "
+                "collision risk, or absence outside the current view."
+            )
+        else:
+            survey_prompt = (
+                "Inspect only the supplied snapshots. Return four short lines: "
+                "SCENE: fixed physical area and camera viewpoint; "
+                "VISIBLE ROUTINE: repeated people/vehicles/objects only if visible; "
+                "CHANGES: observable motion or scene changes across snapshots; "
+                "CANDIDATE WATCHES: up to three concrete visible states worth asking "
+                "the operator about. Say UNKNOWN for ambiguity. Do not identify people, "
+                "infer intent, or choose alert severity."
+            )
         try:
             survey_result = self._survey_channels(
                 {
@@ -5230,10 +5583,14 @@ class AgentTools:
             **compact_deployment_state(state),
             "surveys": surveys,
             "instruction": (
-                "Now ask the operator what is routine, which visible conditions "
-                "should alert on each channel/group, how severe unexpected activity "
-                "is, whether any state needs a counter/dwell metric, and the preferred "
-                "preemptible 9B consolidation window. Then call configure_deployment."
+                "Now show the sampled scene fingerprint and ask the operator which "
+                "default visible alerts (or explicitly none) to install for every "
+                "selected channel/group. Give one compact alert-description example. "
+                "Also ask what is routine, how severe unexpected activity is, whether "
+                "any state needs a counter/dwell metric, and the preferred "
+                "preemptible 9B consolidation window. For a maritime profile, also ask "
+                "whether to include the role-specific starter policies as shadow probes. "
+                "Then call configure_deployment."
             ),
         }
 
@@ -5316,9 +5673,15 @@ class AgentTools:
             "bookmark_gate": None,
             "bookmark_gate_updated_at_ms": None,
             "origin": "agent",
+            "attention_only": bool(raw_probe.get("attention_only")),
+            "starter_policy": bool(raw_probe.get("starter_policy")),
             "deployment_id": raw_probe.get("deployment_id"),
             "metric_profile_id": raw_probe.get("metric_profile_id"),
         }
+        if isinstance(raw_probe.get("embedding_space"), Mapping):
+            payload["embedding_space"] = copy.deepcopy(
+                dict(raw_probe["embedding_space"])
+            )
         if existing:
             payload = _merge_probe(dict(existing), payload)
             payload["id"] = existing.get("id")
@@ -5332,18 +5695,51 @@ class AgentTools:
     def _apply_deployment_plan(self, args: Dict[str, Any]) -> Dict[str, Any]:
         deployment_id = str(args.get("deployment_id") or "").strip()
         preview = bool(args.get("preview", True))
+        expected_plan_digest = str(
+            args.get("expected_plan_digest") or ""
+        ).strip()
         try:
-            state = self._deployment_store.build_plan(
-                deployment_id,
-                start_live=bool(args.get("start_live", True)),
-                commissioning_after_minutes=max(
-                    1,
-                    min(
-                        120,
-                        int(args.get("commissioning_after_minutes") or 15),
+            if preview:
+                state = self._deployment_store.build_plan(
+                    deployment_id,
+                    start_live=bool(args.get("start_live", True)),
+                    commissioning_after_minutes=max(
+                        1,
+                        min(
+                            120,
+                            int(args.get("commissioning_after_minutes") or 15),
+                        ),
                     ),
-                ),
-            )
+                    probe_pos_floor=float(config.PROBE_POS_FLOOR_DEFAULT),
+                    probe_margin=float(config.PROBE_MARGIN_DEFAULT),
+                    probe_embedding_space=self._current_embedding_space(),
+                )
+            else:
+                # Apply the already-previewed immutable plan. Rebuilding here
+                # changes generated_at_ms and, worse, could apply corrections
+                # that the operator never reviewed.
+                state = self._deployment_store.load(deployment_id)
+                if not isinstance(state.get("plan"), Mapping):
+                    if expected_plan_digest:
+                        raise DeploymentWorkflowError(
+                            "deployment has no reviewed preview plan"
+                        )
+                    # Compatibility for trusted backend callers predating the
+                    # approval UI. Chat/UI applies always carry the digest.
+                    state = self._deployment_store.build_plan(
+                        deployment_id,
+                        start_live=bool(args.get("start_live", True)),
+                        commissioning_after_minutes=max(
+                            1,
+                            min(
+                                120,
+                                int(args.get("commissioning_after_minutes") or 15),
+                            ),
+                        ),
+                        probe_pos_floor=float(config.PROBE_POS_FLOOR_DEFAULT),
+                        probe_margin=float(config.PROBE_MARGIN_DEFAULT),
+                        probe_embedding_space=self._current_embedding_space(),
+                    )
         except DeploymentWorkflowError as exc:
             raise ToolError(str(exc)) from exc
         plan = (
@@ -5351,7 +5747,27 @@ class AgentTools:
             if isinstance(state.get("plan"), Mapping)
             else {}
         )
+        plan_digest = hashlib.blake2s(
+            json.dumps(
+                plan,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+                default=str,
+            ).encode("utf-8"),
+            digest_size=16,
+        ).hexdigest()
+        if (
+            not preview
+            and expected_plan_digest
+            and expected_plan_digest != plan_digest
+        ):
+            raise ToolError(
+                "Deployment draft changed after this preview. Generate and review a new approval card."
+            )
         diff = {
+            "deployment_profile": plan.get("deployment_profile") or "general",
+            "starter_policy_mode": plan.get("starter_policy_mode") or "none",
             "channel_ids": [
                 int(item.get("channel_id"))
                 for item in (plan.get("channels") or [])
@@ -5372,13 +5788,50 @@ class AgentTools:
                 "status": "preview",
                 "deployment_id": deployment_id,
                 "stage": state.get("stage"),
+                "plan_digest": plan_digest,
                 "diff": diff,
+                "groups": copy.deepcopy(plan.get("groups") or []),
+                "proposed_probes": [
+                    {
+                        "name": item.get("name"),
+                        "channel_id": item.get("channel_id"),
+                        "positives": list(item.get("positives") or []),
+                        "negatives": list(item.get("negatives") or []),
+                        "severity": item.get("severity"),
+                        "pos_floor": item.get("pos_floor"),
+                        "margin": item.get("margin"),
+                        "embedding_backend": (
+                            (item.get("embedding_space") or {}).get("backend")
+                            if isinstance(item.get("embedding_space"), Mapping)
+                            else None
+                        ),
+                        "attention_only": bool(item.get("attention_only")),
+                    }
+                    for item in (plan.get("probes") or [])
+                    if isinstance(item, Mapping)
+                ],
+                "proposed_counted_states": [
+                    {
+                        "id": item.get("id"),
+                        "name": item.get("name"),
+                        "channel_id": item.get("channel_id"),
+                        "counter_mode": item.get("counter_mode"),
+                        "count_transition": item.get("count_transition"),
+                        "duration_state": item.get("duration_state"),
+                    }
+                    for item in (plan.get("counted_states") or [])
+                    if isinstance(item, Mapping)
+                ],
                 "per_channel": [
                     {
                         "channel_id": item.get("channel_id"),
                         "alert_policy_preview": str(
                             item.get("alert_policy_prompt") or ""
                         )[:1_200],
+                        "channel_role": item.get("channel_role"),
+                        "stream_prompt_preview": str(
+                            item.get("stream_system_prompt") or ""
+                        )[:800],
                     }
                     for item in (plan.get("channels") or [])
                     if isinstance(item, Mapping)
@@ -5457,9 +5910,40 @@ class AgentTools:
                     deployment_id,
                     str(channel_plan.get("alert_policy_prompt") or ""),
                 )
+                update_args: Dict[str, Any] = {
+                    "channel_id": channel_id,
+                    "alert_policy_prompt": merged_alert_prompt,
+                }
+                generated_stream_prompt = str(
+                    channel_plan.get("stream_system_prompt") or ""
+                ).strip()
+                if generated_stream_prompt:
+                    current_stream_prompt = str(
+                        (current_effective or {}).get("stream_system_prompt") or ""
+                    )
+                    update_args["stream_system_prompt"] = self._deployment_policy_prompt(
+                        current_stream_prompt,
+                        deployment_id,
+                        generated_stream_prompt,
+                    )
+                generated_rollups = channel_plan.get("rollup_prompts")
+                if isinstance(generated_rollups, Mapping):
+                    current_rollups = (
+                        (current_effective or {}).get("rollup_prompts")
+                        if isinstance((current_effective or {}).get("rollup_prompts"), Mapping)
+                        else {}
+                    )
+                    update_args["rollup_prompts"] = {
+                        level: self._deployment_policy_prompt(
+                            str(current_rollups.get(level) or ""),
+                            deployment_id,
+                            str(generated_rollups.get(level) or ""),
+                        )
+                        for level in ("L1", "L2", "L3")
+                        if str(generated_rollups.get(level) or "").strip()
+                    }
                 self._lxm.update_prompt_settings(
-                    channel_id=channel_id,
-                    alert_policy_prompt=merged_alert_prompt,
+                    **update_args,
                 )
                 applied["prompt_channels"].append(channel_id)
             except Exception as exc:
@@ -5567,6 +6051,7 @@ class AgentTools:
 
         receipt = {
             "deployment_id": deployment_id,
+            "plan_digest": plan_digest,
             "status": "partial" if errors else "applied",
             "applied": applied,
             "errors": errors,
@@ -6461,10 +6946,30 @@ class AgentTools:
         channel_id   = self._resolve_channel_id(args, required=False)
         image_path   = str(args.get("image_path") or "").strip() or None
         detection_id = _opt_int(args.get("detection_id"))
+        raw_detection_ids = args.get("detection_ids")
+        detection_ids: List[int] = []
+        if isinstance(raw_detection_ids, Sequence) and not isinstance(
+            raw_detection_ids, (str, bytes, bytearray)
+        ):
+            for raw_id in raw_detection_ids:
+                normalized_id = _opt_int(raw_id)
+                if normalized_id is None or normalized_id <= 0:
+                    raise ToolError("detection_ids must contain positive integers.")
+                if int(normalized_id) not in detection_ids:
+                    detection_ids.append(int(normalized_id))
+        elif raw_detection_ids is not None:
+            raise ToolError("detection_ids must be an array of detection IDs.")
+        if len(detection_ids) > 9:
+            raise ToolError("describe_frame accepts at most 9 detection_ids per vision batch.")
         prompt = str(args.get("prompt") or "").strip() or (
             "Describe what is happening in this image in detail. "
             "Note any people, vehicles, objects, or unusual activity."
         )
+
+        if detection_ids:
+            if image_path is not None or detection_id is not None:
+                raise ToolError("Use detection_ids alone for a batch; do not combine it with detection_id or image_path.")
+            return self._describe_detection_batch(detection_ids, prompt)
 
         # Prefer explicit archive/file evidence over a live snapshot. Users often
         # ask about "channel X" while also passing detection_id from archive search.
@@ -6542,6 +7047,150 @@ class AgentTools:
             "image_url": f"/detections/image?image_path={quote(resolved_path, safe='')}",
             "detection_id": detection_id,
             "snapshot_b64": encoded,
+        }
+
+    def _describe_detection_batch(
+        self,
+        detection_ids: Sequence[int],
+        prompt: str,
+    ) -> Dict[str, Any]:
+        requested_ids = [int(item) for item in detection_ids[:9]]
+        records = self._ds.fetch_detections_by_ids(
+            requested_ids,
+            include_vectors=False,
+        )
+        by_id = {
+            int(record.get("id") or record.get("detection_id")): record
+            for record in records
+            if _opt_int(record.get("id") or record.get("detection_id")) is not None
+        }
+        prepared: List[Dict[str, Any]] = []
+        missing_ids: List[int] = []
+        for detection_id in requested_ids:
+            record = by_id.get(detection_id)
+            if not isinstance(record, Mapping):
+                missing_ids.append(detection_id)
+                continue
+            image_data_url: Optional[str] = None
+            image_path = str(record.get("image_path") or "").strip()
+            if image_path and Path(image_path).exists():
+                try:
+                    encoded = self._jpeg(Image.open(image_path), max_edge=960, quality=88)
+                    image_data_url = _image_data_url(encoded)
+                except Exception:
+                    image_data_url = None
+            if image_data_url is None:
+                image_data_url = _image_data_url(record.get("thumbnail"))
+            if image_data_url is None:
+                missing_ids.append(detection_id)
+                continue
+            prepared.append(
+                {
+                    "detection_id": detection_id,
+                    "channel_id": _opt_int(record.get("channel_id")),
+                    "timestamp_ms": _detection_timestamp_ms(record),
+                    "source": str(record.get("source") or "").strip() or None,
+                    "image_url": f"/detections/thumbnail/{detection_id}",
+                    "data_url": image_data_url,
+                }
+            )
+        if not prepared:
+            raise ToolError("None of the selected archive candidates has usable visual evidence.")
+
+        instruction = (
+            "Analyze every archive candidate independently against the operator hypothesis below. "
+            "Use only visible pixels in the corresponding image; do not reuse prior summaries, labels, "
+            "or other candidates as evidence. Return exactly one JSON object with key verdicts. "
+            "verdicts must contain one item per Snapshot with snapshot_index, verdict "
+            "(match, no_match, or uncertain), and a short visible_evidence string. "
+            "Do not omit uncertain images.\n\n"
+            f"Operator hypothesis: {prompt}"
+        )
+        content: List[Dict[str, Any]] = [{"type": "text", "text": instruction}]
+        for index, candidate in enumerate(prepared, start=1):
+            content.append(
+                {
+                    "type": "text",
+                    "text": (
+                        f"Snapshot {index}; detection_id={candidate['detection_id']}; "
+                        f"channel_id={candidate.get('channel_id')}; timestamp_ms={candidate.get('timestamp_ms')}"
+                    ),
+                }
+            )
+            content.append(
+                {
+                    "type": "image_url",
+                    "image_url": {
+                        "url": candidate["data_url"],
+                        "detail": "high",
+                    },
+                }
+            )
+        messages = [
+            {
+                "role": "system",
+                "content": (
+                    "You are EVA's bounded visual verification stage. Compare each supplied image "
+                    "with the stated visible hypothesis and return factual JSON only."
+                ),
+            },
+            {"role": "user", "content": content},
+        ]
+        raw_description = str(self._lm(messages) or "").strip()
+        parse_status, by_snapshot, validation_errors, quality_flags = (
+            _validate_archive_vision_contract(
+                raw_description,
+                expected_count=len(prepared),
+            )
+        )
+
+        verdicts: List[Dict[str, Any]] = []
+        for index, candidate in enumerate(prepared, start=1):
+            raw = by_snapshot.get(index, {})
+            verdict = _normalize_archive_vision_verdict(raw.get("verdict"))
+            evidence = re.sub(
+                r"\s+",
+                " ",
+                str(raw.get("visible_evidence") or raw.get("evidence") or "").strip(),
+            )[:320]
+            verdicts.append(
+                {
+                    "snapshot_index": index,
+                    "detection_id": candidate["detection_id"],
+                    "channel_id": candidate.get("channel_id"),
+                    "timestamp_ms": candidate.get("timestamp_ms"),
+                    "source": candidate.get("source"),
+                    "image_url": candidate.get("image_url"),
+                    "verdict": verdict,
+                    "visible_evidence": evidence or "VLM did not return grounded evidence for this candidate.",
+                }
+            )
+        match_ids = [row["detection_id"] for row in verdicts if row["verdict"] == "match"]
+        no_match_ids = [row["detection_id"] for row in verdicts if row["verdict"] == "no_match"]
+        uncertain_ids = [row["detection_id"] for row in verdicts if row["verdict"] == "uncertain"]
+        return {
+            "description": raw_description,
+            "source": "archive_candidate_batch",
+            "query": prompt,
+            "vision_checked": True,
+            "parse_status": parse_status,
+            "validation_errors": validation_errors,
+            "quality_flags": quality_flags,
+            "requested_count": len(requested_ids),
+            "candidate_count": len(prepared),
+            "detection_ids": [row["detection_id"] for row in prepared],
+            "missing_detection_ids": missing_ids,
+            "match_count": len(match_ids),
+            "no_match_count": len(no_match_ids),
+            "uncertain_count": len(uncertain_ids),
+            "matched_detection_ids": match_ids,
+            "no_match_detection_ids": no_match_ids,
+            "uncertain_detection_ids": uncertain_ids,
+            "verdicts": verdicts,
+            "note": (
+                "Vision verdicts cover only this bounded SigLIP candidate batch; "
+                "they do not prove absence outside the reviewed candidates."
+            ),
         }
 
     def _describe_from_thumb_b64(
@@ -9254,7 +9903,7 @@ def _build_scoped_agent_system_prompt(
             "Incident control route:\n"
             "- For an explicit report/create request, normalize the window and call draft_incident with preview=true.\n"
             "- The server-owned draft spans the event and returns its evidence digest; do not rebuild it with repeated reads.\n"
-            "- Follow/stop are preview-only in chat. Never silently enable focus or apply an incident draft."
+            "- Follow/stop/review are preview-only in chat. Never silently enable focus, apply an incident draft, or change incident lifecycle."
         )
 
     if "deployment" in intents:
@@ -9270,7 +9919,8 @@ def _build_scoped_agent_system_prompt(
             "Archive research route:\n"
             "- Resolve channel/time scope and report search coverage. Semantic matches rank attention, not factual confirmation.\n"
             "- Preserve source semantics: probe, semantic snapshot, VLM summary, and VLM alert are different evidence classes.\n"
-            "- Use describe_frame before saying a visual claim is confirmed."
+            "- EVA batches up to nine diverse top candidates through describe_frame. Use those per-frame verdicts for conclusions.\n"
+            "- Positive and negative visual claims are symmetric: never say the event is absent when the vision batch is missing, unparsed, or uncertain."
         )
 
     if "help" in intents:
@@ -9496,6 +10146,7 @@ def build_system_prompt(
         f"- If the operator asks to confirm video-summary findings with images/snaps, use get_video_summaries with include_evidence_frames=true or call get_detections with source=vlm_summary/source=vlm_alert, the same channel, and the same since_ms/until_ms. Do not use semantic search as the first proof step for exact time evidence.\n"
         f"- For image confirmation of video summaries, do not fall back to source=probe detections or a live frame unless the operator explicitly asks for probe/live corroboration. If no vlm_summary/vlm_alert archive frames are available, say that VLM snap evidence is unavailable for that period.\n"
         f"- Never say that an event is visually confirmed unless a tool in this turn returned archive frame rows with image_url for the relevant channel/time and describe_frame analyzed the relevant frame(s). If no image rows are returned, say that only text-summary evidence is available and provide the exact image query attempted.\n"
+        f"- Absence needs the same visual discipline as presence. search_archive returns ranked candidates, never a binary zero-match verdict. Do not say 'no visual evidence', 'not detected', or 'all results contain no X' unless the bounded describe_frame batch completed with parsed no_match verdicts; even then limit the conclusion to the reviewed candidates.\n"
         f"- Use get_visual_window_signals when you need a quick CLIP P/N/M attention signal over video-description frames. Treat P/N/M as a cue for where to inspect next, not as proof. Before concluding, inspect summaries and call describe_frame on relevant candidate frames.\n"
         f"- Summary rows may carry vector_signal.capture_attention: seconds whose measured motion was far above that channel's own learned norm (mode=burst; activity_x = times above typical). Bursts are trusted server-side attention markers - prefer those windows when picking evidence frames and when the operator asks about spikes, sudden motion, or 'что резкого было'. Motion blur on burst frames is expected physics of fast events; a sharper companion frame of the same second may exist in the archive as anchor_role=burst_companion. Bursts are statistical attention, not semantic proof - verify in frames before alerting.\n"
         f"- For burst/spike/attention questions call list_attention_bursts FIRST: it is bounded and already sorted by strength. Do not fan out over get_video_summaries or L1 rollups to find spikes. Rows with coverage_gap=true (and any backpressure_gap_count) mean those windows were dropped under LM backpressure: report them as unknown intervals, never as calm.\n"
@@ -9624,6 +10275,7 @@ _TOOL_INTENT_GROUPS: Dict[str, frozenset[str]] = {
         "get_incident",
         "draft_incident",
         "follow_incident",
+        "review_incident",
         "stop_incident_follow",
     }),
 }
@@ -9664,10 +10316,10 @@ def _classify_tool_intents(user_text: Any, context: Mapping[str, Any]) -> List[s
         add("deployment")
         return intents
     if re.search(
-        r"\b(?:report|create|draft|follow|stop|show|get|open)\s+(?:the\s+|this\s+|an?\s+)?incident\b|"
-        r"\bincident\s+(?:id|draft|follow|focus)\b|"
-        r"(?:созда|состав|оформ|покаж|откро|след|сопровож|останов).{0,28}инцидент|"
-        r"инцидент.{0,28}(?:созда|чернов|покаж|откро|след|сопровож|останов)",
+        r"\b(?:report|create|draft|follow|stop|show|get|open|review|confirm|resolve|dismiss|reopen)\s+(?:the\s+|this\s+|an?\s+)?incident\b|"
+        r"\bincident\s+(?:id|draft|follow|focus|review|series)\b|"
+        r"(?:созда|состав|оформ|покаж|откро|след|сопровож|останов|подтверд|закр|отклон|переоткр).{0,28}инцидент|"
+        r"инцидент.{0,28}(?:созда|чернов|покаж|откро|след|сопровож|останов|подтверд|закр|отклон|переоткр)",
         text,
     ):
         add("incident_control")
@@ -9756,11 +10408,33 @@ def _select_relevant_tool_schemas(
         else:
             allowed_names.discard("query_counted_state_metric")
 
+    if "deployment" in intents:
+        # Protocol Deploy is a phase machine.  A 4B head gets only the one
+        # schema valid for the trusted durable stage, so it cannot narrate an
+        # update without writing the draft or skip straight to preview/apply.
+        if context.get("deployment_maritime_roles_pending"):
+            allowed_names.clear()
+        elif context.get("deployment_requirements_supplied"):
+            allowed_names.intersection_update({"configure_deployment"})
+        elif (
+            context.get("deployment_preview_pending")
+            or str(context.get("deployment_stage") or "")
+            == "requirements_configured"
+        ):
+            allowed_names.intersection_update({"apply_deployment_plan"})
+
+    if context.get("video_event_followup_missing_time"):
+        # The prior trusted result identifies the event/channel but has no
+        # drillable timestamp.  Do not let a small head broaden this into a
+        # multi-channel search; the final response must ask for the time.
+        allowed_names.clear()
+
     # A broad video request without a named channel must inventory scope first.
     # Once the inventory result is remembered, detail tools become available in
     # the same turn.
     if (
         "video_research" in intents
+        and "archive_research" not in intents
         and context.get("channel_id") is None
         and not context.get("video_inventory_completed")
         and not context.get("research_continuation")
@@ -9773,6 +10447,45 @@ def _select_relevant_tool_schemas(
         if isinstance(schema, Mapping)
         and str((schema.get("function") or {}).get("name") or "") in allowed_names
     ]
+
+
+def _extract_archive_search_query(value: Any) -> Optional[str]:
+    """Extract the visible hypothesis from an explicit archive request.
+
+    This is intentionally conservative. It only runs after archive intent was
+    classified and exists to keep the server-owned RANK step deterministic for
+    a small local model; it is not a general natural-language parser.
+    """
+
+    text = unicodedata.normalize("NFKC", str(value or "")).strip()
+    if not text:
+        return None
+    patterns = (
+        r"\blook\s+for\s+(.+)$",
+        r"\bfind\s+(.+?)\s+in\s+(?:the\s+)?(?:video-description\s+)?archive\b",
+        r"\b(?:video-description\s+)?archive\s+(?:for|about)\s+(.+)$",
+        r"(?:ищи|найди|найдите|поиск)\s+(.+?)\s+в\s+архиве\b",
+        r"(?:поиск\s+по|в)\s+архив(?:у|е)\s+(?:по|для|про)?\s*(.+)$",
+    )
+    candidate = ""
+    for pattern in patterns:
+        match = re.search(pattern, text, flags=re.IGNORECASE)
+        if match:
+            candidate = str(match.group(1) or "").strip()
+            break
+    if not candidate:
+        return None
+    candidate = re.split(
+        r"\b(?:during|within|over|from)\s+(?:the\s+)?(?:last|past)\b|"
+        r"\b(?:за|в\s+течение)\s+(?:последн\w+)?\s*\d",
+        candidate,
+        maxsplit=1,
+        flags=re.IGNORECASE,
+    )[0]
+    candidate = candidate.strip(" \t\r\n.,;:!?\"'“”«»")
+    if not candidate or len(candidate) > 500:
+        return None
+    return candidate
 
 
 def _extract_vlm_alert_criterion(text: Any) -> Optional[str]:
@@ -9820,6 +10533,10 @@ def _seed_turn_tool_context(user_text: Any) -> Dict[str, Any]:
         )
     )
     context["tool_intents"] = _classify_tool_intents(routing_text, context)
+    if "archive_research" in context["tool_intents"]:
+        archive_query = _extract_archive_search_query(routing_text)
+        if archive_query:
+            context["archive_search_query"] = archive_query
     if "counted_state" in context["tool_intents"]:
         context["counted_state_saved_metric"] = bool(
             re.search(
@@ -9850,9 +10567,30 @@ def _seed_turn_tool_context(user_text: Any) -> Dict[str, Any]:
             normalized_unicode,
         ):
             context["incident_operation"] = "stop"
+        elif re.search(
+            r"\b(?:review|confirm|resolve|dismiss|reopen)\b.{0,24}\bincident\b|"
+            r"(?:подтверд|закр|отклон|переоткр).{0,24}инцидент",
+            normalized_unicode,
+        ):
+            context["incident_operation"] = "review"
         else:
             context["incident_operation"] = "get"
     if "deployment" in context["tool_intents"]:
+        target_channel_count = _deployment_target_channel_count(routing_text)
+        if target_channel_count is not None:
+            context["deployment_target_channel_count"] = target_channel_count
+        context["deployment_start_new"] = _operator_starts_fresh_deployment(
+            routing_text
+        )
+        context["deployment_profile"] = (
+            "maritime"
+            if re.search(
+                r"\b(?:maritime|port|coast|coastline|sea[ -]?gate|fairway)\b|"
+                r"порт|морск|берегов|побереж|фарватер",
+                normalized_unicode,
+            )
+            else "general"
+        )
         context["deployment_survey_only"] = bool(
             re.search(
                 r"\bsurvey[\s-]*only\b|только\s+обзор|только\s+осмотр",
@@ -9865,6 +10603,15 @@ def _seed_turn_tool_context(user_text: Any) -> Dict[str, Any]:
                 normalized_unicode,
             )
         )
+        explicit_alert_names = _deployment_explicit_alert_names(routing_text)
+        if explicit_alert_names:
+            context["deployment_explicit_alert_names"] = explicit_alert_names
+        no_alert_channel_ids = _deployment_no_alert_channel_ids(routing_text)
+        if no_alert_channel_ids:
+            context["deployment_no_alert_channel_ids"] = no_alert_channel_ids
+        no_probe_channel_ids = _deployment_no_probe_channel_ids(routing_text)
+        if no_probe_channel_ids:
+            context["deployment_no_probe_channel_ids"] = no_probe_channel_ids
     user_text_value = routing_text.strip()
     if context.get("vlm_alert_policy_request"):
         context["vlm_alert_criterion"] = _extract_vlm_alert_criterion(user_text_value)
@@ -9892,6 +10639,86 @@ def _inherit_followup_tool_context(
     history: Sequence[Mapping[str, Any]],
 ) -> Dict[str, Any]:
     """Carry the last operator intent into terse continuations and time choices."""
+
+    # "protocol: deploy, target N" is a fresh commissioning request, not a
+    # terse continuation of whichever draft happened to be newest in history.
+    if context.get("deployment_start_new"):
+        return context
+
+    deployment = _latest_deployment_context(history)
+    deployment_selection = (
+        _deployment_channel_selection(
+            user_text,
+            deployment.get("deployment_available_channel_ids") or (),
+        )
+        if deployment
+        else []
+    )
+    if deployment and (
+        _looks_like_deployment_followup(user_text)
+        or (
+            str(deployment.get("deployment_stage") or "") == "inventory"
+            and bool(deployment_selection)
+        )
+    ):
+        # Protocol Deploy is a durable, phase-bound workflow.  Keep its compact
+        # server-owned state authoritative across turns so a small local head
+        # cannot reinterpret a channel selection as generic video research.
+        context["tool_intents"] = ["deployment"]
+        context.update(deployment)
+        selected = deployment_selection
+        if selected:
+            context["deployment_selected_channel_ids"] = selected
+            context["deployment_groups"] = _deployment_groups_from_text(
+                user_text,
+                selected,
+            )
+            context["deployment_channel_roles"] = _deployment_channel_roles_from_text(
+                user_text,
+                selected,
+            )
+            if (
+                str(context.get("deployment_profile") or "general") == "maritime"
+                and {
+                    int(item.get("channel_id"))
+                    for item in context["deployment_channel_roles"]
+                    if isinstance(item, Mapping)
+                    and _opt_int(item.get("channel_id")) is not None
+                }
+                != set(selected)
+            ):
+                context["deployment_maritime_roles_pending"] = True
+        explicit_alert_names = _deployment_explicit_alert_names(user_text)
+        if explicit_alert_names:
+            context["deployment_explicit_alert_names"] = explicit_alert_names
+        no_alert_channel_ids = _deployment_no_alert_channel_ids(user_text)
+        if no_alert_channel_ids:
+            context["deployment_no_alert_channel_ids"] = no_alert_channel_ids
+        no_probe_channel_ids = _deployment_no_probe_channel_ids(user_text)
+        if no_probe_channel_ids:
+            context["deployment_no_probe_channel_ids"] = no_probe_channel_ids
+        starter_policy_mode = _deployment_starter_policy_mode_from_text(user_text)
+        if starter_policy_mode:
+            context["deployment_starter_policy_mode"] = starter_policy_mode
+        quiet_window = _deployment_quiet_window_from_text(user_text)
+        if quiet_window is not None:
+            context["deployment_quiet_window"] = quiet_window
+            context["deployment_quiet_window_confirmed"] = True
+        context["inherited_operator_intent"] = True
+        return context
+
+    video_scope = _matched_video_event_followup_scope(user_text, history)
+    if video_scope is not None and "video_research" in (context.get("tool_intents") or ()):
+        context["channel_id"] = video_scope["channel_id"]
+        context["video_candidate_channel_ids"] = [video_scope["channel_id"]]
+        context["inherited_video_event_scope"] = True
+        context["selected_event_query"] = video_scope.get("event_query")
+        if isinstance(video_scope.get("time_window"), Mapping):
+            context["time_window"] = copy.deepcopy(video_scope["time_window"])
+        else:
+            context["video_event_followup_missing_time"] = True
+        context["inherited_operator_intent"] = True
+        return context
 
     if context.get("tool_intents"):
         return context
@@ -9940,6 +10767,562 @@ def _inherit_followup_tool_context(
         if prior_user_messages >= 4:
             break
     return context
+
+
+def _looks_like_video_event_followup(value: Any) -> bool:
+    text = unicodedata.normalize("NFKC", str(value or "")).casefold()
+    return bool(
+        re.search(
+            r"\b(?:look|dig|drill|go)\s+(?:more\s+)?(?:deep|deeper|into)|"
+            r"\b(?:follow[ -]?up|this|that|the selected)\b.{0,48}\b(?:event|incident|episode)|"
+            r"углуб|разбер.{0,32}(?:событи|эпизод|инцидент)|"
+            r"(?:этот|тот|выбранн\w*)\s+(?:событи|эпизод|инцидент)",
+            text,
+        )
+    )
+
+
+def _video_followup_terms(value: Any) -> set[str]:
+    text = unicodedata.normalize("NFKC", str(value or "")).casefold()
+    stop = {
+        "about", "again", "deeper", "drill", "event", "follow", "into",
+        "look", "more", "please", "that", "the", "this", "with",
+        "давай", "этот", "событие", "эпизод", "инцидент", "глубже", "подробнее",
+    }
+    return {
+        token
+        for token in re.findall(r"[\w-]{4,}", text, flags=re.UNICODE)
+        if token not in stop and not token.isdigit()
+    }
+
+
+def _entry_time_window(entry: Mapping[str, Any], payload: Mapping[str, Any]) -> Optional[Dict[str, Any]]:
+    source = (
+        entry.get("time_window")
+        if isinstance(entry.get("time_window"), Mapping)
+        else payload.get("time_window")
+    )
+    if isinstance(source, Mapping):
+        from_ts = _opt_float(source.get("from_ts"))
+        to_ts = _opt_float(source.get("to_ts"))
+        if from_ts is not None and to_ts is not None and to_ts > from_ts:
+            return {
+                "from_ts": from_ts,
+                "to_ts": to_ts,
+                "since_ms": _opt_int(source.get("since_ms")) or int(from_ts * 1000),
+                "until_ms": _opt_int(source.get("until_ms")) or int(to_ts * 1000),
+                "from_local": source.get("from_local"),
+                "to_local": source.get("to_local"),
+                "duration_sec": _opt_float(source.get("duration_sec")) or (to_ts - from_ts),
+            }
+    from_ts = _opt_float(entry.get("window_start") or entry.get("from_ts"))
+    to_ts = _opt_float(entry.get("window_end") or entry.get("to_ts"))
+    if from_ts is not None and to_ts is not None and to_ts > from_ts:
+        return {
+            "from_ts": from_ts,
+            "to_ts": to_ts,
+            "since_ms": int(from_ts * 1000),
+            "until_ms": int(to_ts * 1000),
+            "duration_sec": to_ts - from_ts,
+        }
+    timestamp_ms = _opt_int(entry.get("timestamp_ms"))
+    if timestamp_ms is not None and timestamp_ms > 0:
+        center = timestamp_ms / 1000.0
+        return {
+            "from_ts": center - 60.0,
+            "to_ts": center + 60.0,
+            "since_ms": timestamp_ms - 60_000,
+            "until_ms": timestamp_ms + 60_000,
+            "duration_sec": 120.0,
+        }
+    return None
+
+
+def _matched_video_event_followup_scope(
+    user_text: Any,
+    history: Sequence[Mapping[str, Any]],
+) -> Optional[Dict[str, Any]]:
+    """Resolve a selected event only from prior trusted video tool results."""
+
+    if not _looks_like_video_event_followup(user_text):
+        return None
+    terms = _video_followup_terms(user_text)
+    matches: List[Dict[str, Any]] = []
+    for message in reversed(list(history)):
+        if not isinstance(message, Mapping):
+            continue
+        tool_name = str(message.get("tool_name") or message.get("name") or "")
+        if tool_name not in {"get_video_summaries", "list_video_summary_channels"}:
+            continue
+        payload = _tool_result_payload(message)
+        if not payload or payload.get("error"):
+            continue
+        channel_id = _opt_int(payload.get("channel_id"))
+        entries = payload.get("entries") if isinstance(payload.get("entries"), list) else []
+        for entry in entries:
+            if not isinstance(entry, Mapping):
+                continue
+            entry_channel = _opt_int(entry.get("channel_id")) or channel_id
+            if entry_channel is None or entry_channel <= 0:
+                continue
+            haystack = " ".join(
+                str(entry.get(key) or "")
+                for key in ("summary", "title", "label", "event", "channel_title")
+            )
+            normalized = unicodedata.normalize("NFKC", haystack).casefold()
+            if terms and not any(term in normalized for term in terms):
+                continue
+            matches.append(
+                {
+                    "channel_id": int(entry_channel),
+                    "event_query": re.sub(r"\s+", " ", haystack).strip()[:400],
+                    "time_window": _entry_time_window(entry, payload),
+                }
+            )
+        if matches:
+            break
+    channel_ids = {int(row["channel_id"]) for row in matches}
+    if len(channel_ids) != 1:
+        return None
+    timed = next((row for row in matches if row.get("time_window")), None)
+    return timed or matches[0]
+
+
+_DEPLOYMENT_TOOL_NAMES = frozenset(
+    {
+        "start_deployment",
+        "configure_deployment",
+        "survey_deployment",
+        "apply_deployment_plan",
+        "get_deployment_status",
+    }
+)
+
+
+def _tool_result_payload(message: Mapping[str, Any]) -> Optional[Dict[str, Any]]:
+    raw = message.get("tool_result")
+    if raw in (None, ""):
+        raw = message.get("content")
+    if isinstance(raw, Mapping):
+        return dict(raw)
+    if not isinstance(raw, str) or not raw.strip():
+        return None
+    try:
+        payload = json.loads(raw)
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return None
+    return dict(payload) if isinstance(payload, Mapping) else None
+
+
+def _latest_deployment_context(
+    history: Sequence[Mapping[str, Any]],
+) -> Optional[Dict[str, Any]]:
+    for message in reversed(list(history)):
+        if not isinstance(message, Mapping):
+            continue
+        tool_name = str(message.get("tool_name") or message.get("name") or "")
+        if tool_name not in _DEPLOYMENT_TOOL_NAMES:
+            continue
+        payload = _tool_result_payload(message)
+        if not payload or payload.get("error"):
+            continue
+        return _deployment_context_from_payload(payload)
+    return None
+
+
+def _deployment_context_from_payload(
+    payload: Mapping[str, Any],
+) -> Optional[Dict[str, Any]]:
+    deployment_id = str(payload.get("deployment_id") or "").strip()
+    stage = str(payload.get("stage") or "").strip()
+    if not deployment_id or stage in {"applied", "cancelled", "failed"}:
+        return None
+    available_from_rows = [
+        int(item.get("id"))
+        for item in (payload.get("available_channels") or [])
+        if isinstance(item, Mapping) and _opt_int(item.get("id")) is not None
+    ]
+    available_from_ids = [
+        int(item)
+        for item in (payload.get("available_channel_ids") or [])
+        if _opt_int(item) is not None
+    ]
+    available = list(dict.fromkeys(available_from_ids or available_from_rows))[:100]
+    selected = [
+        int(item)
+        for item in (payload.get("selected_channel_ids") or [])
+        if _opt_int(item) is not None
+    ]
+    return {
+        "deployment_id": deployment_id,
+        "deployment_stage": stage,
+        "deployment_profile": str(payload.get("deployment_profile") or "general"),
+        "deployment_starter_policy_mode": str(
+            payload.get("starter_policy_mode") or "none"
+        ),
+        "deployment_quiet_window": copy.deepcopy(payload.get("quiet_window")),
+        "deployment_quiet_window_confirmed": bool(
+            payload.get("quiet_window_confirmed")
+        ),
+        "deployment_target_channel_count": max(
+            1,
+            min(8, int(payload.get("target_channel_count") or 8)),
+        ),
+        "deployment_available_channel_ids": available,
+        "deployment_selected_channel_ids": selected,
+        "deployment_groups": copy.deepcopy(payload.get("groups") or []),
+        "deployment_channel_roles": copy.deepcopy(payload.get("channel_roles") or []),
+        "deployment_missing_requirement_channel_ids": [
+            int(item)
+            for item in (payload.get("missing_requirement_channel_ids") or [])
+            if _opt_int(item) is not None
+        ],
+    }
+
+
+def _operator_supplies_deployment_requirements(user_text: Any) -> bool:
+    """Recognize a substantive policy answer, not a generic workflow continuation."""
+
+    text = unicodedata.normalize("NFKC", str(user_text or "")).casefold()
+    categories = (
+        r"\b(?:routine|normal(?:ly)?|expected|baseline)\b|рутин|обычн|нормальн|ожидаем",
+        r"\b(?:alert|watch|notify|alarm|severity|critical|high|low)\b|алерт|тревог|уведом|критич|важн",
+        r"\b(?:novelty|unexpected|unusual|unknown)\b|новизн|непредусмотр|необычн|неизвестн",
+        r"\b(?:count|counter|dwell|duration|how long)\b|сч[её]тчик|посчита|длительн|сколько\s+врем",
+        r"\b(?:quiet\s+window|consolidation|from\s+\d{1,2}(?::\d{2})?\s+to\s+\d{1,2})\b|"
+        r"тих\w*\s+окн|консолидац|с\s+\d{1,2}(?::\d{2})?\s+до\s+\d{1,2}",
+    )
+    explicit_no_alerts = bool(
+        re.search(
+            r"\b(?:no|without)\s+(?:default\s+)?alerts?\b|"
+            r"без\s+(?:дефолтн\w*\s+)?алерт|алерт\w*\s+не\s+(?:нуж|став)",
+            text,
+        )
+    )
+    requests_grounded_suggestions = bool(
+        re.search(
+            r"\b(?:suggest|propose|draft)\b.{0,40}\b(?:default\s+)?alerts?\b|"
+            r"предлож\w*.{0,40}(?:алерт|тревог)",
+            text,
+        )
+    )
+    return (
+        sum(bool(re.search(pattern, text)) for pattern in categories) >= 2
+        or explicit_no_alerts
+        or requests_grounded_suggestions
+    )
+
+
+def _deployment_target_channel_count(user_text: Any) -> Optional[int]:
+    """Read the operator's requested channel cap from a deploy invocation."""
+
+    text = unicodedata.normalize("NFKC", str(user_text or ""))
+    patterns = (
+        r"\btarget\s*(?:[-:=]|is)?\s*(\d{1,2})\s*(?:channels?)?\b",
+        r"\b(?:deploy(?:ment)?|protocol\s*:?\s*deploy)\b.{0,32}?\b(\d{1,2})\s+channels?\b",
+        r"\b(?:таргет|цель)\s*(?:[-:=]|это)?\s*(\d{1,2})\s*(?:канал\w*)?\b",
+    )
+    for pattern in patterns:
+        match = re.search(pattern, text, flags=re.IGNORECASE)
+        if match:
+            return max(1, min(8, int(match.group(1))))
+    return None
+
+
+def _operator_starts_fresh_deployment(user_text: Any) -> bool:
+    """Treat an explicit protocol invocation with a target as a new draft."""
+
+    text = unicodedata.normalize("NFKC", str(user_text or "")).casefold()
+    if _deployment_target_channel_count(text) is None:
+        return False
+    if re.search(r"\b(?:resume|continue)\b|продолж|возобнов", text):
+        return False
+    return bool(
+        re.search(r"\bprotocol\s*:?\s*deploy\b|\bdeploy(?:ment)?\b|протокол\s+депло", text)
+    )
+
+
+def _deployment_explicit_alert_names(user_text: Any) -> List[str]:
+    """Extract operator-authored quoted Rule/Alert names for an allowlist."""
+
+    text = unicodedata.normalize("NFKC", str(user_text or ""))
+    names: List[str] = []
+    for match in re.finditer(
+        r"\b(?:rule|alert)\s*(?:\d+\s*)?(?:named\s*)?[:=]?\s*[\"“]([^\"”]{1,100})[\"”]",
+        text,
+        flags=re.IGNORECASE,
+    ):
+        name = " ".join(str(match.group(1) or "").split())
+        if name and name.casefold() not in {item.casefold() for item in names}:
+            names.append(name)
+    return names[:16]
+
+
+def _deployment_no_alert_channel_ids(user_text: Any) -> List[int]:
+    """Extract channels for which the operator explicitly requested no defaults."""
+
+    text = unicodedata.normalize("NFKC", str(user_text or ""))
+    ids: List[int] = []
+    no_alert = (
+        r"(?:no|without)\s+(?:default\s+)?alerts?"
+        r"|без\s+(?:дефолтн\w*\s+)?алерт\w*"
+        r"|алерт\w*\s+не\s+(?:нуж\w*|став\w*)"
+    )
+    channel = r"(?:ch(?:annel)?|канал)\s*#?(\d{1,9})"
+    for pattern in (
+        channel + r".{0,100}?(?:" + no_alert + r")",
+        r"(?:" + no_alert + r").{0,100}?" + channel,
+    ):
+        for match in re.finditer(pattern, text, flags=re.IGNORECASE):
+            channel_id = int(match.group(1))
+            if channel_id not in ids:
+                ids.append(channel_id)
+    return ids[:8]
+
+
+def _deployment_no_probe_channel_ids(user_text: Any) -> List[int]:
+    """Read an explicit UI/chat request to omit probe/counter proposals."""
+
+    text = unicodedata.normalize("NFKC", str(user_text or ""))
+    if not re.search(
+        r"\b(?:remove|omit|skip|reject|without|no)\b.{0,40}\b(?:probes?|counters?)\b|"
+        r"(?:убра|исключ|отклон|без)\w*.{0,40}(?:проб|сч[её]тчик)",
+        text,
+        flags=re.IGNORECASE,
+    ):
+        return []
+    match = re.search(
+        r"\b(?:channels?|ch|канал\w*)\s*#?\s*([\d# ,]+)",
+        text,
+        flags=re.IGNORECASE,
+    )
+    if not match:
+        return []
+    return list(
+        dict.fromkeys(int(item) for item in re.findall(r"\d{1,9}", match.group(1)))
+    )[:8]
+
+
+def _deployment_requirements_without_probes(
+    requirements: Sequence[Mapping[str, Any]],
+    channel_ids: Sequence[int],
+) -> List[Dict[str, Any]]:
+    """Preserve VLM alerts while deterministically removing vector proposals."""
+
+    rejected = {int(item) for item in channel_ids}
+    corrected: List[Dict[str, Any]] = []
+    for raw_pack in requirements:
+        if not isinstance(raw_pack, Mapping):
+            continue
+        pack = copy.deepcopy(dict(raw_pack))
+        pack_ids = [
+            int(item)
+            for item in (pack.get("channel_ids") or [])
+            if _opt_int(item) is not None
+        ]
+        rejected_ids = [item for item in pack_ids if item in rejected]
+        kept_ids = [item for item in pack_ids if item not in rejected]
+        if kept_ids:
+            kept = copy.deepcopy(pack)
+            kept["channel_ids"] = kept_ids
+            corrected.append(kept)
+        if rejected_ids:
+            stripped = copy.deepcopy(pack)
+            stripped["channel_ids"] = rejected_ids
+            stripped["alerts"] = [
+                {
+                    **copy.deepcopy(dict(alert)),
+                    "positive_query": "",
+                    "contrast_query": "",
+                    "counter_mode": "none",
+                }
+                for alert in (pack.get("alerts") or [])
+                if isinstance(alert, Mapping)
+            ]
+            corrected.append(stripped)
+    return corrected
+
+
+def _trusted_deployment_state_message(state: Mapping[str, Any]) -> str:
+    """Bounded server-owned Protocol Deploy receipt for the small agent head."""
+
+    receipt = compact_deployment_state(state)
+    receipt["survey_fingerprints"] = [
+        {
+            "channel_id": row.get("channel_id"),
+            "title": row.get("title"),
+            "sample_count": row.get("sample_count"),
+            "scene_fingerprint": str(row.get("survey") or "")[:700],
+            "error": str(row.get("error") or "")[:200] or None,
+        }
+        for row in (state.get("surveys") or [])[:8]
+        if isinstance(row, Mapping)
+    ]
+    groups = list(receipt.get("groups") or [])
+    group_guard = (
+        " Existing operator groups are already configured exactly as shown in "
+        "groups; list them accurately and do not ask to recreate them or claim "
+        "that grouping is unset."
+        if groups
+        else " No operator groups are configured in this durable state."
+    )
+    return (
+        "Trusted Protocol Deploy durable state (server-owned; never invent or replace "
+        "deployment_id, stage, channel IDs, groups, or survey evidence):\n"
+        + json.dumps(receipt, ensure_ascii=False, separators=(",", ":"), default=str)
+        + "\nAt stage surveyed or requirements_partial, do not repeat inventory, "
+        "scope configuration, or survey. "
+        + group_guard
+        + " If the operator has not supplied policy requirements, ask for expected routine, "
+        "visible alert conditions and severity, novelty response, optional counters/dwell "
+        "metrics, and a preemptible consolidation quiet window. Survey fingerprints are "
+        "sparse sampled evidence, not proof of continuous coverage; never claim 100% "
+        "coverage or no gaps from this receipt."
+    )
+
+
+def _looks_like_deployment_followup(user_text: Any) -> bool:
+    text = unicodedata.normalize("NFKC", str(user_text or "")).casefold()
+    return bool(
+        operator_requests_continuation(text)
+        or re.search(
+            r"\b(?:deploy(?:ment)?|select|choose|channel|group|survey|baseline|"
+            r"routine|alert|severity|novelty|quiet\s+window|start\s+live|preview|apply)\b|"
+            r"депло|выбер|канал|групп|обзор|сцен|рутин|алерт|тревог|тих\w*\s+окн|примен",
+            text,
+        )
+    )
+
+
+def _deployment_channel_selection(
+    user_text: Any,
+    available_channel_ids: Sequence[Any],
+) -> List[int]:
+    allowed = {
+        int(item)
+        for item in available_channel_ids
+        if _opt_int(item) is not None
+    }
+    if not allowed:
+        return []
+    mentioned = [
+        int(item)
+        for item in re.findall(r"(?<![\w.])#?(\d{1,9})(?![\w.])", str(user_text or ""))
+    ]
+    return list(dict.fromkeys(item for item in mentioned if item in allowed))[:8]
+
+
+def _deployment_groups_from_text(
+    user_text: Any,
+    selected_channel_ids: Sequence[int],
+) -> List[Dict[str, Any]]:
+    selected = {int(item) for item in selected_channel_ids}
+    grouped: Dict[str, List[int]] = {}
+    for match in re.finditer(
+        r"\bchannel\s*#?(\d{1,9})\s+(?:as|in|into)\s+([\w-]{1,80})",
+        str(user_text or ""),
+        flags=re.IGNORECASE,
+    ):
+        channel_id = int(match.group(1))
+        if channel_id not in selected:
+            continue
+        name = match.group(2).strip("_- ")
+        if name:
+            grouped.setdefault(name, []).append(channel_id)
+    for match in re.finditer(
+        r"\bgroup\s+([\w-]{1,80})\s*:\s*([#\d,\s]+)",
+        str(user_text or ""),
+        flags=re.IGNORECASE,
+    ):
+        name = match.group(1).strip("_- ")
+        channel_ids = [
+            int(item)
+            for item in re.findall(r"\d{1,9}", match.group(2))
+            if int(item) in selected
+        ]
+        if name and channel_ids:
+            grouped.setdefault(name, []).extend(channel_ids)
+    return [
+        {"name": name, "channel_ids": list(dict.fromkeys(channel_ids))}
+        for name, channel_ids in grouped.items()
+    ][:8]
+
+
+def _deployment_channel_roles_from_text(
+    user_text: Any,
+    selected_channel_ids: Sequence[int],
+) -> List[Dict[str, Any]]:
+    """Parse only the closed role syntax emitted by the deployment UI.
+
+    Roles remain operator-owned: IDs outside the selected inventory and role
+    names outside the closed maritime enum are discarded rather than repaired.
+    """
+
+    selected = {int(item) for item in selected_channel_ids}
+    allowed_roles = {
+        "maritime_gate",
+        "maritime_coast",
+        "maritime_mixed_ptz",
+    }
+    roles: Dict[int, Dict[str, Any]] = {}
+    for match in re.finditer(
+        r"\b(?:ch(?:annel)?|канал)\s*#?(\d{1,9})\s+role\s+"
+        r"(maritime_gate|maritime_coast|maritime_mixed_ptz)"
+        r"(?:\s+location\s+[\"“]([^\"”]{1,160})[\"”])?",
+        unicodedata.normalize("NFKC", str(user_text or "")),
+        flags=re.IGNORECASE,
+    ):
+        channel_id = int(match.group(1))
+        role = str(match.group(2) or "").lower()
+        if channel_id not in selected or role not in allowed_roles:
+            continue
+        row: Dict[str, Any] = {"channel_id": channel_id, "role": role}
+        location = " ".join(str(match.group(3) or "").split())
+        if location:
+            row["location"] = location
+        roles[channel_id] = row
+    return [roles[channel_id] for channel_id in selected_channel_ids if channel_id in roles]
+
+
+def _deployment_starter_policy_mode_from_text(user_text: Any) -> Optional[str]:
+    """Read the closed maritime starter choice emitted by the survey card."""
+
+    match = re.search(
+        r"\bstarter\s+policy\s+mode\s+(none|shadow)\b",
+        unicodedata.normalize("NFKC", str(user_text or "")),
+        flags=re.IGNORECASE,
+    )
+    return str(match.group(1)).lower() if match else None
+
+
+def _deployment_quiet_window_from_text(
+    user_text: Any,
+) -> Optional[Dict[str, Any]]:
+    """Parse the closed consolidation schedule emitted by the survey card."""
+
+    text = unicodedata.normalize("NFKC", str(user_text or ""))
+    if re.search(
+        r"\bconsolidation\s+quiet\s+window\s+disabled\b",
+        text,
+        flags=re.IGNORECASE,
+    ):
+        return {"enabled": False}
+    match = re.search(
+        r"\bconsolidation\s+quiet\s+window\s+"
+        r"(\d{2}:\d{2})-(\d{2}:\d{2})\s+timezone\s+"
+        r"([A-Za-z0-9_+./-]{1,80})\s+every\s+day\b",
+        text,
+        flags=re.IGNORECASE,
+    )
+    if not match:
+        return None
+    return {
+        "enabled": True,
+        "start_local": match.group(1),
+        "end_local": match.group(2),
+        "timezone": match.group(3),
+        "days": list(range(7)),
+    }
 
 
 def _tool_schema_names(schemas: Sequence[Mapping[str, Any]]) -> set[str]:
@@ -10002,6 +11385,57 @@ def _required_bounded_workflow_tool_call(
         )
 
     if (
+        "archive_research" in intents
+        and not context.get("archive_search_completed")
+        and context.get("archive_search_query")
+        and "search_archive" in available
+        and not (
+            relative_range
+            and not isinstance(time_window, Mapping)
+            and "normalize_time_window" in available
+        )
+    ):
+        search_args: Dict[str, Any] = {
+            "query": str(context["archive_search_query"])[:500],
+            "scope": "detections",
+            "limit": max(6, min(48, AGENT_ARCHIVE_VISION_BATCH_SIZE * 3)),
+        }
+        if context.get("channel_id") is not None:
+            search_args["channel_id"] = int(context["channel_id"])
+        return _ToolCall(
+            id=f"required-archive-rank-{uuid.uuid4().hex[:12]}",
+            name="search_archive",
+            args=search_args,
+        )
+
+    if (
+        "archive_research" in intents
+        and context.get("archive_search_completed")
+        and context.get("archive_vision_required")
+        and not context.get("archive_vision_completed")
+        and not context.get("archive_vision_attempted")
+        and "describe_frame" in available
+    ):
+        detection_ids = [
+            int(item)
+            for item in (context.get("archive_vision_candidate_ids") or [])[:9]
+            if _opt_int(item) is not None and int(item) > 0
+        ]
+        if detection_ids:
+            query = str(context.get("archive_search_query") or "visible archive event").strip()
+            return _ToolCall(
+                id=f"required-archive-vision-{uuid.uuid4().hex[:12]}",
+                name="describe_frame",
+                args={
+                    "detection_ids": detection_ids,
+                    "prompt": (
+                        "Verify whether each candidate visibly matches the archive query: "
+                        + query[:500]
+                    ),
+                },
+            )
+
+    if (
         context.get("incident_operation") == "draft"
         and not context.get("incident_draft_completed")
         and context.get("channel_id") is not None
@@ -10036,6 +11470,100 @@ def _required_bounded_workflow_tool_call(
                 "sources": ["semantic_snapshot"],
             },
         )
+
+    if "deployment" in intents:
+        deployment_id = str(context.get("deployment_id") or "").strip()
+        stage = str(context.get("deployment_stage") or "").strip()
+        selected_channel_ids = [
+            int(item)
+            for item in (context.get("deployment_selected_channel_ids") or [])
+            if _opt_int(item) is not None
+        ][:8]
+        requirement_correction = context.get("deployment_requirement_correction")
+        if (
+            deployment_id
+            and isinstance(requirement_correction, list)
+            and requirement_correction
+            and "configure_deployment" in available
+        ):
+            return _ToolCall(
+                id=f"required-deploy-correction-{uuid.uuid4().hex[:12]}",
+                name="configure_deployment",
+                args={
+                    "deployment_id": deployment_id,
+                    "requirements": copy.deepcopy(requirement_correction),
+                },
+            )
+        if not deployment_id and "start_deployment" in available:
+            return _ToolCall(
+                id=f"required-deploy-start-{uuid.uuid4().hex[:12]}",
+                name="start_deployment",
+                args={
+                    "target_channel_count": int(
+                        context.get("deployment_target_channel_count") or 8
+                    ),
+                    "resume_latest": not bool(
+                        context.get("deployment_start_new")
+                    ),
+                    "deployment_profile": str(
+                        context.get("deployment_profile") or "general"
+                    ),
+                },
+            )
+        if (
+            deployment_id
+            and stage in {"", "inventory"}
+            and selected_channel_ids
+            and "configure_deployment" in available
+        ):
+            maritime = str(context.get("deployment_profile") or "general") == "maritime"
+            channel_roles = [
+                copy.deepcopy(dict(item))
+                for item in (context.get("deployment_channel_roles") or [])
+                if isinstance(item, Mapping)
+                and _opt_int(item.get("channel_id")) in selected_channel_ids
+            ]
+            if maritime and {
+                int(item["channel_id"])
+                for item in channel_roles
+            } != set(selected_channel_ids):
+                # The role is an operator-owned control value. Never let the
+                # model invent one just to advance the maritime workflow.
+                return None
+            return _ToolCall(
+                id=f"required-deploy-configure-{uuid.uuid4().hex[:12]}",
+                name="configure_deployment",
+                args={
+                    "deployment_id": deployment_id,
+                    "channel_ids": selected_channel_ids,
+                    "groups": copy.deepcopy(context.get("deployment_groups") or []),
+                    **({"channel_roles": channel_roles} if maritime else {}),
+                },
+            )
+        if (
+            deployment_id
+            and stage == "scope_configured"
+            and "survey_deployment" in available
+        ):
+            return _ToolCall(
+                id=f"required-deploy-survey-{uuid.uuid4().hex[:12]}",
+                name="survey_deployment",
+                args={"deployment_id": deployment_id, "fast_mode": False},
+            )
+        if (
+            deployment_id
+            and stage == "requirements_configured"
+            and "apply_deployment_plan" in available
+        ):
+            return _ToolCall(
+                id=f"required-deploy-preview-{uuid.uuid4().hex[:12]}",
+                name="apply_deployment_plan",
+                args={
+                    "deployment_id": deployment_id,
+                    "preview": True,
+                    "start_live": True,
+                },
+            )
 
     if (
         "deployment" in intents
@@ -10084,6 +11612,25 @@ def _bounded_workflow_plan_completed(context: Mapping[str, Any]) -> bool:
         context.get("incident_draft_completed")
         or context.get("counted_state_completed")
         or context.get("deployment_survey_completed")
+        or context.get("deployment_requirements_pending")
+        or context.get("deployment_requirements_partial")
+        or context.get("deployment_preview_completed")
+        or context.get("deployment_maritime_roles_pending")
+        or (
+            "deployment" in (context.get("tool_intents") or ())
+            and context.get("deployment_id")
+            and str(context.get("deployment_stage") or "") == "inventory"
+            and not context.get("deployment_selected_channel_ids")
+        )
+        or (
+            "archive_research" in (context.get("tool_intents") or ())
+            and context.get("archive_search_completed")
+            and (
+                not context.get("archive_vision_required")
+                or context.get("archive_vision_completed")
+                or context.get("archive_vision_attempted")
+            )
+        )
     )
 
 
@@ -10124,7 +11671,10 @@ def _required_video_research_tool_call(
     ]
     if (
         not candidates
-        and context.get("video_overview_request")
+        and (
+            context.get("video_overview_request")
+            or context.get("inherited_video_event_scope")
+        )
         and context.get("channel_id") is not None
         and isinstance(context.get("time_window"), Mapping)
     ):
@@ -10136,7 +11686,10 @@ def _required_video_research_tool_call(
     }
     remaining = [channel_id for channel_id in candidates if channel_id not in completed]
     if (
-        context.get("video_inventory_completed")
+        (
+            context.get("video_inventory_completed")
+            or context.get("channel_id") is not None
+        )
         and not context.get("video_inventory_requires_confirmation")
         and remaining
         and "get_video_summaries" in available
@@ -10242,6 +11795,109 @@ def _turn_tool_cache_key(tool_name: str, args: Mapping[str, Any]) -> str:
 
 def _apply_turn_tool_context(tool_name: str, args: Dict[str, Any], context: Dict[str, Any]) -> Dict[str, Any]:
     prepared = dict(args or {})
+    if tool_name in (_DEPLOYMENT_TOOL_NAMES - {"start_deployment"}):
+        # Deployment identity and phase are durable server state.  A compact
+        # local model must not be able to substitute a plausible-looking ID.
+        deployment_id = str(context.get("deployment_id") or "").strip()
+        if deployment_id:
+            prepared["deployment_id"] = deployment_id
+        if (
+            tool_name == "configure_deployment"
+            and str(context.get("deployment_stage") or "")
+            in {
+                "surveyed",
+                "requirements_partial",
+                "requirements_configured",
+                "plan_ready",
+            }
+        ):
+            # Resending channel_ids calls the workflow's scope-reset path and
+            # clears completed surveys.  Requirements turns may only change
+            # requirements/quiet-window/profile policy fields.
+            prepared.pop("channel_ids", None)
+            prepared.pop("groups", None)
+        if (
+            tool_name == "configure_deployment"
+            and str(context.get("deployment_profile") or "general")
+            != "maritime"
+        ):
+            # Maritime roles and starter packs are profile-owned.  Small
+            # general-purpose heads sometimes invent them from traffic words.
+            prepared.pop("channel_roles", None)
+            prepared.pop("starter_policy_mode", None)
+        elif tool_name == "configure_deployment":
+            trusted_roles = [
+                copy.deepcopy(dict(item))
+                for item in (context.get("deployment_channel_roles") or [])
+                if isinstance(item, Mapping)
+            ]
+            if trusted_roles:
+                prepared["channel_roles"] = trusted_roles
+            else:
+                prepared.pop("channel_roles", None)
+            starter_policy_mode = str(
+                context.get("deployment_starter_policy_mode") or "none"
+            )
+            prepared["starter_policy_mode"] = (
+                starter_policy_mode
+                if starter_policy_mode in {"none", "shadow"}
+                else "none"
+            )
+        if tool_name == "configure_deployment":
+            if context.get("deployment_quiet_window_confirmed"):
+                prepared["quiet_window"] = copy.deepcopy(
+                    context.get("deployment_quiet_window") or {"enabled": False}
+                )
+            else:
+                prepared.pop("quiet_window", None)
+        explicit_alert_names = {
+            str(item).strip().casefold()
+            for item in (context.get("deployment_explicit_alert_names") or [])
+            if str(item).strip()
+        }
+        no_alert_channel_ids = {
+            int(item)
+            for item in (context.get("deployment_no_alert_channel_ids") or [])
+            if _opt_int(item) is not None
+        }
+        if (
+            tool_name == "configure_deployment"
+            and (explicit_alert_names or no_alert_channel_ids)
+            and isinstance(prepared.get("requirements"), list)
+        ):
+            filtered_requirements: List[Dict[str, Any]] = []
+            for raw_pack in prepared.get("requirements") or []:
+                if not isinstance(raw_pack, Mapping):
+                    continue
+                pack = copy.deepcopy(dict(raw_pack))
+                pack_channel_ids = {
+                    int(item)
+                    for item in (pack.get("channel_ids") or [])
+                    if _opt_int(item) is not None
+                }
+                explicit_none = pack_channel_ids.intersection(
+                    no_alert_channel_ids
+                )
+                remaining = pack_channel_ids - explicit_none
+                for channel_id in sorted(explicit_none):
+                    none_pack = copy.deepcopy(pack)
+                    none_pack["channel_ids"] = [channel_id]
+                    none_pack["alerts"] = []
+                    filtered_requirements.append(none_pack)
+                if remaining:
+                    pack["channel_ids"] = sorted(remaining)
+                    if explicit_alert_names:
+                        pack["alerts"] = [
+                            copy.deepcopy(dict(alert))
+                            for alert in (pack.get("alerts") or [])
+                            if isinstance(alert, Mapping)
+                            and str(alert.get("name") or "").strip().casefold()
+                            in explicit_alert_names
+                        ]
+                    filtered_requirements.append(pack)
+            prepared["requirements"] = filtered_requirements
+        if tool_name == "apply_deployment_plan":
+            prepared["preview"] = True
     operator_relative_range = str(context.get("operator_relative_range") or "").strip()
     if operator_relative_range and tool_name == "normalize_time_window":
         timezone = prepared.get("timezone")
@@ -10331,7 +11987,7 @@ def _apply_turn_tool_context(tool_name: str, args: Dict[str, Any], context: Dict
     channel_id = context.get("channel_id")
     should_default_channel = not (
         tool_name == "describe_frame"
-        and _has_any_arg(prepared, ("detection_id", "image_path"))
+        and _has_any_arg(prepared, ("detection_id", "detection_ids", "image_path"))
     )
     if should_default_channel and channel_id is not None and tool_name in {
         "get_video_summaries",
@@ -10378,7 +12034,7 @@ def _apply_turn_tool_context(tool_name: str, args: Dict[str, Any], context: Dict
     if tool_name == "prepare_probe_calibration_batch" and not prepared.get("job_id") and context.get("workflow_job_id"):
         prepared["job_id"] = context.get("workflow_job_id")
 
-    if tool_name in {"draft_incident", "follow_incident", "stop_incident_follow"}:
+    if tool_name in {"draft_incident", "follow_incident", "review_incident", "stop_incident_follow"}:
         # Chat may only prepare a MUT preview.  Application remains the trusted
         # UI approval path even when the operator says "apply" in prose.
         prepared["preview"] = True
@@ -10412,6 +12068,85 @@ def _apply_turn_tool_context(tool_name: str, args: Dict[str, Any], context: Dict
     return prepared
 
 
+def _remember_turn_tool_failure(
+    tool_name: str,
+    args: Mapping[str, Any],
+    error: Any,
+    context: Dict[str, Any],
+) -> Optional[Dict[str, Any]]:
+    """Latch a failed server-owned archive drill as a terminal unknown result."""
+
+    if (
+        tool_name != "describe_frame"
+        or "archive_research" not in (context.get("tool_intents") or ())
+        or not context.get("archive_search_completed")
+        or not context.get("archive_vision_required")
+    ):
+        return None
+    detection_ids = [
+        int(item)
+        for item in (args.get("detection_ids") or [])[:9]
+        if _opt_int(item) is not None and int(item) > 0
+    ]
+    if not detection_ids:
+        return None
+    error_text = re.sub(r"\s+", " ", str(error or "archive vision failed")).strip()[:500]
+    context["archive_vision_attempted"] = True
+    context["archive_vision_completed"] = False
+    context["archive_vision_failed"] = True
+    context["archive_vision_status"] = "failed"
+    context["archive_vision_parse_status"] = "failed"
+    context["archive_vision_candidate_count"] = len(detection_ids)
+    context["archive_vision_error"] = error_text
+    return {
+        "error": error_text,
+        "source": "archive_candidate_batch",
+        "status": "failed",
+        "vision_checked": False,
+        "parse_status": "failed",
+        "candidate_count": len(detection_ids),
+        "detection_ids": detection_ids,
+        "retryable_in_turn": False,
+        "next_step_hint": (
+            "The bounded visual drill was attempted once and failed. Do not retry "
+            "this batch in the same turn; report the ranked candidates as visually unverified."
+        ),
+    }
+
+
+def _log_turn_tool_failure(
+    *,
+    session_id: Any,
+    request_id: Any,
+    call_id: Any,
+    tool_name: Any,
+    args: Mapping[str, Any],
+    error: BaseException,
+    archive_failure: Optional[Mapping[str, Any]],
+) -> None:
+    """Emit correlation metadata without private arguments or error text."""
+
+    detection_ids = args.get("detection_ids")
+    candidate_count = (
+        len(detection_ids)
+        if isinstance(detection_ids, Sequence)
+        and not isinstance(detection_ids, (str, bytes, bytearray))
+        else 0
+    )
+    _AGENT_LOG.warning(
+        "agent_tool_failed request_id=%s session_id=%s call_id=%s tool=%s "
+        "workload=%s retry_reason=%s final_error_class=%s candidate_count=%s",
+        str(request_id or "unknown")[:96],
+        str(session_id or "unknown")[:96],
+        str(call_id or "unknown")[:96],
+        str(tool_name or "unknown")[:96],
+        "archive_candidate_batch" if archive_failure is not None else "tool_execution",
+        "bounded_drill_terminal" if archive_failure is not None else "tool_execution_failed",
+        type(error).__name__,
+        min(99, max(0, int(candidate_count))),
+    )
+
+
 def _remember_turn_tool_result(tool_name: str, result: Any, context: Dict[str, Any]) -> None:
     if not isinstance(result, Mapping):
         return
@@ -10422,6 +12157,7 @@ def _remember_turn_tool_result(tool_name: str, result: Any, context: Dict[str, A
         "get_incident",
         "draft_incident",
         "follow_incident",
+        "review_incident",
         "stop_incident_follow",
     }:
         incident = result.get("incident")
@@ -10441,6 +12177,7 @@ def _remember_turn_tool_result(tool_name: str, result: Any, context: Dict[str, A
         "start_deployment",
         "configure_deployment",
         "survey_deployment",
+        "apply_deployment_plan",
         "get_deployment_status",
     }:
         deployment_id = str(result.get("deployment_id") or "").strip()
@@ -10449,8 +12186,96 @@ def _remember_turn_tool_result(tool_name: str, result: Any, context: Dict[str, A
         stage = str(result.get("stage") or "").strip()
         if stage:
             context["deployment_stage"] = stage
+        available_channel_ids = [
+            int(item.get("id"))
+            for item in (result.get("available_channels") or [])
+            if isinstance(item, Mapping) and _opt_int(item.get("id")) is not None
+        ]
+        if available_channel_ids:
+            context["deployment_available_channel_ids"] = available_channel_ids
+        if result.get("selected_channel_ids") is not None:
+            context["deployment_selected_channel_ids"] = [
+                int(item)
+                for item in (result.get("selected_channel_ids") or [])
+                if _opt_int(item) is not None
+            ]
+        if result.get("groups") is not None:
+            context["deployment_groups"] = copy.deepcopy(result.get("groups") or [])
+        if result.get("channel_roles") is not None:
+            context["deployment_channel_roles"] = copy.deepcopy(
+                result.get("channel_roles") or []
+            )
+        if result.get("requirement_warnings") is not None:
+            context["deployment_requirement_warnings"] = list(
+                result.get("requirement_warnings") or []
+            )[:8]
+        if result.get("missing_requirement_channel_ids") is not None:
+            context["deployment_missing_requirement_channel_ids"] = [
+                int(item)
+                for item in (result.get("missing_requirement_channel_ids") or [])
+                if _opt_int(item) is not None
+            ]
         if tool_name == "survey_deployment" and result.get("survey_count") is not None:
             context["deployment_survey_completed"] = True
+            context["deployment_requirements_pending"] = True
+            context["deployment_requirements_receipt"] = {
+                "deployment_id": result.get("deployment_id"),
+                "selected_channel_ids": list(
+                    result.get("selected_channel_ids") or []
+                ),
+                "groups": copy.deepcopy(result.get("groups") or []),
+                "surveys": copy.deepcopy(result.get("surveys") or []),
+                "deployment_profile": result.get("deployment_profile"),
+            }
+        if tool_name == "start_deployment" and str(result.get("stage") or "") == "inventory":
+            context["deployment_inventory_receipt"] = {
+                "deployment_id": result.get("deployment_id"),
+                "target_channel_count": result.get("target_channel_count"),
+                "available_channels": copy.deepcopy(
+                    result.get("available_channels") or []
+                ),
+                "deployment_profile": result.get("deployment_profile"),
+            }
+        if (
+            tool_name == "configure_deployment"
+            and str(result.get("stage") or "") == "requirements_configured"
+        ):
+            context.pop("deployment_requirement_correction", None)
+            context.pop("deployment_requirements_supplied", None)
+            context["deployment_preview_pending"] = True
+        elif (
+            tool_name == "configure_deployment"
+            and str(result.get("stage") or "") == "requirements_partial"
+        ):
+            context.pop("deployment_requirement_correction", None)
+            context.pop("deployment_requirements_supplied", None)
+            context["deployment_requirements_partial"] = True
+            context["deployment_partial_receipt"] = {
+                "deployment_id": result.get("deployment_id"),
+                "selected_channel_ids": list(
+                    result.get("selected_channel_ids") or []
+                ),
+                "groups": copy.deepcopy(result.get("groups") or []),
+                "requirement_pack_count": result.get("requirement_pack_count"),
+                "missing_requirement_channel_ids": list(
+                    result.get("missing_requirement_channel_ids") or []
+                ),
+                "requirement_warnings": list(
+                    result.get("requirement_warnings") or []
+                ),
+            }
+        if tool_name == "apply_deployment_plan" and result.get("status") == "preview":
+            context.pop("deployment_preview_pending", None)
+            context["deployment_preview_completed"] = True
+            context["deployment_preview_receipt"] = {
+                "status": "preview",
+                "deployment_id": result.get("deployment_id"),
+                "stage": result.get("stage"),
+                "diff": copy.deepcopy(result.get("diff") or {}),
+                "operator_action": result.get("operator_action"),
+                "approval": copy.deepcopy(result.get("approval") or {}),
+                "per_channel": copy.deepcopy(result.get("per_channel") or []),
+            }
         return
 
     if tool_name == "normalize_time_window":
@@ -10465,6 +12290,47 @@ def _remember_turn_tool_result(tool_name: str, result: Any, context: Dict[str, A
                 "relative_range": result.get("relative_range"),
                 "duration_sec": result.get("duration_sec"),
             }
+        return
+
+    if tool_name == "search_archive":
+        context["archive_search_completed"] = True
+        context["archive_search_query"] = str(result.get("query") or "").strip()
+        candidate_ids = [
+            int(item)
+            for item in (result.get("vision_candidate_ids") or [])[:9]
+            if _opt_int(item) is not None and int(item) > 0
+        ]
+        context["archive_vision_candidate_ids"] = candidate_ids
+        context["archive_vision_required"] = bool(candidate_ids)
+        context["archive_vision_completed"] = False
+        context["archive_vision_attempted"] = False
+        context["archive_vision_failed"] = False
+        context["archive_vision_status"] = "pending" if candidate_ids else "not_required"
+        context["archive_vision_error"] = None
+        context["archive_vision_parse_status"] = None
+        context["archive_vision_match_count"] = None
+        time_window = result.get("time_window")
+        if isinstance(time_window, Mapping):
+            context["time_window"] = dict(time_window)
+        return
+
+    if tool_name == "describe_frame" and result.get("source") == "archive_candidate_batch":
+        parse_status = str(result.get("parse_status") or "unparsed")
+        context["archive_vision_attempted"] = True
+        context["archive_vision_completed"] = bool(result.get("vision_checked"))
+        context["archive_vision_failed"] = False
+        context["archive_vision_status"] = (
+            "succeeded" if parse_status == "parsed" else parse_status
+        )
+        context["archive_vision_error"] = None
+        context["archive_vision_parse_status"] = parse_status
+        context["archive_vision_candidate_count"] = _opt_int(result.get("candidate_count"))
+        context["archive_vision_match_count"] = _opt_int(result.get("match_count"))
+        context["archive_vision_no_match_count"] = _opt_int(result.get("no_match_count"))
+        context["archive_vision_uncertain_count"] = _opt_int(result.get("uncertain_count"))
+        context["archive_vision_matched_detection_ids"] = list(
+            result.get("matched_detection_ids") or []
+        )[:9]
         return
 
     if tool_name == "get_prompt_settings":
@@ -10721,6 +12587,7 @@ def _record_turn_signal_ledger(
         "get_incident",
         "draft_incident",
         "follow_incident",
+        "review_incident",
         "stop_incident_follow",
     }:
         incident = result.get("incident") if isinstance(result.get("incident"), Mapping) else {}
@@ -10943,6 +12810,7 @@ def _record_turn_signal_ledger(
         "start_deployment",
         "configure_deployment",
         "survey_deployment",
+        "apply_deployment_plan",
         "get_deployment_status",
     }:
         _signal_ledger_append(
@@ -10955,6 +12823,8 @@ def _record_turn_signal_ledger(
                 "next_action": result.get("next_action"),
                 "selected_channel_ids": result.get("selected_channel_ids"),
                 "survey_count": result.get("survey_count"),
+                "requirement_warnings": result.get("requirement_warnings"),
+                "preview_diff": result.get("diff"),
             },
             limit=8,
         )
@@ -11118,6 +12988,7 @@ def _record_turn_signal_ledger(
         return
 
     if tool_name == "describe_frame":
+        verdicts = result.get("verdicts") if isinstance(result.get("verdicts"), list) else []
         _signal_ledger_append(
             ledger,
             "evidence",
@@ -11126,6 +12997,22 @@ def _record_turn_signal_ledger(
                 "channel_id": result.get("channel_id"),
                 "source": result.get("source"),
                 "has_description": bool(str(result.get("description") or "").strip()),
+                "vision_checked": bool(result.get("vision_checked")),
+                "parse_status": result.get("parse_status"),
+                "candidate_count": result.get("candidate_count"),
+                "match_count": result.get("match_count"),
+                "no_match_count": result.get("no_match_count"),
+                "uncertain_count": result.get("uncertain_count"),
+                "matched_detection_ids": list(result.get("matched_detection_ids") or [])[:9],
+                "verdict_samples": [
+                    {
+                        "detection_id": row.get("detection_id"),
+                        "verdict": row.get("verdict"),
+                        "visible_evidence": _compact_signal_value(row.get("visible_evidence"), 180),
+                    }
+                    for row in verdicts[:6]
+                    if isinstance(row, Mapping)
+                ],
                 "note": _compact_signal_value(result.get("note"), 180),
             },
         )
@@ -11326,6 +13213,8 @@ def _video_research_response_needs_recovery(
             normalized,
         )
     )
+    if _video_response_grounding_issues(text, ledger):
+        return True
     if clarification:
         return False
     completed_evidence = any(
@@ -11346,6 +13235,555 @@ def _video_research_response_needs_recovery(
         or bool(re.search(r"\bch\s*#?\s*\d+\b", normalized))
     )
     return factual_claim
+
+
+def _trusted_turn_channel_ids(ledger: Mapping[str, Any]) -> set[int]:
+    trusted: set[int] = set()
+
+    def visit(value: Any, key: str = "") -> None:
+        if isinstance(value, Mapping):
+            for child_key, child in value.items():
+                name = str(child_key)
+                if name == "channel_id":
+                    channel_id = _opt_int(child)
+                    if channel_id is not None and channel_id > 0:
+                        trusted.add(int(channel_id))
+                elif name.endswith("channel_ids") and isinstance(child, Sequence) and not isinstance(child, (str, bytes, bytearray)):
+                    for item in child:
+                        channel_id = _opt_int(item)
+                        if channel_id is not None and channel_id > 0:
+                            trusted.add(int(channel_id))
+                visit(child, name)
+        elif isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
+            for child in value:
+                visit(child, key)
+
+    for section in ("coverage", "summary_findings", "evidence", "semantic_signals", "errors"):
+        visit(ledger.get(section), section)
+    query = str(ledger.get("user_query") or "")
+    trusted.update(
+        int(match)
+        for match in re.findall(
+            r"(?:\bchannel\s*#?|\bch\s*#?|\bканал(?:а|е|у|ом)?\s*#?)(\d{1,9})\b",
+            query,
+            flags=re.IGNORECASE,
+        )
+    )
+    return trusted
+
+
+def _trusted_alert_counts_by_channel(ledger: Mapping[str, Any]) -> Dict[int, set[int]]:
+    counts: Dict[int, set[int]] = {}
+
+    def collect_numbers(value: Any, *, alert_context: bool = False) -> set[int]:
+        found: set[int] = set()
+        if isinstance(value, Mapping):
+            for key, child in value.items():
+                key_alert = alert_context or "alert" in str(key).casefold()
+                found.update(collect_numbers(child, alert_context=key_alert))
+        elif isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
+            for child in value:
+                found.update(collect_numbers(child, alert_context=alert_context))
+        elif alert_context:
+            number = _opt_int(value)
+            if number is not None and number >= 0:
+                found.add(int(number))
+        return found
+
+    rows: List[Mapping[str, Any]] = []
+    for section in ("coverage", "summary_findings"):
+        for row in ledger.get(section) or []:
+            if isinstance(row, Mapping):
+                rows.append(row)
+                nested = row.get("candidate_channels")
+                if isinstance(nested, list):
+                    rows.extend(item for item in nested if isinstance(item, Mapping))
+    for row in rows:
+        channel_id = _opt_int(row.get("channel_id"))
+        if channel_id is None or channel_id <= 0:
+            continue
+        row_counts = collect_numbers(row)
+        if row_counts:
+            counts.setdefault(int(channel_id), set()).update(row_counts)
+    return counts
+
+
+def _video_response_grounding_issues(value: Any, ledger: Mapping[str, Any]) -> List[str]:
+    """Find channel/count claims not supported by a current-turn result."""
+
+    text = unicodedata.normalize("NFKC", str(value or ""))
+    mentioned = {
+        int(match)
+        for match in re.findall(
+            r"(?:\bchannel\s*#?|\bch\s*#?|\bканал(?:а|е|у|ом)?\s*#?)(\d{1,9})\b",
+            text,
+            flags=re.IGNORECASE,
+        )
+    }
+    trusted = _trusted_turn_channel_ids(ledger)
+    issues = [f"unsupported_channel:{channel_id}" for channel_id in sorted(mentioned - trusted)]
+    trusted_counts = _trusted_alert_counts_by_channel(ledger)
+    count_patterns = (
+        r"(?:\bchannel\s*#?|\bch\s*#?|\bканал(?:а|е|у|ом)?\s*#?)(\d{1,9})"
+        r"[^\n.]{0,120}?\b(\d+)\s+(?:alerts?|алерт(?:а|ов|ы)?)\b",
+        r"\b(\d+)\s+(?:alerts?|алерт(?:а|ов|ы)?)\b[^\n.]{0,120}?"
+        r"(?:\bchannel\s*#?|\bch\s*#?|\bканал(?:а|е|у|ом)?\s*#?)(\d{1,9})",
+    )
+    for index, pattern in enumerate(count_patterns):
+        for first, second in re.findall(pattern, text, flags=re.IGNORECASE):
+            channel_id, alert_count = (
+                (int(first), int(second)) if index == 0 else (int(second), int(first))
+            )
+            if alert_count not in trusted_counts.get(channel_id, set()):
+                issues.append(f"unsupported_alert_count:{channel_id}:{alert_count}")
+    return sorted(set(issues))
+
+
+def _format_video_event_followup_clarification(
+    context: Mapping[str, Any],
+    ledger: Mapping[str, Any],
+) -> str:
+    query = str(ledger.get("user_query") or "")
+    russian = bool(re.search(r"[а-яё]", query, flags=re.IGNORECASE))
+    channel_id = _opt_int(context.get("channel_id"))
+    event_query = str(context.get("selected_event_query") or "selected event").strip()[:240]
+    if russian:
+        return (
+            f"Я сохранила выбранный эпизод на CH {channel_id}, но в предыдущем результате нет "
+            f"надёжного таймстемпа для углубления: {event_query}. Укажи примерное время события — "
+            "я проверю только этот канал и соседнее временное окно, не расширяя поиск на другие камеры."
+        )
+    return (
+        f"I retained the selected event on CH {channel_id}, but the prior trusted result has no "
+        f"drillable timestamp for it: {event_query}. Give me the approximate event time and I will "
+        "inspect only that channel and its adjacent window, without broadening to other cameras."
+    )
+
+
+def _archive_research_response_needs_recovery(
+    value: Any,
+    context: Mapping[str, Any],
+) -> bool:
+    """Reject archive conclusions that outrun the bounded vision drill."""
+
+    if "archive_research" not in (context.get("tool_intents") or ()):
+        return False
+    if not context.get("archive_search_completed"):
+        return False
+    text = unicodedata.normalize("NFKC", str(value or "")).casefold()
+    if not text.strip():
+        return True
+    definitive_negative = bool(
+        re.search(
+            r"\b(?:no\s+(?:visual\s+)?evidence|no\s+(?:direct\s+)?matches?|"
+            r"no\b.{0,80}\b(?:found|detected|present)|"
+            r"nothing\s+(?:was\s+)?found|not\s+(?:found|detected|present)|"
+            r"no\s+(?:animal|person|vehicle|object|event))\b|"
+            r"(?:не\s+найден|не\s+обнаружен|ни\s+одн\w*.{0,80}(?:не\s+найден|не\s+обнаружен)|"
+            r"визуальн\w*\s+доказательств\s+нет|"
+            r"совпадени\w*\s+нет|отсутствует\s+на\s+всех)",
+            text,
+        )
+    )
+    definitive_positive = bool(
+        re.search(
+            r"\b(?:visual\s+evidence\s+(?:was\s+)?found|evidence\s+found|"
+            r"visual\s+match(?:es)?\s+(?:was|were)?\s*found|"
+            r"(?:is|are|was|were)\s+visibly\s+present|"
+            r"image(?:s)?\s+(?:shows?|confirms?)\b|"
+            r"визуальн\w*\s+(?:совпадени\w*|подтверждени\w*)\s+найден|"
+            r"на\s+кадр(?:е|ах)\s+(?:виден|видна|видно|видны))\b",
+            text,
+        )
+    )
+    coverage_overclaim = bool(
+        re.search(r"100\s*%\s+(?:of\s+)?(?:the\s+)?archive|100\s*%\s+архив", text)
+    )
+    if coverage_overclaim:
+        return True
+    if not definitive_negative and not definitive_positive:
+        return False
+    if context.get("archive_vision_required") and not context.get("archive_vision_completed"):
+        return True
+    if context.get("archive_vision_parse_status") != "parsed":
+        return True
+    match_count = _opt_int(context.get("archive_vision_match_count"))
+    if definitive_positive:
+        return match_count is None or match_count <= 0
+    uncertain_count = _opt_int(context.get("archive_vision_uncertain_count"))
+    no_match_count = _opt_int(context.get("archive_vision_no_match_count"))
+    return bool(
+        match_count is None
+        or match_count > 0
+        or uncertain_count is None
+        or uncertain_count > 0
+        or no_match_count is None
+        or no_match_count <= 0
+    )
+
+
+def _format_archive_research_fallback(
+    ledger: Mapping[str, Any],
+    *,
+    tool_messages: Optional[Sequence[Mapping[str, Any]]] = None,
+) -> str:
+    query_text = str(ledger.get("user_query") or "")
+    russian = bool(re.search(r"[а-яё]", query_text, flags=re.IGNORECASE))
+    search_result: Mapping[str, Any] = {}
+    vision_result: Mapping[str, Any] = {}
+    for message in tool_messages or ():
+        if not isinstance(message, Mapping) or str(message.get("role") or "") != "tool":
+            continue
+        name = str(message.get("name") or "")
+        raw_content = message.get("content")
+        try:
+            payload = json.loads(raw_content) if isinstance(raw_content, str) else raw_content
+        except Exception:
+            payload = None
+        if not isinstance(payload, Mapping):
+            continue
+        if name == "search_archive":
+            search_result = payload
+        elif name == "describe_frame" and payload.get("source") == "archive_candidate_batch":
+            vision_result = payload
+
+    query = str(search_result.get("query") or query_text or "archive query").strip()
+    count = _opt_int(search_result.get("count")) or 0
+    shown = _opt_int(search_result.get("results_returned_to_model")) or 0
+    lexical = _opt_int(search_result.get("lexical_match_count_in_returned")) or 0
+    time_window = search_result.get("time_window") if isinstance(search_result.get("time_window"), Mapping) else {}
+    coverage = search_result.get("coverage") if isinstance(search_result.get("coverage"), Mapping) else {}
+    scanned = _opt_int(coverage.get("scanned_candidates"))
+    total = _opt_int(coverage.get("total_candidates"))
+    lines = [
+        f"Результат архивного поиска: `{query}`"
+        if russian
+        else f"Archive search result: `{query}`"
+    ]
+    if time_window:
+        start = time_window.get("from_local") or time_window.get("from_utc")
+        end = time_window.get("to_local") or time_window.get("to_utc")
+        duration = time_window.get("duration_sec")
+        lines.append(
+            (f"- Период сервера: {start} — {end}; {duration} секунд."
+             if russian else f"- Server-resolved window: {start} — {end}; {duration} seconds.")
+        )
+    if search_result:
+        lines.append(
+            (
+                f"- SigLIP вернул {count} ранжированных кандидатов; модели показано {shown}. "
+                f"Текстовых совпадений среди возвращённых: {lexical}."
+                if russian
+                else f"- SigLIP returned {count} ranked candidates; {shown} were exposed to the agent. "
+                f"Lexical matches in the returned set: {lexical}."
+            )
+        )
+    if scanned is not None or total is not None:
+        lines.append(
+            (
+                f"- Retrieval coverage: просмотрено {scanned} из {total} совместимых индексированных кандидатов."
+                if russian
+                else f"- Retrieval coverage: scanned {scanned} of {total} compatible indexed candidates."
+            )
+        )
+
+    vision_failed = bool(
+        vision_result
+        and (
+            str(vision_result.get("status") or "") == "failed"
+            or str(vision_result.get("parse_status") or "") == "failed"
+        )
+    )
+    if vision_failed:
+        candidate_count = _opt_int(vision_result.get("candidate_count")) or 0
+        error_text = str(vision_result.get("error") or "visual verification failed")[:500]
+        lines.append(
+            (
+                f"- Vision-проверка {candidate_count} кандидатов была выполнена один раз и завершилась ошибкой: {error_text}"
+                if russian
+                else f"- Vision verification of {candidate_count} candidates was attempted once and failed: {error_text}"
+            )
+        )
+        lines.append(
+            (
+                "- Эти кандидаты остаются визуально непроверенными; по ним нельзя утверждать ни наличие, ни отсутствие события."
+                if russian
+                else "- These candidates remain visually unverified; neither presence nor absence can be concluded from them."
+            )
+        )
+    elif vision_result:
+        candidate_count = _opt_int(vision_result.get("candidate_count")) or 0
+        match_count = _opt_int(vision_result.get("match_count")) or 0
+        no_match_count = _opt_int(vision_result.get("no_match_count")) or 0
+        uncertain_count = _opt_int(vision_result.get("uncertain_count")) or 0
+        parse_status = str(vision_result.get("parse_status") or "unknown")
+        lines.append(
+            (
+                f"- Vision batch: проверено {candidate_count}; match={match_count}, "
+                f"no_match={no_match_count}, uncertain={uncertain_count}; parser={parse_status}."
+                if russian
+                else f"- Vision batch: reviewed {candidate_count}; match={match_count}, "
+                f"no_match={no_match_count}, uncertain={uncertain_count}; parser={parse_status}."
+            )
+        )
+        verdicts = vision_result.get("verdicts") if isinstance(vision_result.get("verdicts"), list) else []
+        for row in verdicts[:9]:
+            if not isinstance(row, Mapping) or row.get("verdict") not in {"match", "uncertain"}:
+                continue
+            lines.append(
+                f"- #{row.get('detection_id')} — {row.get('verdict')}: "
+                f"{str(row.get('visible_evidence') or '')[:320]}"
+            )
+    else:
+        lines.append(
+            (
+                "- Vision-проверка кандидатов не завершилась; делать вывод об отсутствии события нельзя."
+                if russian
+                else "- Candidate vision verification did not complete; absence cannot be concluded."
+            )
+        )
+    lines.append(
+        (
+            "Это вывод только по ограниченному vision-батчу лучших кандидатов, а не доказательство отсутствия во всём архиве."
+            if russian
+            else "This conclusion covers only the bounded vision batch of top candidates; it is not proof of absence across the whole archive."
+        )
+    )
+    return "\n".join(lines)
+
+
+def _format_deployment_inventory_receipt(context: Mapping[str, Any]) -> str:
+    """Render the first operator choice without exposing internal tool names."""
+
+    receipt = (
+        context.get("deployment_inventory_receipt")
+        if isinstance(context.get("deployment_inventory_receipt"), Mapping)
+        else {}
+    )
+    cap = max(1, min(8, int(receipt.get("target_channel_count") or 8)))
+    channels = [
+        row
+        for row in (receipt.get("available_channels") or [])
+        if isinstance(row, Mapping) and _opt_int(row.get("id")) is not None
+    ]
+    lines = [
+        "Protocol Deploy started — no live settings changed.",
+        f"- Deployment ID: `{receipt.get('deployment_id') or context.get('deployment_id') or 'unknown'}`",
+        f"- Selection cap: up to {cap} channel(s). Fewer than {cap} is valid.",
+        "- Available channels:",
+    ]
+    lines.extend(
+        f"  - `{int(row.get('id'))}` — {str(row.get('title') or 'Untitled channel')}"
+        for row in channels
+    )
+    lines.extend(
+        [
+            "Reply with one or more channel IDs. You may also name groups in the same message; groups are optional.",
+            "Example: `112, 118; group home_workspace: 112; group traffic_simulation: 118`.",
+        ]
+    )
+    return "\n".join(lines)
+
+
+def _format_deployment_maritime_roles_pending(context: Mapping[str, Any]) -> str:
+    """Ask for closed maritime controls without allowing model invention."""
+
+    selected = [
+        int(item)
+        for item in (context.get("deployment_selected_channel_ids") or [])
+        if _opt_int(item) is not None
+    ]
+    return "\n".join(
+        [
+            "Protocol Deploy has not changed live settings.",
+            f"- Selected channels: {selected}",
+            "- A maritime role is required for every selected channel before scene survey.",
+            "Choose in the deployment card: `Sea / port gate`, `Coastline`, or `Mixed / PTZ tour`. The location/view label is optional.",
+            "No channel role will be guessed by the agent.",
+        ]
+    )
+
+
+def _format_deployment_requirements_receipt(context: Mapping[str, Any]) -> str:
+    """Show the survey and ask for explicit per-channel policy requirements."""
+
+    receipt = (
+        context.get("deployment_requirements_receipt")
+        if isinstance(context.get("deployment_requirements_receipt"), Mapping)
+        else {}
+    )
+    selected = [int(item) for item in (receipt.get("selected_channel_ids") or [])]
+    lines = [
+        "Protocol Deploy survey saved — no alerts or live settings changed.",
+        f"- Deployment ID: `{receipt.get('deployment_id') or context.get('deployment_id') or 'unknown'}`",
+        f"- Selected channels: {selected}",
+    ]
+    groups = [
+        str(row.get("name"))
+        for row in (receipt.get("groups") or [])
+        if isinstance(row, Mapping) and row.get("name")
+    ]
+    if groups:
+        lines.append(f"- Groups: {groups}")
+    if str(receipt.get("deployment_profile") or "general") == "maritime":
+        lines.extend(
+            [
+                "- Maritime operating card required for every channel: choose `maritime_gate`, `maritime_coast`, or `maritime_mixed_ptz`, and give a short location/view label.",
+                "- Choose whether to add the role-specific starter watches as non-bookmarking shadow probes (`shadow`) or install none (`none`).",
+            ]
+        )
+    lines.append("- Sampled scene fingerprints (sparse observations, not continuous coverage):")
+    for row in (receipt.get("surveys") or []):
+        if not isinstance(row, Mapping):
+            continue
+        summary = str(
+            row.get("scene_fingerprint")
+            or row.get("survey")
+            or row.get("error")
+            or "No usable sample"
+        )
+        lines.append(
+            f"  - CH {row.get('channel_id')} {str(row.get('title') or '').strip()}: {summary[:700]}"
+        )
+    grouped_ids = {
+        int(channel_id)
+        for row in (receipt.get("groups") or [])
+        if isinstance(row, Mapping)
+        for channel_id in (row.get("channel_ids") or [])
+    }
+    scopes = [
+        {
+            "name": str(row.get("name")),
+            "channel_ids": [int(item) for item in (row.get("channel_ids") or [])],
+        }
+        for row in (receipt.get("groups") or [])
+        if isinstance(row, Mapping) and row.get("name")
+    ]
+    scopes.extend(
+        {"name": f"channel_{channel_id}", "channel_ids": [channel_id]}
+        for channel_id in selected
+        if channel_id not in grouped_ids
+    )
+    if scopes:
+        lines.append("- Commissioning order:")
+        lines.extend(
+            f"  {index + 1}. `{scope['name']}` → {scope['channel_ids']}"
+            for index, scope in enumerate(scopes)
+        )
+        first = scopes[0]
+        lines.append(
+            f"Start with `{first['name']}` only. You may describe its alerts yourself, or reply `suggest default alerts for group {first['name']}` and EVA will draft grounded, review-only VLM criteria from the sampled scene."
+        )
+    lines.extend(
+        [
+            "For every selected channel, reply with the normal routine and the default visible alerts you want. Explicitly say `no default alerts` for a channel if that is intentional. Also give the unexpected-event severity, novelty sensitivity, optional counter/duration, and the preemptible consolidation quiet window.",
+            "Good alert example: `CH 112 — Alert \"Person collapse\": trigger when a person visibly falls and remains down for 10 s; severity high; deduplicate one continuing episode for 2 min; count incidents, do not measure routine sitting.`",
+            "You can answer channel by channel; saved answers remain in the draft until every selected channel is covered.",
+        ]
+    )
+    return "\n".join(lines)
+
+
+def _format_deployment_partial_receipt(context: Mapping[str, Any]) -> str:
+    """Render a truthful per-channel requirements continuation."""
+
+    receipt = (
+        context.get("deployment_partial_receipt")
+        if isinstance(context.get("deployment_partial_receipt"), Mapping)
+        else {}
+    )
+    selected = [int(item) for item in (receipt.get("selected_channel_ids") or [])]
+    missing = [
+        int(item)
+        for item in (receipt.get("missing_requirement_channel_ids") or [])
+    ]
+    saved = [item for item in selected if item not in set(missing)]
+    group_names = [
+        str(item.get("name"))
+        for item in (receipt.get("groups") or [])
+        if isinstance(item, Mapping) and item.get("name")
+    ]
+    lines = [
+        "Protocol Deploy requirements saved partially — no preview generated or applied.",
+        f"- Deployment ID: `{receipt.get('deployment_id') or context.get('deployment_id') or 'unknown'}`",
+        f"- Selected scope remains unchanged: {selected}",
+        f"- Existing groups remain unchanged: {group_names}",
+        f"- Requirements saved for: {saved}",
+        f"- Requirements still needed only for: {missing}",
+        "Provide the routine, visible alert conditions and severity, novelty response, and optional counters for only the missing channels. Do not select additional channels or repeat the survey.",
+    ]
+    warnings = list(receipt.get("requirement_warnings") or [])
+    if warnings:
+        lines.append("- Draft warnings:")
+        lines.extend(f"  - {str(item)}" for item in warnings[:8])
+    next_scopes = [
+        {
+            "name": str(row.get("name")),
+            "channel_ids": [int(item) for item in (row.get("channel_ids") or [])],
+        }
+        for row in (receipt.get("groups") or [])
+        if isinstance(row, Mapping)
+        and set(int(item) for item in (row.get("channel_ids") or [])).intersection(missing)
+    ]
+    if next_scopes:
+        next_scope = next_scopes[0]
+        lines.append(
+            f"Next scope: `{next_scope['name']}` → {next_scope['channel_ids']}. Describe its alerts, or reply `suggest default alerts for group {next_scope['name']}`."
+        )
+    return "\n".join(lines)
+
+
+def _format_deployment_preview_receipt(context: Mapping[str, Any]) -> str:
+    """Render the trusted preview result without asking the 4B head to restate it."""
+
+    receipt = (
+        context.get("deployment_preview_receipt")
+        if isinstance(context.get("deployment_preview_receipt"), Mapping)
+        else {}
+    )
+    diff = receipt.get("diff") if isinstance(receipt.get("diff"), Mapping) else {}
+    deployment_id = str(
+        receipt.get("deployment_id") or context.get("deployment_id") or "unknown"
+    )
+    channel_ids = [int(item) for item in (diff.get("channel_ids") or [])]
+    approval = (
+        receipt.get("approval")
+        if isinstance(receipt.get("approval"), Mapping)
+        else {}
+    )
+    lines = [
+        "Protocol Deploy preview generated — not applied.",
+        f"- Deployment ID: `{deployment_id}`",
+        f"- Selected channels: {channel_ids}",
+        f"- Channel groups: {int(diff.get('channel_group_count') or 0)}",
+        f"- Channel policy documents: {int(diff.get('alert_policy_count') or 0)}",
+        f"- Attention probes: {int(diff.get('probe_count') or 0)}",
+        f"- Counted-state profiles: {int(diff.get('counted_state_count') or 0)}",
+        f"- Start live after Apply: {'yes' if diff.get('start_live') else 'no'}",
+    ]
+    quiet_window = diff.get("quiet_window")
+    if isinstance(quiet_window, Mapping) and quiet_window.get("enabled"):
+        lines.append(
+            "- Preemptible consolidation window: "
+            f"{quiet_window.get('start_local')}–{quiet_window.get('end_local')} "
+            f"({quiet_window.get('timezone')})"
+        )
+    warnings = list(context.get("deployment_requirement_warnings") or [])
+    if warnings:
+        lines.append("- Draft warnings:")
+        lines.extend(f"  - {str(item)}" for item in warnings[:8])
+    lines.extend(
+        [
+            "- Survey fingerprints are sparse samples, not proof of continuous coverage or absence of gaps.",
+            (
+                "A deployment approval card is shown with this response. Expand each channel policy there, then press Apply deployment if it is correct; otherwise describe the correction in chat."
+                if approval.get("plan_id")
+                else "The approval card could not be created; do not assume the preview was applied. Ask an administrator to regenerate the preview."
+            ),
+            "Until the approval action succeeds, live settings and commissioning are unchanged.",
+        ]
+    )
+    return "\n".join(lines)
 
 
 def _format_completion_fallback(
@@ -11631,6 +14069,7 @@ class AgentRunner:
         tool_context: Optional[ToolExecutionContext] = None,
         force_tools: bool = False,
         console_context: Optional[Mapping[str, Any]] = None,
+        drive_console: bool = True,
     ) -> Generator[str, None, None]:
         """
         Main entry point. Yields SSE-formatted strings.
@@ -11789,6 +14228,189 @@ class AgentRunner:
             user_text,
             history_prefix,
         )
+        if "deployment" not in (turn_tool_context.get("tool_intents") or ()):
+            # PostgreSQL history may omit raw tool rows. A terse UI-generated
+            # channel/group reply must still resume the durable inventory
+            # draft instead of falling through to ungrounded model prose.
+            try:
+                deployment_hint = self._tools._deployment_store.latest_unfinished()
+            except Exception:
+                deployment_hint = None
+            if isinstance(deployment_hint, Mapping):
+                hint_context = _deployment_context_from_payload(
+                    compact_deployment_state(deployment_hint)
+                )
+                selection = _deployment_channel_selection(
+                    user_text,
+                    (hint_context or {}).get(
+                        "deployment_available_channel_ids"
+                    )
+                    or (),
+                )
+                if selection or (
+                    str((hint_context or {}).get("deployment_stage") or "")
+                    != "inventory"
+                    and _looks_like_deployment_followup(user_text)
+                ):
+                    turn_tool_context["tool_intents"] = ["deployment"]
+                    turn_tool_context["deployment_profile"] = str(
+                        deployment_hint.get("deployment_profile") or "general"
+                    )
+        if (
+            "deployment" in (turn_tool_context.get("tool_intents") or ())
+            and not turn_tool_context.get("deployment_start_new")
+        ):
+            # PostgreSQL chat history intentionally omits raw tool messages.
+            # Rehydrate only the compact deployment receipt from its durable
+            # workflow store; never ask the model to reconstruct phase state.
+            try:
+                active_deployment = self._tools._deployment_store.latest_unfinished(
+                    str(turn_tool_context.get("deployment_profile") or "general")
+                )
+            except Exception:
+                active_deployment = None
+            if isinstance(active_deployment, Mapping):
+                trusted_deployment_state = copy.deepcopy(dict(active_deployment))
+                durable_context = _deployment_context_from_payload(
+                    compact_deployment_state(active_deployment)
+                )
+                if durable_context:
+                    turn_tool_context.update(durable_context)
+                    selected = _deployment_channel_selection(
+                        user_text,
+                        durable_context.get("deployment_available_channel_ids") or (),
+                    )
+                    if selected:
+                        turn_tool_context["deployment_selected_channel_ids"] = selected
+                        turn_tool_context["deployment_groups"] = _deployment_groups_from_text(
+                            user_text,
+                            selected,
+                        )
+                        turn_tool_context["deployment_channel_roles"] = (
+                            _deployment_channel_roles_from_text(user_text, selected)
+                        )
+                        if (
+                            str(
+                                durable_context.get("deployment_profile")
+                                or "general"
+                            )
+                            == "maritime"
+                            and {
+                                int(item.get("channel_id"))
+                                for item in turn_tool_context[
+                                    "deployment_channel_roles"
+                                ]
+                                if isinstance(item, Mapping)
+                                and _opt_int(item.get("channel_id")) is not None
+                            }
+                            != set(selected)
+                        ):
+                            turn_tool_context[
+                                "deployment_maritime_roles_pending"
+                            ] = True
+                    no_probe_channel_ids = _deployment_no_probe_channel_ids(
+                        user_text
+                    )
+                    starter_policy_mode = (
+                        _deployment_starter_policy_mode_from_text(user_text)
+                    )
+                    if starter_policy_mode:
+                        turn_tool_context["deployment_starter_policy_mode"] = (
+                            starter_policy_mode
+                        )
+                    quiet_window = _deployment_quiet_window_from_text(user_text)
+                    if quiet_window is not None:
+                        turn_tool_context["deployment_quiet_window"] = quiet_window
+                        turn_tool_context[
+                            "deployment_quiet_window_confirmed"
+                        ] = True
+                    if no_probe_channel_ids:
+                        turn_tool_context["deployment_no_probe_channel_ids"] = (
+                            no_probe_channel_ids
+                        )
+                        turn_tool_context["deployment_requirement_correction"] = (
+                            _deployment_requirements_without_probes(
+                                [
+                                    row
+                                    for row in (
+                                        active_deployment.get("requirements") or []
+                                    )
+                                    if isinstance(row, Mapping)
+                                ],
+                                no_probe_channel_ids,
+                            )
+                        )
+                        turn_tool_context["deployment_requirements_supplied"] = True
+                    if (
+                        str(durable_context.get("deployment_stage") or "")
+                        in {
+                            "surveyed",
+                            "requirements_partial",
+                            "requirements_configured",
+                            "plan_ready",
+                        }
+                        and _operator_supplies_deployment_requirements(user_text)
+                    ):
+                        turn_tool_context["deployment_requirements_supplied"] = True
+                    elif (
+                        str(durable_context.get("deployment_stage") or "") == "surveyed"
+                    ):
+                        turn_tool_context["deployment_requirements_pending"] = True
+                        turn_tool_context["deployment_requirements_receipt"] = {
+                            "deployment_id": active_deployment.get("deployment_id"),
+                            "selected_channel_ids": list(
+                                active_deployment.get("selected_channel_ids") or []
+                            ),
+                            "groups": copy.deepcopy(
+                                active_deployment.get("groups") or []
+                            ),
+                            "surveys": [
+                                {
+                                    "channel_id": row.get("channel_id"),
+                                    "title": row.get("title"),
+                                    "sample_count": row.get("sample_count"),
+                                    "scene_fingerprint": str(
+                                        row.get("survey") or ""
+                                    )[:700],
+                                    "error": row.get("error"),
+                                }
+                                for row in (active_deployment.get("surveys") or [])
+                                if isinstance(row, Mapping)
+                            ],
+                            "deployment_profile": active_deployment.get(
+                                "deployment_profile"
+                            ),
+                        }
+                    elif (
+                        str(durable_context.get("deployment_stage") or "")
+                        == "requirements_partial"
+                    ):
+                        turn_tool_context["deployment_requirements_partial"] = True
+                        turn_tool_context["deployment_partial_receipt"] = {
+                            "deployment_id": active_deployment.get("deployment_id"),
+                            "selected_channel_ids": list(
+                                active_deployment.get("selected_channel_ids") or []
+                            ),
+                            "groups": copy.deepcopy(
+                                active_deployment.get("groups") or []
+                            ),
+                            "requirement_pack_count": len(
+                                active_deployment.get("requirements") or []
+                            ),
+                            "missing_requirement_channel_ids": list(
+                                durable_context.get(
+                                    "deployment_missing_requirement_channel_ids"
+                                )
+                                or []
+                            ),
+                            "requirement_warnings": list(
+                                active_deployment.get("requirement_warnings") or []
+                            ),
+                        }
+            else:
+                trusted_deployment_state = None
+        else:
+            trusted_deployment_state = None
         apply_console_context_defaults(turn_tool_context, console_context)
         turn_tool_context["active_skill_slugs"] = list(requested_skill_slugs)
         requested_skill_tool_names = _skill_tool_names(requested_skill_slugs)
@@ -11808,6 +14430,15 @@ class AgentRunner:
             tool_intents=turn_tool_context.get("tool_intents") or [],
         )
         trusted_research_messages: List[Dict[str, Any]] = []
+        if trusted_deployment_state is not None:
+            trusted_research_messages.append(
+                {
+                    "role": "system",
+                    "content": _trusted_deployment_state_message(
+                        trusted_deployment_state
+                    ),
+                }
+            )
         console_context_message = trusted_console_context_message(console_context)
         if console_context_message:
             trusted_research_messages.append(
@@ -12011,15 +14642,65 @@ class AgentRunner:
                     or _video_overview_research_plan_completed(turn_tool_context)
                 )
             ):
+                if turn_tool_context.get("deployment_requirements_pending"):
+                    completion_instruction = (
+                        "The trusted Protocol Deploy survey phase is complete. Do not call "
+                        "more tools in this turn. Briefly report the surveyed channels and "
+                        "scene fingerprints from trusted durable state, then ask the operator "
+                        "for expected routine, visible alert conditions and severity, novelty "
+                        "response, optional counter/dwell metrics, and the consolidation quiet "
+                        "window. Preserve and list any existing groups exactly; do not ask the "
+                        "operator to recreate them. Use the exact trusted deployment_id; never "
+                        "invent one. Treat survey fingerprints as sparse samples and do not "
+                        "claim continuous coverage or absence of gaps."
+                    )
+                elif turn_tool_context.get("deployment_requirements_partial"):
+                    missing_ids = list(
+                        turn_tool_context.get(
+                            "deployment_missing_requirement_channel_ids"
+                        )
+                        or []
+                    )
+                    completion_instruction = (
+                        "Protocol Deploy saved a partial requirements draft and did NOT "
+                        "generate or apply a preview. State which channel requirements were "
+                        "saved, then ask only for the missing selected channel IDs: "
+                        + json.dumps(missing_ids)
+                        + ". Preserve existing groups and saved requirements. Do not claim "
+                        "coverage, readiness, preview completion, or live changes."
+                    )
+                elif turn_tool_context.get("deployment_preview_completed"):
+                    warnings = list(
+                        turn_tool_context.get("deployment_requirement_warnings")
+                        or []
+                    )
+                    warning_instruction = (
+                        " Report these draft warnings explicitly: "
+                        + json.dumps(warnings, ensure_ascii=False, default=str)
+                        + "."
+                        if warnings
+                        else ""
+                    )
+                    completion_instruction = (
+                        "The Protocol Deploy preview was generated but NOT applied. Do not "
+                        "say applied, active, commissioned, scheduled, fully aligned, no "
+                        "errors, full coverage, or no gaps. Report exact preview diff counts "
+                        "as channel policies, probes, counted states, and groups; then tell "
+                        "the operator that only the trusted UI Apply action can change live "
+                        "settings. Survey fingerprints are sparse samples, not coverage proof."
+                        + warning_instruction
+                    )
+                else:
+                    completion_instruction = (
+                        "The bounded server-owned workflow plan is complete. "
+                        "Do not call more tools in this turn. Synthesize the completed "
+                        "inventory and summary results now; state coverage and any "
+                        "unchecked scope."
+                    )
                 in_flight.append(
                     {
                         "role": "system",
-                        "content": (
-                            "The bounded server-owned workflow plan is complete. "
-                            "Do not call more tools in this turn. Synthesize the completed "
-                            "inventory and summary results now; state coverage and any "
-                            "unchecked scope."
-                        ),
+                        "content": completion_instruction,
                     }
                 )
                 yield _sse(
@@ -12041,7 +14722,16 @@ class AgentRunner:
                 lm_cancel_event = threading.Event()
                 lm_tool_kwargs = (
                     {"tool_choice": "required"}
-                    if force_tools and tool_calls_used == 0 and available_tool_schemas
+                    if (
+                        tool_calls_used == 0
+                        and available_tool_schemas
+                        and (
+                            force_tools
+                            or turn_tool_context.get(
+                                "deployment_requirements_supplied"
+                            )
+                        )
+                    )
                     else {}
                 )
                 try:
@@ -12272,22 +14962,44 @@ class AgentRunner:
                     _remember_turn_tool_result(tc.name, result, turn_tool_context)
                     _record_turn_signal_ledger(turn_signal_ledger, tc.name, result_for_model)
                     ui_result = _tool_result_for_ui(tc.name, result)
+                    ui_effects = (
+                        derive_agent_ui_effects(
+                            tc.name,
+                            tc.args,
+                            ui_result,
+                            seed=tc.id,
+                        )
+                        if drive_console
+                        else []
+                    )
                     yield _sse({
                         "type": "tool_result",
                         "call_id": tc.id,
                         "name": tc.name,
                         "result": ui_result,
-                        "ui_effects": derive_agent_ui_effects(
-                            tc.name,
-                            tc.args,
-                            ui_result,
-                            seed=tc.id,
-                        ),
+                        "ui_effects": ui_effects,
                     })
                     if research_event is not None:
                         yield _sse({"type": "research_state", **research_event})
                 except (ToolError, ToolGatewayError) as exc:
-                    error_payload = {"error": str(exc)}
+                    archive_failure = _remember_turn_tool_failure(
+                        tc.name,
+                        tc.args,
+                        str(exc),
+                        turn_tool_context,
+                    )
+                    _log_turn_tool_failure(
+                        session_id=session_id,
+                        request_id=(tool_context.request_id if tool_context is not None else None),
+                        call_id=tc.id,
+                        tool_name=tc.name,
+                        args=tc.args,
+                        error=exc,
+                        archive_failure=archive_failure,
+                    )
+                    error_payload = archive_failure or {"error": str(exc)}
+                    if archive_failure is not None:
+                        stop_tool_loop_after_batch = True
                     code = getattr(exc, "code", None)
                     if code:
                         error_payload["code"] = str(code)
@@ -12314,7 +15026,25 @@ class AgentRunner:
                         }
                     )
                 except Exception as exc:
-                    error_payload = {"error": f"Internal tool error: {exc}"}
+                    public_error = f"Internal tool error: {exc}"
+                    archive_failure = _remember_turn_tool_failure(
+                        tc.name,
+                        tc.args,
+                        public_error,
+                        turn_tool_context,
+                    )
+                    _log_turn_tool_failure(
+                        session_id=session_id,
+                        request_id=(tool_context.request_id if tool_context is not None else None),
+                        call_id=tc.id,
+                        tool_name=tc.name,
+                        args=tc.args,
+                        error=exc,
+                        archive_failure=archive_failure,
+                    )
+                    error_payload = archive_failure or {"error": public_error}
+                    if archive_failure is not None:
+                        stop_tool_loop_after_batch = True
                     result_msg = {"role": "tool", "tool_call_id": tc.id, "name": tc.name,
                                   "content": json.dumps(error_payload)}
                     _record_turn_signal_ledger(
@@ -12418,9 +15148,47 @@ class AgentRunner:
                 **final_compaction,
             })
 
-        full_text_parts: List[str] = []
+        deterministic_final_text: Optional[str]
+        if turn_tool_context.get("video_event_followup_missing_time"):
+            deterministic_final_text = _format_video_event_followup_clarification(
+                turn_tool_context,
+                turn_signal_ledger,
+            )
+        elif turn_tool_context.get("archive_vision_status") == "failed":
+            deterministic_final_text = _format_archive_research_fallback(
+                turn_signal_ledger,
+                tool_messages=in_flight,
+            )
+        elif turn_tool_context.get("deployment_maritime_roles_pending"):
+            deterministic_final_text = _format_deployment_maritime_roles_pending(
+                turn_tool_context
+            )
+        elif turn_tool_context.get("deployment_preview_completed"):
+            deterministic_final_text = _format_deployment_preview_receipt(
+                turn_tool_context
+            )
+        elif turn_tool_context.get("deployment_requirements_partial"):
+            deterministic_final_text = _format_deployment_partial_receipt(
+                turn_tool_context
+            )
+        elif (
+            turn_tool_context.get("deployment_requirements_pending")
+            and turn_tool_context.get("deployment_requirements_receipt")
+        ):
+            deterministic_final_text = _format_deployment_requirements_receipt(
+                turn_tool_context
+            )
+        elif turn_tool_context.get("deployment_inventory_receipt"):
+            deterministic_final_text = _format_deployment_inventory_receipt(
+                turn_tool_context
+            )
+        else:
+            deterministic_final_text = None
+        full_text_parts: List[str] = (
+            [deterministic_final_text] if deterministic_final_text else []
+        )
         final_transport_error: Optional[Exception] = None
-        for stream_attempt in range(2):
+        for stream_attempt in range(0 if deterministic_final_text else 2):
             stream_cancel_event = threading.Event()
             try:
                 for stream_kind, stream_value in _stream_items_with_heartbeats(
@@ -12472,10 +15240,16 @@ class AgentRunner:
                 })
 
         if final_transport_error is not None:
-            final_text = _format_completion_fallback(
-                turn_signal_ledger,
-                tool_messages=in_flight,
-            )
+            if turn_tool_context.get("archive_search_completed"):
+                final_text = _format_archive_research_fallback(
+                    turn_signal_ledger,
+                    tool_messages=in_flight,
+                )
+            else:
+                final_text = _format_completion_fallback(
+                    turn_signal_ledger,
+                    tool_messages=in_flight,
+                )
             yield _sse({
                 "type": "completion_recovery",
                 "message": (
@@ -12485,6 +15259,10 @@ class AgentRunner:
             })
         else:
             final_text = "".join(full_text_parts)
+        archive_recovery_needed = _archive_research_response_needs_recovery(
+            final_text,
+            turn_tool_context,
+        )
         if (
             _final_response_is_incomplete(final_text)
             or _video_research_response_needs_recovery(
@@ -12492,11 +15270,18 @@ class AgentRunner:
                 turn_tool_context,
                 turn_signal_ledger,
             )
+            or archive_recovery_needed
         ):
-            final_text = _format_completion_fallback(
-                turn_signal_ledger,
-                tool_messages=in_flight,
-            )
+            if turn_tool_context.get("archive_search_completed"):
+                final_text = _format_archive_research_fallback(
+                    turn_signal_ledger,
+                    tool_messages=in_flight,
+                )
+            else:
+                final_text = _format_completion_fallback(
+                    turn_signal_ledger,
+                    tool_messages=in_flight,
+                )
             yield _sse({
                 "type": "completion_recovery",
                 "message": "The local model returned an incomplete final response; using completed tool results.",
@@ -13945,6 +16730,148 @@ def _detection_timestamp_ms(row: Mapping[str, Any]) -> int:
     return 0
 
 
+def _archive_payload(row: Mapping[str, Any]) -> Mapping[str, Any]:
+    for key in ("payload", "payload_json"):
+        value = row.get(key)
+        if isinstance(value, Mapping):
+            return value
+    return {}
+
+
+def _archive_summary_text(row: Mapping[str, Any]) -> str:
+    direct = str(row.get("summary") or "").strip()
+    if direct:
+        return direct
+    return str(_archive_payload(row).get("summary") or "").strip()
+
+
+def _normalize_archive_lexical_text(value: Any) -> str:
+    return re.sub(
+        r"[^\w]+",
+        " ",
+        unicodedata.normalize("NFKC", str(value or "")).casefold(),
+        flags=re.UNICODE,
+    ).strip()
+
+
+def _annotate_archive_query_evidence(
+    row: Mapping[str, Any],
+    query: str,
+) -> Dict[str, Any]:
+    annotated = dict(row)
+    summary = _archive_summary_text(row)
+    if summary:
+        annotated["text_evidence_excerpt"] = re.sub(r"\s+", " ", summary).strip()[:500]
+    normalized_query = _normalize_archive_lexical_text(query)
+    normalized_summary = _normalize_archive_lexical_text(summary)
+    query_terms = [term for term in normalized_query.split() if len(term) >= 2]
+    exact_phrase = bool(
+        normalized_query
+        and normalized_summary
+        and normalized_query in normalized_summary
+    )
+    all_terms = bool(
+        query_terms
+        and normalized_summary
+        and all(term in normalized_summary.split() for term in query_terms)
+    )
+    annotated["lexical_match"] = bool(exact_phrase or all_terms)
+    annotated["lexical_match_kind"] = (
+        "exact_phrase"
+        if exact_phrase
+        else "all_query_terms"
+        if all_terms
+        else "none"
+    )
+    return annotated
+
+
+def _archive_candidate_visual_key(row: Mapping[str, Any]) -> Tuple[Any, ...]:
+    payload = _archive_payload(row)
+    provenance = payload.get("provenance") if isinstance(payload.get("provenance"), Mapping) else {}
+    frame_hash = str(
+        row.get("frame_hash")
+        or payload.get("frame_hash")
+        or provenance.get("selected_frame_hash")
+        or ""
+    ).strip()
+    channel_id = _opt_int(row.get("channel_id"))
+    if frame_hash:
+        return ("hash", channel_id, frame_hash)
+    timestamp_ms = _detection_timestamp_ms(row)
+    if timestamp_ms > 0:
+        return ("time", channel_id, timestamp_ms)
+    return ("id", _opt_int(row.get("detection_id") or row.get("id")))
+
+
+def _select_archive_vision_candidates(
+    rows: Sequence[Mapping[str, Any]],
+    *,
+    limit: int = AGENT_ARCHIVE_VISION_BATCH_SIZE,
+) -> List[Dict[str, Any]]:
+    bounded_limit = max(1, min(9, int(limit)))
+    source_priority = {
+        "vlm_summary": 4,
+        "vlm_alert": 3,
+        "semantic_snapshot": 2,
+        "probe": 1,
+    }
+    selected: List[Dict[str, Any]] = []
+    positions: Dict[Tuple[Any, ...], int] = {}
+    for raw in rows:
+        if not isinstance(raw, Mapping):
+            continue
+        detection_id = _opt_int(raw.get("detection_id") or raw.get("id"))
+        if detection_id is None or detection_id <= 0:
+            continue
+        candidate = dict(raw)
+        candidate["detection_id"] = int(detection_id)
+        key = _archive_candidate_visual_key(candidate)
+        prior_position = positions.get(key)
+        if prior_position is not None:
+            prior = selected[prior_position]
+            prior_priority = source_priority.get(str(prior.get("source") or ""), 0)
+            candidate_priority = source_priority.get(str(candidate.get("source") or ""), 0)
+            if candidate_priority > prior_priority:
+                selected[prior_position] = candidate
+            continue
+        if len(selected) >= bounded_limit:
+            continue
+        positions[key] = len(selected)
+        selected.append(candidate)
+    return selected
+
+
+def _archive_requested_time_window(
+    since_ms: Optional[int],
+    until_ms: Optional[int],
+) -> Dict[str, Any]:
+    from datetime import datetime, timezone
+    from zoneinfo import ZoneInfo
+
+    resolved_until_ms = int(until_ms if until_ms is not None else time.time() * 1000.0)
+    resolved_since_ms = int(since_ms if since_ms is not None else resolved_until_ms)
+    if resolved_since_ms > resolved_until_ms:
+        resolved_since_ms, resolved_until_ms = resolved_until_ms, resolved_since_ms
+    try:
+        local_tz = ZoneInfo(AGENT_SITE_TIMEZONE)
+    except Exception:
+        local_tz = timezone.utc
+
+    start_utc = datetime.fromtimestamp(resolved_since_ms / 1000.0, timezone.utc)
+    end_utc = datetime.fromtimestamp(resolved_until_ms / 1000.0, timezone.utc)
+    return {
+        "timezone": AGENT_SITE_TIMEZONE,
+        "since_ms": resolved_since_ms,
+        "until_ms": resolved_until_ms,
+        "from_utc": start_utc.isoformat(),
+        "to_utc": end_utc.isoformat(),
+        "from_local": start_utc.astimezone(local_tz).isoformat(),
+        "to_local": end_utc.astimezone(local_tz).isoformat(),
+        "duration_sec": max(0.0, (resolved_until_ms - resolved_since_ms) / 1000.0),
+    }
+
+
 def _archive_score_semantics(source: Any) -> str:
     source_text = str(source or "").strip().lower()
     logical_source = ARCHIVE_SOURCE_ALIASES.get(source_text, source_text)
@@ -15287,6 +18214,7 @@ def _tool_result_for_ui(tool_name: str, result: Any) -> Any:
             "get_incident",
             "draft_incident",
             "follow_incident",
+            "review_incident",
             "stop_incident_follow",
         }
         and isinstance(result, dict)
@@ -15371,10 +18299,15 @@ def _compact_search_result_for_model(r: Dict[str, Any]) -> Dict[str, Any]:
         "probe_name": r.get("probe_name"),
         "channel_id": r.get("channel_id"),
         "image_url": r.get("image_url"),
+        "text_evidence_excerpt": str(r.get("text_evidence_excerpt") or "")[:500] or None,
+        "lexical_match": bool(r.get("lexical_match")),
+        "lexical_match_kind": r.get("lexical_match_kind"),
+        "score_semantics": "semantic_retrieval_ranking_not_probability",
+        "needs_describe_frame": bool(r.get("image_url")),
     }
     if detection_id is not None:
         row["detection_id"] = detection_id
-    return row
+    return {key: value for key, value in row.items() if value is not None}
 
 
 def _compact_prompt_settings_for_model(result: Dict[str, Any]) -> Dict[str, Any]:
@@ -15601,6 +18534,10 @@ def _compact_incident_for_model(
         "incident_id": value.get("incident_id") or value.get("id"),
         "revision": value.get("revision"),
         "state": value.get("state"),
+        "perception_state": value.get("perception_state"),
+        "risk_state": value.get("risk_state"),
+        "case_state": value.get("case_state"),
+        "attention_state": value.get("attention_state"),
         "title": _compact_signal_value(value.get("title"), 240),
         "channel_ids": list(channels)[:8] if isinstance(channels, list) else [],
         "severity": value.get("severity"),
@@ -15658,6 +18595,71 @@ def _compact_incident_for_model(
     return {key: item for key, item in compact.items() if item not in (None, [], {})}
 
 
+def _compact_incident_temporal_for_model(value: Any) -> Dict[str, Any]:
+    if not isinstance(value, Mapping):
+        return {}
+    return {
+        "supported": bool(value.get("supported")),
+        "episode_total": int(value.get("episode_total") or 0),
+        "episodes": [
+            {
+                key: item.get(key)
+                for key in (
+                    "episode_key",
+                    "perception_state",
+                    "semantic_key",
+                    "possible_start_ms",
+                    "observed_start_ms",
+                    "observed_end_ms",
+                    "possible_end_ms",
+                    "scale_disposition",
+                    "operator_review_required",
+                )
+                if item.get(key) is not None
+            }
+            for item in list(value.get("episodes") or [])[:4]
+            if isinstance(item, Mapping)
+        ],
+        "series_links": [
+            {
+                key: item.get(key)
+                for key in (
+                    "relation_id",
+                    "relation_state",
+                    "confidence",
+                    "related_incident_id",
+                    "direction",
+                    "semantic_key",
+                    "gap_ms",
+                    "operator_review_required",
+                )
+                if item.get(key) is not None
+            }
+            for item in list(value.get("series_links") or [])[:4]
+            if isinstance(item, Mapping)
+        ],
+        "lifecycle_history": [
+            {
+                key: item.get(key)
+                for key in (
+                    "axis",
+                    "from_state",
+                    "to_state",
+                    "incident_revision",
+                    "transitioned_at_ms",
+                    "reason",
+                    "source_kind",
+                )
+                if item.get(key) is not None
+            }
+            for item in list(value.get("lifecycle_history") or [])[-8:]
+            if isinstance(item, Mapping)
+        ],
+        "correction_count": int(value.get("correction_count") or 0),
+        "transition_total": int(value.get("transition_total") or 0),
+    }
+
+
 def _compact_tool_result_for_model(tool_name: str, result: Any) -> Any:
     if not isinstance(result, dict):
         return result
@@ -15666,6 +18668,7 @@ def _compact_tool_result_for_model(tool_name: str, result: Any) -> Any:
         "get_incident",
         "draft_incident",
         "follow_incident",
+        "review_incident",
         "stop_incident_follow",
     }:
         compact = {
@@ -15674,6 +18677,8 @@ def _compact_tool_result_for_model(tool_name: str, result: Any) -> Any:
             "draft_digest": result.get("draft_digest"),
             "incident": _compact_incident_for_model(result.get("incident")),
             "proposed_follow": dict(result.get("proposed_follow") or {}),
+            "proposed_review": dict(result.get("proposed_review") or {}),
+            "temporal": _compact_incident_temporal_for_model(result.get("temporal")),
             "runtime_lease_removed": result.get("runtime_lease_removed"),
             "action_receipt": result.get("action_receipt"),
         }
@@ -15697,9 +18702,16 @@ def _compact_tool_result_for_model(tool_name: str, result: Any) -> Any:
             "version": result.get("version"),
             "stage": result.get("stage"),
             "next_action": result.get("next_action"),
+            "deployment_profile": result.get("deployment_profile") or "general",
+            "starter_policy_mode": result.get("starter_policy_mode") or "none",
+            "starter_policy_confirmed": bool(result.get("starter_policy_confirmed")),
             "target_channel_count": result.get("target_channel_count"),
             "selected_channel_ids": result.get("selected_channel_ids"),
+            "available_channel_ids": list(
+                result.get("available_channel_ids") or []
+            )[:100],
             "groups": list(result.get("groups") or [])[:8],
+            "channel_roles": list(result.get("channel_roles") or [])[:8],
             "available_channels": [
                 {
                     "id": row.get("id"),
@@ -15712,11 +18724,32 @@ def _compact_tool_result_for_model(tool_name: str, result: Any) -> Any:
             "survey_count": result.get("survey_count"),
             "surveyed_channel_ids": result.get("surveyed_channel_ids"),
             "requirement_pack_count": result.get("requirement_pack_count"),
+            "missing_requirement_channel_ids": list(
+                result.get("missing_requirement_channel_ids") or []
+            )[:8],
+            "requirement_warnings": list(
+                result.get("requirement_warnings") or []
+            )[:8],
             "quiet_window": result.get("quiet_window"),
+            "quiet_window_confirmed": bool(result.get("quiet_window_confirmed")),
             "plan_summary": result.get("plan_summary"),
             "commissioning": result.get("commissioning"),
             "instruction": result.get("instruction"),
         }
+        if tool_name == "configure_deployment" and result.get("surveys"):
+            compact_deployment["surveys"] = [
+                {
+                    "channel_id": row.get("channel_id"),
+                    "title": row.get("title"),
+                    "sample_count": row.get("sample_count"),
+                    "scene_fingerprint": str(
+                        row.get("scene_fingerprint") or ""
+                    )[:700],
+                    "error": row.get("error"),
+                }
+                for row in (result.get("surveys") or [])[:8]
+                if isinstance(row, Mapping)
+            ]
         if tool_name == "get_deployment_status":
             compact_deployment["commissioning_l1_reviews"] = [
                 {
@@ -15756,7 +18789,17 @@ def _compact_tool_result_for_model(tool_name: str, result: Any) -> Any:
             "deployment_id": result.get("deployment_id"),
             "stage": result.get("stage"),
             "next_action": result.get("next_action"),
+            "deployment_profile": result.get("deployment_profile") or "general",
+            "starter_policy_mode": result.get("starter_policy_mode") or "none",
+            "starter_policy_confirmed": bool(result.get("starter_policy_confirmed")),
+            "quiet_window": result.get("quiet_window"),
+            "quiet_window_confirmed": bool(result.get("quiet_window_confirmed")),
             "selected_channel_ids": result.get("selected_channel_ids"),
+            "groups": list(result.get("groups") or [])[:8],
+            "channel_roles": list(result.get("channel_roles") or [])[:8],
+            "missing_requirement_channel_ids": list(
+                result.get("missing_requirement_channel_ids") or []
+            )[:8],
             "survey_count": result.get("survey_count"),
             "surveys": [
                 {
@@ -15788,8 +18831,14 @@ def _compact_tool_result_for_model(tool_name: str, result: Any) -> Any:
         return _attach_action_plan_hint({
             "status": result.get("status"),
             "deployment_id": result.get("deployment_id"),
+            "plan_digest": result.get("plan_digest"),
             "stage": result.get("stage"),
             "diff": result.get("diff"),
+            "groups": list(result.get("groups") or [])[:8],
+            "proposed_probes": list(result.get("proposed_probes") or [])[:32],
+            "proposed_counted_states": list(
+                result.get("proposed_counted_states") or []
+            )[:32],
             "per_channel": [
                 {
                     "channel_id": row.get("channel_id"),
@@ -15899,13 +18948,27 @@ def _compact_tool_result_for_model(tool_name: str, result: Any) -> Any:
 
     if tool_name == "search_archive":
         rows = result.get("results") if isinstance(result.get("results"), list) else []
+        visible_rows = [
+            _compact_search_result_for_model(r)
+            for r in rows[:8]
+            if isinstance(r, dict)
+        ]
         return {
             "scope": result.get("scope"),
+            "query": result.get("query"),
             "source": result.get("source"),
             "source_label": result.get("source_label") or _archive_source_label(result.get("source")),
             "count": result.get("count"),
+            "match_semantics": result.get("match_semantics") or "ranked_candidates_not_binary_matches",
+            "time_window": result.get("time_window"),
+            "lexical_match_count_in_returned": result.get("lexical_match_count_in_returned"),
+            "vision_candidate_ids": list(result.get("vision_candidate_ids") or [])[:9],
+            "vision_candidate_count": result.get("vision_candidate_count"),
+            "vision_verification_required": bool(result.get("vision_verification_required")),
+            "results_returned_to_model": len(visible_rows),
+            "results_omitted_from_model": max(0, len(rows) - len(visible_rows)),
             "coverage": result.get("coverage"),
-            "results": [_compact_search_result_for_model(r) for r in rows[:8] if isinstance(r, dict)],
+            "results": visible_rows,
         }
 
     if tool_name == "build_research_batch":
@@ -16689,6 +19752,41 @@ def _compact_tool_result_for_model(tool_name: str, result: Any) -> Any:
         }, result)
 
     if tool_name == "describe_frame":
+        if result.get("source") == "archive_candidate_batch":
+            verdicts = result.get("verdicts") if isinstance(result.get("verdicts"), list) else []
+            return {
+                "source": "archive_candidate_batch",
+                "query": result.get("query"),
+                "vision_checked": bool(result.get("vision_checked")),
+                "parse_status": result.get("parse_status"),
+                "validation_errors": list(result.get("validation_errors") or [])[:16],
+                "quality_flags": list(result.get("quality_flags") or [])[:16],
+                "requested_count": result.get("requested_count"),
+                "candidate_count": result.get("candidate_count"),
+                "missing_detection_ids": list(result.get("missing_detection_ids") or [])[:9],
+                "match_count": result.get("match_count"),
+                "no_match_count": result.get("no_match_count"),
+                "uncertain_count": result.get("uncertain_count"),
+                "matched_detection_ids": list(result.get("matched_detection_ids") or [])[:9],
+                "no_match_detection_ids": list(result.get("no_match_detection_ids") or [])[:9],
+                "uncertain_detection_ids": list(result.get("uncertain_detection_ids") or [])[:9],
+                "verdicts": [
+                    {
+                        "snapshot_index": row.get("snapshot_index"),
+                        "detection_id": row.get("detection_id"),
+                        "channel_id": row.get("channel_id"),
+                        "timestamp_ms": row.get("timestamp_ms"),
+                        "source": row.get("source"),
+                        "image_url": row.get("image_url"),
+                        "verdict": row.get("verdict"),
+                        "visible_evidence": str(row.get("visible_evidence") or "")[:320],
+                    }
+                    for row in verdicts[:9]
+                    if isinstance(row, Mapping)
+                ],
+                "description": str(result.get("description") or "")[:1_500],
+                "note": result.get("note"),
+            }
         return {
             "description": result.get("description"),
             "source": result.get("source"),

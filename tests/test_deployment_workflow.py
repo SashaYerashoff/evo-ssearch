@@ -7,6 +7,7 @@ from deployment_workflow import (
     DeploymentWorkflowError,
     ProtocolDeploymentStore,
     aggregate_counted_state_metric,
+    compact_deployment_state,
 )
 
 
@@ -78,8 +79,16 @@ class _GroupStore:
 class _Manager:
     def __init__(self):
         self.prompts = {
-            11: {"alert_policy_prompt": "KEEP EXISTING POLICY"},
-            12: {"alert_policy_prompt": ""},
+            11: {
+                "alert_policy_prompt": "KEEP EXISTING POLICY",
+                "stream_system_prompt": "KEEP STREAM CORE",
+                "rollup_prompts": {"L1": "", "L2": "", "L3": ""},
+            },
+            12: {
+                "alert_policy_prompt": "",
+                "stream_system_prompt": "",
+                "rollup_prompts": {"L1": "", "L2": "", "L3": ""},
+            },
         }
         self.sessions = {}
         self.schedule = None
@@ -93,8 +102,19 @@ class _Manager:
     def get_prompt_settings(self, channel_id=None):
         return {"current": copy.deepcopy(self.prompts[int(channel_id)])}
 
-    def update_prompt_settings(self, channel_id=None, alert_policy_prompt=None):
-        self.prompts[int(channel_id)]["alert_policy_prompt"] = alert_policy_prompt
+    def update_prompt_settings(
+        self,
+        channel_id=None,
+        alert_policy_prompt=None,
+        stream_system_prompt=None,
+        rollup_prompts=None,
+    ):
+        channel = self.prompts[int(channel_id)]
+        channel["alert_policy_prompt"] = alert_policy_prompt
+        if stream_system_prompt is not None:
+            channel["stream_system_prompt"] = stream_system_prompt
+        if rollup_prompts is not None:
+            channel["rollup_prompts"] = copy.deepcopy(dict(rollup_prompts))
         return {"status": "updated"}
 
     def start_session(self, channel_id):
@@ -209,12 +229,29 @@ def test_protocol_deploy_builds_bounded_durable_plan():
             "days": [0, 1, 2, 3, 4, 5, 6],
         },
     )
-    planned = store.build_plan(deployment_id)
+    embedding_space = {
+        "backend": "siglip2",
+        "model": "google/siglip2-base-patch16-224",
+        "revision": "test-revision",
+    }
+    planned = store.build_plan(
+        deployment_id,
+        probe_pos_floor=0.05,
+        probe_margin=0.02,
+        probe_embedding_space=embedding_space,
+    )
     plan = planned["plan"]
 
     assert planned["stage"] == "plan_ready"
     assert len(plan["channels"]) == 2
+    assert plan["groups"] == [
+        {"name": "Perimeter", "channel_ids": [11]},
+        {"name": "Operations", "channel_ids": [12]},
+    ]
     assert len(plan["probes"]) == 1
+    assert plan["probes"][0]["pos_floor"] == 0.05
+    assert plan["probes"][0]["margin"] == 0.02
+    assert plan["probes"][0]["embedding_space"] == embedding_space
     assert len(plan["counted_states"]) == 1
     assert plan["probes"][0]["metric_profile_id"] == plan["counted_states"][0]["id"]
     assert "operator" not in plan["channels"][1]["alert_policy_prompt"].lower()
@@ -258,6 +295,369 @@ def test_protocol_deploy_rejects_more_than_eight_channels_and_bad_duration_state
                 }
             ],
         )
+
+
+def test_protocol_deploy_target_is_a_cap_and_mismatched_draft_is_not_resumed():
+    runtime = _RuntimeState()
+    store = ProtocolDeploymentStore(runtime)
+    two = store.start(
+        [{"id": index, "title": str(index)} for index in range(1, 6)],
+        target_channel_count=2,
+        resume_latest=False,
+    )
+    store.configure(two["deployment_id"], channel_ids=[1])
+
+    four = store.start(
+        [{"id": index, "title": str(index)} for index in range(1, 6)],
+        target_channel_count=4,
+        resume_latest=True,
+    )
+    assert four["deployment_id"] != two["deployment_id"]
+    assert four["target_channel_count"] == 4
+
+    configured = store.configure(four["deployment_id"], channel_ids=[1, 2])
+    assert configured["selected_channel_ids"] == [1, 2]
+    with pytest.raises(DeploymentWorkflowError, match="at most 4"):
+        store.configure(four["deployment_id"], channel_ids=[1, 2, 3, 4, 5])
+
+
+def test_protocol_deploy_compact_receipt_keeps_full_inventory_ids_for_ui_resume():
+    store = ProtocolDeploymentStore()
+    state = store.start(
+        [
+            {"id": channel_id, "title": f"Camera {channel_id}"}
+            for channel_id in range(1, 54)
+        ],
+        target_channel_count=8,
+        resume_latest=False,
+    )
+
+    compact = compact_deployment_state(state)
+
+    assert compact["available_channel_ids"] == list(range(1, 54))
+    assert len(compact["available_channels"]) == 16
+
+
+def test_maritime_operator_journey_keeps_scope_partial_review_and_apply_bounded():
+    store = ProtocolDeploymentStore()
+    state = store.start(
+        [
+            {"id": channel_id, "title": f"Coast camera {channel_id}"}
+            for channel_id in range(1, 54)
+        ],
+        target_channel_count=8,
+        deployment_profile="maritime",
+        resume_latest=False,
+    )
+    deployment_id = state["deployment_id"]
+    scoped = store.configure(
+        deployment_id,
+        channel_ids=[2, 7, 19, 41],
+        groups=[
+            {"name": "port_gates", "channel_ids": [2, 7]},
+            {"name": "coastline", "channel_ids": [19, 41]},
+        ],
+        channel_roles=[
+            {"channel_id": 2, "role": "maritime_gate", "location": "North gate"},
+            {"channel_id": 7, "role": "maritime_gate", "location": "South gate"},
+            {"channel_id": 19, "role": "maritime_coast", "location": "West beach"},
+            {"channel_id": 41, "role": "maritime_mixed_ptz", "location": "Harbour tour"},
+        ],
+    )
+    assert scoped["stage"] == "scope_configured"
+    assert len(scoped["selected_channel_ids"]) == 4
+
+    surveyed = store.record_survey(
+        deployment_id,
+        {
+            "channels": [
+                {
+                    "channel_id": channel_id,
+                    "title": f"Coast camera {channel_id}",
+                    "sample_count": 4,
+                    "survey": "VIEW: sampled maritime view; CAMERA: steady",
+                }
+                for channel_id in [2, 7, 19, 41]
+            ]
+        },
+    )
+    assert surveyed["stage"] == "surveyed"
+
+    partial = store.configure(
+        deployment_id,
+        quiet_window={
+            "enabled": True,
+            "timezone": "Europe/Riga",
+            "start_local": "01:00",
+            "end_local": "05:00",
+            "days": [0, 1, 2, 3, 4, 5, 6],
+        },
+        requirements=[
+            {
+                "name": "Port gates",
+                "channel_ids": [2, 7],
+                "expected_routine": "ordinary separated vessel passage",
+                "alerts": [
+                    {
+                        "name": "Converging vessel paths",
+                        "description": "two visible vessels converge in the gate",
+                        "severity": "high",
+                        "positive_query": "two vessels on visibly converging paths",
+                        "contrast_query": "vessels passing on separated parallel paths",
+                    }
+                ],
+            }
+        ],
+    )
+    assert partial["stage"] == "requirements_partial"
+    assert partial["quiet_window_confirmed"] is True
+    assert compact_deployment_state(partial)["missing_requirement_channel_ids"] == [19, 41]
+
+    complete = store.configure(
+        deployment_id,
+        requirements=[
+            {
+                "name": "Coastline",
+                "channel_ids": [19, 41],
+                "expected_routine": "ordinary coastline and PTZ patrol views",
+                "alerts": [],
+            }
+        ],
+    )
+    assert complete["stage"] == "requirements_configured"
+
+    preview = store.build_plan(deployment_id)
+    assert preview["stage"] == "plan_ready"
+    assert len(preview["plan"]["channels"]) == 4
+    assert len(preview["plan"]["groups"]) == 2
+    assert len(preview["plan"]["probes"]) == 2
+    applied = store.mark_applied(deployment_id, receipt={"status": "applied"})
+    assert applied["stage"] == "commissioning_pending"
+
+
+def test_protocol_deploy_drops_overlapping_duplicate_requirement_pack():
+    store = ProtocolDeploymentStore()
+    deployment_id = _configured_state(store)
+    configured = store.configure(
+        deployment_id,
+        requirements=[
+            {
+                "name": "Operations",
+                "channel_ids": [12],
+                "alerts": [
+                    {
+                        "name": "Occupancy",
+                        "description": "Visible workstation occupancy",
+                        "severity": "log",
+                        "positive_query": "person at workstation",
+                        "contrast_query": "empty workstation",
+                        "counter_mode": "count_transitions",
+                        "duration_state": "positive",
+                    }
+                ],
+            },
+            {
+                "name": "quiet_window",
+                "channel_ids": [11, 12],
+                "alerts": [
+                    {
+                        "name": "Occupancy",
+                        "description": "Visible workstation occupancy",
+                        "severity": "log",
+                        "positive_query": "person at workstation",
+                        "contrast_query": "empty workstation",
+                        "counter_mode": "count_transitions",
+                        "duration_state": "positive",
+                    }
+                ],
+            },
+        ],
+    )
+
+    assert len(configured["requirements"]) == 1
+    assert configured["requirements"][0]["alerts"][0]["counter_mode"] == "count_and_duration"
+    assert configured["requirement_warnings"]
+    assert "quiet window is a separate field" in configured["requirement_warnings"][0]
+
+
+def test_protocol_deploy_merges_partial_channel_requirements_before_preview():
+    store = ProtocolDeploymentStore()
+    deployment_id = _configured_state(store)
+    partial = store.configure(
+        deployment_id,
+        requirements=[
+            {"name": "Gate", "channel_ids": [11], "alerts": []}
+        ],
+    )
+    compact_partial = compact_deployment_state(partial)
+    assert partial["stage"] == "requirements_partial"
+    assert compact_partial["missing_requirement_channel_ids"] == [12]
+    with pytest.raises(DeploymentWorkflowError, match="every selected channel"):
+        store.build_plan(deployment_id)
+
+    complete = store.configure(
+        deployment_id,
+        requirements=[
+            {"name": "Desk", "channel_ids": [12], "alerts": []}
+        ],
+    )
+    assert complete["stage"] == "requirements_configured"
+    assert [pack["channel_ids"] for pack in complete["requirements"]] == [
+        [11],
+        [12],
+    ]
+    assert complete["groups"] == [
+        {"name": "Perimeter", "channel_ids": [11]},
+        {"name": "Operations", "channel_ids": [12]},
+    ]
+
+    corrected = store.configure(
+        deployment_id,
+        requirements=[
+            {
+                "name": "Gate",
+                "channel_ids": [11],
+                "alerts": [
+                    {
+                        "name": "Gate occupied",
+                        "description": "person at gate",
+                        "severity": "low",
+                        "positive_query": "person at gate",
+                        "contrast_query": "clear gate",
+                    },
+                    {
+                        "name": "Gate blocked",
+                        "description": "vehicle blocking gate",
+                        "severity": "high",
+                        "positive_query": "vehicle blocking gate",
+                        "contrast_query": "clear vehicle lane",
+                    },
+                ],
+            }
+        ],
+    )
+    gate_pack = next(
+        pack for pack in corrected["requirements"] if pack["channel_ids"] == [11]
+    )
+    assert [alert["name"] for alert in gate_pack["alerts"]] == [
+        "Gate occupied",
+        "Gate blocked",
+    ]
+    assert any(pack["channel_ids"] == [12] for pack in corrected["requirements"])
+    assert corrected["stage"] == "requirements_configured"
+
+
+def test_maritime_deploy_builds_ptz_prompts_and_shadow_starter_probes():
+    store = ProtocolDeploymentStore()
+    state = store.start(
+        [
+            {"id": 41, "title": "Sea gate"},
+            {"id": 42, "title": "West beach"},
+        ],
+        deployment_profile="maritime",
+        resume_latest=False,
+    )
+    deployment_id = state["deployment_id"]
+    configured = store.configure(
+        deployment_id,
+        channel_ids=[41, 42],
+        channel_roles=[
+            {
+                "channel_id": 41,
+                "role": "maritime_gate",
+                "location": "Liepaja north gate",
+            },
+            {"channel_id": 42, "role": "maritime_coast"},
+        ],
+        starter_policy_mode="shadow",
+        quiet_window={
+            "enabled": True,
+            "timezone": "Europe/Riga",
+            "start_local": "01:00",
+            "end_local": "04:00",
+            "days": [0, 1, 2, 3, 4, 5, 6],
+        },
+    )
+
+    planned = store.build_plan(deployment_id)
+    plan = planned["plan"]
+
+    assert configured["deployment_profile"] == "maritime"
+    assert plan["deployment_profile"] == "maritime"
+    assert len(plan["channels"]) == 2
+    assert len(plan["probes"]) == 8
+    assert all(probe["attention_only"] for probe in plan["probes"])
+    gate = next(row for row in plan["channels"] if row["channel_id"] == 41)
+    assert gate["channel_role"] == "maritime_gate"
+    assert "Camera-global motion is not vessel motion" in gate["stream_system_prompt"]
+    assert "Liepaja north gate" in gate["stream_system_prompt"]
+    assert "not observed" in gate["rollup_prompts"]["L3"]
+    assert plan["quiet_window"]["timezone"] == "Europe/Riga"
+
+
+def test_maritime_deploy_requires_a_role_for_every_selected_channel():
+    store = ProtocolDeploymentStore()
+    state = store.start(
+        [{"id": 41, "title": "Sea gate"}, {"id": 42, "title": "Beach"}],
+        deployment_profile="maritime",
+        resume_latest=False,
+    )
+    store.configure(
+        state["deployment_id"],
+        channel_ids=[41, 42],
+        channel_roles=[{"channel_id": 41, "role": "maritime_gate"}],
+        starter_policy_mode="shadow",
+    )
+
+    with pytest.raises(DeploymentWorkflowError, match="assign a maritime role"):
+        store.build_plan(state["deployment_id"])
+
+
+def test_maritime_composite_apply_installs_prompt_layers_and_shadow_probes(monkeypatch):
+    store = ProtocolDeploymentStore()
+    state = store.start(
+        [{"id": 11, "title": "Sea gate"}],
+        deployment_profile="maritime",
+        resume_latest=False,
+    )
+    deployment_id = state["deployment_id"]
+    store.configure(
+        deployment_id,
+        channel_ids=[11],
+        channel_roles=[{
+            "channel_id": 11,
+            "role": "maritime_gate",
+            "location": "West coast gate",
+        }],
+        starter_policy_mode="shadow",
+    )
+    manager = _Manager()
+    probes = _ProbeStore()
+    tools = AgentTools(
+        detections_store=_DetectionStore(),
+        probes_store=probes,
+        luxriot_manager=manager,
+        embed_text_fn=lambda _text: None,
+        embed_image_fn=lambda _image: None,
+        call_lm_fn=lambda *_args, **_kwargs: "",
+        encode_jpeg_fn=lambda *_args, **_kwargs: "",
+        search_indexed_folder_fn=lambda **_kwargs: [],
+        search_detections_fn=lambda **_kwargs: [],
+        deployment_store=store,
+    )
+    monkeypatch.setattr(tools, "_schedule_deployment_commissioning", lambda _deployment_id: None)
+
+    applied = tools.execute(
+        "apply_deployment_plan",
+        {"deployment_id": deployment_id, "preview": False},
+    )
+
+    assert applied["status"] == "applied"
+    assert "KEEP STREAM CORE" in manager.prompts[11]["stream_system_prompt"]
+    assert "visual aggregation core" in manager.prompts[11]["stream_system_prompt"]
+    assert "eight-hour maritime consolidation" in manager.prompts[11]["rollup_prompts"]["L3"]
+    assert len(probes.rows) == 4
+    assert all(probe["attention_only"] for probe in probes.rows)
 
 
 def test_counted_metric_keeps_alert_delivery_and_unknown_time_out_of_count():
@@ -304,8 +704,8 @@ def test_composite_apply_is_idempotent_and_preserves_existing_alert_policy(monke
     deployment_store.configure(
         deployment_id,
         requirements=[
-            {
-                "name": "Gate",
+                {
+                    "name": "Gate",
                 "channel_ids": [11],
                 "unexpected_severity": "normal",
                 "novelty_sensitivity": "balanced",
@@ -317,9 +717,15 @@ def test_composite_apply_is_idempotent_and_preserves_existing_alert_policy(monke
                         "positive_query": "person waiting at gate",
                         "contrast_query": "clear unattended gate",
                         "counter_mode": "count_transitions",
-                    }
-                ],
-            }
+                        }
+                    ],
+                },
+                {
+                    "name": "Workstation baseline",
+                    "channel_ids": [12],
+                    "expected_routine": "ordinary workstation activity",
+                    "alerts": [],
+                },
         ],
         quiet_window={
             "enabled": True,
@@ -394,8 +800,8 @@ def test_first_commissioning_pass_runs_l1_and_returns_proposals_only(monkeypatch
     deployment_store.configure(
         deployment_id,
         requirements=[
-            {
-                "name": "Gate",
+                {
+                    "name": "Gate",
                 "channel_ids": [11],
                 "alerts": [
                     {
@@ -404,9 +810,15 @@ def test_first_commissioning_pass_runs_l1_and_returns_proposals_only(monkeypatch
                         "severity": "low",
                         "positive_query": "person waiting at gate",
                         "contrast_query": "clear unattended gate",
-                    }
-                ],
-            }
+                        }
+                    ],
+                },
+                {
+                    "name": "Workstation baseline",
+                    "channel_ids": [12],
+                    "expected_routine": "ordinary workstation activity",
+                    "alerts": [],
+                },
         ],
     )
     deployment_store.build_plan(deployment_id)

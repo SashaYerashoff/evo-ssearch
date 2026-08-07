@@ -7,7 +7,7 @@ from types import SimpleNamespace
 from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
 from unittest.mock import patch
 
-from luxriot_connector import LuxriotManager
+from luxriot_connector import DEFAULT_ALERTS_JSON_PROMPT, LuxriotManager
 
 
 def build_manager(directory: Path, alert_parser=None) -> LuxriotManager:
@@ -735,6 +735,23 @@ class VlmAlertPromptContractTests(unittest.TestCase):
                 normalized,
             )
 
+    def test_persisted_v1_contract_is_upgraded_without_alert_policy_migration(self):
+        with tempfile.TemporaryDirectory() as temp:
+            manager = build_manager(Path(temp))
+            old_contract = (
+                "Machine-readable current-batch state for EVA memory, navigation, "
+                "and alert actions:\nBATCH_STATE_JSON:\n"
+                '{"version": 1, "events": [], "observed_states": [], '
+                '"routines": [], "memory_pass": [], "alerts": []}'
+            )
+
+            normalized = manager._normalize_json_alert_prompt(old_contract)
+
+            self.assertEqual(normalized, DEFAULT_ALERTS_JSON_PROMPT)
+            self.assertIn('"version": 2', normalized)
+            self.assertIn("state=returned", normalized)
+            self.assertIn('"applies_to_event_keys": []', normalized)
+
     def test_legacy_stream_alert_prompt_returns_migration_suggestion(self):
         with tempfile.TemporaryDirectory() as temp:
             manager = build_manager(Path(temp))
@@ -947,6 +964,21 @@ class VlmAlertPromptContractTests(unittest.TestCase):
                 diagnostics["alert_events"][0]["id"],
                 result.alert_events[0]["id"],
             )
+
+    def test_alert_parser_uses_first_evidence_snapshot_unless_anchor_is_explicit(self):
+        parser = load_lm_alert_parser()
+        summary = (
+            "BATCH_STATE_JSON:\n"
+            '{"version":1,"cover":{"snapshot_index":3},"events":[],'
+            '"observed_states":[],"routines":[],"memory_pass":[],'
+            '"alerts":[{"title":"Vessel convergence","severity":"high",'
+            '"snapshot_indices":[2,3]}]}'
+        )
+
+        parsed = parser(summary, 7, 1_781_700_060_000)
+
+        self.assertEqual(parsed[0]["snapshot_indices"], [2, 3])
+        self.assertEqual(parsed[0]["anchor_snapshot"], 2)
 
 
 if __name__ == "__main__":

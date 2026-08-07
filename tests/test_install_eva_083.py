@@ -129,7 +129,7 @@ class OfflineInstallerUnitTests(unittest.TestCase):
             installer.EXPECTED_VERSION,
             (ROOT / "VERSION").read_text(encoding="utf-8").strip(),
         )
-        self.assertEqual(installer.EXPECTED_SCHEMA, "20260801_0011")
+        self.assertEqual(installer.EXPECTED_SCHEMA, "20260805_0013")
 
     def test_discovers_existing_app_dotenv_before_source_and_preserves_target(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -229,9 +229,17 @@ class OfflineInstallerUnitTests(unittest.TestCase):
         rendered = installer.render_env_update(raw, updates)
 
         self.assertEqual(missing, [])
-        self.assertEqual(updates, {"EVOSSEARCH_APP_VERSION": installer.EXPECTED_VERSION})
+        self.assertEqual(
+            updates,
+            {
+                "EVOSSEARCH_APP_VERSION": installer.EXPECTED_VERSION,
+                "EVOSSEARCH_UI_MODE": "react",
+            },
+        )
         self.assertEqual(values["EVOSSEARCH_APP_VERSION"], installer.EXPECTED_VERSION)
+        self.assertEqual(values["EVOSSEARCH_UI_MODE"], "react")
         self.assertIn(f"EVOSSEARCH_APP_VERSION='{installer.EXPECTED_VERSION}'", rendered)
+        self.assertIn("EVOSSEARCH_UI_MODE='react'", rendered)
         self.assertIn('EVOSSEARCH_HOST="10.20.30.40"', rendered)
 
     def test_noninteractive_configuration_accepts_environment_without_echoing_secrets(self):
@@ -265,6 +273,8 @@ class OfflineInstallerUnitTests(unittest.TestCase):
 
     def test_env_dsn_references_are_resolved_in_memory_but_raw_file_is_preserved(self):
         existing = dict(COMPLETE_ENV)
+        existing["EVOSSEARCH_APP_VERSION"] = installer.EXPECTED_VERSION
+        existing["EVOSSEARCH_UI_MODE"] = "react"
         existing["EVA_API_PASSWORD"] = "expanded-password"
         existing["EVA_DATABASE_DSN"] = "postgresql://api:${EVA_API_PASSWORD}@db.internal/eva"
         raw = env_text(existing, prefix="# keep comments")
@@ -409,6 +419,26 @@ class OfflineInstallerUnitTests(unittest.TestCase):
         self.assertNotIn("EVA_MIGRATION_DATABASE_DSN", values)
         self.assertEqual(updates, {})
 
+    def test_interactive_migration_dsn_is_process_only_and_not_persisted(self):
+        values = {"EVA_DATABASE_DSN": COMPLETE_ENV["EVA_DATABASE_DSN"]}
+        updates = {}
+        privileged = "postgresql://migrator:INTERACTIVE-SECRET@db.internal/eva"
+
+        with patch.object(installer.getpass, "getpass", return_value=privileged):
+            migration_dsn, source, error = installer.prepare_migration_dsn(
+                values,
+                updates,
+                environ={},
+                migrate=True,
+                non_interactive=False,
+            )
+
+        self.assertEqual(migration_dsn, privileged)
+        self.assertEqual(source, "interactive process-only value")
+        self.assertIsNone(error)
+        self.assertNotIn("EVA_MIGRATION_DATABASE_DSN", values)
+        self.assertEqual(updates, {})
+
     def test_migration_dsn_equal_to_runtime_is_rejected(self):
         runtime = COMPLETE_ENV["EVA_DATABASE_DSN"]
         values = {"EVA_DATABASE_DSN": runtime}
@@ -445,6 +475,58 @@ class OfflineInstallerUnitTests(unittest.TestCase):
 
             mutate_host.assert_not_called()
             self.assertFalse((root / "backups").exists())
+
+    def test_apply_proves_revision_table_privileges_before_any_mutation(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = make_source(root)
+            env_file = root / "eva-ai.env"
+            env_file.write_text(env_text(), encoding="utf-8")
+            options = make_options(root, source, env_file=env_file, migrate=True)
+            options.dry_run = False
+            prepared = installer.prepare_install(
+                options,
+                environ={
+                    "EVA_INSTALL_MIGRATION_DSN": (
+                        "postgresql://migrator:MIGRATION-SECRET@db.internal/eva"
+                    )
+                },
+            )
+
+            with (
+                patch.object(installer.os, "geteuid", return_value=0),
+                patch.object(
+                    installer,
+                    "_verify_migration_capability",
+                    side_effect=installer.InstallerError("revision privilege denied"),
+                ) as verify_db,
+                patch.object(installer, "_ensure_service_account") as mutate_host,
+            ):
+                with self.assertRaisesRegex(installer.InstallerError, "revision privilege denied"):
+                    installer.apply_install(prepared)
+
+            verify_db.assert_called_once()
+            mutate_host.assert_not_called()
+            self.assertFalse((root / "backups").exists())
+
+    def test_migration_capability_check_rolls_back_noop_revision_update(self):
+        runner = type("Runner", (), {"commands": []})()
+
+        def run(command, **_kwargs):
+            runner.commands.append([str(item) for item in command])
+            return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
+
+        runner.run = run
+        installer._verify_migration_capability(
+            runner,
+            "postgresql://migrator:secret@db.internal/eva",
+        )
+
+        command = runner.commands[0]
+        sql = command[command.index("--command") + 1]
+        self.assertIn("SELECT version_num FROM public.alembic_version", sql)
+        self.assertIn("UPDATE public.alembic_version SET version_num = version_num", sql)
+        self.assertIn("ROLLBACK", sql)
 
     def test_apply_staging_failure_restores_preexisting_env_without_backup_snapshot(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -526,6 +608,84 @@ class OfflineInstallerUnitTests(unittest.TestCase):
                 failures,
             )
             self.assertNotIn("changeme", stdout.getvalue().lower())
+
+    def test_explicit_live_evo_check_can_accept_heuristic_matched_password(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = make_source(root)
+            site_env = dict(COMPLETE_ENV)
+            site_env["EVOSSEARCH_LUXRIOT_PASSWORD"] = "changeme"
+            env_file = root / "eva-ai.env"
+            env_file.write_text(env_text(site_env), encoding="utf-8")
+            options = make_options(root, source, env_file=env_file, migrate=False)
+            options.verify_luxriot_credential = True
+
+            with patch.object(
+                installer,
+                "_verify_luxriot_credential",
+                return_value=(True, "http_200"),
+            ) as verify:
+                prepared = installer.prepare_install(options, environ={})
+
+            failures = [finding.message for finding in prepared.findings if finding.level == "FAIL"]
+            warnings = [finding.message for finding in prepared.findings if finding.level == "WARN"]
+            self.assertFalse(any("LUXRIOT_PASSWORD" in message for message in failures))
+            self.assertTrue(any("authenticated read-only Evo" in message for message in warnings))
+            verify.assert_called_once()
+
+    def test_failed_live_evo_check_keeps_placeholder_gate_closed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = make_source(root)
+            site_env = dict(COMPLETE_ENV)
+            site_env["EVOSSEARCH_LUXRIOT_PASSWORD"] = "changeme"
+            env_file = root / "eva-ai.env"
+            env_file.write_text(env_text(site_env), encoding="utf-8")
+            options = make_options(root, source, env_file=env_file, migrate=False)
+            options.verify_luxriot_credential = True
+
+            with patch.object(
+                installer,
+                "_verify_luxriot_credential",
+                return_value=(False, "HTTPError"),
+            ):
+                prepared = installer.prepare_install(options, environ={})
+
+            failures = [finding.message for finding in prepared.findings if finding.level == "FAIL"]
+            self.assertTrue(any("authenticated Evo check failed" in message for message in failures))
+            self.assertFalse(any("changeme" in message.lower() for message in failures))
+
+    def test_automatic_rollback_restores_database_and_previous_service_state(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = make_source(root)
+            env_file = root / "eva-ai.env"
+            env_file.write_text(env_text(), encoding="utf-8")
+            options = make_options(root, source, env_file=env_file, migrate=True)
+            prepared = installer.prepare_install(
+                options,
+                environ={
+                    "EVA_INSTALL_MIGRATION_DSN": (
+                        "postgresql://migrator:MIGRATION-SECRET@db.internal/eva"
+                    )
+                },
+            )
+            calls = []
+
+            class Runner:
+                def run(self, command, *, env=None, cwd=None):
+                    calls.append(([str(item) for item in command], dict(env or {})))
+                    return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
+
+            backup = root / "backups/patch-1"
+            backup.mkdir(parents=True)
+            self.assertTrue(installer._automatic_rollback(prepared, Runner(), backup))
+
+            command, environment = calls[0]
+            self.assertIn("--restore-db", command)
+            self.assertNotIn("--no-start", command)
+            self.assertEqual(environment["EVA_PATCH_CONFIRM_DB_RESTORE"], "yes")
+            self.assertEqual(environment["EVA_PATCH_PG_DSN"], prepared.migration_dsn)
 
     def test_verified_code_only_adopt_warns_but_does_not_block_existing_placeholder(self):
         with tempfile.TemporaryDirectory() as tmp:

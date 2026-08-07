@@ -101,6 +101,7 @@ from incident_service import (
     incident_report_xml,
 )
 from incident_commands import IncidentCommandService
+from incident_maintenance import IncidentMaintenanceWorker
 from incident_store import (
     IncidentRevisionConflict,
     IncidentStoreNotReady,
@@ -263,6 +264,8 @@ _audit_db_pool: Optional[PsycopgPool] = None
 _audit_db_pool_lock = Lock()
 _control_plane_db_pool: Optional[PsycopgPool] = None
 _control_plane_db_lock = Lock()
+_archive_db_pool: Optional[PsycopgPool] = None
+_archive_db_pool_lock = Lock()
 _inference_worker_db_pool: Optional[PsycopgPool] = None
 _inference_worker_db_lock = Lock()
 _inference_queue_runtime: Optional[LuxriotInferenceQueueRuntime] = None
@@ -343,6 +346,8 @@ _MUTATION_ENDPOINT_PERMISSIONS: Dict[str, Optional[Permission]] = {
     "incident_draft": Permission.INCIDENTS_MANAGE,
     "incident_follow": Permission.INCIDENTS_MANAGE,
     "incident_stop_follow": Permission.INCIDENTS_MANAGE,
+    "incident_review": Permission.INCIDENTS_MANAGE,
+    "incident_series_review": Permission.INCIDENTS_MANAGE,
     "save_settings": Permission.SETTINGS_MANAGE,
     "save_settings_env": Permission.SETTINGS_MANAGE,
 }
@@ -371,7 +376,10 @@ _SENSITIVE_ENDPOINT_PERMISSIONS: Dict[str, Permission] = {
     "alert_feedback": Permission.DETECTIONS_VIEW,
     "false_positive_report": Permission.REPORTS_VIEW,
     "false_positive_report_export": Permission.DATA_EXPORT,
+    "incident_list": Permission.REPORTS_VIEW,
     "incident_detail": Permission.REPORTS_VIEW,
+    "incident_observations": Permission.REPORTS_VIEW,
+    "incident_temporal_context": Permission.REPORTS_VIEW,
     "incident_export": Permission.DATA_EXPORT,
     "luxriot_channels": Permission.STREAMS_VIEW,
     "luxriot_prompt_settings": Permission.STREAMS_VIEW,
@@ -607,6 +615,29 @@ def _get_control_plane_db_pool() -> PsycopgPool:
         return _control_plane_db_pool
 
 
+def _get_archive_db_pool() -> PsycopgPool:
+    """Return the pool reserved for high-volume archive/attention writes.
+
+    IAM and operator requests intentionally remain on the control-plane pool.
+    A stalled camera, retention pass, or semantic snapshot burst must never be
+    able to consume the connection wait queue used to authenticate operators.
+    """
+
+    global _archive_db_pool
+    with _archive_db_pool_lock:
+        if _archive_db_pool is None:
+            base_settings = DatabaseSettings.from_env()
+            _archive_db_pool = PsycopgPool(
+                replace(
+                    base_settings,
+                    pool_min_size=0,
+                    pool_max_size=min(8, base_settings.pool_max_size),
+                    application_name="eva-ai-archive",
+                )
+            )
+        return _archive_db_pool
+
+
 def _archive_store_mode() -> str:
     return "postgres"
 
@@ -678,7 +709,7 @@ def _build_luxriot_runtime_state_store() -> Optional[PostgresRuntimeStateStore]:
         return cast(Any, _UnavailablePostgresStore("runtime_state"))
     try:
         return PostgresRuntimeStateStore(
-            _get_control_plane_db_pool(),
+            _get_archive_db_pool(),
             _archive_tenant_id(),
         )
     except Exception as exc:
@@ -957,7 +988,11 @@ def _request_channel_ids() -> Set[int]:
         "incident_detail",
         "incident_export",
         "incident_follow",
+        "incident_observations",
+        "incident_review",
+        "incident_series_review",
         "incident_stop_follow",
+        "incident_temporal_context",
     }:
         channel_ids.update(
             _incident_channel_ids_for_request_value(view_args.get("incident_id"))
@@ -2918,7 +2953,7 @@ def _incident_store_not_ready_response(exc: Exception):
                 "migration before reporting incidents."
             ),
             "not_ready": "incident_store",
-            "required_revision": "20260801_0011",
+            "required_revision": "20260805_0012",
         }
     ), 503
 
@@ -2945,6 +2980,88 @@ def _incident_command_service() -> IncidentCommandService:
         _attention_store,
         luxriot_manager,
         draft_assembler_factory=IncidentDraftAssembler,
+    )
+
+
+def _incident_query_values(name: str) -> List[str]:
+    values: List[str] = []
+    for raw in request.args.getlist(name):
+        for item in str(raw or "").split(","):
+            normalized = item.strip()
+            if normalized and normalized not in values:
+                values.append(normalized)
+    return values
+
+
+@app.route('/incidents', methods=['GET'])
+def incident_list():
+    try:
+        view = str(request.args.get("view") or "full").strip().lower()
+        if view not in {"full", "review"}:
+            raise ValueError("view must be full or review")
+        channel_ids = [
+            int(value)
+            for value in _incident_query_values("channel_id")
+            if int(value) > 0
+        ]
+        context = _current_auth_context()
+        scoped_request_without_match = False
+        if context is not None and _is_channel_scoped(context):
+            allowed = {
+                int(value)
+                for value in context.allowed_channel_ids
+                if _to_optional_int(value) is not None and int(value) > 0
+            }
+            if channel_ids:
+                channel_ids = [value for value in channel_ids if value in allowed]
+                scoped_request_without_match = not channel_ids
+            else:
+                channel_ids = sorted(allowed)
+        since_ms = _incident_timestamp_ms(request.args.get("from_ts"), "from_ts")
+        until_ms = _incident_timestamp_ms(request.args.get("to_ts"), "to_ts")
+        limit = max(1, min(500, int(request.args.get("limit") or 100)))
+        offset = max(0, int(request.args.get("offset") or 0))
+        if scoped_request_without_match:
+            records, total = [], 0
+        else:
+            records, total = incident_store.list_incidents(
+                channel_ids=channel_ids or None,
+                states=_incident_query_values("state") or None,
+                perception_states=_incident_query_values("perception_state") or None,
+                risk_states=_incident_query_values("risk_state") or None,
+                case_states=_incident_query_values("case_state") or None,
+                attention_states=_incident_query_values("attention_state") or None,
+                since_ms=since_ms,
+                until_ms=until_ms,
+                limit=limit,
+                offset=offset,
+            )
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
+    except (IncidentStoreNotReady, ArchiveStoreNotReady) as exc:
+        return _incident_store_not_ready_response(exc)
+    except Exception:
+        app.logger.exception(
+            "Incident list failed request_id=%s", getattr(g, "request_id", "")
+        )
+        return jsonify({"error": "incident_list_failed"}), 500
+    service = _incident_command_service()
+    records = [service.reconcile_expired_follow(record) for record in records]
+    public_records = [
+        service.public_review_record(record) if view == "review" else service.public_record(record)
+        for record in records
+    ]
+    return jsonify(
+        {
+            "success": True,
+            "view": view,
+            "incidents": public_records,
+            "total": int(total),
+            "limit": limit,
+            "offset": offset,
+            "attention": luxriot_manager.incident_focus_status(),
+            "maintenance": incident_maintenance.status(),
+        }
     )
 
 
@@ -3002,7 +3119,8 @@ def incident_draft():
 @app.route('/incidents/<incident_id>', methods=['GET'])
 def incident_detail(incident_id: str):
     try:
-        incident = _incident_command_service().get(incident_id)
+        service = _incident_command_service()
+        incident = service.reconcile_expired_follow(service.get(incident_id))
     except ValueError as exc:
         return jsonify({"error": str(exc)}), 400
     except LookupError:
@@ -3013,6 +3131,68 @@ def incident_detail(incident_id: str):
         app.logger.exception("Incident load failed request_id=%s", getattr(g, "request_id", ""))
         return jsonify({"error": "incident_load_failed"}), 500
     return jsonify({"success": True, "incident": _incident_command_service().public_record(incident)})
+
+
+@app.route('/incidents/<incident_id>/observations', methods=['GET'])
+def incident_observations(incident_id: str):
+    try:
+        service = _incident_command_service()
+        incident = service.reconcile_expired_follow(service.get(incident_id))
+        limit = max(1, min(2000, int(request.args.get("limit") or 250)))
+        offset = max(0, int(request.args.get("offset") or 0))
+        since_ms = _incident_timestamp_ms(request.args.get("from_ts"), "from_ts")
+        until_ms = _incident_timestamp_ms(request.args.get("to_ts"), "to_ts")
+        observations, total = incident_store.list_observations(
+            incident_id,
+            since_ms=since_ms,
+            until_ms=until_ms,
+            source_kind=(str(request.args.get("source_kind") or "").strip() or None),
+            limit=limit,
+            offset=offset,
+        )
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
+    except LookupError:
+        return jsonify({"error": "incident_not_found"}), 404
+    except (IncidentStoreNotReady, ArchiveStoreNotReady) as exc:
+        return _incident_store_not_ready_response(exc)
+    except Exception:
+        app.logger.exception(
+            "Incident observations failed request_id=%s",
+            getattr(g, "request_id", ""),
+        )
+        return jsonify({"error": "incident_observations_failed"}), 500
+    return jsonify(
+        {
+            "success": True,
+            "incident_id": str(incident.get("id") or incident_id),
+            "observations": observations,
+            "total": int(total),
+            "limit": limit,
+            "offset": offset,
+        }
+    )
+
+
+@app.route('/incidents/<incident_id>/temporal', methods=['GET'])
+def incident_temporal_context(incident_id: str):
+    try:
+        service = _incident_command_service()
+        incident = service.reconcile_expired_follow(service.get(incident_id))
+        temporal = service.temporal_context(incident)
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
+    except LookupError:
+        return jsonify({"error": "incident_not_found"}), 404
+    except (IncidentStoreNotReady, ArchiveStoreNotReady) as exc:
+        return _incident_store_not_ready_response(exc)
+    except Exception:
+        app.logger.exception(
+            "Incident temporal context failed request_id=%s",
+            getattr(g, "request_id", ""),
+        )
+        return jsonify({"error": "incident_temporal_context_failed"}), 500
+    return jsonify({"success": True, **temporal})
 
 
 @app.route('/incidents/<incident_id>/follow', methods=['POST'])
@@ -3097,6 +3277,107 @@ def incident_stop_follow(incident_id: str):
     return jsonify({"success": True, "incident": _incident_command_service().public_record(updated)})
 
 
+@app.route('/incidents/<incident_id>/review', methods=['POST'])
+def incident_review(incident_id: str):
+    guard = _mutation_guard_error()
+    if guard is not None:
+        return guard
+    data = _json_body()
+    action = str(data.get("action") or "").strip().lower()
+    note = str(data.get("note") or "")
+    try:
+        expected_revision = _to_optional_int(data.get("expected_revision"))
+        updated = _incident_command_service().review_incident(
+            incident_id,
+            actor_id=_feedback_actor_id(),
+            action=action,
+            expected_revision=expected_revision,
+            note=note,
+        )
+        channel_ids = [int(value) for value in updated.get("channel_ids") or []]
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
+    except LookupError:
+        return jsonify({"error": "incident_not_found"}), 404
+    except IncidentRevisionConflict as exc:
+        return jsonify({"error": "incident_revision_conflict", "revision": exc.actual_revision}), 409
+    except (IncidentStoreNotReady, ArchiveStoreNotReady) as exc:
+        return _incident_store_not_ready_response(exc)
+    except Exception:
+        app.logger.exception("Incident review failed request_id=%s", getattr(g, "request_id", ""))
+        return jsonify({"error": "incident_review_failed"}), 500
+    audit_error = _write_completion_audit_or_error(
+        action=f"incident.review.{action}",
+        target_type="incident",
+        target_id=incident_id,
+        channel_id=channel_ids[0] if len(channel_ids) == 1 else None,
+        details={
+            "case_state": str(updated.get("case_state") or "unknown"),
+            "risk_state": str(updated.get("risk_state") or "unknown"),
+            "note_present": bool(note.strip()),
+            **_audit_key_details("channel_ids", channel_ids),
+        },
+    )
+    if audit_error is not None:
+        return audit_error
+    return jsonify({"success": True, "incident": _incident_command_service().public_record(updated)})
+
+
+@app.route('/incidents/<incident_id>/series/<relation_id>/review', methods=['POST'])
+def incident_series_review(incident_id: str, relation_id: str):
+    guard = _mutation_guard_error()
+    if guard is not None:
+        return guard
+    data = _json_body()
+    action = str(data.get("action") or "").strip().lower()
+    note = str(data.get("note") or "")
+    try:
+        service = _incident_command_service()
+        reviewed = service.review_series_relation(
+            incident_id,
+            relation_id,
+            actor_id=_feedback_actor_id(),
+            action=action,
+            note=note,
+        )
+        incident = service.get(incident_id)
+        temporal = service.temporal_context(incident)
+        channel_ids = [int(value) for value in incident.get("channel_ids") or []]
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
+    except LookupError:
+        return jsonify({"error": "incident_relation_not_found"}), 404
+    except (IncidentStoreNotReady, ArchiveStoreNotReady) as exc:
+        return _incident_store_not_ready_response(exc)
+    except Exception:
+        app.logger.exception(
+            "Incident series review failed request_id=%s",
+            getattr(g, "request_id", ""),
+        )
+        return jsonify({"error": "incident_series_review_failed"}), 500
+    audit_error = _write_completion_audit_or_error(
+        action=f"incident.series.{action}",
+        target_type="incident_relation",
+        target_id=relation_id,
+        channel_id=channel_ids[0] if len(channel_ids) == 1 else None,
+        details={
+            "incident_id": incident_id,
+            "relation_state": str(reviewed.get("relation_state") or "unknown"),
+            "note_present": bool(note.strip()),
+            **_audit_key_details("channel_ids", channel_ids),
+        },
+    )
+    if audit_error is not None:
+        return audit_error
+    return jsonify(
+        {
+            "success": True,
+            "relation": reviewed,
+            "temporal": temporal,
+        }
+    )
+
+
 @app.route('/incidents/<incident_id>/export', methods=['GET'])
 def incident_export(incident_id: str):
     export_format = str(request.args.get("format") or "md").strip().lower()
@@ -3113,7 +3394,12 @@ def incident_export(incident_id: str):
     except Exception:
         app.logger.exception("Incident export failed request_id=%s", getattr(g, "request_id", ""))
         return jsonify({"error": "incident_export_failed"}), 500
-    public = _incident_command_service().public_record(incident)
+    service = _incident_command_service()
+    public = service.public_record(incident)
+    # The report is a portable incident record, not merely the original draft.
+    # Include the bounded effective projection of the append-only temporal
+    # ledgers so lifecycle decisions and recurrence review survive export.
+    public["temporal_memory"] = service.temporal_context(incident)
     date_label = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     content = incident_report_xml(public) if export_format == "xml" else incident_report_markdown(public)
     response = Response(
@@ -4112,11 +4398,45 @@ def _lm_response_text(data: Mapping[str, Any]) -> Tuple[str, str]:
     return content_text, str(choice.get("finish_reason") or "").strip().lower()
 
 
+def _lm_standalone_json_mapping(content: str) -> Optional[Mapping[str, Any]]:
+    """Return a top-level JSON object when the response contains JSON only.
+
+    Bounded VLM tools use standalone machine-readable contracts.  Repeated
+    values inside those contracts are validated by their contract owner and
+    must not be mistaken for a runaway prose loop here.  A small Markdown JSON
+    fence is tolerated, but prose before or after the object is not.
+    """
+
+    text = str(content or "").strip()
+    if not text:
+        return None
+    object_start = text.find("{")
+    if object_start < 0:
+        return None
+    prefix = text[:object_start].strip().lower()
+    if prefix not in {"", "```", "```json", "```jsonc"}:
+        return None
+    try:
+        parsed, end = json.JSONDecoder().raw_decode(text[object_start:])
+    except json.JSONDecodeError:
+        return None
+    suffix = text[object_start + end :].strip()
+    if suffix not in {"", "```"} or not isinstance(parsed, Mapping):
+        return None
+    return parsed
+
+
 def _lm_repetition_issue(content: str) -> Optional[str]:
     """Identify a runaway prose loop without penalizing structured JSON arrays."""
 
     text = str(content or "").strip()
     if len(text) < 400:
+        return None
+    structured = _lm_standalone_json_mapping(text)
+    if isinstance(structured, Mapping) and isinstance(structured.get("verdicts"), list):
+        # Archive verdict rows can legitimately share concise evidence when
+        # adjacent snapshots show the same object.  The archive parser owns
+        # row count, indices, verdict enums, and evidence validation.
         return None
     prose = re.split(
         r"\b(?:BATCH_STATE_JSON|ALERTS_JSON|MEMORY_UPDATE_JSON)\s*:",
@@ -4547,7 +4867,17 @@ def _parse_lm_alerts(text: str, default_channel_id: int, default_ts_ms: Optional
                     snapshot_indices.append(snapshot_index)
             if snapshot_indices:
                 validated['snapshot_indices'] = snapshot_indices
-                validated['anchor_snapshot'] = snapshot_indices[-1]
+                try:
+                    explicit_anchor = int(raw.get('anchor_snapshot'))
+                except (TypeError, ValueError):
+                    explicit_anchor = None
+                validated['anchor_snapshot'] = (
+                    int(explicit_anchor)
+                    if explicit_anchor is not None
+                    and explicit_anchor > 0
+                    and explicit_anchor in snapshot_indices
+                    else snapshot_indices[0]
+                )
         return validated
 
     def _extract_balanced_json(blob: str, start_idx: int) -> Optional[Tuple[str, int]]:
@@ -5103,6 +5433,7 @@ except Exception:
 probe_manager = ProbeManager(
     embed_image_fn=get_probe_image_embedding_from_pil,
     embed_text_fn=get_probe_text_embedding,
+    embed_texts_fn=_clip_text_embeddings,
     jpeg_encoder=_encode_jpeg,
     embed_image_with_metadata_fn=get_probe_image_embedding_with_space,
     embedding_space_fn=get_probe_embedding_space,
@@ -5256,7 +5587,7 @@ def _build_archive_stores() -> Tuple[Any, Any]:
         unavailable = _UnavailablePostgresStore("archive")
         return unavailable, unavailable
     try:
-        pool = _get_control_plane_db_pool()
+        pool = _get_archive_db_pool()
         tenant_id = _archive_tenant_id()
         return (
             PostgresProbesStore(pool, tenant_id),
@@ -5280,7 +5611,7 @@ def _build_incident_store() -> Any:
         return _UnavailablePostgresStore("incidents")
     try:
         return PostgresIncidentStore(
-            _get_control_plane_db_pool(),
+            _get_archive_db_pool(),
             _archive_tenant_id(),
         )
     except Exception as exc:
@@ -5288,6 +5619,167 @@ def _build_incident_store() -> Any:
 
 
 incident_store = _build_incident_store()
+incident_maintenance = IncidentMaintenanceWorker(
+    incident_store,
+    _incident_command_service,
+    interval_sec=float(getattr(config, "INCIDENT_MAINTENANCE_INTERVAL_SEC", 15.0)),
+    batch_size=int(getattr(config, "LUXRIOT_INCIDENT_TRACKED_LIMIT", 64)),
+)
+if bool(getattr(config, "INCIDENT_MAINTENANCE_ENABLED", True)):
+    incident_maintenance.start()
+
+
+def _append_l0_incident_observations(
+    channel_id: int,
+    heartbeat: Mapping[str, Any],
+) -> Dict[str, Any]:
+    """Persist one replay-safe heartbeat for every followed incident on a channel.
+
+    The heartbeat intentionally keeps perception ``unknown``: a live batch is
+    evidence about the channel, not proof that it depicts each parallel
+    incident. Incident-specific perception changes require grounded episode
+    association or operator review.
+    """
+
+    batch_id = str(heartbeat.get("batch_id") or "").strip()
+    if not batch_id:
+        return {"attempted": 0, "inserted": 0, "skipped": "missing_batch_id"}
+    service = _incident_command_service()
+    automatic: Dict[str, Any]
+    try:
+        temporal_rows = luxriot_manager._l0_temporal_observations(
+            channel_id=int(channel_id),
+            source_batch_id=batch_id,
+            batch_state=(
+                heartbeat.get("batch_state")
+                if isinstance(heartbeat.get("batch_state"), Mapping)
+                else {}
+            ),
+            batch_start_ms=int(heartbeat.get("batch_start_ms") or 0),
+            batch_end_ms=int(heartbeat.get("batch_end_ms") or 0),
+            coverage_gap=bool(heartbeat.get("coverage_gap")),
+        )
+        automatic = service.ingest_l0_temporal_observations(
+            int(channel_id),
+            heartbeat,
+            temporal_rows,
+            max_new_incidents=4,
+            tracked_limit=int(getattr(config, "LUXRIOT_INCIDENT_TRACKED_LIMIT", 64)),
+        )
+    except Exception as exc:
+        automatic = {
+            "supported": True,
+            "created": 0,
+            "associated": 0,
+            "ended": 0,
+            "error": type(exc).__name__,
+        }
+    incidents, total = incident_store.list_incidents(
+        channel_ids=[int(channel_id)],
+        states=["following"],
+        limit=100,
+    )
+    reconciled_incidents = [service.reconcile_expired_follow(incident) for incident in incidents]
+    directive = luxriot_manager.incident_focus_for_channel(int(channel_id))
+    hot_ids = (
+        set(directive.hot_incident_ids)
+        if directive is not None
+        else set()
+    )
+    inserted = 0
+    failures: List[str] = []
+    for incident in reconciled_incidents:
+        incident_id = str(incident.get("id") or "").strip()
+        follow_policy = (
+            incident.get("follow_policy")
+            if isinstance(incident.get("follow_policy"), Mapping)
+            else {}
+        )
+        if (
+            not incident_id
+            or incident_id not in hot_ids
+            or follow_policy.get("active") is not True
+        ):
+            continue
+        association = service.observation_for_heartbeat(incident, heartbeat)
+        vector_signal = (
+            heartbeat.get("vector_signal")
+            if isinstance(heartbeat.get("vector_signal"), Mapping)
+            else {}
+        )
+        capture_attention = (
+            vector_signal.get("capture_attention")
+            if isinstance(vector_signal.get("capture_attention"), Mapping)
+            else {}
+        )
+        seconds = [
+            item
+            for item in capture_attention.get("seconds") or []
+            if isinstance(item, Mapping)
+        ]
+        activity_values = [
+            float(item.get("activity_x"))
+            for item in seconds
+            if _to_optional_float(item.get("activity_x")) is not None
+        ]
+        run_id = str(follow_policy.get("run_id") or "").strip()
+        try:
+            incident_store.append_observation(
+                {
+                    "incident_id": incident_id,
+                    "idempotency_key": f"l0:{batch_id}",
+                    "source_kind": "vlm_l0_heartbeat",
+                    "observed_at_ms": int(
+                        heartbeat.get("batch_end_ms")
+                        or heartbeat.get("batch_start_ms")
+                        or int(time.time() * 1000.0)
+                    ),
+                    "channel_id": int(channel_id),
+                    "perception_state": str(association.get("perception_state") or "unknown"),
+                    "source_ref": {
+                        "batch_id": batch_id,
+                        "batch_start_ms": heartbeat.get("batch_start_ms"),
+                        "batch_end_ms": heartbeat.get("batch_end_ms"),
+                        "follow_run_id": run_id or None,
+                        "follow_relationship": str(follow_policy.get("relationship") or "continuation"),
+                    },
+                    "payload": {
+                        "batch_state": dict(heartbeat.get("batch_state") or {}),
+                        "coverage_gap": bool(heartbeat.get("coverage_gap")),
+                        "gap_reason": str(heartbeat.get("gap_reason") or "")[:160],
+                        "association": str(association.get("association") or "neutral"),
+                        "matched_keys": list(association.get("matched_keys") or [])[:12],
+                        "homeostasis": {
+                            "sample_count": len(seconds),
+                            "activity_x_max": max(activity_values, default=0.0),
+                            "activity_x_mean": (
+                                sum(activity_values) / len(activity_values)
+                                if activity_values else 0.0
+                            ),
+                            "burst_count": sum(
+                                str(item.get("mode") or "").strip().lower() == "burst"
+                                for item in seconds
+                            ),
+                        },
+                    },
+                }
+            )
+            inserted += 1
+        except Exception as exc:
+            failures.append(f"{incident_id}:{type(exc).__name__}")
+    return {
+        "attempted": len(incidents),
+        "inserted": inserted,
+        "matching_incidents": int(total),
+        "hot_eligible": len(hot_ids),
+        "failures": failures[:8],
+        "automatic_candidates": automatic,
+    }
+
+
+luxriot_manager.set_incident_observation_callback(
+    _append_l0_incident_observations
+)
 semantic_snapshot_writer: Optional[SemanticSnapshotArchiveWriter] = None
 if bool(getattr(config, "SEMANTIC_SNAPSHOT_ARCHIVE_ENABLED", True)):
     semantic_snapshot_writer = SemanticSnapshotArchiveWriter(
@@ -5400,7 +5892,7 @@ def _build_attention_writer() -> BufferedAttentionWriter:
     )
     if storage_enabled and _postgres_archive_enabled():
         _attention_store = PostgresAttentionStore(
-            _get_control_plane_db_pool(),
+            _get_archive_db_pool(),
             _archive_tenant_id(),
         )
     else:
@@ -5606,6 +6098,10 @@ def _admit_alert_derived_probes(
         if _to_optional_int(probe.get("channel_id")) == int(channel_id)
     )
     active_global = len(active_temporary)
+    try:
+        alert_probe_embedding_space = get_probe_embedding_space()
+    except Exception:
+        alert_probe_embedding_space = {}
     for raw_event in alert_events[:8]:
         if active_by_channel > 6 or active_global > 62:
             rejected += 1
@@ -5659,6 +6155,10 @@ def _admit_alert_derived_probes(
         ):
             stored_payload = dict(store_payload)
             stored_payload["attention_only"] = True
+            if alert_probe_embedding_space:
+                stored_payload["embedding_space"] = copy.deepcopy(
+                    dict(alert_probe_embedding_space)
+                )
             probes_store.upsert_probe(stored_payload)
             created_ids.append(str(probe.probe_id))
             lineage_records.append(_probe_lineage_payload(probe))
@@ -5939,25 +6439,39 @@ def _check_postgres_ready() -> Dict[str, Any]:
         )
 
 
-def _secret_is_weak(value: str) -> bool:
+def _secret_is_obvious_placeholder(value: str) -> bool:
     secret = str(value or "").strip()
     if not secret:
         return False
-    if len(secret) < 32:
-        return True
     lowered = secret.lower()
-    weak_values = {
+    placeholder_values = {
         "123",
         "1234",
         "12345",
+        "123456",
         "admin",
         "password",
         "changeme",
         "change-me",
+        "change_me",
         "secret",
         "unit-token",
+        "placeholder",
+        "replace-me",
+        "replace_me",
     }
-    return lowered in weak_values or len(set(secret)) < 8
+    return lowered in placeholder_values
+
+
+def _secret_is_weak(value: str) -> bool:
+    secret = str(value or "").strip()
+    if not secret:
+        return False
+    return (
+        _secret_is_obvious_placeholder(secret)
+        or len(secret) < 12
+        or len(set(secret)) < 6
+    )
 
 
 def _check_deployment_security_ready() -> Dict[str, Any]:
@@ -5965,6 +6479,7 @@ def _check_deployment_security_ready() -> Dict[str, Any]:
         getattr(config, "SECURE_DEPLOYMENT_REQUIRED", False)
     )
     issues: List[str] = []
+    warnings: List[str] = []
     if not bool(getattr(config, "AUTH_COOKIE_SECURE", False)):
         issues.append("EVOSSEARCH_AUTH_COOKIE_SECURE=true is required behind TLS")
     if not config.ALLOWED_ROOTS:
@@ -5979,8 +6494,14 @@ def _check_deployment_security_ready() -> Dict[str, Any]:
             issues.append("ALLOWED_ROOTS contains missing paths: " + ", ".join(invalid_roots[:3]))
     if _secret_is_weak(getattr(config, "ADMIN_TOKEN", "")):
         issues.append("EVOSSEARCH_ADMIN_TOKEN is set but weak; rotate or unset under named auth")
-    if _secret_is_weak(getattr(config, "LUXRIOT_PASSWORD", "")):
-        issues.append("EVOSSEARCH_LUXRIOT_PASSWORD appears to be a placeholder")
+    luxriot_password = str(getattr(config, "LUXRIOT_PASSWORD", "") or "")
+    if _secret_is_obvious_placeholder(luxriot_password):
+        issues.append("EVOSSEARCH_LUXRIOT_PASSWORD is an obvious placeholder")
+    elif _secret_is_weak(luxriot_password):
+        warnings.append(
+            "EVOSSEARCH_LUXRIOT_PASSWORD is shorter or less diverse than recommended; "
+            "Evo connectivity is checked separately"
+        )
 
     ok = not secure_required or not issues
     return _component_result(
@@ -5988,6 +6509,7 @@ def _check_deployment_security_ready() -> Dict[str, Any]:
         "ready" if ok else "misconfigured",
         required=secure_required,
         issues=issues,
+        warnings=warnings,
         secure_deployment_required=secure_required,
         auth_cookie_secure=bool(getattr(config, "AUTH_COOKIE_SECURE", False)),
         allowed_roots_count=len(config.ALLOWED_ROOTS),
@@ -9939,7 +10461,17 @@ def _vlm_archive_alert_events(raw_events: Any, channel_id: int) -> List[Dict[str
                     snapshot_indices.append(int(snapshot_index))
             if snapshot_indices:
                 event["snapshot_indices"] = snapshot_indices
-                event["anchor_snapshot"] = snapshot_indices[-1]
+                explicit_anchor = _to_optional_int(raw_event.get("anchor_snapshot"))
+                event["anchor_snapshot"] = (
+                    int(explicit_anchor)
+                    if explicit_anchor is not None
+                    and explicit_anchor > 0
+                    and explicit_anchor in snapshot_indices
+                    else snapshot_indices[0]
+                )
+        timestamp_source = str(raw_event.get("timestamp_source") or "").strip().lower()
+        if timestamp_source:
+            event["timestamp_source"] = timestamp_source[:40]
         events.append(event)
     return events
 
@@ -10026,7 +10558,7 @@ def _select_vlm_alert_anchor(
                 if parsed is not None and parsed > 0
             ]
             if parsed_indices:
-                snapshot_hint = parsed_indices[-1]
+                snapshot_hint = parsed_indices[0]
     reason = "batch_state_snapshot_reference"
     if snapshot_hint is None:
         snapshot_hint = _vlm_archive_snapshot_hint(event_text)
@@ -10127,6 +10659,9 @@ def _vlm_summary_frame_records(entry: Mapping[str, Any]) -> Tuple[List[Dict[str,
         "batch_cover": batch_cover,
         "latency_trace": dict(entry.get("latency_trace") or {})
         if isinstance(entry.get("latency_trace"), Mapping)
+        else {},
+        "llm_input_stats": dict(entry.get("llm_input_stats") or {})
+        if isinstance(entry.get("llm_input_stats"), Mapping)
         else {},
         "attention_episode_id": str(entry.get("attention_episode_id") or "") or None,
         "attention_phase": str(entry.get("attention_phase") or "") or None,
@@ -10265,6 +10800,9 @@ def _vlm_summary_frame_records(entry: Mapping[str, Any]) -> Tuple[List[Dict[str,
                 "timestamp_ms": event_ts,
                 "delivery_status": str(alert_event.get("delivery_status") or ""),
             }
+            timestamp_source = str(alert_event.get("timestamp_source") or "").strip().lower()
+            if timestamp_source:
+                event_payload["timestamp_source"] = timestamp_source[:40]
             parent_alert_id = str(
                 alert_event.get("id") or alert_event.get("alert_id") or ""
             ).strip()
@@ -15701,20 +16239,30 @@ def luxriot_summary_history():
     if from_ts is not None and to_ts is not None and from_ts > to_ts:
         from_ts, to_ts = to_ts, from_ts
     try:
-        logs, total = detections_store.list_vlm_summary_batches(
+        history_result = detections_store.list_vlm_summary_batches(
             channel_id=channel_id,
             since_ms=int(from_ts * 1000.0) if from_ts is not None else None,
             until_ms=int(to_ts * 1000.0) if to_ts is not None else None,
             limit=limit,
             offset=offset,
+            return_page_info=True,
         )
+        if len(history_result) == 3:
+            logs, total, page_info = history_result
+        else:
+            logs, total = history_result
+            page_info = {
+                'has_more': offset + len(logs) < total,
+                'total_exact': True,
+            }
         return jsonify(
             {
                 'logs': logs,
                 'total': total,
                 'limit': limit,
                 'offset': offset,
-                'has_more': offset + len(logs) < total,
+                'has_more': bool(page_info.get('has_more')),
+                'total_exact': bool(page_info.get('total_exact', True)),
                 'channel_id': channel_id,
                 'from_ts': from_ts,
                 'to_ts': to_ts,
@@ -16348,6 +16896,15 @@ def _build_probe_payload(
         "bookmark_gate": existing.get("bookmark_gate"),
         "bookmark_gate_updated_at_ms": existing.get("bookmark_gate_updated_at_ms"),
     }
+    # A text probe's P/N/M thresholds are meaningful only in the embedding
+    # space in which the operator created or edited it.  Stamp the live space
+    # server-side; never trust a browser-supplied fingerprint and never
+    # silently relabel untouched legacy probes on read.
+    try:
+        probe["embedding_space"] = get_probe_embedding_space()
+    except Exception:
+        if isinstance(existing.get("embedding_space"), Mapping):
+            probe["embedding_space"] = copy.deepcopy(existing["embedding_space"])
     # This function rebuilds the probe from the request body, so authorship and
     # alert lineage must be carried over explicitly: an operator editing an
     # alert-derived probe must not silently turn it into an operator probe.
@@ -16633,7 +17190,10 @@ def _probe_channel_group_scope_error(
 
 @app.route('/probes/list', methods=['GET'])
 def probes_list():
-    probes = probes_store.list_probes()
+    try:
+        probes = probes_store.list_probes()
+    except ArchiveStoreNotReady as exc:
+        return _archive_store_not_ready_response(exc)
     context = _current_auth_context()
     if _auth_enabled() and context is not None:
         probes = [
@@ -16661,10 +17221,25 @@ def probes_list():
             continue
         active_probes.append(probe)
     probes = active_probes
+    try:
+        channel_groups = _visible_probe_channel_groups(context)
+    except ArchiveStoreNotReady as exc:
+        return _archive_store_not_ready_response(exc)
     response = jsonify(
         {
             'probes': probes,
-            'channel_groups': _visible_probe_channel_groups(context),
+            'channel_groups': channel_groups,
+            'defaults': {
+                'pos_floor': float(config.PROBE_POS_FLOOR_DEFAULT),
+                'margin': float(config.PROBE_MARGIN_DEFAULT),
+                'embedding_backend': (
+                    'siglip2'
+                    if 'siglip2' in str(config.CLIP_MODEL or '').lower()
+                    else 'openai_clip'
+                ),
+                'embedding_model': str(config.CLIP_MODEL or ''),
+                'embedding_revision': str(config.CLIP_MODEL_REVISION or ''),
+            },
             'counts': {
                 'visible': len(probes),
                 'persistent': sum(
@@ -18153,6 +18728,8 @@ def get_settings():
         )
         clip_model = _normalize_clip_model_for_policy(config.CLIP_MODEL)
         index_mode = _normalize_index_mode_for_policy(config.INDEX_MODE)
+        vlm_profile = _resolve_lm_profile(kind="vlm")
+        agent_profile = _resolve_lm_profile(kind="agent")
         settings = {
             'host': config.HOST,
             'port': config.PORT,
@@ -18202,6 +18779,16 @@ def get_settings():
             'defaultResults': config.DEFAULT_RESULTS,
             'batchSize': config.BATCH_SIZE,
             'thumbnailQuality': config.THUMBNAIL_QUALITY,
+            'vlmBaseUrl': str(vlm_profile.get('base_url') or ''),
+            'vlmModel': str(vlm_profile.get('model') or ''),
+            'vlmApiKey': '',
+            'vlmApiKeySet': bool(vlm_profile.get('api_key')),
+            'vlmTimeout': int(vlm_profile.get('timeout') or config.LM_TIMEOUT),
+            'agentBaseUrl': str(agent_profile.get('base_url') or ''),
+            'agentModel': str(agent_profile.get('model') or ''),
+            'agentApiKey': '',
+            'agentApiKeySet': bool(agent_profile.get('api_key')),
+            'agentTimeout': int(agent_profile.get('timeout') or config.LM_TIMEOUT),
             'maxCommentLength': config.MAX_COMMENT_LENGTH,
             'maxFileSize': config.MAX_FILE_SIZE_MB,
             'indexFolderName': config.INDEX_FOLDER_NAME,
@@ -18256,7 +18843,7 @@ def save_settings():
         if not data:
             return jsonify({'success': False, 'error': 'No data provided'}), 400
 
-        global active_embedder, clip_model, clip_preprocess, clip_processor, clip_backend_kind, clip_runtime_model, dino_encoder, probe_bookmark_gate
+        global active_embedder, clip_model, clip_preprocess, clip_processor, clip_backend_kind, clip_runtime_model, dino_encoder, probe_bookmark_gate, _agent_runner, _agent_runtime_model_override
 
         required_fields = ['host', 'port', 'debug', 'clipModel', 'minResults', 'maxResults', 'defaultResults']
         for field in required_fields:
@@ -18264,6 +18851,72 @@ def save_settings():
                 return jsonify({'success': False, 'error': f'Missing required field: {field}'}), 400
         debug_enabled = _coerce_bool(data.get('debug', config.DEBUG), config.DEBUG)
         experimental_embedders_enabled = _experimental_embedding_models_enabled()
+
+        current_vlm_profile = _resolve_lm_profile(kind="vlm")
+        current_agent_profile = _resolve_lm_profile(kind="agent")
+        vlm_profile_id = str(current_vlm_profile.get("id") or "vlm").strip() or "vlm"
+        agent_profile_id = str(current_agent_profile.get("id") or "agent").strip() or "agent"
+        if vlm_profile_id == agent_profile_id or vlm_profile_id == "default":
+            vlm_profile_id = "vlm"
+        if agent_profile_id == vlm_profile_id or agent_profile_id == "default":
+            agent_profile_id = "agent"
+
+        def normalize_inference_profile(prefix: str, current: Mapping[str, Any]) -> Dict[str, Any]:
+            base_url = str(data.get(f"{prefix}BaseUrl", current.get("base_url") or "")).strip().rstrip("/")
+            if base_url:
+                parsed = urlparse(base_url)
+                if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+                    raise ValueError(f"{prefix.upper()} base URL must be an http(s) URL")
+            model = str(data.get(f"{prefix}Model", current.get("model") or "")).strip()
+            if not model:
+                raise ValueError(f"{prefix.upper()} model is required")
+            api_key_raw = data.get(f"{prefix}ApiKey")
+            api_key = (
+                str(api_key_raw).strip()
+                if api_key_raw is not None and str(api_key_raw).strip()
+                else str(current.get("api_key") or "").strip()
+            )
+            try:
+                timeout = int(data.get(f"{prefix}Timeout", current.get("timeout") or config.LM_TIMEOUT))
+            except (TypeError, ValueError) as exc:
+                raise ValueError(f"{prefix.upper()} timeout must be an integer") from exc
+            return {
+                "base_url": base_url,
+                "model": model,
+                "api_key": api_key.replace("\r", "").replace("\n", ""),
+                "timeout": min(3600, max(1, timeout)),
+            }
+
+        try:
+            vlm_settings = normalize_inference_profile("vlm", current_vlm_profile)
+            agent_settings = normalize_inference_profile("agent", current_agent_profile)
+        except ValueError as exc:
+            return jsonify({'success': False, 'error': str(exc)}), 400
+
+        configured_lm_profiles = _configured_lm_profiles()
+        updated_lm_profiles = {
+            profile_id: dict(profile)
+            for profile_id, profile in configured_lm_profiles.items()
+        }
+        updated_lm_profiles[vlm_profile_id] = {
+            **dict(updated_lm_profiles.get(vlm_profile_id) or {}),
+            "id": vlm_profile_id,
+            "kind": "vlm",
+            **vlm_settings,
+            "enabled": True,
+        }
+        updated_lm_profiles[agent_profile_id] = {
+            **dict(updated_lm_profiles.get(agent_profile_id) or {}),
+            "id": agent_profile_id,
+            "kind": "agent",
+            **agent_settings,
+            "enabled": True,
+        }
+        lm_profile_ids = [
+            profile_id
+            for profile_id in updated_lm_profiles
+            if profile_id != "default"
+        ]
 
         try:
             port = int(data['port'])
@@ -18654,6 +19307,17 @@ EVOSSEARCH_ALLOWED_ROOTS={os.pathsep.join(config.ALLOWED_ROOTS)}
 """
 
         parsed_env_content = _parse_env_editor_text(env_content)
+        parsed_env_content["EVOSSEARCH_LM_PROFILES"] = ",".join(lm_profile_ids)
+        parsed_env_content["EVOSSEARCH_LM_VLM_PROFILE_ID"] = vlm_profile_id
+        parsed_env_content["EVOSSEARCH_LM_AGENT_PROFILE_ID"] = agent_profile_id
+        for profile_id in (vlm_profile_id, agent_profile_id):
+            profile = updated_lm_profiles[profile_id]
+            parsed_env_content[_lm_profile_env_key(profile_id, "KIND")] = str(profile.get("kind") or "general")
+            parsed_env_content[_lm_profile_env_key(profile_id, "BASE_URL")] = str(profile.get("base_url") or "")
+            parsed_env_content[_lm_profile_env_key(profile_id, "MODEL")] = str(profile.get("model") or "")
+            parsed_env_content[_lm_profile_env_key(profile_id, "API_KEY")] = str(profile.get("api_key") or "")
+            parsed_env_content[_lm_profile_env_key(profile_id, "TIMEOUT")] = str(profile.get("timeout") or config.LM_TIMEOUT)
+            parsed_env_content[_lm_profile_env_key(profile_id, "ENABLED")] = "true"
         known_env_keys = set(parsed_env_content.keys())
         env_content = (
             "# evo-ssearch Configuration\n"
@@ -18694,6 +19358,12 @@ EVOSSEARCH_ALLOWED_ROOTS={os.pathsep.join(config.ALLOWED_ROOTS)}
         config.MAX_COMMENT_LENGTH = max_comment_length
         config.MAX_FILE_SIZE_MB = max_file_size
         config.INDEX_FOLDER_NAME = index_folder
+        config.LM_PROFILES = updated_lm_profiles
+        config.LM_VLM_PROFILE_ID = vlm_profile_id
+        config.LM_AGENT_PROFILE_ID = agent_profile_id
+        with _agent_runner_lock:
+            _agent_runtime_model_override = None
+            _agent_runner = None
         app.config["MAX_CONTENT_LENGTH"] = max(1, int(config.MAX_FILE_SIZE_MB)) * 1024 * 1024
         config.FUSION_ENABLED = fusion_enabled
         config.FUSION_ALPHA = fusion_alpha
@@ -18852,7 +19522,7 @@ def agent_chat():
         return jsonify({'error': 'message is required'}), 400
     session_id = str(data.get('session_id') or '').strip() or None
     image_b64  = str(data.get('image_b64') or '').strip() or None
-    operator_mode = bool(data.get('operator_mode'))
+    operator_mode = data.get('operator_mode') is True
     tool_context = None
     auth_context = _current_auth_context()
     console_context = normalize_agent_console_context(
@@ -18891,6 +19561,7 @@ def agent_chat():
             tool_context=tool_context,
             force_tools=operator_mode,
             console_context=console_context,
+            drive_console=operator_mode,
         )
 
     response = Response(
@@ -19122,9 +19793,14 @@ def agent_session(session_id: str):
 @atexit.register
 def _shutdown_background_workers() -> None:
     global _audit_db_pool, _audit_reader, _audit_writer, _control_plane_db_pool
+    global _archive_db_pool
     global _identity_repository
     global _inference_queue_runtime, _inference_worker_db_pool
     global _attention_writer, _live_clip_batcher, semantic_snapshot_writer
+    try:
+        incident_maintenance.stop(timeout=2.0)
+    except Exception:
+        pass
     try:
         realtime_probe_bookmarks.shutdown()
         fast_vlm_alerts.shutdown()
@@ -19183,6 +19859,12 @@ def _shutdown_background_workers() -> None:
             _audit_db_pool.close()
             _audit_db_pool = None
             _audit_writer = None
+    except Exception:
+        pass
+    try:
+        if _archive_db_pool is not None:
+            _archive_db_pool.close()
+            _archive_db_pool = None
     except Exception:
         pass
     try:

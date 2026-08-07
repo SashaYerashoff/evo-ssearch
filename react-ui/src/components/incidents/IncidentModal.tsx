@@ -16,6 +16,10 @@ import {
   type Incident,
   type IncidentDraftInput,
   type IncidentFollowMode,
+  type IncidentObservation,
+  type IncidentReviewAction,
+  type IncidentSeriesReviewAction,
+  type IncidentTemporalContext,
   type IncidentTimelineEntry,
 } from '../../api/incidents'
 import {
@@ -50,23 +54,62 @@ function signalDigest(entry: IncidentTimelineEntry | undefined): string[] {
   return values
 }
 
+function temporalDisposition(value: unknown): { label: string; description: string } {
+  switch (String(value || '').trim().toLowerCase()) {
+    case 'long_incident_candidate':
+      return {
+        label: 'Long incident candidate',
+        description: 'Activity spans a 15-minute boundary and remains one operator-reviewed incident candidate.',
+      }
+    case 'continuing_incident':
+      return {
+        label: 'Continuing incident',
+        description: 'No grounded return to routine has closed this episode yet.',
+      }
+    case 'short_incident':
+      return {
+        label: 'Short incident',
+        description: 'A bounded episode was observed between routine intervals.',
+      }
+    default:
+      return {
+        label: 'Episode kept for review',
+        description: 'The episode is preserved until routine boundaries and evidence are sufficient to classify it.',
+      }
+  }
+}
+
 export function IncidentModal({
   draftInput,
+  incidentIdValue,
   canExport,
+  canManage = false,
+  onChanged,
   onClose,
 }: {
-  draftInput: IncidentDraftInput
+  draftInput?: IncidentDraftInput
+  incidentIdValue?: string
   canExport: boolean
+  canManage?: boolean
+  onChanged?: (incident: Incident) => void
   onClose: () => void
 }) {
   const [incident, setIncident] = useState<Incident | null>(null)
   const [loading, setLoading] = useState(true)
-  const [busyAction, setBusyAction] = useState<'refresh' | 'follow' | 'stop' | null>(null)
+  const [busyAction, setBusyAction] = useState<'refresh' | 'follow' | 'stop' | `review:${IncidentReviewAction}` | `series:${string}` | null>(null)
   const [error, setError] = useState('')
   const [followMode, setFollowMode] = useState<IncidentFollowMode>('follow')
   const [ttlSeconds, setTtlSeconds] = useState(15 * 60)
   const [localExpiryMs, setLocalExpiryMs] = useState<number | null>(null)
   const [nowMs, setNowMs] = useState(Date.now())
+  const [observations, setObservations] = useState<IncidentObservation[]>([])
+  const [observationTotal, setObservationTotal] = useState(0)
+  const [observationsLoading, setObservationsLoading] = useState(false)
+  const [observationError, setObservationError] = useState('')
+  const [temporal, setTemporal] = useState<IncidentTemporalContext | null>(null)
+  const [temporalLoading, setTemporalLoading] = useState(false)
+  const [temporalError, setTemporalError] = useState('')
+  const [reviewNote, setReviewNote] = useState('')
 
   const id = incidentId(incident)
   const timeline = useMemo(() => incidentTimeline(incident), [incident])
@@ -84,18 +127,65 @@ export function IncidentModal({
     if (backendExpiry) setLocalExpiryMs(null)
   }, [])
 
+  const loadObservations = useCallback(async (incidentIdValue: string) => {
+    if (!incidentIdValue) return
+    setObservationsLoading(true)
+    setObservationError('')
+    try {
+      const page = await incidentsApi.observations(incidentIdValue, { limit: 250 })
+      setObservations(Array.isArray(page.observations) ? page.observations : [])
+      setObservationTotal(Number(page.total || 0))
+    } catch (exception: any) {
+      setObservationError(exception?.message || 'Incident observation ledger is unavailable.')
+    } finally {
+      setObservationsLoading(false)
+    }
+  }, [])
+
+  const loadTemporalContext = useCallback(async (incidentIdValue: string) => {
+    if (!incidentIdValue) return
+    setTemporalLoading(true)
+    setTemporalError('')
+    try {
+      setTemporal(await incidentsApi.temporal(incidentIdValue))
+    } catch (exception: any) {
+      setTemporal(null)
+      setTemporalError(exception?.message || 'Temporal incident memory is unavailable.')
+    } finally {
+      setTemporalLoading(false)
+    }
+  }, [])
+
   useEffect(() => {
     let alive = true
     setLoading(true)
     setError('')
-    incidentsApi.draft(draftInput)
+    const request = incidentIdValue
+      ? incidentsApi.get(incidentIdValue)
+      : draftInput
+        ? incidentsApi.draft(draftInput)
+        : Promise.reject(new Error('Incident source is missing.'))
+    request
       .then((next) => { if (alive) replaceIncident(next) })
       .catch((exception: any) => {
-        if (alive) setError(exception?.message || 'EVA could not draft this incident.')
+        if (alive) setError(exception?.message || 'EVA could not load this incident.')
       })
       .finally(() => { if (alive) setLoading(false) })
     return () => { alive = false }
-  }, [draftInput.anchor_detection_id, draftInput.channel_id, draftInput.from_ts, draftInput.to_ts, replaceIncident])
+  }, [
+    draftInput?.anchor_detection_id,
+    draftInput?.channel_id,
+    draftInput?.from_ts,
+    draftInput?.to_ts,
+    incidentIdValue,
+    replaceIncident,
+  ])
+
+  useEffect(() => {
+    if (!id) return
+    void loadObservations(id)
+    void loadTemporalContext(id)
+  }, [id, loadObservations, loadTemporalContext])
 
   useEffect(() => {
     if (!followActive || !expiryMs) return
@@ -117,6 +207,7 @@ export function IncidentModal({
     setError('')
     try {
       replaceIncident(await incidentsApi.get(id))
+      await Promise.all([loadObservations(id), loadTemporalContext(id)])
     } catch (exception: any) {
       setError(exception?.message || 'Incident refresh failed.')
     } finally {
@@ -124,13 +215,15 @@ export function IncidentModal({
     }
   }
 
-  async function retryDraft() {
+  async function retryLoad() {
     setLoading(true)
     setError('')
     try {
-      replaceIncident(await incidentsApi.draft(draftInput))
+      if (incidentIdValue) replaceIncident(await incidentsApi.get(incidentIdValue))
+      else if (draftInput) replaceIncident(await incidentsApi.draft(draftInput))
+      else throw new Error('Incident source is missing.')
     } catch (exception: any) {
-      setError(exception?.message || 'EVA could not draft this incident.')
+      setError(exception?.message || 'EVA could not load this incident.')
     } finally {
       setLoading(false)
     }
@@ -168,6 +261,54 @@ export function IncidentModal({
     }
   }
 
+  async function applyReview(action: IncidentReviewAction) {
+    if (!id || !incident) return
+    setBusyAction(`review:${action}`)
+    setError('')
+    try {
+      const revision = Number(incident.revision)
+      const updated = await incidentsApi.reviewIncident(id, {
+        action,
+        ...(Number.isInteger(revision) && revision > 0 ? { expected_revision: revision } : {}),
+        ...(reviewNote.trim() ? { note: reviewNote.trim() } : {}),
+      })
+      setReviewNote('')
+      replaceIncident(updated)
+      await Promise.all([loadObservations(id), loadTemporalContext(id)])
+      onChanged?.(updated)
+    } catch (exception: any) {
+      const message = exception?.message || 'Incident review could not be saved.'
+      setError(message.includes('revision')
+        ? 'This incident changed while it was open. Refresh it and review the latest state.'
+        : message)
+    } finally {
+      setBusyAction(null)
+    }
+  }
+
+  async function applySeriesReview(
+    relationId: string,
+    action: IncidentSeriesReviewAction,
+  ) {
+    if (!id || !relationId) return
+    setBusyAction(`series:${relationId}:${action}`)
+    setError('')
+    try {
+      const result = await incidentsApi.reviewSeries(
+        id,
+        relationId,
+        action,
+        reviewNote,
+      )
+      setTemporal(result.temporal)
+      setReviewNote('')
+    } catch (exception: any) {
+      setError(exception?.message || 'Recurrence-series review could not be saved.')
+    } finally {
+      setBusyAction(null)
+    }
+  }
+
   const bounds = incident?.time_bounds || {}
   const title = String(incident?.title || 'Incident reconstruction')
   const narrative = String(incident?.summary || incident?.description || '').trim()
@@ -181,12 +322,41 @@ export function IncidentModal({
   const qualia = incident?.qualia_digest && typeof incident.qualia_digest === 'object'
     ? incident.qualia_digest as Record<string, unknown>
     : {}
+  const synopsis = incident?.synopsis && typeof incident.synopsis === 'object'
+    ? incident.synopsis as Record<string, unknown>
+    : {}
+  const homeostasis = incident?.homeostasis && typeof incident.homeostasis === 'object'
+    ? incident.homeostasis as Record<string, unknown>
+    : {}
+  const followResult = incident?.follow_result && typeof incident.follow_result === 'object'
+    ? incident.follow_result as Record<string, unknown>
+    : {}
+  const keyMoments = Array.isArray(incident?.key_moments) ? incident.key_moments.slice(0, 5) : []
+  const outcome = String(synopsis.outcome || followResult.outcome || 'awaiting_review').replace(/_/g, ' ')
+  const followHomeostasis = followResult.homeostasis && typeof followResult.homeostasis === 'object'
+    ? followResult.homeostasis as Record<string, unknown>
+    : {}
+  const elevatedDurationMs = Number(homeostasis.elevated_duration_ms || 0)
+  const settlingMs = Number(homeostasis.settling_ms || 0)
   const coverageFraction = Number(coverage.covered_fraction_estimate)
   const rawTimeline = incident?.timeline?.length
     ? incident.timeline
     : incident?.events?.length
       ? incident.events
       : incident?.qualia_timeline || []
+  const lifecycle = [
+    ['Perception', incident?.perception_state],
+    ['Risk', incident?.risk_state],
+    ['Case', incident?.case_state],
+    ['Attention', incident?.attention_state],
+  ]
+  const visibleObservations = observations.slice(-8).reverse()
+  const primaryEpisode = temporal?.episodes?.[0]
+  const disposition = temporalDisposition(primaryEpisode?.scale_disposition)
+  const seriesLinks = temporal?.series_links || []
+  const lifecycleHistory = temporal?.lifecycle_history || []
+  const normalizedCaseState = String(incident?.case_state || 'candidate').toLowerCase()
+  const historicalCase = ['closed', 'dismissed', 'false_positive'].includes(normalizedCaseState)
 
   return (
     <div className="scrim incident-scrim" onClick={(event) => { event.stopPropagation(); onClose() }}>
@@ -202,7 +372,9 @@ export function IncidentModal({
         <header className="modal-head">
           <div>
             <div className="modal-title" id="incident-modal-title"><IconFileDescription size={16} /> Incident report</div>
-            <div className="incident-subtitle">Drafted from stored evidence · current observations remain operator-reviewed</div>
+            <div className="incident-subtitle">
+              {incidentIdValue ? 'Stored incident · current observations remain operator-reviewed' : 'Drafted from stored evidence · current observations remain operator-reviewed'}
+            </div>
           </div>
           <button className="modal-close" onClick={onClose} aria-label="Close incident report" autoFocus>
             <IconX size={18} />
@@ -241,12 +413,106 @@ export function IncidentModal({
               </dl>
 
               {narrative && <div className="incident-narrative">{narrative}</div>}
+              <section className="incident-human-state" aria-label="Incident operator synopsis">
+                <div><span>Outcome</span><strong>{outcome}</strong></div>
+                <div><span>Confidence</span><strong>{String(synopsis.confidence || 'unknown')}</strong></div>
+                <div><span>Coverage</span><strong>{String(coverage.status || 'unknown')}{Number.isFinite(coverageFraction) ? ` · ${Math.round(coverageFraction * 100)}%` : ''}</strong></div>
+              </section>
+              <section className="incident-homeostasis" aria-label="Homeostatic response">
+                <div className="incident-section-title">Homeostatic response <small>attention signals, not visual proof</small></div>
+                <dl>
+                  <div><dt>Activity apex</dt><dd>{Number(homeostasis.activity_x_max || 0).toFixed(1)}×</dd></div>
+                  <div><dt>Elevated</dt><dd>{elevatedDurationMs > 0 ? formatIncidentDuration(elevatedDurationMs) : '—'}</dd></div>
+                  <div><dt>Settling</dt><dd>{settlingMs > 0 ? formatIncidentDuration(settlingMs) : '—'}</dd></div>
+                  <div><dt>Bursts</dt><dd>{Number(homeostasis.burst_count || 0)}</dd></div>
+                  <div><dt>Probe hits</dt><dd>{Number(homeostasis.probe_hits || 0)} / {Number(homeostasis.probe_samples || 0)}</dd></div>
+                </dl>
+              </section>
+              {Object.keys(followResult).length > 0 && (
+                <section className={`incident-follow-result outcome-${String(followResult.outcome || 'inconclusive')}`}>
+                  <div className="incident-section-title">Last Follow result</div>
+                  <strong>{String(followResult.outcome || 'inconclusive').replace(/_/g, ' ')}</strong>
+                  <p>{String(followResult.description || '')}</p>
+                  <small>
+                    {Number(followResult.observation_count || 0)} L0 observations · {String(followResult.stop_reason || 'completed').replace(/_/g, ' ')}
+                    {Number(followHomeostasis.sample_count || 0) > 0
+                      ? ` · activity apex ${Number(followHomeostasis.activity_x_max || 0).toFixed(1)}× · ${Number(followHomeostasis.burst_count || 0)} bursts`
+                      : ''}
+                  </small>
+                </section>
+              )}
+              {keyMoments.length > 0 && (
+                <section className="incident-key-moments">
+                  <div className="incident-section-title">Key moments</div>
+                  <ol>
+                    {keyMoments.map((moment, index) => (
+                      <li key={`${String(moment.semantic_key || 'moment')}-${index}`}>
+                        <time>{fmtTime(moment.timestamp_ms || moment.occurred_at_ms)}</time>
+                        <span>{String(moment.label || moment.summary || moment.semantic_key || 'Observed transition')}</span>
+                      </li>
+                    ))}
+                  </ol>
+                </section>
+              )}
+              {(temporalLoading || temporalError || (temporal?.supported && primaryEpisode)) && (
+                <section className="incident-temporal-memory" aria-label="Temporal incident memory">
+                  <div className="incident-section-title">Temporal memory <small>routine-separated, operator-reviewed</small></div>
+                  {temporalLoading && <p className="incident-temporal-status">Loading episode boundaries…</p>}
+                  {temporalError && <p className="incident-temporal-status warning">{temporalError}</p>}
+                  {!temporalLoading && !temporalError && primaryEpisode && (
+                    <>
+                      <div className="incident-temporal-disposition">
+                        <strong>{disposition.label}</strong>
+                        <span>{disposition.description}</span>
+                        {primaryEpisode.semantic_key && <i>{primaryEpisode.semantic_key.replace(/_/g, ' ')}</i>}
+                      </div>
+                      {seriesLinks.length > 0 && (
+                        <div className="incident-series-links">
+                          <span>Possible recurrence series</span>
+                          <ul>
+                            {seriesLinks.slice(0, 4).map((link) => (
+                              <li key={link.relation_id}>
+                                <strong>{link.direction === 'prior' ? 'Earlier' : 'Later'} incident #{link.related_incident_id.slice(0, 8)}</strong>
+                                <span>{link.semantic_key.replace(/_/g, ' ')} · {formatIncidentDuration(link.gap_ms)} gap · {link.confidence} confidence</span>
+                                {link.relation_state === 'candidate' ? (
+                                  <div className="incident-series-review-actions">
+                                    <small>Candidate only — incidents remain separate until operator review.</small>
+                                    {canManage && (
+                                      <span>
+                                        <button
+                                          className="btn compact"
+                                          onClick={() => void applySeriesReview(link.relation_id, 'confirm')}
+                                          disabled={busyAction != null}
+                                        >Confirm series</button>
+                                        <button
+                                          className="btn compact"
+                                          onClick={() => void applySeriesReview(link.relation_id, 'reject')}
+                                          disabled={busyAction != null}
+                                        >Reject link</button>
+                                      </span>
+                                    )}
+                                  </div>
+                                ) : (
+                                  <small>Operator-confirmed recurrence series; incidents remain separate.</small>
+                                )}
+                              </li>
+                            ))}
+                          </ul>
+                        </div>
+                      )}
+                    </>
+                  )}
+                </section>
+              )}
               {semanticKeys.length > 0 && (
                 <div className="incident-keys" aria-label="Incident semantic keys">
                   {semanticKeys.map((key) => <span key={key}>{String(key).replace(/_/g, ' ')}</span>)}
                 </div>
               )}
 
+              <details className="incident-technical">
+                <summary>Technical evidence · {evidenceCount} references · {observationTotal} heartbeats</summary>
+                <div className="incident-technical-body">
               <section className="incident-grounding" aria-label="Incident grounding and coverage">
                 <div>
                   <span>Evidence refs</span>
@@ -266,6 +532,34 @@ export function IncidentModal({
                   </strong>
                 </div>
               </section>
+              <section className="incident-lifecycle" aria-label="Independent incident lifecycle axes">
+                {lifecycle.map(([label, value]) => (
+                  <div key={label}>
+                    <span>{label}</span>
+                    <strong>{String(value || 'unknown').replace(/_/g, ' ')}</strong>
+                  </div>
+                ))}
+              </section>
+              {lifecycleHistory.length > 0 && (
+                <section className="incident-lifecycle-history" aria-labelledby="incident-lifecycle-history-title">
+                  <div className="incident-observations-head">
+                    <h3 id="incident-lifecycle-history-title">Lifecycle history</h3>
+                    <span>{temporal?.transition_total || lifecycleHistory.length} immutable transitions</span>
+                  </div>
+                  <ol>
+                    {lifecycleHistory.slice(-12).reverse().map((transition) => (
+                      <li key={transition.id}>
+                        <time>{fmtTime(transition.transitioned_at_ms)}</time>
+                        <strong>{String(transition.axis || 'state').replace(/_/g, ' ')}</strong>
+                        <span>
+                          {String(transition.from_state || 'unset').replace(/_/g, ' ')} → {String(transition.to_state || 'unknown').replace(/_/g, ' ')}
+                        </span>
+                        <small>{String(transition.reason || transition.source_kind || '').replace(/_/g, ' ')}</small>
+                      </li>
+                    ))}
+                  </ol>
+                </section>
+              )}
               {uncertainties.length > 0 && (
                 <section className="incident-uncertainties" aria-label="Incident uncertainties">
                   <strong><IconAlertTriangle size={14} /> Operator review required</strong>
@@ -293,6 +587,75 @@ export function IncidentModal({
                   </ol>
                 )}
               </section>
+
+              <section className="incident-observations" aria-labelledby="incident-observations-title">
+                <div className="incident-observations-head">
+                  <h3 id="incident-observations-title">Observation ledger</h3>
+                  <span>{observationTotal} immutable heartbeats</span>
+                </div>
+                {observationsLoading && <div className="incident-observation-status">Loading durable observations…</div>}
+                {observationError && <div className="incident-observation-status warning">{observationError}</div>}
+                {!observationsLoading && !observationError && visibleObservations.length === 0 && (
+                  <div className="incident-observation-status">No L0 heartbeat has been appended yet.</div>
+                )}
+                {visibleObservations.length > 0 && (
+                  <ol>
+                    {visibleObservations.map((observation) => (
+                      <li key={observation.id}>
+                        <time>{fmtTime(observation.observed_at_ms)}</time>
+                        <strong>{String(observation.source_kind || 'observation').replace(/_/g, ' ')}</strong>
+                        <span>
+                          {String(observation.payload?.association || observation.perception_state || 'unknown').replace(/_/g, ' ')} · channel #{observation.channel_id || '?'}
+                        </span>
+                      </li>
+                    ))}
+                  </ol>
+                )}
+              </section>
+                </div>
+              </details>
+
+              {id && canManage && (
+                <section className="incident-operator-review" aria-labelledby="incident-operator-review-title">
+                  <div>
+                    <h3 id="incident-operator-review-title">Operator review</h3>
+                    <p>Lifecycle decisions are audited. They do not rewrite visual evidence or merge related incidents.</p>
+                  </div>
+                  <label>
+                    Optional note
+                    <textarea
+                      value={reviewNote}
+                      onChange={(event) => setReviewNote(event.target.value.slice(0, 1000))}
+                      placeholder="Why this incident is being confirmed, closed, or dismissed…"
+                      rows={2}
+                    />
+                  </label>
+                  <div className="incident-review-actions">
+                    {historicalCase ? (
+                      <button className="btn primary" onClick={() => void applyReview('reopen')} disabled={busyAction != null}>
+                        {busyAction === 'review:reopen' ? 'Reopening…' : 'Reopen incident'}
+                      </button>
+                    ) : (
+                      <>
+                        {['candidate', 'unknown'].includes(normalizedCaseState) && (
+                          <button className="btn primary" onClick={() => void applyReview('confirm')} disabled={busyAction != null}>
+                            {busyAction === 'review:confirm' ? 'Confirming…' : 'Confirm incident'}
+                          </button>
+                        )}
+                        <button className="btn" onClick={() => void applyReview('resolve')} disabled={busyAction != null}>
+                          {busyAction === 'review:resolve' ? 'Closing…' : 'Resolve & close'}
+                        </button>
+                        <button className="btn" onClick={() => void applyReview('dismiss')} disabled={busyAction != null}>
+                          {busyAction === 'review:dismiss' ? 'Dismissing…' : 'Dismiss'}
+                        </button>
+                        <button className="btn danger" onClick={() => void applyReview('false_positive')} disabled={busyAction != null}>
+                          {busyAction === 'review:false_positive' ? 'Saving…' : 'False positive'}
+                        </button>
+                      </>
+                    )}
+                  </div>
+                </section>
+              )}
 
               <section className={`incident-follow ${followActive ? 'active' : ''}`} aria-labelledby="incident-follow-title">
                 <div>
@@ -328,7 +691,7 @@ export function IncidentModal({
                       </select>
                     </label>
                     <button className="btn primary" onClick={startFollow} disabled={busyAction != null || !id}>
-                      <IconEye size={14} /> {busyAction === 'follow' ? 'Starting…' : 'Start follow'}
+                    <IconEye size={14} /> {busyAction === 'follow' ? 'Starting…' : (bounds.observed_end && Date.now() - Number(bounds.observed_end) > 120_000 ? 'Watch for recurrence' : 'Start follow')}
                     </button>
                   </div>
                 )}
@@ -346,8 +709,8 @@ export function IncidentModal({
 
           {!loading && !incident && (
             <div className="incident-empty">
-              <p>No incident draft is available. The source evidence has not been changed.</p>
-              <button className="btn" onClick={retryDraft}><IconRefresh size={14} /> Retry draft</button>
+              <p>No incident report is available. The source evidence has not been changed.</p>
+              <button className="btn" onClick={retryLoad}><IconRefresh size={14} /> Retry</button>
             </div>
           )}
         </div>

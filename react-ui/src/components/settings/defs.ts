@@ -18,14 +18,21 @@ export interface FieldDef {
 export interface Section { title: string; help?: string; fields?: FieldDef[]; kind?: 'severity' | 'capacity'; experimental?: boolean }
 export interface TabDef { id: string; label: string; custom?: 'env' | 'audit' | 'users' | 'diagnostics' | 'appearance'; sections?: Section[] }
 
-const CLIP_MODELS = ['ViT-B/32', 'ViT-B/16', 'ViT-L/14', 'ViT-L/14@336px'].map((v) => ({ v }))
+const CLIP_MODELS = [
+  'google/siglip2-base-patch16-224',
+  'ViT-B/32',
+  'ViT-B/16',
+  'ViT-L/14',
+  'ViT-L/14@336px',
+].map((v) => ({ v }))
 
 // keys writable via POST /settings (guards the save payload)
 export const WRITABLE_KEYS: string[] = [
   'host', 'port', 'debug',
   'minResults', 'maxResults', 'defaultResults',
-  'embedder', 'clipModel', 'dinoModel', 'dinoEmbedDim', 'dinoWeightsPath', 'indexMode',
-  'fusionEnabled', 'fusionAlpha', 'batchSize', 'thumbnailQuality',
+  'clipModel', 'indexMode', 'batchSize', 'thumbnailQuality',
+  'vlmBaseUrl', 'vlmModel', 'vlmApiKey', 'vlmTimeout',
+  'agentBaseUrl', 'agentModel', 'agentApiKey', 'agentTimeout',
   'rerankEnabled', 'rerankTopK', 'segmentsEnabled', 'segmentMinPatches', 'maxCommentLength', 'maxFileSize',
   'luxriotBaseUrl', 'luxriotUsername', 'luxriotPassword', 'luxriotDefaultChannelId',
   'luxriotSnapshotInterval', 'luxriotSnapshotMaxEdge', 'luxriotMaxBufferFrames',
@@ -64,27 +71,29 @@ export const TABS: TabDef[] = [
     id: 'models', label: 'Models',
     sections: [
       {
-        title: 'Backend & model', help: 'Embedding backend and thumbnail quality. DINO / fusion are experimental.',
+        title: 'VLM inference', help: 'Vision-language endpoint used for live L0 descriptions and visual alerts. API key is write-only; leave it blank to keep the stored value.',
         fields: [
-          { key: 'embedder', label: 'Backend', type: 'select', options: [{ v: 'clip' }, { v: 'dino' }, { v: 'fusion' }], note: 'dino / fusion require experimental embedders' },
-          { key: 'clipModel', label: 'CLIP model', type: 'select', options: CLIP_MODELS },
+          { key: 'vlmBaseUrl', label: 'VLM API base URL', type: 'text', note: 'OpenAI-compatible /v1 endpoint' },
+          { key: 'vlmModel', label: 'VLM model', type: 'text' },
+          { key: 'vlmApiKey', label: 'VLM API key', type: 'password' },
+          { key: 'vlmTimeout', label: 'VLM timeout (s)', type: 'number', min: 1, max: 3600 },
+        ],
+      },
+      {
+        title: 'Agent inference', help: 'Language-model endpoint used by EVA Agent and semantic consolidation. API key is write-only; leave it blank to keep the stored value.',
+        fields: [
+          { key: 'agentBaseUrl', label: 'Agent API base URL', type: 'text', note: 'OpenAI-compatible /v1 endpoint' },
+          { key: 'agentModel', label: 'Agent model', type: 'text' },
+          { key: 'agentApiKey', label: 'Agent API key', type: 'password' },
+          { key: 'agentTimeout', label: 'Agent timeout (s)', type: 'number', min: 1, max: 3600 },
+        ],
+      },
+      {
+        title: 'Semantic embedding', help: 'Embedding model used by archive search and attention probes.',
+        fields: [
+          { key: 'clipModel', label: 'Embedding model', type: 'select', options: CLIP_MODELS },
           { key: 'batchSize', label: 'Batch size', type: 'number', min: 1, max: 128 },
           { key: 'thumbnailQuality', label: 'Thumbnail quality', type: 'range', min: 50, max: 100, step: 1 },
-        ],
-      },
-      {
-        title: 'DINO', help: 'Secondary DINOv3 encoder — used only when backend is DINO or fusion.', experimental: true,
-        fields: [
-          { key: 'dinoModel', label: 'DINO model', type: 'text' },
-          { key: 'dinoEmbedDim', label: 'DINO embedding dim', type: 'number', min: 128, max: 4096 },
-          { key: 'dinoWeightsPath', label: 'DINO weights path', type: 'text' },
-        ],
-      },
-      {
-        title: 'Fusion', help: 'Weighted CLIP+DINO blend — implemented but off unless experimental embedders are enabled.', experimental: true,
-        fields: [
-          { key: 'fusionEnabled', label: 'Fusion enabled', type: 'checkbox' },
-          { key: 'fusionAlpha', label: 'Fusion alpha (CLIP↔DINO)', type: 'range', min: 0, max: 1, step: 0.05 },
         ],
       },
     ],

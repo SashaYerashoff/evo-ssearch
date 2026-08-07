@@ -1,18 +1,18 @@
 # EVA 0.8.5 — профиль порта: 8 регулируемых каналов
 
-Статус: кандидат на живой soak, 2026-07-28. Целевая машина: RTX 4070
+Статус: Ventspils maritime client release candidate. Целевая машина: RTX 4070
 Super 12 GB, Intel Core i9 14-го поколения, 64 GB DDRAM, Ubuntu 24.04.
 
 ## Размещение нагрузки
 
-- RTX 4070S: только Qwen VLM в vLLM. CLIP, CV и 9B deep-review не должны
-  занимать VRAM этой карты.
+- RTX 4070S: Qwen3-VL-4B в vLLM и закреплённый SigLIP2 base для независимой
+  семантической индексации. vLLM ограничен своим memory envelope; SigLIP2
+  работает в том же CUDA device отдельными микробатчами. OpenAI CLIP сохранён
+  только для сравнения и чтения legacy-индекса.
 - Intel QSV: аппаратный decode восьми потоков, если драйвер и источник
   поддерживают его.
-- CPU/iGPU: плотный CV около 4 fps/channel и CLIP 1 Hz/channel. Текущий
-  PyTorch CPU fallback объединяет одновременные CLIP-вызовы в микробатчи до
-  восьми; OpenVINO/iGPU остаётся предпочтительным ускорением после отдельной
-  проверки качества embeddings.
+- CPU/iGPU: плотный CV около 4 fps/channel. CPU fallback для SigLIP2 остаётся
+  аварийным профилем, а не штатным восьмиканальным размещением.
 - CPU/RAM: отдельный llama.cpp 9B endpoint для L3 deep review, concurrency 1.
   Он не выгружает и не замещает live 4B.
 
@@ -87,13 +87,17 @@ EVOSSEARCH_SEMANTIC_SNAPSHOT_ARCHIVE_ENABLED=true
 EVOSSEARCH_SEMANTIC_SNAPSHOT_ARCHIVE_QUEUE=512
 EVOSSEARCH_SEMANTIC_SNAPSHOT_ARCHIVE_BATCH_SIZE=32
 
-EVOSSEARCH_LUXRIOT_ROLLUP_L3_DEEP_ENABLED=false
+EVOSSEARCH_LUXRIOT_ROLLUP_L3_DEEP_ENABLED=true
 EVOSSEARCH_LUXRIOT_ROLLUP_L3_QUIET_WINDOW_ENABLED=false
 EVOSSEARCH_LUXRIOT_ROLLUP_L3_QUIET_WINDOW_TIMEZONE=Europe/Riga
 ```
 
-Deep L3 включается только после запуска отдельного endpoint и сохранения
-операторского окна. Оба флага по умолчанию fail-closed.
+Локальный 9B endpoint устанавливается и проверяется заранее, но deep L3
+остаётся fail-closed, пока оператор не сохранит разрешённое тихое окно.
+Закрытый gate откладывает deep review и не забирает ресурс у live-потока.
+
+React является штатным UI этой клиентской ветки; `/?ui=legacy` остаётся
+аварийным fallback без изменения конфигурации сервиса.
 
 ## Ёмкость архива
 

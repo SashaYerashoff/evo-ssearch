@@ -11,6 +11,27 @@ SIGLIP2_REVISION="${EVA_PORT_SIGLIP2_REVISION:-75de2d55ec2d0b4efc50b3e9ad70dba96
 SIGLIP2_CACHE_REPO="${EVA_PORT_SIGLIP2_CACHE_REPO:-/mnt/eva-llamacpp-lab/models/huggingface/models--google--siglip2-base-patch16-224}"
 LLAMA_SOURCE="${EVA_PORT_LLAMA_SOURCE:-/mnt/eva-llamacpp-lab/src/llama.cpp}"
 REACT_UI_ROOT="${REPO_ROOT}/react-ui"
+EXPECTED_BRANCH="${EVA_PORT_EXPECTED_BRANCH:-feature/maritime-port-specs}"
+RELEASE_FLAVOR="${EVA_PORT_RELEASE_FLAVOR:-ventspils-maritime-client}"
+SOURCE_BRANCH="$(git -C "${REPO_ROOT}" branch --show-current)"
+SOURCE_COMMIT="$(git -C "${REPO_ROOT}" rev-parse HEAD)"
+SOURCE_DIRTY="$(git -C "${REPO_ROOT}" status --porcelain --untracked-files=normal)"
+WORKTREE_CLEAN=true
+
+if [[ "${SOURCE_BRANCH}" != "${EXPECTED_BRANCH}" && "${EVA_PORT_ALLOW_OTHER_BRANCH:-0}" != "1" ]]; then
+    echo "ERROR: port client bundle must be built from ${EXPECTED_BRANCH}; current branch is ${SOURCE_BRANCH}." >&2
+    echo "Set EVA_PORT_ALLOW_OTHER_BRANCH=1 only for an explicitly reviewed recovery build." >&2
+    exit 1
+fi
+if [[ -n "${SOURCE_DIRTY}" && "${EVA_PORT_ALLOW_DIRTY:-0}" != "1" ]]; then
+    echo "ERROR: port client bundle requires a clean committed working tree." >&2
+    echo "Commit the release candidate, or set EVA_PORT_ALLOW_DIRTY=1 only for a labelled diagnostic build." >&2
+    exit 1
+fi
+if [[ -n "${SOURCE_DIRTY}" ]]; then
+    WORKTREE_CLEAN=false
+    echo "WARNING: building a diagnostic payload from a dirty tree; finalization will refuse it." >&2
+fi
 
 for required in \
     "${MODEL_VLM}/model.safetensors" \
@@ -81,10 +102,10 @@ rsync -a --delete --delete-excluded \
     "${REPO_ROOT}/" "${STAGING_ROOT}/repo/"
 
 rsync -a --delete "${MODEL_VLM}/" "${STAGING_ROOT}/models/qwen3-vl-4b-awq/"
-install -p -m 0644 \
+rsync -a \
     "${MODEL_9B}/Qwen3.5-9B-Q4_K_M.gguf" \
     "${STAGING_ROOT}/models/qwen3.5-9b-mtp/Qwen3.5-9B-Q4_K_M.gguf"
-install -p -m 0644 "${CLIP_WEIGHT}" "${STAGING_ROOT}/models/clip/ViT-B-32.pt"
+rsync -a "${CLIP_WEIGHT}" "${STAGING_ROOT}/models/clip/ViT-B-32.pt"
 rsync -a --delete \
     "${SIGLIP2_CACHE_REPO}/" \
     "${STAGING_ROOT}/models/huggingface/models--google--siglip2-base-patch16-224/"
@@ -97,18 +118,51 @@ rsync -a --delete \
 
 install -p -m 0755 "${SCRIPT_DIR}/install_port_appliance.py" "${STAGING_ROOT}/install_port_appliance.py"
 install -p -m 0755 "${SCRIPT_DIR}/install_port_appliance.sh" "${STAGING_ROOT}/install.sh"
+install -p -m 0755 "${SCRIPT_DIR}/eva_offline_deploy.py" "${STAGING_ROOT}/eva_offline_deploy.py"
+install -p -m 0755 "${SCRIPT_DIR}/eva_offline_deploy.sh" "${STAGING_ROOT}/START_EVA_AI.sh"
+install -p -m 0755 \
+    "${SCRIPT_DIR}/offline_bundle_dependencies.py" \
+    "${STAGING_ROOT}/offline_bundle_dependencies.py"
 install -p -m 0644 \
     "${REPO_ROOT}/deployment/port_4070s/constraints-port-4070s.txt" \
     "${STAGING_ROOT}/constraints-port-4070s.txt"
-install -p -m 0644 \
-    "${REPO_ROOT}/deployment/port_4070s/START_HERE.txt" \
-    "${STAGING_ROOT}/START_HERE.txt"
+if [[ "${RELEASE_FLAVOR}" == "universal-offline" ]]; then
+    install -p -m 0644 \
+        "${REPO_ROOT}/deployment/universal/START_HERE.md" \
+        "${STAGING_ROOT}/START_HERE.md"
+else
+    install -p -m 0644 \
+        "${REPO_ROOT}/deployment/port_4070s/START_HERE.txt" \
+        "${STAGING_ROOT}/START_HERE.txt"
+fi
 install -p -m 0644 \
     "${REPO_ROOT}/deployment/port_4070s/apt-packages-ubuntu-24.04.txt" \
     "${STAGING_ROOT}/apt/package-names.txt"
 install -p -m 0644 \
     "${REPO_ROOT}/deployment/port_4070s/REPOSITORY_BACKUP.txt" \
     "${STAGING_ROOT}/repository-backup/README.txt"
+python3 - "${STAGING_ROOT}/SOURCE_REVISION.json" "${SOURCE_BRANCH}" "${SOURCE_COMMIT}" "${RELEASE_FLAVOR}" "${WORKTREE_CLEAN}" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+target, branch, commit, flavor, clean = sys.argv[1:]
+Path(target).write_text(
+    json.dumps(
+        {
+            "format": 1,
+            "release_flavor": flavor,
+            "branch": branch,
+            "commit": commit,
+            "working_tree_clean": clean == "true",
+        },
+        indent=2,
+        sort_keys=True,
+    )
+    + "\n",
+    encoding="utf-8",
+)
+PY
 git -C "${REPO_ROOT}" bundle create \
     "${STAGING_ROOT}/repository-backup/evo-ssearch-all-refs.bundle" \
     --all
@@ -116,4 +170,6 @@ python3 "${SCRIPT_DIR}/build_appliance_installer_deb.py" \
     --output-dir "${STAGING_ROOT}/installer-deb"
 
 echo "Base payload prepared at ${STAGING_ROOT}"
-echo "Populate wheelhouse/ and apt/, then run scripts/finalize_port_usb_bundle.py."
+echo "Universal entry point: ${STAGING_ROOT}/START_EVA_AI.sh"
+echo "Base payload only: populate and validate wheelhouse/ and apt/ before finalization."
+echo "For a complete fresh/update bundle, use scripts/build_universal_usb_bundle.sh."

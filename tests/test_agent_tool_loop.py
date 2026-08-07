@@ -277,6 +277,58 @@ class AgentToolLoopTests(unittest.TestCase):
         self.assertEqual(call.name, "track_visual_state_transitions")
         self.assertNotRegex(call.args["negative_state_query"], r"\b(?:no|not|without)\b")
 
+        archive = _seed_turn_tool_context(
+            'Search the video-description archive for "Zenbook webcam" look for sphynx cat'
+        )
+        self.assertIn("archive_research", archive["tool_intents"])
+        self.assertEqual(archive["archive_search_query"], "sphynx cat")
+        self.assertIn(
+            "archive_research",
+            agent._extract_requested_skill_slugs(
+                'Search the video-description archive for "Zenbook webcam" look for sphynx cat'
+            ),
+        )
+        archive["active_skill_slugs"] = ["archive_research"]
+        archive["skill_tool_names"] = sorted(
+            agent._skill_tool_names(["archive_research"])
+        )
+        schemas = _select_relevant_tool_schemas(agent._TOOL_SCHEMAS, archive)
+        self.assertIn(
+            "search_archive",
+            {schema["function"]["name"] for schema in schemas},
+        )
+        call = agent._required_bounded_workflow_tool_call(archive, schemas)
+        self.assertEqual(call.name, "search_archive")
+        self.assertNotIn("channel_id", call.args)
+
+        archive.update({"channel_id": 112, "video_inventory_completed": True})
+        schemas = _select_relevant_tool_schemas(agent._TOOL_SCHEMAS, archive)
+        call = agent._required_bounded_workflow_tool_call(archive, schemas)
+        self.assertEqual(call.name, "search_archive")
+        self.assertEqual(call.args["query"], "sphynx cat")
+        self.assertEqual(call.args["channel_id"], 112)
+        self.assertGreaterEqual(call.args["limit"], 6)
+
+        archive.update(
+            {
+                "archive_search_completed": True,
+                "archive_search_query": "sphynx cat",
+                "archive_vision_required": True,
+                "archive_vision_completed": False,
+                "archive_vision_candidate_ids": list(range(101, 109)),
+            }
+        )
+        schemas = _select_relevant_tool_schemas(agent._TOOL_SCHEMAS, archive)
+        call = agent._required_bounded_workflow_tool_call(archive, schemas)
+        self.assertEqual(call.name, "describe_frame")
+        self.assertEqual(call.args["detection_ids"], list(range(101, 109)))
+        self.assertIn("sphynx cat", call.args["prompt"])
+        archive["archive_vision_attempted"] = True
+        self.assertIsNone(
+            agent._required_bounded_workflow_tool_call(archive, schemas)
+        )
+        self.assertTrue(agent._bounded_workflow_plan_completed(archive))
+
         incident = _seed_turn_tool_context(
             "Report incident on channel 112 for the last 10 minutes"
         )
@@ -311,6 +363,15 @@ class AgentToolLoopTests(unittest.TestCase):
         deploy["deployment_stage"] = "scope_configured"
         call = agent._required_bounded_workflow_tool_call(deploy, schemas)
         self.assertEqual(call.name, "survey_deployment")
+
+        fresh = _seed_turn_tool_context("protocol: deploy, target - 4 channels")
+        self.assertEqual(fresh["deployment_target_channel_count"], 4)
+        self.assertTrue(fresh["deployment_start_new"])
+        schemas = _select_relevant_tool_schemas(agent._TOOL_SCHEMAS, fresh)
+        call = agent._required_bounded_workflow_tool_call(fresh, schemas)
+        self.assertEqual(call.name, "start_deployment")
+        self.assertEqual(call.args["target_channel_count"], 4)
+        self.assertFalse(call.args["resume_latest"])
 
     def test_routing_repairs_common_operator_typos_and_inherits_followup_intent(self):
         initial = _seed_turn_tool_context(
@@ -350,6 +411,724 @@ class AgentToolLoopTests(unittest.TestCase):
         )
         self.assertIn("video_research", continued["tool_intents"])
         self.assertEqual(continued["operator_relative_range"], "last 24 hours")
+
+    def test_video_event_followup_retains_trusted_channel_and_window(self):
+        history = [
+            {
+                "role": "tool",
+                "name": "get_video_summaries",
+                "content": json.dumps(
+                    {
+                        "channel_id": 420,
+                        "depth": "L1",
+                        "entries": [
+                            {
+                                "window_start": 1_000.0,
+                                "window_end": 1_060.0,
+                                "summary": (
+                                    "Dublin Road: a red car overtakes another vehicle "
+                                    "near the junction."
+                                ),
+                            }
+                        ],
+                    }
+                ),
+            }
+        ]
+        text = "Look deeper into that Dublin Road overtaking event"
+        context = agent._inherit_followup_tool_context(
+            _seed_turn_tool_context(text),
+            text,
+            history,
+        )
+
+        self.assertEqual(context["channel_id"], 420)
+        self.assertEqual(context["video_candidate_channel_ids"], [420])
+        self.assertEqual(context["time_window"]["from_ts"], 1_000.0)
+        self.assertTrue(context["inherited_video_event_scope"])
+        schemas = _select_relevant_tool_schemas(agent._TOOL_SCHEMAS, context)
+        call = agent._required_video_research_tool_call(context, schemas)
+        self.assertIsNotNone(call)
+        self.assertEqual(call.name, "get_video_summaries")
+        self.assertEqual(call.args["channel_id"], 420)
+
+    def test_video_event_followup_without_timestamp_does_not_broaden_scope(self):
+        history = [
+            {
+                "role": "tool",
+                "name": "get_video_summaries",
+                "content": json.dumps(
+                    {
+                        "channel_id": 420,
+                        "entries": [
+                            {"summary": "Dublin Road overtaking event selected by operator."}
+                        ],
+                    }
+                ),
+            }
+        ]
+        text = "Drill deeper into that Dublin Road overtaking event"
+        context = agent._inherit_followup_tool_context(
+            _seed_turn_tool_context(text),
+            text,
+            history,
+        )
+
+        self.assertEqual(context["channel_id"], 420)
+        self.assertTrue(context["video_event_followup_missing_time"])
+        self.assertEqual(_select_relevant_tool_schemas(agent._TOOL_SCHEMAS, context), [])
+        answer = agent._format_video_event_followup_clarification(
+            context,
+            {"user_query": text},
+        )
+        self.assertIn("CH 420", answer)
+        self.assertIn("approximate event time", answer)
+        self.assertIn("without broadening", answer)
+
+    def test_video_final_rejects_channel_and_alert_counts_absent_from_current_turn(self):
+        ledger = agent._new_turn_signal_ledger("Show latest alerts across all channels")
+        agent._record_turn_signal_ledger(
+            ledger,
+            "list_video_summary_channels",
+            {
+                "active_count": 1,
+                "candidate_channels": [
+                    {"channel_id": 420, "alert_total": 2, "summary_count": 9}
+                ],
+            },
+        )
+
+        self.assertEqual(
+            agent._video_response_grounding_issues(
+                "CH 420 has 2 alerts in the current window.",
+                ledger,
+            ),
+            [],
+        )
+        issues = agent._video_response_grounding_issues(
+            "CH 211 has 0 alerts and CH 420 has 7 alerts.",
+            ledger,
+        )
+        self.assertIn("unsupported_channel:211", issues)
+        self.assertIn("unsupported_alert_count:420:7", issues)
+        self.assertTrue(
+            agent._video_research_response_needs_recovery(
+                "CH 211 has 0 alerts and CH 420 has 7 alerts.",
+                {"tool_intents": ["video_research"]},
+                ledger,
+            )
+        )
+
+    def test_protocol_deploy_rehydrates_scope_selection_from_tool_history(self):
+        start_result = {
+            "deployment_id": "deploy-home-1",
+            "stage": "inventory",
+            "available_channels": [
+                {"id": 106, "title": "pixel9a"},
+                {"id": 112, "title": "Zenbook webcam"},
+                {"id": 118, "title": "emu-1"},
+            ],
+            "selected_channel_ids": [],
+            "groups": [],
+        }
+        text = (
+            "Select channels 112 and 118. Group channel 112 as home_workspace "
+            "and channel 118 as traffic_simulation. This rehearses an 8-channel deployment."
+        )
+        context = agent._inherit_followup_tool_context(
+            _seed_turn_tool_context(text),
+            text,
+            [
+                {
+                    "role": "tool",
+                    "tool_name": "start_deployment",
+                    "tool_result": json.dumps(start_result),
+                }
+            ],
+        )
+
+        self.assertEqual(context["tool_intents"], ["deployment"])
+        self.assertEqual(context["deployment_id"], "deploy-home-1")
+        self.assertEqual(context["deployment_stage"], "inventory")
+        self.assertEqual(context["deployment_selected_channel_ids"], [112, 118])
+        self.assertEqual(
+            context["deployment_groups"],
+            [
+                {"name": "home_workspace", "channel_ids": [112]},
+                {"name": "traffic_simulation", "channel_ids": [118]},
+            ],
+        )
+
+        fresh = agent._inherit_followup_tool_context(
+            _seed_turn_tool_context("protocol: deploy, target - 4 channels"),
+            "protocol: deploy, target - 4 channels",
+            [
+                {
+                    "role": "tool",
+                    "tool_name": "start_deployment",
+                    "tool_result": json.dumps(start_result),
+                }
+            ],
+        )
+        self.assertNotIn("deployment_id", fresh)
+        self.assertEqual(fresh["deployment_target_channel_count"], 4)
+
+        grouped = agent._deployment_groups_from_text(
+            "112, 118; group home_workspace: 112; group traffic_simulation: 118",
+            [112, 118],
+        )
+        self.assertEqual(
+            grouped,
+            [
+                {"name": "home_workspace", "channel_ids": [112]},
+                {"name": "traffic_simulation", "channel_ids": [118]},
+            ],
+        )
+
+        schemas = _select_relevant_tool_schemas(agent._TOOL_SCHEMAS, context)
+        call = agent._required_bounded_workflow_tool_call(context, schemas)
+        self.assertEqual(call.name, "configure_deployment")
+        self.assertEqual(call.args["channel_ids"], [112, 118])
+        self.assertEqual(call.args["groups"], context["deployment_groups"])
+
+        context["deployment_stage"] = "scope_configured"
+        call = agent._required_bounded_workflow_tool_call(context, schemas)
+        self.assertEqual(call.name, "survey_deployment")
+
+        numeric_only = agent._inherit_followup_tool_context(
+            _seed_turn_tool_context("112, 118"),
+            "112, 118",
+            [
+                {
+                    "role": "tool",
+                    "tool_name": "start_deployment",
+                    "tool_result": json.dumps(start_result),
+                }
+            ],
+        )
+        self.assertEqual(numeric_only["tool_intents"], ["deployment"])
+        self.assertEqual(numeric_only["deployment_selected_channel_ids"], [112, 118])
+
+    def test_maritime_scope_requires_operator_roles_and_carries_closed_ui_values(self):
+        start_result = {
+            "deployment_id": "deploy-port-1",
+            "deployment_profile": "maritime",
+            "target_channel_count": 8,
+            "stage": "inventory",
+            "available_channel_ids": [41, 42],
+            "available_channels": [
+                {"id": 41, "title": "North gate"},
+                {"id": 42, "title": "West coast"},
+            ],
+            "selected_channel_ids": [],
+            "groups": [],
+            "channel_roles": [],
+        }
+        history = [{
+            "role": "tool",
+            "tool_name": "start_deployment",
+            "tool_result": json.dumps(start_result),
+        }]
+        compact = agent._compact_tool_result_for_model(
+            "start_deployment",
+            start_result,
+        )
+        self.assertEqual(compact["deployment_profile"], "maritime")
+        self.assertEqual(compact["available_channel_ids"], [41, 42])
+        survey_compact = agent._compact_tool_result_for_model(
+            "survey_deployment",
+            {
+                **start_result,
+                "stage": "surveyed",
+                "starter_policy_mode": "shadow",
+                "starter_policy_confirmed": True,
+                "selected_channel_ids": [41, 42],
+                "groups": [{"name": "gates", "channel_ids": [41, 42]}],
+                "channel_roles": [
+                    {"channel_id": 41, "role": "maritime_gate"},
+                    {"channel_id": 42, "role": "maritime_mixed_ptz"},
+                ],
+                "surveys": [
+                    {"channel_id": 41, "scene_fingerprint": "VIEW: port gate"},
+                    {"channel_id": 42, "scene_fingerprint": "VIEW: mixed"},
+                ],
+            },
+        )
+        self.assertEqual(survey_compact["deployment_profile"], "maritime")
+        self.assertTrue(survey_compact["starter_policy_confirmed"])
+        self.assertEqual(survey_compact["groups"][0]["name"], "gates")
+        self.assertEqual(len(survey_compact["surveys"]), 2)
+
+        incomplete = agent._inherit_followup_tool_context(
+            _seed_turn_tool_context("41, 42"),
+            "41, 42",
+            history,
+        )
+        self.assertTrue(incomplete["deployment_maritime_roles_pending"])
+        self.assertTrue(agent._bounded_workflow_plan_completed(incomplete))
+        self.assertEqual(
+            _select_relevant_tool_schemas(agent._TOOL_SCHEMAS, incomplete),
+            [],
+        )
+        self.assertIn(
+            "No channel role will be guessed",
+            agent._format_deployment_maritime_roles_pending(incomplete),
+        )
+
+        text = (
+            'Select channels 41, 42; group gates: 41, 42; '
+            'CH 41 role maritime_gate location "Ventspils north gate"; '
+            'CH 42 role maritime_mixed_ptz location "West coastline tour"'
+        )
+        complete = agent._inherit_followup_tool_context(
+            _seed_turn_tool_context(text),
+            text,
+            history,
+        )
+        self.assertNotIn("deployment_maritime_roles_pending", complete)
+        self.assertEqual(
+            complete["deployment_channel_roles"],
+            [
+                {
+                    "channel_id": 41,
+                    "role": "maritime_gate",
+                    "location": "Ventspils north gate",
+                },
+                {
+                    "channel_id": 42,
+                    "role": "maritime_mixed_ptz",
+                    "location": "West coastline tour",
+                },
+            ],
+        )
+        schemas = _select_relevant_tool_schemas(agent._TOOL_SCHEMAS, complete)
+        call = agent._required_bounded_workflow_tool_call(complete, schemas)
+        self.assertEqual(call.name, "configure_deployment")
+        self.assertEqual(call.args["channel_roles"], complete["deployment_channel_roles"])
+
+        supplied = _apply_turn_tool_context(
+            "configure_deployment",
+            {
+                "deployment_id": "invented",
+                "requirements": [{"name": "Gates", "channel_ids": [41, 42]}],
+                "starter_policy_mode": "shadow",
+            },
+            {
+                **complete,
+                "deployment_stage": "surveyed",
+                "deployment_starter_policy_mode": "none",
+            },
+        )
+        self.assertEqual(supplied["starter_policy_mode"], "none")
+        self.assertEqual(
+            agent._deployment_starter_policy_mode_from_text(
+                "Starter policy mode shadow"
+            ),
+            "shadow",
+        )
+        quiet_window = agent._deployment_quiet_window_from_text(
+            "Consolidation quiet window 01:00-05:00 timezone Europe/Riga every day"
+        )
+        self.assertEqual(
+            quiet_window,
+            {
+                "enabled": True,
+                "start_local": "01:00",
+                "end_local": "05:00",
+                "timezone": "Europe/Riga",
+                "days": list(range(7)),
+            },
+        )
+        quiet_prepared = _apply_turn_tool_context(
+            "configure_deployment",
+            {"quiet_window": {"enabled": True, "timezone": "Invented/Zone"}},
+            {
+                **complete,
+                "deployment_stage": "surveyed",
+                "deployment_quiet_window_confirmed": True,
+                "deployment_quiet_window": quiet_window,
+            },
+        )
+        self.assertEqual(quiet_prepared["quiet_window"], quiet_window)
+
+    def test_protocol_deploy_inventory_turn_stops_for_operator_scope(self):
+        context = _seed_turn_tool_context("Protocol Deploy, target 8 channels")
+        context.update(
+            {
+                "deployment_id": "deploy-home-1",
+                "deployment_stage": "inventory",
+                "deployment_available_channel_ids": [112, 118],
+                "deployment_selected_channel_ids": [],
+            }
+        )
+
+        self.assertTrue(agent._bounded_workflow_plan_completed(context))
+
+    def test_protocol_deploy_survey_boundary_uses_trusted_state_and_pins_id(self):
+        state = {
+            "deployment_id": "deploy-home-1",
+            "version": 1,
+            "stage": "surveyed",
+            "deployment_profile": "general",
+            "target_channel_count": 8,
+            "available_channels": [
+                {"id": 112, "title": "Zenbook webcam"},
+                {"id": 118, "title": "emu-1"},
+            ],
+            "selected_channel_ids": [112, 118],
+            "groups": [
+                {"name": "home_workspace", "channel_ids": [112]},
+                {"name": "traffic_simulation", "channel_ids": [118]},
+            ],
+            "surveys": [
+                {
+                    "channel_id": 112,
+                    "title": "Zenbook webcam",
+                    "sample_count": 4,
+                    "survey": "SCENE: home workspace; CHANGES: person crosses view",
+                },
+                {
+                    "channel_id": 118,
+                    "title": "emu-1",
+                    "sample_count": 4,
+                    "survey": "SCENE: road simulation; CHANGES: moving vehicle",
+                },
+            ],
+            "requirements": [],
+        }
+
+        receipt = agent._trusted_deployment_state_message(state)
+        self.assertIn("deploy-home-1", receipt)
+        self.assertIn("home workspace", receipt)
+        self.assertIn("road simulation", receipt)
+        self.assertIn("groups are already configured", receipt)
+        self.assertIn("do not ask to recreate them", receipt)
+
+        context = {
+            "tool_intents": ["deployment"],
+            "deployment_id": "deploy-home-1",
+            "deployment_stage": "surveyed",
+            "deployment_requirements_pending": True,
+        }
+        self.assertTrue(agent._bounded_workflow_plan_completed(context))
+
+        prepared = _apply_turn_tool_context(
+            "configure_deployment",
+            {
+                "deployment_id": "deploy_001",
+                "channel_ids": [999],
+                "groups": [{"name": "wrong", "channel_ids": [999]}],
+                "requirements": [
+                    {"name": "desk", "channel_ids": [112]}
+                ],
+            },
+            context,
+        )
+        self.assertEqual(prepared["deployment_id"], "deploy-home-1")
+        self.assertNotIn("channel_ids", prepared)
+        self.assertNotIn("groups", prepared)
+        self.assertEqual(prepared["requirements"][0]["channel_ids"], [112])
+
+        general_prepared = _apply_turn_tool_context(
+            "configure_deployment",
+            {
+                "deployment_id": "deploy_001",
+                "channel_roles": [
+                    {"channel_id": 118, "role": "maritime_mixed_ptz"}
+                ],
+                "starter_policy_mode": "shadow",
+                "requirements": [
+                    {"name": "traffic", "channel_ids": [118]}
+                ],
+            },
+            {**context, "deployment_profile": "general"},
+        )
+        self.assertNotIn("channel_roles", general_prepared)
+        self.assertNotIn("starter_policy_mode", general_prepared)
+        self.assertEqual(general_prepared["deployment_id"], "deploy-home-1")
+
+        explicit_names = agent._deployment_explicit_alert_names(
+            'Alert 1 "Vehicle-person collision" and Alert named “Blocked intersection”'
+        )
+        self.assertEqual(
+            explicit_names,
+            ["Vehicle-person collision", "Blocked intersection"],
+        )
+        allowlisted = _apply_turn_tool_context(
+            "configure_deployment",
+            {
+                "deployment_id": "invented",
+                "requirements": [
+                    {
+                        "name": "traffic",
+                        "channel_ids": [118],
+                        "alerts": [
+                            {"name": "Blocked intersection"},
+                            {"name": "Pedestrian loitering"},
+                        ],
+                    }
+                ],
+            },
+            {
+                **context,
+                "deployment_profile": "general",
+                "deployment_explicit_alert_names": ["Blocked intersection"],
+            },
+        )
+        self.assertEqual(
+            [
+                alert["name"]
+                for alert in allowlisted["requirements"][0]["alerts"]
+            ],
+            ["Blocked intersection"],
+        )
+
+        self.assertFalse(
+            agent._operator_supplies_deployment_requirements("continue")
+        )
+        self.assertTrue(
+            agent._operator_supplies_deployment_requirements(
+                "Routine is desk work; alert if the person collapses with high "
+                "severity, and use a quiet window from 01:00 to 04:00."
+            )
+        )
+        self.assertEqual(
+            agent._deployment_no_alert_channel_ids(
+                "CH 112: no default alerts; канал 118 — без дефолтных алертов"
+            ),
+            [112, 118],
+        )
+        self.assertEqual(
+            agent._deployment_no_probe_channel_ids(
+                "For channels 112, 118, keep the policies but reject probes and counters"
+            ),
+            [112, 118],
+        )
+        corrected = agent._deployment_requirements_without_probes(
+            [
+                {
+                    "name": "gate watch",
+                    "channel_ids": [112, 118],
+                    "alerts": [
+                        {
+                            "name": "Converging vessel",
+                            "positive_query": "vessel converging on fairway traffic",
+                            "contrast_query": "ordinary parallel passage",
+                            "counter_mode": "count_transitions",
+                        }
+                    ],
+                }
+            ],
+            [118],
+        )
+        self.assertEqual(corrected[0]["channel_ids"], [112])
+        self.assertEqual(corrected[0]["alerts"][0]["positive_query"], "vessel converging on fairway traffic")
+        self.assertEqual(corrected[1]["channel_ids"], [118])
+        self.assertEqual(corrected[1]["alerts"][0]["positive_query"], "")
+        self.assertEqual(corrected[1]["alerts"][0]["counter_mode"], "none")
+        no_alerts = _apply_turn_tool_context(
+            "configure_deployment",
+            {
+                "deployment_id": "invented",
+                "requirements": [
+                    {
+                        "name": "quiet channel",
+                        "channel_ids": [112],
+                        "alerts": [{"name": "Invented watch"}],
+                    }
+                ],
+            },
+            {
+                **context,
+                "deployment_profile": "general",
+                "deployment_no_alert_channel_ids": [112],
+            },
+        )
+        self.assertEqual(no_alerts["requirements"][0]["alerts"], [])
+
+        requirements_context = {
+            **context,
+            "deployment_requirements_pending": False,
+            "deployment_requirements_supplied": True,
+        }
+        schemas = _select_relevant_tool_schemas(
+            agent._TOOL_SCHEMAS,
+            requirements_context,
+        )
+        self.assertEqual(
+            {row["function"]["name"] for row in schemas},
+            {"configure_deployment"},
+        )
+        requirements_context.pop("deployment_requirements_supplied")
+        requirements_context["deployment_stage"] = "requirements_configured"
+        requirements_context["deployment_preview_pending"] = True
+        schemas = _select_relevant_tool_schemas(
+            agent._TOOL_SCHEMAS,
+            requirements_context,
+        )
+        self.assertEqual(
+            {row["function"]["name"] for row in schemas},
+            {"apply_deployment_plan"},
+        )
+        call = agent._required_bounded_workflow_tool_call(
+            requirements_context,
+            schemas,
+        )
+        self.assertEqual(call.name, "apply_deployment_plan")
+        self.assertIs(call.args["preview"], True)
+        self.assertIs(call.args["start_live"], True)
+
+        result_context = dict(requirements_context)
+        agent._remember_turn_tool_result(
+            "configure_deployment",
+            {
+                "deployment_id": "deploy-home-1",
+                "stage": "requirements_configured",
+                "requirement_warnings": ["ignored duplicate pack"],
+            },
+            result_context,
+        )
+        self.assertEqual(
+            result_context["deployment_requirement_warnings"],
+            ["ignored duplicate pack"],
+        )
+        agent._remember_turn_tool_result(
+            "apply_deployment_plan",
+            {
+                "status": "preview",
+                "deployment_id": "deploy-home-1",
+                "stage": "plan_ready",
+            },
+            result_context,
+        )
+        self.assertTrue(result_context["deployment_preview_completed"])
+        receipt_text = agent._format_deployment_preview_receipt(
+            {
+                **result_context,
+                "deployment_preview_receipt": {
+                    "deployment_id": "deploy-home-1",
+                    "diff": {
+                        "channel_ids": [112, 118],
+                        "channel_group_count": 2,
+                        "alert_policy_count": 2,
+                        "probe_count": 4,
+                        "counted_state_count": 2,
+                        "start_live": False,
+                    },
+                },
+            }
+        )
+        self.assertIn("preview generated — not applied", receipt_text)
+        self.assertIn("Attention probes: 4", receipt_text)
+        self.assertIn("Counted-state profiles: 2", receipt_text)
+        self.assertIn("live settings and commissioning are unchanged", receipt_text)
+
+        partial_context = {
+            "deployment_id": "deploy-home-1",
+            "deployment_stage": "surveyed",
+        }
+        agent._remember_turn_tool_result(
+            "configure_deployment",
+            {
+                "deployment_id": "deploy-home-1",
+                "stage": "requirements_partial",
+                "selected_channel_ids": [112, 118],
+                "groups": [
+                    {"name": "home_workspace", "channel_ids": [112]},
+                    {"name": "traffic_simulation", "channel_ids": [118]},
+                ],
+                "requirement_pack_count": 2,
+                "missing_requirement_channel_ids": [118],
+                "requirement_warnings": [],
+            },
+            partial_context,
+        )
+        partial_text = agent._format_deployment_partial_receipt(partial_context)
+        self.assertTrue(partial_context["deployment_requirements_partial"])
+        self.assertIn("Selected scope remains unchanged: [112, 118]", partial_text)
+        self.assertIn("Requirements still needed only for: [118]", partial_text)
+        self.assertIn("Do not select additional channels", partial_text)
+
+    def test_protocol_deploy_runner_rehydrates_durable_state_when_history_omits_tools(self):
+        state = {
+            "deployment_id": "deploy-home-1",
+            "version": 1,
+            "stage": "inventory",
+            "deployment_profile": "general",
+            "target_channel_count": 8,
+            "available_channels": [
+                {"id": 112, "title": "Zenbook webcam"},
+                {"id": 118, "title": "emu-1"},
+            ],
+            "selected_channel_ids": [],
+            "groups": [],
+            "surveys": [],
+            "requirements": [],
+        }
+
+        class DeploymentStore:
+            def latest_unfinished(self, _profile=None):
+                return dict(state)
+
+        class DeploymentTools(_FakeTools):
+            def __init__(self):
+                super().__init__()
+                self._deployment_store = DeploymentStore()
+
+            def execute(self, name, args, progress_cb=None):
+                self.calls += 1
+                self.call_args.append((name, dict(args)))
+                if name == "configure_deployment":
+                    state.update(
+                        {
+                            "stage": "scope_configured",
+                            "selected_channel_ids": list(args["channel_ids"]),
+                            "groups": list(args["groups"]),
+                        }
+                    )
+                elif name == "survey_deployment":
+                    state.update(
+                        {
+                            "stage": "surveyed",
+                            "surveys": [
+                                {"channel_id": 112},
+                                {"channel_id": 118},
+                            ],
+                        }
+                    )
+                return agent.compact_deployment_state(state)
+
+        runner = AgentRunner.__new__(AgentRunner)
+        runner.store = _FakeStore(
+            history=[
+                {"role": "user", "content": "Protocol Deploy, target 8 channels"},
+                {"role": "assistant", "content": "Choose channels."},
+            ]
+        )
+        runner._lm_client = _FakeLMClient(tool_rounds=0)
+        runner._tools = DeploymentTools()
+        runner._ps = object()
+        runner._ds = object()
+        runner._lxm = object()
+
+        list(
+            runner.stream_chat(
+                "session-1",
+                "112, 118; group home_workspace: 112; group traffic_simulation: 118",
+            )
+        )
+
+        self.assertEqual(
+            [name for name, _args in runner._tools.call_args],
+            ["configure_deployment", "survey_deployment"],
+        )
+        self.assertEqual(
+            runner._tools.call_args[0][1]["groups"],
+            [
+                {"name": "home_workspace", "channel_ids": [112]},
+                {"name": "traffic_simulation", "channel_ids": [118]},
+            ],
+        )
 
     def test_video_period_research_executes_required_reads_before_model_narrative(self):
         class ResearchTools(_FakeTools):
@@ -487,6 +1266,88 @@ class AgentToolLoopTests(unittest.TestCase):
         ][-1]
         self.assertTrue(duplicate_result["result"]["duplicate_suppressed"])
 
+    def test_failed_required_archive_vision_batch_runs_once_and_returns_unknown(self):
+        class FailingArchiveTools(_FakeTools):
+            def execute(self, name, args, progress_cb=None):
+                self.calls += 1
+                self.call_args.append((name, dict(args)))
+                if name == "search_archive":
+                    return {
+                        "query": "red car",
+                        "count": 8,
+                        "results_returned_to_model": 8,
+                        "lexical_match_count_in_returned": 0,
+                        "vision_candidate_ids": list(range(101, 109)),
+                        "vision_candidate_count": 8,
+                        "results": [],
+                    }
+                if name == "describe_frame":
+                    raise agent.ToolError("synthetic archive VLM failure")
+                raise AssertionError(name)
+
+        runner = AgentRunner.__new__(AgentRunner)
+        runner.store = _FakeStore()
+        runner._lm_client = _FakeLMClient(tool_rounds=0)
+        runner._tools = FailingArchiveTools()
+        runner._ps = object()
+        runner._ds = object()
+        runner._lxm = object()
+
+        events = [
+            json.loads(item.removeprefix("data: ").strip())
+            for item in runner.stream_chat(
+                "session-1",
+                "Search the video-description archive for a red car",
+            )
+            if item.startswith("data: ")
+        ]
+
+        self.assertEqual(
+            [name for name, _args in runner._tools.call_args],
+            ["search_archive", "describe_frame"],
+        )
+        describe_results = [
+            event
+            for event in events
+            if event.get("type") == "tool_result"
+            and event.get("name") == "describe_frame"
+        ]
+        self.assertEqual(len(describe_results), 1)
+        self.assertEqual(describe_results[0]["result"]["status"], "failed")
+        self.assertFalse(describe_results[0]["result"]["retryable_in_turn"])
+        final_text = "".join(
+            event.get("content", "")
+            for event in events
+            if event.get("type") == "text"
+        )
+        self.assertIn("attempted once and failed", final_text)
+        self.assertIn("neither presence nor absence", final_text)
+
+    def test_tool_failure_log_has_correlation_but_no_private_payload(self):
+        with self.assertLogs("agent", level="WARNING") as captured:
+            agent._log_turn_tool_failure(
+                session_id="session-7",
+                request_id="request-9",
+                call_id="call-11",
+                tool_name="describe_frame",
+                args={
+                    "detection_ids": list(range(8)),
+                    "prompt": "PRIVATE OPERATOR QUERY",
+                    "api_key": "PRIVATE SECRET",
+                },
+                error=agent.ToolError("PRIVATE FAILURE BODY"),
+                archive_failure={"status": "failed"},
+            )
+
+        line = "\n".join(captured.output)
+        self.assertIn("request_id=request-9", line)
+        self.assertIn("session_id=session-7", line)
+        self.assertIn("call_id=call-11", line)
+        self.assertIn("tool=describe_frame", line)
+        self.assertIn("candidate_count=8", line)
+        self.assertIn("final_error_class=ToolError", line)
+        self.assertNotIn("PRIVATE", line)
+
     def test_completed_archive_tool_emits_closed_console_effect(self):
         runner = AgentRunner.__new__(AgentRunner)
         runner.store = _FakeStore()
@@ -534,6 +1395,38 @@ class AgentToolLoopTests(unittest.TestCase):
         self.assertEqual(runner._tools.call_args[0][1]["since_ms"], 1_000)
         self.assertEqual(result["ui_effects"][0]["target"], "archive")
         self.assertEqual(result["ui_effects"][0]["action"], "show_results")
+
+    def test_operator_off_keeps_research_but_suppresses_console_effects(self):
+        runner = AgentRunner.__new__(AgentRunner)
+        runner.store = _FakeStore()
+        runner._lm_client = _FakeLMClient(
+            tool_rounds=1,
+            tool_name="search_archive",
+        )
+        runner._tools = _FakeTools(
+            result={
+                "query": "person at gate",
+                "results": [{"id": 77, "channel_id": 7, "timestamp_ms": 2_000}],
+            }
+        )
+        runner._ps = object()
+        runner._ds = object()
+        runner._lxm = object()
+
+        events = [
+            json.loads(item.removeprefix("data: ").strip())
+            for item in runner.stream_chat(
+                "session-1",
+                "Search the archive for person at gate",
+                drive_console=False,
+            )
+            if item.startswith("data: ")
+        ]
+
+        self.assertEqual(runner._tools.calls, 1)
+        result = next(item for item in events if item.get("type") == "tool_result")
+        self.assertEqual(result["name"], "search_archive")
+        self.assertEqual(result["ui_effects"], [])
 
     def test_activated_runbook_tools_pass_the_intent_gate(self):
         query = "проверь канал 115, был ли почтальон вчера вечером?"
@@ -1594,6 +2487,7 @@ class AgentToolLoopTests(unittest.TestCase):
                 "get_incident",
                 "draft_incident",
                 "follow_incident",
+                "review_incident",
                 "stop_incident_follow",
             },
         )

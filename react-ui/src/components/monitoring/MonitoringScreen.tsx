@@ -19,6 +19,7 @@ import {
   type ProbeInput,
   type ProbeListCounts,
   type ProbeOrigin,
+  type ProbeThresholdDefaults,
 } from '../../api/probes'
 import type { Channel } from '../../api/types'
 import { videoApi } from '../../api/video'
@@ -123,6 +124,7 @@ export function MonitoringScreen({
   const [probes, setProbes] = useState<Probe[]>([])
   const [groups, setGroups] = useState<ProbeChannelGroup[]>([])
   const [counts, setCounts] = useState<ProbeListCounts>({})
+  const [probeDefaults, setProbeDefaults] = useState<ProbeThresholdDefaults>({ pos_floor: 0.05, margin: 0.02 })
   const [runtime, setRuntime] = useState<Record<number, string>>({})
   const [inspectId, setInspectId] = useState<string | null>(null)
   const [loading, setLoading] = useState(false)
@@ -148,6 +150,7 @@ export function MonitoringScreen({
       setProbes(next)
       setGroups(response.channel_groups || [])
       setCounts(response.counts || {})
+      if (response.defaults) setProbeDefaults(response.defaults)
       setInspectId((current) => (
         current && next.some((probe) => probe.id === current) ? current : null
       ))
@@ -555,6 +558,7 @@ export function MonitoringScreen({
           busy={busy}
           canControlCapture={canOperate}
           canCreateBookmarks={canCreateBookmarks}
+          defaults={probeDefaults}
           onClose={() => setEditing(null)}
           onSave={saveProbe}
           onCasted={refresh}

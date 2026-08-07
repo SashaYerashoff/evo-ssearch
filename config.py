@@ -153,7 +153,7 @@ def _get_lm_profiles(
     return profiles
 
 
-def _get_app_version(default: str = "β 0.8.5") -> str:
+def _get_app_version(default: str = "β 0.8.7") -> str:
     env_value = os.getenv("EVOSSEARCH_APP_VERSION", "").strip()
     if env_value:
         return env_value
@@ -850,6 +850,84 @@ class Config:
         2,
         min(24, LUXRIOT_ATTENTION_MAX_VLM_FRAMES),
     )
+    # Incident attention is bounded independently from durable lifecycle state:
+    # two foreground incidents in the ordinary case, up to four in the model
+    # envelope when critical/operator-selected work competes, and eight hot
+    # unresolved incidents retained by the scheduler.
+    _INCIDENT_ATTENTION_DEFAULTS = {
+        'LUXRIOT_INCIDENT_FOREGROUND_LIMIT': (
+            'EVOSSEARCH_LUXRIOT_INCIDENT_FOREGROUND_LIMIT', 2, 1, 4
+        ),
+        'LUXRIOT_INCIDENT_FOREGROUND_HARD_LIMIT': (
+            'EVOSSEARCH_LUXRIOT_INCIDENT_FOREGROUND_HARD_LIMIT', 4, 2, 8
+        ),
+        'LUXRIOT_INCIDENT_HOT_LIMIT': (
+            'EVOSSEARCH_LUXRIOT_INCIDENT_HOT_LIMIT', 8, 4, 32
+        ),
+        'LUXRIOT_INCIDENT_TRACKED_LIMIT': (
+            'EVOSSEARCH_LUXRIOT_INCIDENT_TRACKED_LIMIT', 64, 8, 256
+        ),
+    }
+    for _name, (_env_name, _default, _minimum, _maximum) in _INCIDENT_ATTENTION_DEFAULTS.items():
+        try:
+            _value = int(os.getenv(_env_name, str(_default)))
+        except (TypeError, ValueError):
+            _value = _default
+        locals()[_name] = max(_minimum, min(_maximum, _value))
+    del _name, _env_name, _default, _minimum, _maximum, _value, _INCIDENT_ATTENTION_DEFAULTS
+    LUXRIOT_INCIDENT_FOREGROUND_HARD_LIMIT = max(
+        LUXRIOT_INCIDENT_FOREGROUND_LIMIT,
+        LUXRIOT_INCIDENT_FOREGROUND_HARD_LIMIT,
+    )
+    LUXRIOT_INCIDENT_HOT_LIMIT = max(
+        LUXRIOT_INCIDENT_FOREGROUND_HARD_LIMIT,
+        LUXRIOT_INCIDENT_HOT_LIMIT,
+    )
+    LUXRIOT_INCIDENT_TRACKED_LIMIT = max(
+        LUXRIOT_INCIDENT_HOT_LIMIT,
+        LUXRIOT_INCIDENT_TRACKED_LIMIT,
+    )
+    INCIDENT_MAINTENANCE_ENABLED = _get_bool_env(
+        'EVOSSEARCH_INCIDENT_MAINTENANCE_ENABLED',
+        'true',
+    )
+    try:
+        INCIDENT_MAINTENANCE_INTERVAL_SEC = float(
+            os.getenv('EVOSSEARCH_INCIDENT_MAINTENANCE_INTERVAL_SEC', '15')
+        )
+    except (TypeError, ValueError):
+        INCIDENT_MAINTENANCE_INTERVAL_SEC = 15.0
+    INCIDENT_MAINTENANCE_INTERVAL_SEC = max(
+        1.0,
+        min(300.0, INCIDENT_MAINTENANCE_INTERVAL_SEC),
+    )
+    _L0_PROMPT_BUDGET_DEFAULTS = {
+        'LUXRIOT_L0_CONTEXT_WINDOW_TOKENS': (
+            'EVOSSEARCH_LUXRIOT_L0_CONTEXT_WINDOW_TOKENS', 16384, 8192, 262144
+        ),
+        'LUXRIOT_L0_TEXT_BUDGET_TOKENS': (
+            'EVOSSEARCH_LUXRIOT_L0_TEXT_BUDGET_TOKENS', 5000, 1024, 65536
+        ),
+        'LUXRIOT_L0_VISION_BUDGET_TOKENS': (
+            'EVOSSEARCH_LUXRIOT_L0_VISION_BUDGET_TOKENS', 5500, 512, 65536
+        ),
+        'LUXRIOT_L0_OUTPUT_BUDGET_TOKENS': (
+            'EVOSSEARCH_LUXRIOT_L0_OUTPUT_BUDGET_TOKENS', 1536, 256, 32768
+        ),
+        'LUXRIOT_L0_INCIDENT_BUDGET_TOKENS': (
+            'EVOSSEARCH_LUXRIOT_L0_INCIDENT_BUDGET_TOKENS', 900, 128, 16384
+        ),
+        'LUXRIOT_L0_VISION_TOKENS_PER_IMAGE_ESTIMATE': (
+            'EVOSSEARCH_LUXRIOT_L0_VISION_TOKENS_PER_IMAGE_ESTIMATE', 300, 64, 2048
+        ),
+    }
+    for _name, (_env_name, _default, _minimum, _maximum) in _L0_PROMPT_BUDGET_DEFAULTS.items():
+        try:
+            _value = int(os.getenv(_env_name, str(_default)))
+        except (TypeError, ValueError):
+            _value = _default
+        locals()[_name] = max(_minimum, min(_maximum, _value))
+    del _name, _env_name, _default, _minimum, _maximum, _value, _L0_PROMPT_BUDGET_DEFAULTS
     LUXRIOT_ALERT_DERIVED_PROBES_ENABLED = _get_bool_env(
         'EVOSSEARCH_LUXRIOT_ALERT_DERIVED_PROBES_ENABLED',
         'False',
@@ -878,6 +956,17 @@ class Config:
     except (TypeError, ValueError):
         LUXRIOT_LIVE_SEGMENT_READ_TIMEOUT_SEC = 5.0
     LUXRIOT_LIVE_SEGMENT_READ_TIMEOUT_SEC = max(1.0, min(30.0, LUXRIOT_LIVE_SEGMENT_READ_TIMEOUT_SEC))
+    LUXRIOT_FFMPEG_HWACCEL = str(
+        os.getenv('EVOSSEARCH_LUXRIOT_FFMPEG_HWACCEL', 'auto') or 'auto'
+    ).strip().lower()
+    if LUXRIOT_FFMPEG_HWACCEL not in {'auto', 'qsv', 'vaapi', 'software', 'none', 'off'}:
+        LUXRIOT_FFMPEG_HWACCEL = 'auto'
+    LUXRIOT_FFMPEG_INTEL_DEVICE = str(
+        os.getenv('EVOSSEARCH_LUXRIOT_FFMPEG_INTEL_DEVICE', '') or ''
+    ).strip()
+    LUXRIOT_FFMPEG_QSV_DEVICE = str(
+        os.getenv('EVOSSEARCH_LUXRIOT_FFMPEG_QSV_DEVICE', '') or ''
+    ).strip()
     try:
         LUXRIOT_MEDIA_CONNECT_TIMEOUT_SEC = float(
             os.getenv('EVOSSEARCH_LUXRIOT_MEDIA_CONNECT_TIMEOUT_SEC', '3.0')
@@ -1636,6 +1725,16 @@ class Config:
         PROBE_THUMB_MAX_EDGE = 256
     if PROBE_THUMB_MAX_EDGE < 64:
         PROBE_THUMB_MAX_EDGE = 64
+    try:
+        PROBE_ROI_QUERY_EMBED_BUDGET = int(
+            os.getenv('EVOSSEARCH_PROBE_ROI_QUERY_EMBED_BUDGET', '2')
+        )
+    except (TypeError, ValueError):
+        PROBE_ROI_QUERY_EMBED_BUDGET = 2
+    PROBE_ROI_QUERY_EMBED_BUDGET = min(
+        16,
+        max(0, PROBE_ROI_QUERY_EMBED_BUDGET),
+    )
     try:
         PROBE_BOOKMARK_COOLDOWN_SEC = float(os.getenv('EVOSSEARCH_PROBE_BOOKMARK_COOLDOWN_SEC', '8.0'))
     except (TypeError, ValueError):

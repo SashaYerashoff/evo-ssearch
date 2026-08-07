@@ -42,6 +42,7 @@ export function restoreAgentTranscript(messages: AgentStoredMsg[]): RestoredAgen
       const result = parsedToolResult(message.tool_result ?? message.content)
       const name = String(message.tool_name || owner?.name || 'tool').trim()
       const planId = result?.approval?.plan_id
+        || result?.action_plan?.plan_id
         || (result?.status === 'preview' ? result?.plan_id : null)
         || null
       appendAction(restored, index, {

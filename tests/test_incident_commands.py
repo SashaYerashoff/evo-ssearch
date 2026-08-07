@@ -4,7 +4,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from incident_commands import IncidentCommandService
+from incident_commands import IncidentCommandService, incident_storage_record
 from incident_store import IncidentRevisionConflict
 
 
@@ -16,6 +16,10 @@ def _record(*, revision: int = 1, state: str = "following"):
         "id": INCIDENT_ID,
         "revision": revision,
         "state": state,
+        "perception_state": "observed",
+        "risk_state": "unknown",
+        "case_state": "open",
+        "attention_state": "follow" if state == "following" else "inactive",
         "title": "Craft crossing the port gate",
         "channel_ids": [112],
         "timeline_refs": [],
@@ -32,17 +36,34 @@ class _Store:
         self.record = _record()
         self.conflict = False
         self.update_calls = []
+        self.observations = []
 
     def get_incident(self, incident_id):
         return dict(self.record) if incident_id == INCIDENT_ID else None
 
-    def update_incident(self, incident_id, *, expected_revision, changes, actor_id):
+    def update_incident(
+        self,
+        incident_id,
+        *,
+        expected_revision,
+        changes,
+        actor_id,
+        transition=None,
+    ):
         self.update_calls.append((incident_id, expected_revision, dict(changes), actor_id))
         if self.conflict:
             raise IncidentRevisionConflict(incident_id, expected_revision, expected_revision + 1)
         self.record.update(dict(changes))
         self.record["revision"] += 1
         return dict(self.record)
+
+    def list_observations(self, incident_id, **_kwargs):
+        assert incident_id == INCIDENT_ID
+        return [dict(item) for item in self.observations], len(self.observations)
+
+    def append_observation(self, observation, **_kwargs):
+        self.observations.append(dict(observation))
+        return dict(observation)
 
 
 class _Runtime:
@@ -96,6 +117,7 @@ def test_stop_persists_before_removing_runtime_focus():
     assert runtime.stop_calls == [INCIDENT_ID]
     assert updated["revision"] == 2
     assert updated["state"] == "draft"
+    assert updated["attention_state"] == "inactive"
     assert updated["follow_policy"]["active"] is False
     assert updated["follow_policy"]["stopped_at_ms"] == 10_000
 
@@ -114,10 +136,77 @@ def test_follow_uses_explicit_optimistic_revision():
 
     assert updated["revision"] == 2
     assert updated["state"] == "following"
+    assert updated["case_state"] == "open"
+    assert updated["attention_state"] == "critical"
     assert updated["follow_policy"]["mode"] == "critical"
     assert updated["follow_policy"]["expires_at_ms"] == 130_000
     assert lease.level.value == "critical"
     assert "Craft crossing the port gate" in runtime.start_context
+
+
+def test_operator_confirm_opens_case_without_inventing_risk_or_perception():
+    store = _Store()
+    store.record.update(
+        {
+            "state": "draft",
+            "case_state": "candidate",
+            "perception_state": "unknown",
+            "risk_state": "unknown",
+            "attention_state": "inactive",
+            "follow_policy": {},
+        }
+    )
+    runtime = _Runtime()
+
+    updated = _service(store, runtime).review_incident(
+        INCIDENT_ID,
+        actor_id="operator-1",
+        action="confirm",
+        expected_revision=1,
+        note="Grounded entry reviewed on the archive frames.",
+    )
+
+    assert updated["state"] == "reported"
+    assert updated["case_state"] == "open"
+    assert updated["perception_state"] == "unknown"
+    assert updated["risk_state"] == "unknown"
+    assert runtime.stop_calls == []
+    observation = store.observations[-1]
+    assert observation["source_kind"] == "operator_review"
+    assert observation["payload"]["action"] == "confirm"
+    assert observation["payload"]["previous"]["case_state"] == "candidate"
+    assert observation["payload"]["current"]["case_state"] == "open"
+
+
+def test_false_positive_stops_follow_and_reopen_is_explicit():
+    store = _Store()
+    runtime = _Runtime()
+    service = _service(store, runtime)
+
+    closed = service.review_incident(
+        INCIDENT_ID,
+        actor_id="operator-1",
+        action="false_positive",
+        expected_revision=1,
+    )
+
+    assert closed["state"] == "closed"
+    assert closed["case_state"] == "false_positive"
+    assert closed["risk_state"] == "resolved"
+    assert closed["attention_state"] == "inactive"
+    assert runtime.stop_calls == [INCIDENT_ID]
+    assert any(item.get("source_kind") == "follow_completed" for item in store.observations)
+    assert store.observations[-1]["payload"]["action"] == "false_positive"
+
+    reopened = service.review_incident(
+        INCIDENT_ID,
+        actor_id="operator-1",
+        action="reopen",
+        expected_revision=closed["revision"],
+    )
+    assert reopened["state"] == "reported"
+    assert reopened["case_state"] == "open"
+    assert reopened["risk_state"] == "unknown"
 
 
 def test_draft_digest_is_stable_and_content_bound():
@@ -135,3 +224,443 @@ def test_draft_digest_is_stable_and_content_bound():
     assert first == service.draft_digest(dict(reversed(list(draft.items()))))
     changed = {**draft, "title": "Vehicle enters"}
     assert service.draft_digest(changed) != first
+    assert incident_storage_record(draft)["idempotency_key"].startswith(
+        "incident-draft:"
+    )
+
+
+def test_store_draft_materializes_long_episode_and_candidate_series_without_merge():
+    prior = {
+        **_record(state="draft"),
+        "id": "00000000-0000-0000-0000-000000000116",
+        "possible_start_ms": 1_000,
+        "observed_start_ms": 1_000,
+        "observed_end_ms": 2_000,
+        "timeline_refs": [
+            {
+                "timestamp_ms": 1_000,
+                "semantic_key": "person_entry",
+                "label": "Person enters the room",
+                "source": "state_transition",
+            }
+        ],
+    }
+
+    class _TemporalStore:
+        def __init__(self):
+            self.episodes = []
+            self.relations = []
+            self.created = None
+
+        def create_incident(self, record, **_kwargs):
+            self.created = {
+                "id": INCIDENT_ID,
+                "revision": 1,
+                **dict(record),
+            }
+            return dict(self.created)
+
+        def append_episode(self, record, **_kwargs):
+            self.episodes.append(dict(record))
+            return dict(record)
+
+        def append_relation(self, record, **_kwargs):
+            self.relations.append(dict(record))
+            return dict(record)
+
+        def list_incidents(self, **_kwargs):
+            return [dict(prior)], 1
+
+    draft = {
+        "title": "Person enters and remains",
+        "channel_ids": [112],
+        "time_bounds": {
+            "possible_start_ms": 3_000,
+            "observed_start_ms": 3_000,
+            "observed_end_ms": 3_000 + 16 * 60 * 1_000,
+            "possible_end_ms": 3_000 + 16 * 60 * 1_000,
+        },
+        "timeline": [
+            {
+                "timestamp_ms": 3_000,
+                "semantic_key": "person_entry",
+                "label": "Person enters the room",
+                "source": "state_transition",
+            }
+        ],
+        "evidence": [{"detection_id": 41}],
+        "coverage": {"status": "covered"},
+    }
+    store = _TemporalStore()
+
+    created = _service(store, _Runtime()).store_draft(
+        draft,
+        actor_id="operator-1",
+    )
+
+    assert created["id"] == INCIDENT_ID
+    assert len(store.episodes) == 1
+    assert store.episodes[0]["semantic_key"] == "person_entry"
+    assert (
+        store.episodes[0]["coverage"]["scale_disposition"]
+        == "long_incident_candidate"
+    )
+    assert len(store.relations) == 1
+    assert store.relations[0]["relation_type"] == "series_member"
+    assert store.relations[0]["relation_state"] == "candidate"
+    assert store.relations[0]["payload"]["automatic_merge"] is False
+
+
+def test_generic_vlm_transport_key_is_rejected_as_series_evidence():
+    relation_id = "00000000-0000-0000-0000-000000000119"
+
+    class _GenericStore:
+        def __init__(self):
+            self.appended = []
+
+        def list_episodes(self, *_args, **_kwargs):
+            return [{"episode_key": "legacy"}], 1
+
+        def list_relations(self, *_args, **_kwargs):
+            return [
+                {
+                    "id": relation_id,
+                    "subject_incident_id": INCIDENT_ID,
+                    "object_incident_id": "00000000-0000-0000-0000-000000000116",
+                    "relation_type": "series_member",
+                    "relation_state": "candidate",
+                    "payload": {"semantic_key": "vlm_alert"},
+                }
+            ], 1
+
+        def append_relation(self, record, **_kwargs):
+            self.appended.append(dict(record))
+            return dict(record)
+
+        def list_incidents(self, **_kwargs):
+            raise AssertionError("generic semantic keys must not start series search")
+
+    store = _GenericStore()
+    service = _service(store, _Runtime())
+    incident = {
+        **_record(state="draft"),
+        "timeline_refs": [
+            {
+                "timestamp_ms": 1_000,
+                "semantic_key": "vlm_alert",
+                "label": "Person enters",
+                "source": "vlm_alert",
+            }
+        ],
+    }
+
+    result = service.ensure_temporal_projection(incident)
+
+    assert service._primary_semantic_key(incident) == ""
+    assert result["relation_created"] is False
+    assert result["relations_rejected"] == 1
+    assert store.appended[0]["relation_state"] == "rejected"
+    assert store.appended[0]["payload"]["supersedes_relation_id"] == relation_id
+
+
+def test_operator_review_appends_series_correction_without_merging_incidents():
+    relation_id = "00000000-0000-0000-0000-000000000119"
+    correction_id = "00000000-0000-0000-0000-000000000120"
+
+    class _SeriesStore(_Store):
+        def __init__(self):
+            super().__init__()
+            self.relations = [
+                {
+                    "id": relation_id,
+                    "subject_incident_id": INCIDENT_ID,
+                    "object_incident_id": "00000000-0000-0000-0000-000000000116",
+                    "relation_type": "series_member",
+                    "relation_state": "candidate",
+                    "confidence": "medium",
+                    "rationale": "Same semantic track recurred.",
+                    "payload": {
+                        "semantic_key": "person_entry",
+                        "series_key": "series-person-entry",
+                        "gap_ms": 120_000,
+                        "operator_review_required": True,
+                    },
+                }
+            ]
+
+        def list_relations(self, *_args, **_kwargs):
+            return [dict(item) for item in self.relations], len(self.relations)
+
+        def list_episodes(self, *_args, **_kwargs):
+            return [], 0
+
+        def append_relation(self, record, **_kwargs):
+            stored = {"id": correction_id, **dict(record)}
+            self.relations.append(stored)
+            return dict(stored)
+
+    store = _SeriesStore()
+    service = _service(store, _Runtime())
+
+    correction = service.review_series_relation(
+        INCIDENT_ID,
+        relation_id,
+        actor_id="operator-1",
+        action="confirm",
+        note="Same person and behavior; keep as a recurrence series.",
+    )
+    temporal = service.temporal_context(store.record)
+
+    assert correction["relation_state"] == "confirmed"
+    assert correction["payload"]["supersedes_relation_id"] == relation_id
+    assert correction["payload"]["automatic_merge"] is False
+    assert len(temporal["series_links"]) == 1
+    assert temporal["series_links"][0]["relation_id"] == correction_id
+    assert temporal["series_links"][0]["relation_state"] == "confirmed"
+    assert temporal["correction_count"] == 1
+
+
+def test_l0_temporal_ingestion_creates_continues_and_ends_candidate_at_routine():
+    class _AutomaticStore:
+        def __init__(self):
+            self.records = []
+            self.observations = []
+            self.transitions = []
+
+        def list_incidents(self, **_kwargs):
+            return [dict(item) for item in self.records], len(self.records)
+
+        def create_incident(self, record, **_kwargs):
+            stored = {
+                "id": INCIDENT_ID,
+                "revision": 1,
+                **dict(record),
+            }
+            self.records.append(stored)
+            return dict(stored)
+
+        def update_incident(
+            self,
+            incident_id,
+            *,
+            expected_revision,
+            changes,
+            actor_id,
+            transition=None,
+        ):
+            record = next(item for item in self.records if item["id"] == incident_id)
+            assert record["revision"] == expected_revision
+            record.update(dict(changes))
+            record["revision"] += 1
+            if transition:
+                self.transitions.append(dict(transition))
+            return dict(record)
+
+        def append_observation(self, observation, **_kwargs):
+            if not any(
+                item["idempotency_key"] == observation["idempotency_key"]
+                for item in self.observations
+            ):
+                self.observations.append(dict(observation))
+            return dict(observation)
+
+    store = _AutomaticStore()
+    service = _service(store, _Runtime())
+    base_heartbeat = {
+        "batch_id": "batch-1",
+        "batch_start_ms": 1_000,
+        "batch_end_ms": 2_000,
+        "vector_signal": {
+            "capture_attention": {
+                "seconds": [
+                    {"activity_x": 1.2, "mode": "normal"},
+                    {"activity_x": 4.5, "mode": "burst"},
+                ]
+            }
+        },
+    }
+    first = {
+        "observation_id": "obs-1",
+        "kind": "event",
+        "state": "new",
+        "semantic_key": "person enter",
+        "label": "Person enters the room",
+        "start_ms": 1_000,
+        "end_ms": 2_000,
+        "evidence_refs": ["batch-1:snapshot:2"],
+    }
+
+    created = service.ingest_l0_temporal_observations(
+        112, base_heartbeat, [first]
+    )
+    continued = service.ingest_l0_temporal_observations(
+        112,
+        {**base_heartbeat, "batch_id": "batch-2", "batch_start_ms": 3_000, "batch_end_ms": 4_000},
+        [
+            {
+                **first,
+                "observation_id": "obs-2",
+                "state": "continuing",
+                "start_ms": 3_000,
+                "end_ms": 4_000,
+                "evidence_refs": ["batch-2:snapshot:1"],
+            }
+        ],
+    )
+    ended = service.ingest_l0_temporal_observations(
+        112,
+        {**base_heartbeat, "batch_id": "batch-3", "batch_start_ms": 5_000, "batch_end_ms": 6_000},
+        [
+            {
+                "observation_id": "routine-1",
+                "kind": "routine_gap",
+                "semantic_key": "desk routine",
+                "label": "Room returned to routine",
+                "start_ms": 6_000,
+                "end_ms": 6_000,
+                "applies_to": ["person enter"],
+            }
+        ],
+    )
+
+    assert created["created"] == 1
+    assert continued["created"] == 0
+    assert continued["associated"] == 1
+    assert ended["ended"] == 1
+    assert len(store.records) == 1
+    assert store.records[0]["perception_state"] == "ended"
+    assert store.records[0]["case_state"] == "candidate"
+    assert store.records[0]["possible_end_ms"] == 6_000
+    assert len(store.records[0]["timeline_refs"]) == 2
+    assert len(store.observations) == 3
+    assert store.records[0]["qualia_refs"][0]["activity_x_max"] == 4.5
+
+
+def test_open_automatic_incident_waits_for_boundary_before_episode_materialization():
+    class _ProjectionStore:
+        def __init__(self):
+            self.episodes = []
+
+        def list_episodes(self, *_args, **_kwargs):
+            return [], 0
+
+        def list_relations(self, *_args, **_kwargs):
+            return [], 0
+
+        def append_episode(self, record, **_kwargs):
+            self.episodes.append(dict(record))
+            return dict(record)
+
+        def list_incidents(self, **_kwargs):
+            return [], 0
+
+    store = _ProjectionStore()
+    service = _service(store, _Runtime())
+    open_incident = {
+        **_record(state="candidate"),
+        "case_state": "candidate",
+        "perception_state": "observed",
+        "possible_start_ms": 1_000,
+        "observed_start_ms": 1_000,
+        "observed_end_ms": 2_000,
+        "possible_end_ms": None,
+        "timeline_refs": [
+            {"semantic_key": "person enter", "label": "Person enters"}
+        ],
+    }
+
+    result = service.ensure_temporal_projection(open_incident)
+
+    assert result["episode_created"] is False
+    assert store.episodes == []
+
+
+def test_review_projection_is_compact_and_keeps_independent_lifecycle_axes():
+    service = IncidentCommandService(
+        _Store(),
+        object(),
+        object(),
+        _Runtime(),
+        wall_clock_ms=lambda: 90_000,
+    )
+    record = {
+        **_record(state="draft"),
+        "case_state": "candidate",
+        "possible_start_ms": 10_000,
+        "observed_start_ms": 20_000,
+        "observed_end_ms": 40_000,
+        "possible_end_ms": 50_000,
+        "timeline_refs": [
+            {"timestamp_ms": 20_000, "semantic_key": "craft_entry", "label": "Craft enters"},
+        ],
+        "evidence_refs": [
+            {"timestamp_ms": 30_000, "detection_id": 44, "role": "apex"},
+        ],
+        "anchor_ref": {"timestamp_ms": 20_000, "detection_id": 41},
+        "uncertainties": ["Operator confirmation required"],
+        "report": {"severity": "high", "summary": "Craft crossed the gate."},
+    }
+
+    review = service.public_review_record(record)
+
+    assert review["review_state"] == "needs_review"
+    assert review["perception_state"] == "observed"
+    assert review["case_state"] == "candidate"
+    assert review["cover"] == {"detection_id": 44, "timestamp_ms": 30_000, "role": "apex"}
+    assert review["observed_duration_ms"] == 20_000
+    assert review["case_duration_ms"] == 80_000
+    assert review["semantic_keys"] == ["craft_entry"]
+    assert review["uncertainty_count"] == 1
+    assert "timeline" not in review
+    assert "evidence" not in review
+
+
+def test_operator_confirmed_ended_episode_stays_active_until_case_closure():
+    service = IncidentCommandService(
+        _Store(),
+        object(),
+        object(),
+        _Runtime(),
+        wall_clock_ms=lambda: 90_000,
+    )
+    record = {
+        **_record(state="reported"),
+        "case_state": "open",
+        "possible_start_ms": 10_000,
+        "observed_start_ms": 20_000,
+        "observed_end_ms": 40_000,
+        "possible_end_ms": 50_000,
+    }
+
+    review = service.public_review_record(record)
+
+    assert review["review_state"] == "active"
+    assert review["observed_duration_ms"] == 20_000
+
+
+def test_expired_follow_is_durably_finalized_with_operator_result():
+    store = _Store()
+    store.record["follow_policy"] = {
+        "active": True,
+        "mode": "follow",
+        "run_id": "run-1",
+        "relationship": "recurrence_watch",
+        "started_at_ms": 1_000,
+        "expires_at_ms": 9_000,
+    }
+    store.observations = [
+        {
+            "incident_id": INCIDENT_ID,
+            "observed_at_ms": 8_000,
+            "source_ref": {"follow_run_id": "run-1"},
+            "payload": {"association": "neutral"},
+        }
+    ]
+
+    updated = _service(store, _Runtime()).reconcile_expired_follow(store.record)
+
+    assert updated["state"] == "draft"
+    assert updated["attention_state"] == "inactive"
+    assert updated["follow_policy"]["active"] is False
+    assert updated["report"]["follow_result"]["outcome"] == "recurrence_not_confirmed"
+    assert store.observations[-1]["source_kind"] == "follow_completed"

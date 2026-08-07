@@ -1,6 +1,6 @@
 import { api } from './client'
 
-// A single CLIP-probe hit (frame that matched the probe).
+// A single semantic-probe hit (frame that matched the active embedding space).
 export interface ProbeHit {
   thumbnail?: string | null
   image_url?: string | null
@@ -91,6 +91,15 @@ export interface ProbeListResponse {
   probes: Probe[]
   channel_groups?: ProbeChannelGroup[]
   counts?: ProbeListCounts
+  defaults?: ProbeThresholdDefaults
+}
+
+export interface ProbeThresholdDefaults {
+  pos_floor: number
+  margin: number
+  embedding_backend?: string
+  embedding_model?: string
+  embedding_revision?: string
 }
 
 // Live capture status for a channel (GET /probes/status).

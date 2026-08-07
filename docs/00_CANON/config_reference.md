@@ -9,7 +9,7 @@ the human reference. Secrets
 Defaults shown are the code defaults, not the pilot values. Pilot/field values
 live in the internal field-rollout doc with `[FIELD]` markers.
 
-Last reviewed: 2026-07-27 (β 0.8.5 release preparation)
+Last reviewed: 2026-08-06 (β 0.8.7 release preparation)
 
 ## Secure-pilot required set
 
@@ -77,6 +77,8 @@ EVOSSEARCH_AUTH_COOKIE_SECURE=true   # when TLS terminates at app or proxy
 | `EVOSSEARCH_LUXRIOT_SNAPSHOT_INTERVAL` (`5`) | Capture cadence (s). Pilot uses aggressive values `[FIELD]` — see sizing |
 | `EVOSSEARCH_LUXRIOT_SNAPSHOT_MAX_EDGE` (`800`) | Snapshot max edge px |
 | `EVOSSEARCH_LUXRIOT_CAPTURE_SOURCE` (`auto`) | `snapshot`, `live_segment`, or automatic fallback. A true intra-second CV apex requires `live_segment` |
+| `EVOSSEARCH_LUXRIOT_FFMPEG_HWACCEL` (`auto`) | `auto` probes QSV, then Intel VAAPI, and uses the first working hardware decode/VPP path; any channel-level failure is retried in software. Use `qsv`, `vaapi`, or `software`/`off` to force a guarded backend |
+| `EVOSSEARCH_LUXRIOT_FFMPEG_INTEL_DEVICE` (auto-discovered) | Optional Intel DRM render node such as `/dev/dri/renderD128`. Auto-discovery verifies PCI vendor `0x8086` and never selects the NVIDIA render node. The legacy `...QSV_DEVICE` name remains a compatibility alias |
 | `EVOSSEARCH_LUXRIOT_LIVE_SEGMENT_SECONDS` (`60`) | Bounded lifetime of one incremental dense-capture pipe. Summaries are emitted inside the window; the longer lease amortizes recorder-open latency |
 | `EVOSSEARCH_LUXRIOT_LIVE_SEGMENT_FPS` (`3`) | Raw dense candidates per source-second before one CV apex is selected |
 | `EVOSSEARCH_LUXRIOT_CAPTURE_REQUEST_TIMEOUT_SEC` (`5`) | Short timeout for per-frame snapshot capture; prevents stale UI when Luxriot stalls |
@@ -178,6 +180,14 @@ thresholds, alert policy, live sampling, or the live routine context.
 | Shared-endpoint protected lane | With capacity >1, EVA keeps one physical request slot free for interactive agent or fast-alert work. L0 and L1–L3 cannot borrow it; capacity-one backends remain serial and do not deadlock |
 | LM admission order | On a shared endpoint: interactive agent, realtime alert, live L0, then L1-L3/background rollup. Rollups do not own a protected slot; the port topology should still route them to the separate agent/CPU endpoint |
 | `EVOSSEARCH_LUXRIOT_ROLLUP_CONTEXT_LIMIT_TOKENS` (`32768`) | Conservative text-only L1-L3 context ceiling. Oversized source/corrective blocks are middle-compacted before the request while preserving metadata at the head and recent evidence/instructions at the tail |
+| `EVOSSEARCH_LUXRIOT_INCIDENT_FOREGROUND_LIMIT` / `_FOREGROUND_HARD_LIMIT` / `_HOT_LIMIT` (`2/4/8`) | Ordinary full-focus incidents, hard model-envelope cap, and unresolved scheduler hot set. Parking is attention-only and never resolves an incident |
+| `EVOSSEARCH_LUXRIOT_INCIDENT_TRACKED_LIMIT` (`64`) | Process-local safety ceiling for durable incident leases; exceeding it is explicit backpressure, not silent lifecycle mutation |
+| `EVOSSEARCH_INCIDENT_MAINTENANCE_ENABLED` (`true`) | Reconcile expired Follow leases durably even when a channel produces no new L0 batch |
+| `EVOSSEARCH_INCIDENT_MAINTENANCE_INTERVAL_SEC` (`15`) | Bounded background reconciliation interval, clamped to 1–300 seconds |
+| `EVOSSEARCH_LUXRIOT_L0_CONTEXT_WINDOW_TOKENS` (`16384`) | Measurable L0 context envelope used by the prompt planner |
+| `EVOSSEARCH_LUXRIOT_L0_TEXT_BUDGET_TOKENS` / `_VISION_BUDGET_TOKENS` / `_OUTPUT_BUDGET_TOKENS` (`5000/5500/1536`) | Separate L0 budgets. Alert criteria and `BATCH_STATE_JSON` are protected atomic blocks; incident context is semantically compacted first |
+| `EVOSSEARCH_LUXRIOT_L0_INCIDENT_BUDGET_TOKENS` (`900`) | Sub-budget shared by at most four incident contexts in an L0 request; incidents 5–8 remain scheduler state only |
+| `EVOSSEARCH_LUXRIOT_L0_VISION_TOKENS_PER_IMAGE_ESTIMATE` (`300`) | Conservative accounting estimate per selected frame for telemetry and fail-before-send budget checks |
 | `EVOSSEARCH_LM_VLM_BALANCER_ENABLED` | Static channel→profile routing across multiple VLM hosts |
 | `EVOSSEARCH_LM_VIDEO_DEFAULT_FRAMES` / `_MAX_FRAMES` | Offline/video-description frame limits |
 | `EVOSSEARCH_LM_VIDEO_MAX_EDGE` | Resize max edge before sending images to VLM |
@@ -199,6 +209,7 @@ thresholds, alert policy, live sampling, or the live routine context.
 | `EVOSSEARCH_AGENT_CONTEXT_HISTORY_BUDGET_TOKENS` (`16000`) | Old chat history budget before trimming |
 | `EVOSSEARCH_AGENT_CONTEXT_WARNING_TOKENS` (`52000`) | Adds an internal compact-answer warning; includes tool-schema estimates during tool decisions |
 | `EVOSSEARCH_AGENT_CONTEXT_HARD_TOKENS` (`60000`) | Stops further tool use and compacts tool payloads before the final model call |
+| `EVOSSEARCH_AGENT_ARCHIVE_VISION_BATCH_SIZE` (`8`, clamped `6`–`9`) | Number of diverse top SigLIP archive candidates verified together in one multi-image VLM request. This is a bounded visual drill, not exhaustive archive coverage |
 
 ## Inference queue
 
@@ -227,6 +238,7 @@ thresholds, alert policy, live sampling, or the live routine context.
 |---|---|
 | `EVOSSEARCH_PROBE_MAX_FRAMES` (`2000`) | Per-channel probe buffer |
 | `EVOSSEARCH_PROBE_THUMB_MAX_EDGE` (`256`) | Probe thumbnail size |
+| `EVOSSEARCH_PROBE_ROI_QUERY_EMBED_BUDGET` (`2`) | Maximum previously uncached ROI thumbnails encoded by one retrospective probe query. Realtime operator ROI results seed the same cache; bounded cold backfill prevents the 5-second daemon from flooding the shared SigLIP batcher |
 | `EVOSSEARCH_PROBE_POS_FLOOR_DEFAULT` (`0.05` for SigLIP2; `0.28` for OpenAI CLIP) | Backend-sensitive raw-cosine floor for newly created and ad-hoc probes. Scores are not transferable between embedding spaces; existing saved probes stay shadowed until their fingerprint matches and thresholds are recalibrated |
 | `EVOSSEARCH_PROBE_MARGIN_DEFAULT` (`0.02` for SigLIP2; `0.08` for OpenAI CLIP) | Backend-sensitive positive-minus-negative margin for newly created and ad-hoc probes |
 | `EVOSSEARCH_PROBE_CAPTURE_WARMUP_SEC` (`2.5`) | Maximum first-frame wait before an empty manual probe query returns an explicit capture-warming state |

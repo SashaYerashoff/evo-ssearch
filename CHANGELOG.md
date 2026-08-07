@@ -4,6 +4,111 @@ Notable changes per release. Detail lives in `readiness/RELEASE_NOTES_<version>.
 Authoritative current state: [docs/00_CANON/facts.md](docs/00_CANON/facts.md).
 Format loosely follows Keep a Changelog.
 
+## Unreleased
+
+- None.
+
+## β 0.8.7 — 2026-08-06 release candidate (temporal incidents and field hardening)
+
+- **Temporal incident memory:** EVA now keeps server-owned observation,
+  episode, incident and recurrence-series identities across L0–L3. Covered
+  high-signal L0 events can open bounded review candidates; exact semantic
+  tracks continue without merging parallel incidents, explicit routine
+  boundaries end only the perceptual episode, and coverage gaps never prove
+  resolution. The 2/4/8 allocator bounds prompt cognition while overflow stays
+  durable and retrievable.
+- **Independent lifecycle and review:** perception, risk, case and attention
+  states have an append-only transition ledger with optimistic revisions.
+  Operators can confirm, resolve, dismiss, mark false-positive or reopen a
+  case, and confirm/reject candidate recurrence links without merging incident
+  IDs. The secured agent exposes the same mutations through preview/apply
+  approval with server-resolved channel, revision and relation bindings.
+- **Incident operations:** Follow produces a durable human-readable outcome;
+  Incident Review separates active, needs-review and historical queues; detail
+  shows evidence covers, temporal episodes, candidate series and lifecycle
+  history. Markdown/XML reports lead with an operator synopsis and compressed
+  homeostatic response instead of dumping every low-level event.
+
+- **Reliable Protocol Deploy on 4B heads:** active deployment drafts are now
+  rehydrated from compact trusted tool receipts across chat turns. Operator
+  channel/group selections deterministically advance through scope
+  configuration and the bounded scene survey instead of being misrouted into
+  generic L1/L2 research. The surveyed phase now injects a server-owned receipt
+  with bounded scene fingerprints, pins the durable deployment ID on every
+  subsequent tool call, and prevents a repeated scope payload from erasing the
+  survey while the agent asks for policy requirements. Authorization-only
+  channel scope no longer leaks into the workflow payload and clears saved
+  groups during requirements collection. Requirements and preview phases expose
+  only their single valid tool, so a small head cannot merely narrate an update
+  without persisting it or skip the operator-review preview. Duplicate overlapping
+  policy packs (including a hallucinated `quiet_window` pack) are discarded with
+  a draft warning, while mixed count-and-duration intent is preserved. Final
+  receipts distinguish a generated preview from an applied plan and prohibit
+  coverage claims from the sparse survey. Partial requirements are durable and
+  preview is blocked until every selected channel has a policy pack; the final
+  partial and preview receipts are rendered from server truth instead of model
+  prose, and general deployments discard model-invented maritime roles/starter
+  policy fields. Operator corrections at `plan_ready` merge alerts by
+  channel-pack and alert name, preserving sibling rules before regenerating the
+  preview. Explicit quoted Rule/Alert names form a server-side allowlist, so
+  model-invented sibling policies cannot enter the durable draft. Appliance Doctor also
+  fails readiness when an installed vLLM unit lacks native tool-choice/parser
+  flags. The React console now exposes the workflow instead of hiding it in a
+  research trace: a searchable inventory picker handles up to 100 visible Evo
+  channels while enforcing the eight-channel attention budget, a scene-survey
+  card offers per-group alert drafting or an explicit no-alert choice, and the
+  final card reviews VLM policies and P/N probes/counters scope by scope before
+  revealing the sole atomic Apply action. Explicit probe rejection rebuilds the
+  draft without discarding its VLM alert policy. The full authorized channel-ID
+  inventory now survives chat-history reloads even when only the first 16 titles
+  are exposed to the 4B head, and the maritime picker requires an explicit
+  closed role for every selected channel before survey; the agent cannot invent
+  a port/coast/PTZ role to advance the draft. Partial configuration returns a
+  fresh review card containing only the still-missing scopes, and the operator's
+  explicit `none`/`shadow` starter choice plus preemptible 9B quiet window survive
+  reloads instead of being inferred by the model.
+- **Operator-mode boundary:** `Operator OFF` now suppresses all agent-chat
+  console-driving effects server-side, with a React-side mixed-version guard.
+  Read-only research and chat answers remain available; explicit operator Apply
+  actions still refresh the affected workspace after a trusted receipt.
+- **Grounded archive search:** SigLIP archive search is explicitly a ranked
+  candidate stage rather than a binary detector. EVA preserves bounded text
+  evidence and server-resolved time/coverage metadata, deduplicates equivalent
+  frames, and verifies the top 6–9 candidates in one multi-image VLM call.
+  Positive and negative visual conclusions now require parsed per-frame
+  verdicts; an uncertain or failed vision batch cannot become a confident
+  “nothing found”, and the reviewed top batch is never presented as exhaustive
+  proof about the whole archive.
+- **Maritime deployment profile:** Protocol Deploy can assign each selected
+  channel a port-gate, coastline, or mixed-PTZ role and preview bounded
+  maritime L0–L3 prompts plus four role-specific shadow probes. Global pan,
+  tilt, zoom, preset cuts, and settling create explicit scene epochs and
+  coverage state instead of object-motion bursts; recurring views are matched
+  before preset-specific probes regain authority, while independent one-Hz
+  SigLIP2 indexing continues. React operator chrome can be switched between
+  English and Latvian without translating evidence or model content.
+- **Ventspils client freeze boundary:** the offline port appliance defaults to
+  the React console with a legacy URL fallback, records the exact clean client
+  branch revision in its manifest, and refuses an accidental dirty or `main`
+  bundle unless an explicit recovery override is supplied.
+- **Console polish:** Research traces are closed by default and only operator
+  clicks change their disclosure state. Appearance can save, recall, overwrite,
+  and delete up to twelve named browser-local custom presets after contrast
+  validation.
+- **Database and verification:** schema head is `20260805_0013`; `0012` adds
+  incident lifecycle and temporal ledgers, while `0013` repairs archive
+  source/channel paging on upgraded databases. Full release verification:
+  1227 backend tests passed (23 skipped, 169 subtests) after the release fixes;
+  83 React tests passed and the production UI build completed.
+- **Universal offline deployment:** one `START_EVA_AI.sh` now detects fresh
+  versus update deployments without Git or internet access. Bundle manifest v2
+  covers fresh/update/report, refuses dirty source snapshots, inventories and
+  verifies every APT package and Python wheel, proves the CPython 3.12 + vLLM
+  dependency solve, carries the `0006 → 0013` SQL plan, backs up before update,
+  automatically rolls back a failed apply and emits a secret-free acceptance
+  report. The accepted React UI is release-managed while all site inference,
+  channel, tenant, retention and Luxriot settings remain preserved.
+
 ## β 0.8.5 — 2026-07-27 release candidate (adaptive attention and memory)
 
 - **Adaptive L0 delivery:** each channel now owns one bounded accumulator.

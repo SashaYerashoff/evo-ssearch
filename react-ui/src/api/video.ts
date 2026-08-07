@@ -71,6 +71,15 @@ export interface SummaryEntry {
   cover_reason?: string
   cover_confidence?: string
   vector_signal?: {
+    camera_scene?: {
+      camera_motion?: 'steady' | 'pan' | 'tilt' | 'zoom' | 'preset_cut' | 'settling' | string
+      scene_epoch?: number
+      coverage_status?: string
+      preset_id?: string
+      preset_status?: string
+      spatial_probes_enabled?: boolean
+      [k: string]: any
+    }
     capture_attention?: {
       seconds?: Array<{
         snapshot?: number | string
@@ -144,13 +153,12 @@ export interface CaptureInput {
 
 export function buildCaptureInput(
   channelId: number,
-  values: { batch: string; every: string; model: string },
+  values: { batch: string; every: string },
 ): CaptureInput {
   return {
     channel_id: channelId,
     batch_size: Number(values.batch),
     interval_sec: Number(values.every),
-    model: values.model.trim() || undefined,
   }
 }
 

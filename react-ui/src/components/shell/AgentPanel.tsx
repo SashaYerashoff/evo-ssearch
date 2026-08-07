@@ -2,7 +2,7 @@ import { useRef, useState, useEffect, useCallback } from 'react'
 import {
   IconSparkles, IconX, IconArrowUp,
   IconPlus, IconTrash, IconPaperclip, IconAlertTriangle, IconPencil, IconChevronRight,
-  IconChevronDown, IconWand, IconCpu, IconVideo, IconDeviceGamepad2, IconArrowAutofitWidth, IconHistory,
+  IconChevronDown, IconWand, IconVideo, IconDeviceGamepad2, IconArrowAutofitWidth, IconHistory,
   IconMaximize, IconMinimize, IconPlayerStop,
 } from '@tabler/icons-react'
 import type { Channel, ArchiveFilters } from '../../api/types'
@@ -59,31 +59,44 @@ function ResearchTrace({
   message,
   onThumb,
   onApply,
+  onSend,
+  channels,
 }: {
   message: Msg
   onThumb: (url: string, title: string) => void
   onApply: (action: ToolAction) => void
+  onSend: (message: string) => void
+  channels: Channel[]
 }) {
   // The operator owns this disclosure state. Streaming updates must not force
   // a trace open or closed after the user has touched it.
-  const [traceOpen, setTraceOpen] = useState(true)
-  const stepCount = (message.actions?.length ?? 0) + (message.notes?.length ?? 0)
+  const [traceOpen, setTraceOpen] = useState(false)
+  const workflowActions = (message.actions || []).filter((action) => (
+    Boolean(action.planId) || action.applied || action.result?.status === 'preview'
+    || ['start_deployment', 'configure_deployment', 'survey_deployment', 'apply_deployment_plan'].includes(action.name)
+  ))
+  const traceActions = (message.actions || []).filter((action) => !workflowActions.includes(action))
+  const stepCount = traceActions.length + (message.notes?.length ?? 0)
   return (
-    <details
-      className="ag-trace"
-      open={traceOpen}
-      onToggle={(event) => setTraceOpen(event.currentTarget.open)}
-    >
-      <summary>Research trace · {stepCount} step{stepCount === 1 ? '' : 's'}</summary>
-      <div className="ag-trace-body">
-        {message.notes?.map((note) => (
-          <div key={note.id} className="ag-note"><span className="ag-note-badge">In progress</span>{note.message}</div>
-        ))}
-        {message.actions?.map((action) => (
-          <ActionCard key={action.id} action={action} onThumb={onThumb} onApply={onApply} />
-        ))}
-      </div>
-    </details>
+    <>
+      {workflowActions.map((action) => (
+        <ActionCard key={action.id} action={action} onThumb={onThumb} onApply={onApply} onSend={onSend} channelCatalog={channels} />
+      ))}
+      {(traceActions.length > 0 || (message.notes?.length ?? 0) > 0) && <details
+        className="ag-trace"
+        open={traceOpen}
+      >
+        <summary onClick={(event) => { event.preventDefault(); setTraceOpen((open) => !open) }}>Research trace · {stepCount} step{stepCount === 1 ? '' : 's'}</summary>
+        <div className="ag-trace-body">
+          {message.notes?.map((note) => (
+            <div key={note.id} className="ag-note"><span className="ag-note-badge">In progress</span>{note.message}</div>
+          ))}
+          {traceActions.map((action) => (
+            <ActionCard key={action.id} action={action} onThumb={onThumb} onApply={onApply} onSend={onSend} channelCatalog={channels} />
+          ))}
+        </div>
+      </details>}
+    </>
   )
 }
 
@@ -105,7 +118,7 @@ function sessionLabel(s: AgentSession): string {
 
 export function AgentPanel({
   open, full, onClose, onToggleFull, section, channels, archiveFilters, onUiEffects, onBusyChange,
-  onLayoutPresetChange, onLayoutPresetCommit, canManageModels, canManageSkills,
+  onLayoutPresetChange, onLayoutPresetCommit, canManageSkills,
 }: {
   open: boolean
   full: boolean
@@ -118,7 +131,6 @@ export function AgentPanel({
   onBusyChange?: (busy: boolean) => void
   onLayoutPresetChange?: (archiveColumns: number) => void
   onLayoutPresetCommit?: (archiveColumns: number) => void
-  canManageModels: boolean
   canManageSkills: boolean
 }) {
   const [msgs, setMsgs] = useState<Msg[]>([])
@@ -128,13 +140,11 @@ export function AgentPanel({
   const [err, setErr] = useState<string | null>(null)
   const [sessions, setSessions] = useState<AgentSession[]>([])
   const [curSession, setCurSession] = useState<string | null>(null)
-  const [model, setModel] = useState('')
-  const [modelDefault, setModelDefault] = useState('')
   const [skills, setSkills] = useState<AgentSkill[]>([])
   const [streams, setStreams] = useState<any[]>([])
   const [lightbox, setLightbox] = useState<{ url: string; title: string } | null>(null)
   const [skillModal, setSkillModal] = useState<{ mode: 'create' | 'edit'; name: string; slug: string; content: string } | null>(null)
-  const [openMenu, setOpenMenu] = useState<'history' | 'skills' | 'model' | 'streams' | null>(null)
+  const [openMenu, setOpenMenu] = useState<'history' | 'skills' | 'streams' | null>(null)
   const [operatorMode, setOperatorMode] = useState(true)
   const [widthPresetIndex, setWidthPresetIndex] = useState(() => {
     const presets = agentWidthPresets(window.innerWidth)
@@ -202,7 +212,6 @@ export function AgentPanel({
     if (!open || loadedRef.current) return
     loadedRef.current = true
     refreshSessions()
-    agentApi.getConfig().then((c) => { setModel(c.model || c.default_model || ''); setModelDefault(c.default_model || '') }).catch(() => {})
     agentApi.skills().then((r) => setSkills(r.skills || [])).catch(() => {})
     refreshStreams()
     const last = localStorage.getItem(LS_SESSION)
@@ -270,11 +279,13 @@ export function AgentPanel({
         else if (e.type === 'tool_call') {
           patchLast((m) => ({ ...m, status: `Running ${labelTool(e.name || '')}…` }))
         } else if (e.type === 'tool_result') {
-          const planId = e.result?.approval?.plan_id || (e.result?.status === 'preview' ? e.result?.plan_id : null) || null
+          const planId = e.result?.approval?.plan_id || e.result?.action_plan?.plan_id || (e.result?.status === 'preview' ? e.result?.plan_id : null) || null
           const act: ToolAction = { id: ++idRef.current, name: e.name || '', result: e.result, error: e.error, planId }
           patchLast((m) => ({ ...m, actions: [...(m.actions || []), act], status: '' }))
           const effects = normalizeConsoleUiEffects(e.ui_effects)
-          if (effects.length) onUiEffects(effects, e.result)
+          // Server-side drive_console is authoritative; this request-local
+          // check is defense in depth for mixed-version deployments.
+          if (operatorMode && effects.length) onUiEffects(effects, e.result)
         } else if (e.type === 'tool_progress') {
           patchLast((m) => ({ ...m, notes: [...(m.notes || []), { id: ++idRef.current, message: e.message || 'Working…' }], status: e.message || 'Working…' }))
         } else if (e.type === 'heartbeat') patchLast((m) => ({ ...m, status: m.text ? '' : 'Still working…' }))
@@ -444,11 +455,11 @@ export function AgentPanel({
         )}
       </div>
 
-      {/* Operator Mode — forces the agent to act via tools & drive the console */}
+      {/* Operator Mode — forces tool use and permits harness-owned console effects */}
       <button
         className={`ag-op-toggle ${operatorMode ? 'on' : ''}`}
         onClick={() => setOperatorMode((v) => !v)}
-        title={operatorMode ? 'Operator Mode ON — agent is forced to use tools and drive the console' : 'Operator Mode OFF — agent answers freely'}
+        title={operatorMode ? 'Operator Mode ON — agent may use tools and drive the console' : 'Operator Mode OFF — agent may research, but will not move or open the console UI'}
       >
         <IconDeviceGamepad2 size={14} /> Operator {operatorMode ? 'ON' : 'OFF'}
       </button>
@@ -474,23 +485,6 @@ export function AgentPanel({
                 </div>
               ))}
             </div>
-          </div>
-        )}
-      </div>
-
-      {/* Model */}
-      <div className="ag-drop">
-        <button className={`ag-drop-btn ${openMenu === 'model' ? 'on' : ''}`} onClick={() => setOpenMenu(openMenu === 'model' ? null : 'model')}>
-          <IconCpu size={14} /> <span className="ag-drop-model">{model || 'default'}</span> <IconChevronDown size={13} />
-        </button>
-        {openMenu === 'model' && (
-          <div className="ag-drop-pop">
-            <div className="ag-drop-head"><span>Agent model</span></div>
-            <div className="ag-model">
-              <input value={model} onChange={(e) => setModel(e.target.value)} placeholder="default" title={modelDefault ? `Default: ${modelDefault}` : ''} disabled={busy || !canManageModels} />
-              {canManageModels && <button className="ag-mini-btn wide" disabled={busy} onClick={() => agentApi.saveConfig(model.trim()).then((c) => { setModel(c.model || model); setOpenMenu(null) }).catch(() => setErr('Failed to set model'))}>Apply</button>}
-            </div>
-            {modelDefault && <div className="ag-drop-note">Default: {modelDefault}</div>}
           </div>
         )}
       </div>
@@ -566,6 +560,8 @@ export function AgentPanel({
                     message={m}
                     onThumb={(url, title) => setLightbox({ url, title })}
                     onApply={applyPlan}
+                    onSend={(message) => send(message)}
+                    channels={channels}
                   />
                 )}
                 {m.error && <div className="chat-error"><IconAlertTriangle size={14} /> {m.error}</div>}

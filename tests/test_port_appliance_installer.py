@@ -22,6 +22,29 @@ sys.modules[SPEC.name] = installer
 SPEC.loader.exec_module(installer)
 
 
+def test_fresh_entrypoint_reads_manifest_before_rendering_target(tmp_path, capsys):
+    manifest = {
+        "target": {
+            "gpu": "RTX 5070 Ti",
+            "os": "Ubuntu 24.04 LTS amd64",
+        }
+    }
+    with (
+        patch.object(installer, "read_manifest", return_value=manifest),
+        patch.object(
+            installer,
+            "validate_target_host",
+            side_effect=installer.InstallError("stop after entrypoint contract"),
+        ),
+    ):
+        result = installer.main(("--bundle-root", str(tmp_path)))
+
+    assert result == 1
+    output = capsys.readouterr()
+    assert "RTX 5070 Ti" in output.out
+    assert "stop after entrypoint contract" in output.err
+
+
 def test_usb_builder_builds_react_for_node_free_runtime():
     builder = (ROOT / "scripts" / "build_port_usb_bundle.sh").read_text(
         encoding="utf-8"
@@ -35,6 +58,9 @@ def test_usb_builder_builds_react_for_node_free_runtime():
     )
     assert "--exclude=react-ui/node_modules/" in builder
     assert "--delete-excluded" in builder
+    assert 'EXPECTED_BRANCH="${EVA_PORT_EXPECTED_BRANCH:-feature/maritime-port-specs}"' in builder
+    assert "port client bundle requires a clean committed working tree" in builder
+    assert "SOURCE_REVISION.json" in builder
     for local_only_pattern in (
         "--exclude='.env*'",
         "--exclude='.venv*'",
@@ -57,7 +83,39 @@ def test_port_profile_shares_bounded_gpu_with_siglip2():
     assert installer.PORT_ENV["EVOSSEARCH_LUXRIOT_ATTENTION_EMBEDDING_CADENCE_MS"] == "1000"
     assert installer.PORT_ENV["EVOSSEARCH_LUXRIOT_SUMMARY_MAX_BATCH_FRAMES"] == "16"
     assert installer.PORT_ENV["EVOSSEARCH_EMBEDDER_EAGER_LOAD"] == "true"
-    assert installer.PORT_ENV["EVOSSEARCH_UI_MODE"] == "legacy"
+    assert installer.PORT_ENV["EVOSSEARCH_UI_MODE"] == "react"
+
+
+def test_port_payload_requires_maritime_runtime_and_react_assets():
+    source = MODULE_PATH.read_text(encoding="utf-8")
+    for relative in (
+        "SOURCE_REVISION.json",
+        "repo/camera_scene.py",
+        "repo/maritime_profiles.py",
+        "repo/docs/maritime_port_profile.md",
+        "repo/react-ui/dist/index.html",
+    ):
+        assert f'"{relative}"' in source
+
+    finalizer = (ROOT / "scripts" / "finalize_port_usb_bundle.py").read_text(
+        encoding="utf-8"
+    )
+    assert '"ventspils-maritime-client", "universal-offline"' in finalizer
+    assert "Refusing to finalize an uncommitted port client bundle" in finalizer
+    assert '"START_EVA_AI.sh"' in finalizer
+    assert '"manifest.txt"' in finalizer
+    assert '"format": 2' in finalizer
+    assert '"installation_modes": ["fresh", "update", "report"]' in finalizer
+    assert '"offline-dependencies.json"' in finalizer
+
+
+def test_predeploy_gate_runs_react_tests_and_production_build():
+    gate = (ROOT / "scripts" / "predeploy_acceptance.sh").read_text(
+        encoding="utf-8"
+    )
+    assert '"${NPM}" --prefix "${REACT_ROOT}" test -- --run' in gate
+    assert '"${NPM}" --prefix "${REACT_ROOT}" run build' in gate
+    assert "React build did not produce dist/index.html" in gate
 
 
 def test_port_profile_has_bounded_queue_and_context():
@@ -72,7 +130,8 @@ def test_port_vlm_uses_stable_vision_backend_and_content_watchdog(tmp_path):
     source = MODULE_PATH.read_text(encoding="utf-8")
     assert "--mm-encoder-attn-backend FLASH_ATTN" in source
     assert "--mm-processor-cache-gb 0" in source
-    assert "--max-num-seqs 8" in source
+    assert "--gpu-memory-utilization 0.72" in source
+    assert "--max-num-seqs 4" in source
     assert "--enforce-eager" not in source
     assert "ExecStartPost={app_dir}/.venv/bin/python {app_dir}/scripts/wait_openai_endpoint.py --timeout 240" in source
     assert "eva-vlm-vision-watchdog.timer" in source
@@ -413,7 +472,8 @@ def test_bootstrap_deb_has_noninteractive_packaging_boundary(tmp_path):
         stdout=subprocess.PIPE,
         text=True,
     )
-    package = tmp_path / "eva-ai-appliance-installer_0.8.5_amd64.deb"
+    version = (ROOT / "VERSION").read_text(encoding="utf-8").strip().removeprefix("β ")
+    package = tmp_path / f"eva-ai-appliance-installer_{version}_amd64.deb"
     assert package.is_file()
     control = subprocess.run(
         ("dpkg-deb", "--field", package),
@@ -430,6 +490,7 @@ def test_bootstrap_deb_has_noninteractive_packaging_boundary(tmp_path):
         text=True,
     ).stdout
     assert "usr/sbin/eva-ai-install" in contents
+    assert "usr/sbin/eva-ai-deploy" in contents
     assert "usr/sbin/eva-ai-doctor" in contents
     assert "models/" not in contents
 

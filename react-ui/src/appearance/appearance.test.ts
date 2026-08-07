@@ -6,6 +6,7 @@ import {
   contrastText,
   mixHex,
   normalizeAppearance,
+  normalizeSavedAppearancePresets,
   normalizeHex,
   resolveThemePalette,
   resolveThemeVariables,
@@ -40,6 +41,23 @@ describe('appearance preferences', () => {
   it('falls back safely when local data is corrupt', () => {
     expect(normalizeAppearance({ preset: 'unknown', overrides: [] })).toEqual(DEFAULT_APPEARANCE)
     expect(normalizeAppearance(null)).toEqual(DEFAULT_APPEARANCE)
+  })
+
+  it('bounds and normalizes named custom presets', () => {
+    expect(normalizeSavedAppearancePresets([
+      {
+        id: 'night watch!',
+        name: '  Night   watch  ',
+        preferences: { ...DEFAULT_APPEARANCE, preset: 'amber-watch', overrides: { accent: '#abc' } },
+      },
+      { id: '', name: 'broken', preferences: {} },
+    ])).toEqual([
+      {
+        id: 'nightwatch',
+        name: 'Night watch',
+        preferences: { ...DEFAULT_APPEARANCE, preset: 'amber-watch', overrides: { accent: '#aabbcc' } },
+      },
+    ])
   })
 
   it('derives a coherent palette from semantic overrides', () => {

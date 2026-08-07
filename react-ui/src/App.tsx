@@ -15,7 +15,7 @@ import type { Probe } from './api/probes'
 import { api, API_FORBIDDEN_EVENT, AUTH_EXPIRED_EVENT } from './api/client'
 import { TopBar } from './components/shell/TopBar'
 import { StatusConsole } from './components/shell/StatusConsole'
-import { LeftRail, MainMenuButton, SECTION_LABELS, type SectionId } from './components/shell/LeftRail'
+import { LeftRail, MainMenuButton, SECTION_LABEL_KEYS, type SectionId } from './components/shell/LeftRail'
 import { AgentEar } from './components/shell/AgentEar'
 import { AgentPanel, type AgentAction } from './components/shell/AgentPanel'
 import { ArchiveScreen } from './components/archive/ArchiveScreen'
@@ -28,6 +28,7 @@ import { HomeScreen } from './components/home/HomeScreen'
 import { NeuralBackground } from './components/shell/NeuralBackground'
 import { useAppearance } from './appearance/AppearanceProvider'
 import type { ConsoleUiEffect } from './ui-effects/consoleEffects'
+import { useI18n } from './i18n/I18nProvider'
 
 export type AgentDrive = AgentAction & { seq: number }
 export interface ConsoleDrive {
@@ -50,6 +51,7 @@ const readRemember = (): boolean => { try { return localStorage.getItem(REMEMBER
 const readRememberedUser = (): string => { try { return localStorage.getItem(REMEMBER_USER_KEY) || '' } catch { return '' } }
 
 function LoginGate({ onDone }: { onDone: (u: AuthUser) => void }) {
+  const { t } = useI18n()
   const [u, setU] = useState(() => readRememberedUser() || 'admin')
   const [p, setP] = useState('')
   const [showPw, setShowPw] = useState(false)
@@ -69,7 +71,7 @@ function LoginGate({ onDone }: { onDone: (u: AuthUser) => void }) {
       } catch { /* storage blocked */ }
       onDone(user)
     }
-    catch (ex: any) { setErr(ex?.message || 'Sign in failed') }
+    catch (ex: any) { setErr(ex?.message || t('auth.failed')) }
     finally { setBusy(false) }
   }
   return (
@@ -77,10 +79,10 @@ function LoginGate({ onDone }: { onDone: (u: AuthUser) => void }) {
       <NeuralBackground />
       <form className="gate-card" onSubmit={submit}>
         <h1>EVA AI</h1>
-        <div className="brand-sub">Command console · sign in</div>
-        <input placeholder="Username" value={u} onChange={(e) => setU(e.target.value)} autoFocus />
+        <div className="brand-sub">{t('auth.command')}</div>
+        <input placeholder={t('auth.username')} value={u} onChange={(e) => setU(e.target.value)} autoFocus />
         <div className="gate-pw">
-          <input placeholder="Password" type={showPw ? 'text' : 'password'} value={p} onChange={(e) => setP(e.target.value)} />
+          <input placeholder={t('auth.password')} type={showPw ? 'text' : 'password'} value={p} onChange={(e) => setP(e.target.value)} />
           <button type="button" className="gate-pw-eye" onClick={() => setShowPw((v) => !v)}
             title={showPw ? 'Hide password' : 'Show password'} aria-label={showPw ? 'Hide password' : 'Show password'}>
             {showPw ? <IconEyeOff size={18} /> : <IconEye size={18} />}
@@ -92,7 +94,7 @@ function LoginGate({ onDone }: { onDone: (u: AuthUser) => void }) {
         </label>
         <div className="gate-err">{err}</div>
         <button className="btn primary" disabled={busy} style={{ justifyContent: 'center' }}>
-          {busy ? 'Signing in…' : 'Sign in'}
+          {busy ? t('auth.signingIn') : t('auth.signIn')}
         </button>
       </form>
     </div>
@@ -101,6 +103,7 @@ function LoginGate({ onDone }: { onDone: (u: AuthUser) => void }) {
 
 export default function App() {
   const { isMotionReduced } = useAppearance()
+  const { t } = useI18n()
   const [user, setUser] = useState<AuthUser | null>(null)
   const [ready, setReady] = useState(false)
   const [channels, setChannels] = useState<Channel[]>([])
@@ -384,7 +387,7 @@ export default function App() {
       <NeuralBackground noAnim={noAnim} />
       <TopBar
         appVersion={appVersion}
-        section={SECTION_LABELS[section]}
+        section={t(SECTION_LABEL_KEYS[section])}
         onBrand={() => setSection('home')}
       />
       {forbiddenNotice && <div className="global-notice" role="alert">{forbiddenNotice}</div>}
@@ -493,7 +496,6 @@ export default function App() {
               onBusyChange={handleAgentBusy}
               onLayoutPresetChange={setAgentArchiveColumns}
               onLayoutPresetCommit={setAgentCommittedArchiveColumns}
-              canManageModels={hasPermission(user, PERMISSION.modelsManage)}
               canManageSkills={hasPermission(user, PERMISSION.promptsManage)}
             />
           </>

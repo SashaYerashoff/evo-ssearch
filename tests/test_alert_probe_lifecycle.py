@@ -373,6 +373,8 @@ class AlertProbeLifecycleTests(unittest.TestCase):
         self.assertEqual(first["expires_at_ms"], 1010000)
         self.assertEqual(first["runtime_status"], "active")
         self.assertEqual(first["lifecycle"]["status"], "active")
+        self.assertEqual(first["pos_floor"], 0.05)
+        self.assertEqual(first["margin"], 0.02)
         json.dumps(first, allow_nan=False)
 
         same_event = AlertProbeLifecycle(
