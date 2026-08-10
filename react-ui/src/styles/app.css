@@ -313,6 +313,10 @@
   background: color-mix(in srgb, var(--accent) 17%, var(--control-hover));
   box-shadow: 0 0 14px -9px var(--accent);
 }
+.menu-shell.open > .menu-rail-trigger {
+  z-index: 1;
+  pointer-events: none;
+}
 .menu-rail-lines,
 .menu-rail-lines::before,
 .menu-rail-lines::after {
