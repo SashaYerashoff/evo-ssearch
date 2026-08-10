@@ -12,6 +12,14 @@ export interface AgentWidthPreset {
   archiveColumns: number
 }
 
+export function agentLayoutViewportWidth(
+  physicalViewportWidth: number,
+  interfaceScale = 1,
+): number {
+  const safeScale = Number.isFinite(interfaceScale) && interfaceScale > 0 ? interfaceScale : 1
+  return physicalViewportWidth / safeScale
+}
+
 const FULL_HD_SPECS = [
   { hiddenColumns: 2, archiveColumns: 4 },
   { hiddenColumns: 3, archiveColumns: 3 },

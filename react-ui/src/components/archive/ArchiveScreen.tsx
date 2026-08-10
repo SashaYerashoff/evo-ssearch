@@ -528,6 +528,7 @@ export function ArchiveScreen({
         active={openTool}
         onSelect={(id) => setOpenTool(id as typeof openTool)}
         leading={navigation}
+        reserveLeading
       >
         {expanded()}
       </ToolTabs>

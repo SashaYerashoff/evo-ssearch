@@ -127,6 +127,7 @@ export function StreamControl(p: {
       active={p.activeTab}
       onSelect={(id) => p.onTab(id as VideoWorkspaceTab)}
       leading={p.navigation}
+      reserveLeading
     >
       {p.activeTab === 'settings' ? (
         <div className="vid-settings-toolbar">
@@ -155,23 +156,23 @@ export function StreamControl(p: {
             <div className="vid-tb-actions">
               <ToolbarActionMenu actions={[
                 {
-                  id: 'reload-channels', label: 'Reload channels', icon: <IconReload size={15} />,
+                  id: 'reload-channels', label: t('video.reloadChannels'), icon: <IconReload size={15} />,
                   onSelect: p.onReload,
                 },
                 ...(p.canCapture && p.capturing ? [{
-                  id: 'stop', label: 'Stop summaries', icon: <IconPlayerStop size={15} />,
+                  id: 'stop', label: t('video.stop'), icon: <IconPlayerStop size={15} />,
                   onSelect: p.onStop, disabled: p.busy, danger: true,
                 }] : []),
                 ...(p.canCapture ? [{
-                  id: 'flush', label: 'Flush pending summaries', icon: <IconDroplet size={15} />,
+                  id: 'flush', label: t('video.flush'), icon: <IconDroplet size={15} />,
                   onSelect: p.onFlush, disabled: p.busy || !p.capturing,
                 }] : []),
                 ...(p.canManagePrompts ? [{
-                  id: 'prompts', label: 'Prompts and alerts', icon: <IconSettings size={15} />,
+                  id: 'prompts', label: t('video.prompts'), icon: <IconSettings size={15} />,
                   onSelect: p.onPromptSettings,
                 }] : []),
                 ...(p.settingsDirty ? [{
-                  id: 'discard', label: 'Discard draft', icon: <IconReload size={15} />,
+                  id: 'discard', label: t('video.discard'), icon: <IconReload size={15} />,
                   onSelect: p.onDiscardSettings, disabled: p.busy,
                 }] : []),
               ]} />
@@ -240,7 +241,7 @@ export function StreamControl(p: {
             </div>
             <div className="vid-tb-actions">
               <ToolbarActionMenu actions={[
-                { id: 'reload-channels', label: 'Reload channels', icon: <IconReload size={15} />, onSelect: p.onReload },
+                { id: 'reload-channels', label: t('video.reloadChannels'), icon: <IconReload size={15} />, onSelect: p.onReload },
                 { id: 'refresh', label: t('video.refresh'), icon: <IconReload size={15} />, onSelect: p.onRefreshFeed },
                 {
                   id: 'collapse',

@@ -279,62 +279,62 @@
 
 /* ---- body ---- */
 .body-row {
+  --menu-rail-width: 28px;
+  --workspace-tabs-top-padding: 14px;
+  --atp-tabrow-height: 30px;
+  --atp-panel-content-height: 80px;
+  --menu-rail-align-offset: 15px;
   --archive-card-width: calc((100cqw - var(--rail-w) - 132px) / 6);
   flex: 1; display: flex; min-height: 0; position: relative;
 }
 
-/* ---- glass navigation drawer: mirrored counterpart to the agent ear ---- */
-.menu-shell { position: absolute; inset: 0 auto 0 0; width: 0; z-index: 62; pointer-events: none; }
+/* ---- compact edge navigation ---- */
+.menu-shell {
+  position: absolute; inset: 0 auto 0 0; z-index: 62;
+  width: 0; pointer-events: none;
+}
 .menu-dismiss {
   position: fixed; inset: 0; z-index: 0; width: 100cqw; height: 100cqh;
   padding: 0; border: 0; border-radius: 0; background: transparent; pointer-events: auto;
 }
-.menu-ear {
-  position: absolute; left: 0; top: 44px; z-index: 3;
-  display: flex; flex-direction: column; align-items: center; gap: 6px;
-  padding: 15px 4px; border: 0;
-  border-radius: 0 var(--radius) var(--radius) 0;
-  color: var(--primary-text); background: linear-gradient(135deg, var(--accent), var(--accent-2));
-  box-shadow: 0 0 22px -4px color-mix(in srgb, var(--accent) 76%, transparent);
+.menu-rail-trigger {
+  position: relative; z-index: 3;
+  width: var(--menu-rail-width); height: var(--atp-panel-content-height); padding: 2px 3px 2px 2px;
+  display: flex; flex-direction: column; align-items: center; gap: 1px;
+  border: 1px solid color-mix(in srgb, var(--line-2) 88%, transparent); border-left: 0;
+  border-radius: 0 9px 9px 0;
+  background: color-mix(in srgb, var(--surface-raised) 88%, transparent);
+  backdrop-filter: blur(18px) saturate(1.15); -webkit-backdrop-filter: blur(18px) saturate(1.15);
+  box-shadow: 10px 0 24px -18px rgba(0,0,0,.86), var(--elev);
   pointer-events: auto;
 }
-.menu-ear:hover, .menu-shell.open .menu-ear { filter: brightness(1.08); box-shadow: 0 0 26px -2px color-mix(in srgb, var(--accent) 82%, transparent); }
-.menu-ear .txt { writing-mode: vertical-rl; transform: rotate(180deg); font-size: 11px; font-weight: 700; letter-spacing: .18em; }
-.menu-header-button {
-  width: 38px; min-width: 38px; height: 100%; min-height: 78px;
-  display: flex; align-items: center;
-  flex-direction: column; justify-content: center; gap: 7px; padding: 10px 4px;
-  color: var(--primary-text);
-  background: linear-gradient(135deg, var(--accent), var(--accent-2));
-  border-radius: 0 11px 11px 0; border: 0;
-  box-shadow: 0 0 22px -4px color-mix(in srgb, var(--accent) 76%, transparent);
-  transition: opacity .14s ease, transform .16s ease, visibility 0s linear 0s,
-    border-color .14s ease, background .14s ease;
+.menu-rail-trigger:hover,
+.menu-rail-trigger.open { border-color: var(--accent-line); background: var(--control-hover); }
+.menu-rail-icon {
+  width: 14px; height: 14px; min-width: 14px;
+  display: grid; place-items: center;
+  color: var(--text-2); background: transparent;
+  border: 1px solid transparent; border-radius: 4px;
+  transition: color .14s ease, border-color .14s ease, background .14s ease, box-shadow .14s ease;
 }
-.menu-header-button svg {
-  width: 20px; height: 20px; flex: 0 0 20px; padding: 2px; border-radius: 0;
-  color: currentColor; background: transparent; border: 0;
+.menu-rail-trigger:hover .menu-rail-icon { color: var(--text); }
+.menu-rail-icon.on {
+  color: var(--accent); background: var(--accent-bg); border-color: var(--accent-line);
+  box-shadow: inset 2px 0 var(--accent);
 }
-.menu-header-button span {
-  color: currentColor; font-family: var(--mono); white-space: nowrap;
-  writing-mode: vertical-rl; transform: rotate(180deg);
-  font-size: 10.5px; font-weight: 750; line-height: 1; letter-spacing: .12em; text-align: center;
-}
-.menu-header-button:hover {
-  color: var(--primary-text); filter: brightness(1.08);
-  box-shadow: 0 0 26px -2px color-mix(in srgb, var(--accent) 82%, transparent);
-}
-.home-menu-slot {
-  position: absolute; top: 41px; left: 0; z-index: 61;
-  width: 38px; height: 96px; display: flex;
+.menu-rail-icon.danger { color: var(--danger); }
+.menu-rail-sep { width: 13px; height: 1px; margin: 0; background: var(--line-2); }
+.menu-shell > .menu-rail-trigger {
+  position: absolute; left: 0;
+  top: calc(var(--workspace-tabs-top-padding) + var(--atp-tabrow-height) + var(--menu-rail-align-offset));
 }
 .menu-drawer {
   position: absolute; left: 0; top: 10px; bottom: 10px; z-index: 2;
-  width: min(248px, calc(100cqw - 32px)); padding: 16px 14px 16px 42px;
+  width: min(248px, calc(100cqw - 32px)); padding: 16px 14px 16px 40px;
   display: flex; flex-direction: column; gap: 5px;
   border: 1px solid color-mix(in srgb, var(--line-2) 82%, transparent); border-left: 0;
   border-radius: 0 var(--radius-lg) var(--radius-lg) 0;
-  background: color-mix(in srgb, var(--surface-raised) 72%, transparent);
+  background: color-mix(in srgb, var(--surface-raised) 82%, transparent);
   backdrop-filter: blur(26px) saturate(1.22); -webkit-backdrop-filter: blur(26px) saturate(1.22);
   box-shadow: 18px 0 48px -24px rgba(0,0,0,.75), var(--elev);
   transform: translateX(calc(-100% - 12px)); opacity: 0; visibility: hidden;
@@ -344,13 +344,13 @@
 .menu-shell.open .menu-drawer { transform: translateX(0); opacity: 1; visibility: visible; transition-delay: 0s; }
 .menu-title { padding: 2px 9px 10px; color: var(--text-mut); font-family: var(--mono); font-size: 10px; font-weight: 700; letter-spacing: .12em; text-transform: uppercase; }
 .menu-item {
-  display: flex; align-items: center; gap: 11px; width: 100%; min-height: 44px; padding: 7px 10px;
-  border: 1px solid transparent; border-radius: 11px; color: var(--text-2); background: transparent; text-align: left;
+  display: flex; align-items: center; gap: 11px; width: 100%; min-height: 42px; padding: 7px 10px;
+  border: 1px solid transparent; border-radius: 10px; color: var(--text-2); background: transparent; text-align: left;
 }
 .menu-item:hover { color: var(--text); background: var(--backdrop-mid); border-color: var(--line); }
 .menu-item.on { color: var(--accent); background: var(--accent-bg); border-color: var(--accent-line); }
 .menu-item.danger { margin-top: auto; color: var(--danger); }
-.ricon { width: 26px; height: 26px; flex: 0 0 26px; display: grid; place-items: center; }
+.ricon { width: 25px; height: 25px; flex: 0 0 25px; display: grid; place-items: center; }
 .menu-label { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 12.5px; font-weight: 650; letter-spacing: .02em; }
 .menu-sep { height: 1px; background: var(--line); margin: 6px 8px; }
 
@@ -386,14 +386,15 @@
 .archive-screen > .tool-tabs { position: relative; z-index: 10; }
 
 /* Tool tabs and their active controls live inside one shared panel. */
-.tool-tabs { --atp-tabrow-height: 30px; display: flex; flex-direction: column; }
+.tool-tabs { display: flex; flex-direction: column; }
 .tool-tabs.with-leading {
-  display: grid; grid-template-columns: 38px minmax(0, 1fr); column-gap: 10px; align-items: stretch;
+  display: flex; flex-direction: column;
 }
 .tool-tabs-leading {
-  position: relative; width: 38px; margin-left: -16px;
-  display: flex; align-items: stretch; padding-top: 0;
+  position: relative; width: var(--menu-rail-width); flex: 0 0 var(--menu-rail-width);
+  box-sizing: border-box; display: flex; align-items: stretch;
 }
+.tool-tabs-leading .menu-rail-trigger { width: 100%; height: 100%; flex: 1 1 auto; }
 /* tool tabs scroll away with the content — no sticky pin, no frosted backdrop band.
    Same plain header across Archive / Video / Monitoring. */
 .atp-tabrow {
@@ -401,6 +402,7 @@
   padding: 0 10px; min-width: 0; overflow: hidden;
   background: transparent;
 }
+.tool-tabs.with-leading .atp-tabrow { margin-left: calc(var(--menu-rail-width) + 8px); }
 .atp-tab {
   position: relative; top: 1px; z-index: 2;
   display: flex; align-items: center; gap: 7px; padding: 6px 11px 7px;
@@ -432,12 +434,13 @@
   padding: 0; overflow: visible;
 }
 .atp-tabpanel-content {
-  flex: 1 1 auto; min-width: 0; min-height: 80px;
+  flex: 1 1 auto; min-width: 0; min-height: var(--atp-panel-content-height);
   display: flex; align-items: center; padding: 12px 14px;
   background: var(--panel); border: 1px solid var(--line-2); border-radius: 12px;
   backdrop-filter: blur(14px); -webkit-backdrop-filter: blur(14px);
   box-shadow: var(--elev);
 }
+.atp-content-row { flex: 1 1 auto; min-width: 0; display: flex; align-items: stretch; gap: 8px; }
 .atp-open { flex: 1 1 auto; width: 100%; min-width: 0; }
 /* the tab already names the section — don't repeat the label inside the panel */
 .atp-tabpanel .atp-glabel { display: none; }
@@ -960,13 +963,16 @@
 /* half: in-flow flex child — compresses the console alongside it */
 .agent-dock.open {
   width: 50cqw;
-  z-index: 20;
+  /* The sticky workspace toolbar is z-index 45. Agent must remain above the
+     whole workspace so content that keeps its fixed geometry disappears under
+     the dock instead of painting across the agent surface. */
+  z-index: 55;
   box-shadow: -24px 0 60px -26px rgba(0,0,0,0.6);
 }
 /* full: absolute overlay — out of flow, so the console behind stays full-width & untouched.
    left starts after the rail so the left bar stays visible/usable. */
 .agent-dock.open.full {
-  position: absolute; top: 0; right: 0; bottom: 0; left: calc(var(--rail-w) + 14px); width: auto; z-index: 16;
+  position: absolute; top: 0; right: 0; bottom: 0; left: calc(var(--rail-w) + 14px); width: auto; z-index: 55;
   border-radius: 14px 0 0 14px; border: 1px solid var(--agent-edge);
 }
 .agent-dock > * { min-width: 380px; }
@@ -1509,13 +1515,13 @@
   gap: 14px; padding: 14px 16px; overflow-y: auto;
 }
 
-/* Workspace navigation, section tabs and filters are one pinned header. The large
-   MENU column deliberately takes width from the filters instead of overlaying them. */
+/* Workspace navigation, section tabs and filters are one pinned header. The compact
+   edge rail owns only its narrow column instead of overlaying the filters. */
 .archive-screen > .tool-tabs.with-leading,
 .mon-cols > .tool-tabs.with-leading,
 .vid-cols > .tool-tabs.with-leading {
   position: sticky; top: 0; z-index: 45;
-  margin: -14px -16px 0; padding: 14px 16px 10px;
+  margin: -14px -16px 0; padding: var(--workspace-tabs-top-padding) 8px 10px 0;
   background: transparent;
   border-bottom: 0;
 }
@@ -1787,6 +1793,7 @@
 .set-navitem:hover { background: var(--void-tile); color: var(--text); }
 .set-navitem.on { color: var(--accent); border-left-color: var(--accent); background: var(--accent-soft); }
 .set-content { flex: 1; min-width: 0; overflow-y: auto; padding: 20px 24px; display: flex; flex-direction: column; gap: 22px; }
+.set-content.appearance-content { min-height: 0; overflow: hidden; padding: 0; gap: 0; }
 .set-loading {
   min-height: 120px; display: flex; align-items: center; justify-content: center; gap: 12px;
   color: var(--text-2);

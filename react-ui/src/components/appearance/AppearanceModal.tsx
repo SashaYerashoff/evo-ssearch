@@ -92,7 +92,7 @@ export function AppearanceModal({ onClose, embedded = false }: { onClose: () => 
 
   function apply() {
     commitPreferences(draft)
-    if (!embedded) onClose()
+    onClose()
   }
 
   function choosePreset(preset: AppearancePreferences['preset']) {
@@ -328,24 +328,45 @@ export function AppearanceModal({ onClose, embedded = false }: { onClose: () => 
           </div>
         </div>
 
-        <div className="appearance-footer">
-          <button
-            className="btn"
-            onClick={() => update({ ...DEFAULT_APPEARANCE, overrides: {} })}
-          >
-            Reset all
-          </button>
-          <div>
-            <button className="btn" onClick={closeWithoutSaving}>Cancel</button>
-            <button
-              className="btn primary"
-              disabled={contrastWarnings.length > 0}
-              title={contrastWarnings.length > 0 ? 'Resolve palette contrast warnings before applying.' : ''}
-              onClick={apply}
-            >
-              Apply appearance
-            </button>
-          </div>
+        <div className={`appearance-footer ${embedded ? 'appearance-footer-embedded' : ''}`}>
+          {embedded ? (
+            <div className="set-actions">
+              <button
+                className="mon-btn"
+                onClick={() => update({ ...DEFAULT_APPEARANCE, overrides: {} })}
+              >
+                <IconRestore size={15} /> Reset to defaults
+              </button>
+              <button
+                className="mon-btn accent"
+                disabled={contrastWarnings.length > 0}
+                title={contrastWarnings.length > 0 ? 'Resolve palette contrast warnings before applying.' : ''}
+                onClick={apply}
+              >
+                <IconCheck size={15} /> Apply appearance
+              </button>
+            </div>
+          ) : (
+            <>
+              <button
+                className="btn"
+                onClick={() => update({ ...DEFAULT_APPEARANCE, overrides: {} })}
+              >
+                Reset all
+              </button>
+              <div>
+                <button className="btn" onClick={closeWithoutSaving}>Cancel</button>
+                <button
+                  className="btn primary"
+                  disabled={contrastWarnings.length > 0}
+                  title={contrastWarnings.length > 0 ? 'Resolve palette contrast warnings before applying.' : ''}
+                  onClick={apply}
+                >
+                  Apply appearance
+                </button>
+              </div>
+            </>
+          )}
         </div>
       </div>
     </div>

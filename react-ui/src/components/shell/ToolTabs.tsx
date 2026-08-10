@@ -4,16 +4,17 @@ import type { ReactNode } from 'react'
 // open in a panel right below. Tabs never move — the active one lights up.
 export interface ToolTab { id: string; icon: ReactNode; label: string; summary: string; badge?: string }
 
-export function ToolTabs({ tabs, active, onSelect, leading, children }: {
+export function ToolTabs({ tabs, active, onSelect, leading, reserveLeading = false, children }: {
   tabs: ToolTab[]
   active: string
   onSelect: (id: string) => void
   leading?: ReactNode
+  reserveLeading?: boolean
   children: ReactNode
 }) {
+  const hasLeadingColumn = Boolean(leading) || reserveLeading
   return (
-    <div className={`tool-tabs ${leading ? 'with-leading' : ''}`}>
-      {leading && <div className="tool-tabs-leading">{leading}</div>}
+    <div className={`tool-tabs ${hasLeadingColumn ? 'with-leading' : ''}`}>
       <div className="atp-tabpanel">
         <div className="atp-tabrow">
           {tabs.map((t) => (
@@ -33,7 +34,10 @@ export function ToolTabs({ tabs, active, onSelect, leading, children }: {
             </button>
           ))}
         </div>
-        <div className="atp-tabpanel-content">{children}</div>
+        <div className="atp-content-row">
+          {hasLeadingColumn && <div className="tool-tabs-leading">{leading}</div>}
+          <div className="atp-tabpanel-content">{children}</div>
+        </div>
       </div>
     </div>
   )

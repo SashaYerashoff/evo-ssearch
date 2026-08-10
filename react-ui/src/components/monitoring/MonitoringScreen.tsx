@@ -427,6 +427,7 @@ export function MonitoringScreen({
         active="probes"
         onSelect={() => {}}
         leading={navigation}
+        reserveLeading
       >
         <div className="probe-board-toolbar">
           <div className="mon-search" title="Search names, prompts, channels and parent alerts">

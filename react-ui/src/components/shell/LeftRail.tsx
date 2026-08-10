@@ -1,7 +1,6 @@
 import {
   IconFileDescription,
   IconLogout,
-  IconMenu2,
   IconPhotoSearch,
   IconSettings,
   IconTargetArrow,
@@ -19,39 +18,70 @@ export const SECTION_LABEL_KEYS: Record<SectionId, TranslationKey> = {
   agent: 'nav.agent',
 }
 
-const NAV: { id: SectionId; labelKey: TranslationKey; Icon: any }[] = [
+const NAV = [
   { id: 'archive', labelKey: 'nav.archive', Icon: IconPhotoSearch },
   { id: 'video', labelKey: 'nav.summariesShort', Icon: IconFileDescription },
   { id: 'monitoring', labelKey: 'nav.probes', Icon: IconTargetArrow },
-]
+] satisfies { id: SectionId; labelKey: TranslationKey; Icon: typeof IconPhotoSearch }[]
 
-export function MainMenuButton({ open, onToggle }: { open: boolean; onToggle: () => void }) {
+type MenuRailTriggerProps = {
+  active: SectionId
+  visibleSections: SectionId[]
+  showSettings: boolean
+  open: boolean
+  onToggle: () => void
+}
+
+export function MenuRailTrigger({ active, visibleSections, showSettings, open, onToggle }: MenuRailTriggerProps) {
   const { t } = useI18n()
-  if (open) return null
+  const items = NAV.filter(({ id }) => visibleSections.includes(id))
   return (
     <button
-      className="menu-header-button"
-      aria-expanded={false}
+      className={`menu-rail-trigger ${open ? 'open' : ''}`}
+      aria-label={open ? t('nav.closeMenu') : t('nav.openMenu')}
+      aria-expanded={open}
       aria-controls="eva-main-menu"
-      title={t('nav.openMenu')}
+      title={open ? t('nav.closeMenu') : t('nav.openMenu')}
       onClick={onToggle}
     >
-      <IconMenu2 size={20} stroke={2} />
-      <span>{t('nav.menu')}</span>
+      {items.map(({ id, Icon }) => (
+        <span key={id} className={`menu-rail-icon ${active === id ? 'on' : ''}`} aria-hidden="true">
+          <Icon size={11} stroke={2} />
+        </span>
+      ))}
+      {showSettings && (
+        <>
+          <span className="menu-rail-sep" aria-hidden="true" />
+          <span className="menu-rail-icon" aria-hidden="true">
+            <IconSettings size={11} stroke={2} />
+          </span>
+        </>
+      )}
+      <span className="menu-rail-icon danger" aria-hidden="true">
+        <IconLogout size={11} stroke={2} />
+      </span>
     </button>
   )
 }
 
 export function LeftRail({
-  active, visibleSections, showSettings, open, showTrigger, onOpenChange, onNavigate, onSettings, onLogout,
+  active,
+  visibleSections,
+  showSettings,
+  showTrigger,
+  open,
+  onOpenChange,
+  onNavigate,
+  onSettings,
+  onLogout,
 }: {
   active: SectionId
   visibleSections: SectionId[]
   showSettings: boolean
-  open: boolean
   showTrigger: boolean
+  open: boolean
   onOpenChange: (open: boolean) => void
-  onNavigate: (s: SectionId) => void
+  onNavigate: (section: SectionId) => void
   onSettings: () => void
   onLogout: () => void
 }) {
@@ -65,31 +95,30 @@ export function LeftRail({
     return () => window.removeEventListener('keydown', closeOnEscape)
   }, [open, onOpenChange])
 
-  const navigate = (id: SectionId) => {
-    onNavigate(id)
+  const items = NAV.filter(({ id }) => visibleSections.includes(id))
+  const navigate = (section: SectionId) => {
+    onNavigate(section)
     onOpenChange(false)
   }
 
   return (
-    <div className={`menu-shell ${open ? 'open' : ''}`}>
+    <aside className={`menu-shell ${open ? 'open' : ''}`}>
       {open && <button className="menu-dismiss" onClick={() => onOpenChange(false)} aria-label={t('nav.closeMenu')} />}
-      {showTrigger && !open && (
-        <button
-          className="menu-ear"
-          aria-expanded={false}
-          aria-controls="eva-main-menu"
-          title={t('nav.openMenu')}
-          onClick={() => onOpenChange(true)}
-        >
-          <IconMenu2 size={15} stroke={2} />
-          <span className="txt">{t('nav.menu')}</span>
-        </button>
+      {showTrigger && (
+        <MenuRailTrigger
+          active={active}
+          visibleSections={visibleSections}
+          showSettings={showSettings}
+          open={open}
+          onToggle={() => onOpenChange(!open)}
+        />
       )}
+
       <nav className="menu-drawer" id="eva-main-menu" aria-hidden={!open}>
         <div className="menu-title">{t('nav.navigation')}</div>
-        {NAV.filter(({ id }) => visibleSections.includes(id)).map(({ id, labelKey, Icon }) => (
+        {items.map(({ id, labelKey, Icon }) => (
           <button key={id} className={`menu-item ${active === id ? 'on' : ''}`} onClick={() => navigate(id)}>
-            <span className="ricon"><Icon size={23} stroke={1.8} /></span>
+            <span className="ricon"><Icon size={22} stroke={1.8} /></span>
             <span className="menu-label">{t(labelKey)}</span>
           </button>
         ))}
@@ -97,16 +126,16 @@ export function LeftRail({
           <>
             <div className="menu-sep" />
             <button className="menu-item" onClick={() => { onSettings(); onOpenChange(false) }}>
-              <span className="ricon"><IconSettings size={22} stroke={1.8} /></span>
+              <span className="ricon"><IconSettings size={21} stroke={1.8} /></span>
               <span className="menu-label">{t('nav.settings')}</span>
             </button>
           </>
         )}
         <button className="menu-item danger" onClick={() => { onOpenChange(false); onLogout() }}>
-          <span className="ricon"><IconLogout size={22} stroke={1.8} /></span>
+          <span className="ricon"><IconLogout size={21} stroke={1.8} /></span>
           <span className="menu-label">{t('nav.logout')}</span>
         </button>
       </nav>
-    </div>
+    </aside>
   )
 }
