@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib.util
+import inspect
 import io
 import os
 import stat
@@ -70,6 +71,7 @@ def make_source(root: Path) -> Path:
         "react-ui/dist/index.html": "<!doctype html><div id=\"root\"></div>\n",
         "scripts/preflight_patch.sh": "#!/bin/sh\nexit 0\n",
         "scripts/install_patch.sh": "#!/bin/sh\nexit 0\n",
+        "scripts/install_media_runtime.sh": "#!/bin/sh\nexit 0\n",
         "scripts/verify_patch.sh": "#!/bin/sh\nexit 0\n",
         "scripts/rollback.sh": "#!/bin/sh\nexit 0\n",
         "scripts/install_assets/eva-ai.service.in": (
@@ -816,9 +818,61 @@ class OfflineInstallerUnitTests(unittest.TestCase):
 
             self.assertIn("preflight_patch.sh", plan)
             self.assertIn("install_patch.sh", plan)
+            self.assertIn("checksummed offline FFmpeg runtime", plan)
             self.assertIn("Alembic current -> upgrade head -> current", plan)
             self.assertIn("verify_patch.sh", plan)
             self.assertIn("rollback.sh", plan)
+
+    def test_included_media_runtime_is_verified_before_apply(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = make_source(root)
+            env_file = root / "eva-ai.env"
+            env_file.write_text(env_text(), encoding="utf-8")
+            options = make_options(root, source, env_file=env_file, migrate=False)
+            runtime = options.bundle_dir / "runtime"
+            runtime.mkdir(parents=True)
+
+            prepared = installer.prepare_install(options, environ={})
+            failures = [finding.message for finding in prepared.findings if finding.level == "FAIL"]
+
+            self.assertTrue(any("bundled media runtime path is missing" in row for row in failures))
+
+    def test_media_runtime_install_precedes_migration_and_service_start(self):
+        source = inspect.getsource(installer.apply_install)
+        self.assertLess(source.index("_install_media_runtime"), source.index("alembic ="))
+        self.assertLess(
+            source.index("_install_media_runtime"),
+            source.index('(\"systemctl\", \"enable\"'),
+        )
+
+    def test_media_runtime_uses_opencv_overlay_only_when_venv_needs_it(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = make_source(root)
+            env_file = root / "eva-ai.env"
+            env_file.write_text(env_text(), encoding="utf-8")
+            options = make_options(root, source, env_file=env_file, migrate=False)
+            (options.bundle_dir / "runtime").mkdir()
+            helper = options.bundle_dir / "scripts/install_media_runtime.sh"
+            helper.parent.mkdir(parents=True)
+            helper.write_text("#!/bin/sh\n", encoding="utf-8")
+            helper.chmod(0o755)
+            prepared = installer.prepare_install(options, environ={})
+            calls = []
+
+            class Runner:
+                def run(self, command, **_kwargs):
+                    calls.append([str(item) for item in command])
+                    return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
+
+            with patch.object(installer, "_venv_has_healthy_opencv", return_value=False):
+                self.assertTrue(installer._install_media_runtime(prepared, Runner()))
+            self.assertIn("--with-opencv-overlay", calls[-1])
+
+            with patch.object(installer, "_venv_has_healthy_opencv", return_value=True):
+                self.assertTrue(installer._install_media_runtime(prepared, Runner()))
+            self.assertNotIn("--with-opencv-overlay", calls[-1])
 
     def test_adopt_plan_preserves_existing_systemd_unit(self):
         with tempfile.TemporaryDirectory() as tmp:

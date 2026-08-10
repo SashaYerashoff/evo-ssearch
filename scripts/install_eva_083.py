@@ -16,6 +16,7 @@ import argparse
 import fcntl
 import getpass
 import grp
+import hashlib
 import os
 import pwd
 import re
@@ -692,6 +693,65 @@ def _wheelhouse_files(bundle_dir: Path) -> list[Path]:
     return sorted({path for pattern in patterns for path in wheelhouse.glob(pattern)})
 
 
+def _media_runtime_findings(bundle_dir: Path) -> list[Finding]:
+    """Validate an optional self-contained media payload before apply.
+
+    Patch bundles may omit the payload when a complete wheelhouse/system media
+    stack is supplied.  When ``runtime/`` is present, however, it is an atomic
+    contract: helper, FFmpeg binaries, one OpenCV wheel and every recorded
+    checksum must be valid before the live service is stopped.
+    """
+
+    runtime_dir = bundle_dir / "runtime"
+    if not runtime_dir.exists():
+        return [Finding("WARN", "bundle has no self-contained media runtime; existing dependencies will be reused")]
+    required = (
+        bundle_dir / "scripts" / "install_media_runtime.sh",
+        runtime_dir / "SHA256SUMS",
+        runtime_dir / "manifest.txt",
+        runtime_dir / "ffmpeg" / "bin" / "ffmpeg",
+        runtime_dir / "ffmpeg" / "bin" / "ffprobe",
+        runtime_dir / "ffmpeg" / "LICENSE.txt",
+    )
+    failures = [path for path in required if not path.is_file()]
+    if failures:
+        return [
+            Finding("FAIL", f"bundled media runtime path is missing: {path}")
+            for path in failures
+        ]
+    helper = required[0]
+    if not os.access(helper, os.X_OK):
+        return [Finding("FAIL", f"bundled media installer is not executable: {helper}")]
+    wheels = sorted((runtime_dir / "opencv").glob("opencv_python_headless-*.whl"))
+    if len(wheels) != 1:
+        return [Finding("FAIL", "bundled media runtime must contain exactly one OpenCV wheel")]
+
+    checksum_file = runtime_dir / "SHA256SUMS"
+    try:
+        records = checksum_file.read_text(encoding="utf-8").splitlines()
+        checked = 0
+        for record in records:
+            expected, separator, relative = record.strip().partition("  ")
+            if not separator or not re.fullmatch(r"[0-9a-fA-F]{64}", expected):
+                raise ValueError("malformed SHA256SUMS record")
+            candidate = (runtime_dir / relative).resolve(strict=False)
+            if runtime_dir.resolve(strict=False) not in candidate.parents or not candidate.is_file():
+                raise ValueError(f"unsafe or missing checksum target: {relative}")
+            digest = hashlib.sha256()
+            with candidate.open("rb") as handle:
+                for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                    digest.update(chunk)
+            actual = digest.hexdigest()
+            if actual.lower() != expected.lower():
+                raise ValueError(f"checksum mismatch: {relative}")
+            checked += 1
+        if checked == 0:
+            raise ValueError("SHA256SUMS is empty")
+    except (OSError, ValueError) as exc:
+        return [Finding("FAIL", f"bundled media runtime verification failed: {exc}")]
+    return [Finding("OK", f"self-contained media runtime verified ({checked} checksums)")]
+
+
 def _version(source_dir: Path) -> str:
     version_file = source_dir / "VERSION"
     if not version_file.is_file():
@@ -732,6 +792,7 @@ def collect_preflight(
             add("FAIL", f"required offline payload path is missing: {path}")
         elif path.suffix == ".sh" and not os.access(path, os.X_OK):
             add("FAIL", f"installer helper is not executable: {path}")
+    findings.extend(_media_runtime_findings(options.bundle_dir))
     source_version = _version(options.source_dir)
     if source_version == EXPECTED_VERSION:
         add("OK", f"source version is {EXPECTED_VERSION}")
@@ -958,6 +1019,10 @@ def build_plan(prepared: PreparedInstall) -> list[PlanAction]:
         PlanAction(
             "install",
             "run existing scripts/install_patch.sh for code/env/unit/DB backup and static copy; keep service stopped",
+        ),
+        PlanAction(
+            "media",
+            "install the checksummed offline FFmpeg runtime and add the bundled OpenCV overlay only when the target venv lacks it",
         ),
     ]
     if options.migrate:
@@ -1274,6 +1339,50 @@ def _latest_backup_marker(backup_root: Path) -> str:
         return ""
 
 
+def _venv_has_healthy_opencv(python: Path) -> bool:
+    """Probe only the target venv, deliberately excluding an old overlay."""
+
+    environment = dict(os.environ)
+    environment.pop("PYTHONPATH", None)
+    completed = subprocess.run(
+        (
+            str(python),
+            "-c",
+            (
+                "import cv2,numpy as np; "
+                "image=np.zeros((8,8,3),dtype=np.uint8); "
+                "assert cv2.cvtColor(image,cv2.COLOR_BGR2RGB).shape==(8,8,3)"
+            ),
+        ),
+        env=environment,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        check=False,
+    )
+    return completed.returncode == 0
+
+
+def _install_media_runtime(prepared: PreparedInstall, runner: CommandRunner) -> bool:
+    """Install an included media payload after backup, before DB/service work."""
+
+    options = prepared.options
+    runtime_dir = options.bundle_dir / "runtime"
+    if not runtime_dir.is_dir():
+        return False
+    python = options.app_dir / ".venv" / "bin" / "python"
+    command: list[str | Path] = [
+        options.bundle_dir / "scripts" / "install_media_runtime.sh",
+        "--bundle-dir", options.bundle_dir,
+        "--app-dir", options.app_dir,
+        "--python", python,
+        "--owner", f"{options.service_user}:{options.service_group}",
+    ]
+    if not _venv_has_healthy_opencv(python):
+        command.append("--with-opencv-overlay")
+    runner.run(command)
+    return True
+
+
 @contextmanager
 def install_lock(path: Path):
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -1414,6 +1523,12 @@ def apply_install(prepared: PreparedInstall) -> Path:
             f"service_name={options.service_name}\n"
         )
         _atomic_write(backup_dir / "offline-installer-state.txt", state, 0o600)
+
+        # ``oldapp.py`` imports cv2 during process bootstrap.  The universal
+        # bundle keeps rescue OpenCV out of the site's legacy venv and exposes
+        # it through .eva-runtime/python in run_prod.sh.  This must happen
+        # before migrations and, critically, before the first service start.
+        _install_media_runtime(prepared, runner)
 
         if options.migrate:
             db_dump = backup_dir / "postgres.dump"

@@ -6,6 +6,13 @@ Format loosely follows Keep a Changelog.
 
 ## Unreleased
 
+- **Bundled media is now part of the Python installer transaction:** when an
+  offline bundle contains the self-contained runtime, its FFmpeg/OpenCV files
+  and checksums are validated during read-only preflight and installed after
+  the rollback snapshot but before Alembic or the first service start. Legacy
+  venvs without OpenCV use the isolated `.eva-runtime/python` overlay instead
+  of being modified in place.
+
 - **Legacy 0006 upgrade safety:** Alembic now accepts both PostgreSQL URLs and
   libpq conninfo without leaking or mangling credentials, while preflight also
   proves schema ownership, `eva_owner` role switching, and transactional DDL
