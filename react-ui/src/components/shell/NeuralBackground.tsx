@@ -70,11 +70,12 @@ const AURORA_SPEED = 0.05  // fraction of a lissajous cycle per second-ish — e
 const AURORA_ALPHA = 0.08  // per-blob opacity (normal blending — overlaps stay bounded)
 // This is ambient, very slow motion. Painting full-screen radial gradients at the
 // monitor refresh rate needlessly competes with local CUDA inference on demo hosts
-// where the display and VLM share a small GPU. Twenty frames per second remains
-// visually fluid at these speeds while leaving substantially more compositor time.
-const PAINT_INTERVAL_MS = 66
+// where the display and VLM share a small GPU. Twelve frames per second remains
+// fluid enough for this slow ambient layer while leaving substantially more compositor time.
+const PAINT_INTERVAL_MS = 83
 const AURORA_REFRESH_MS = 750
-const AURORA_BUFFER_SCALE = 0.22
+const AURORA_BUFFER_SCALE = 0.16
+const CANVAS_RENDER_SCALE = 0.5
 
 export function NeuralBackground({ noAnim = false }: { noAnim?: boolean }) {
   const ref = useRef<HTMLCanvasElement>(null)
@@ -114,14 +115,16 @@ export function NeuralBackground({ noAnim = false }: { noAnim?: boolean }) {
     }
 
     function build() {
-      const dpr = Math.min(window.devicePixelRatio || 1, 1.25)
       w = window.innerWidth
       h = window.innerHeight
-      cv.width = Math.round(w * dpr)
-      cv.height = Math.round(h * dpr)
+      // The background is intentionally soft. Rendering it at half resolution
+      // avoids making Chromium contend with CUDA over millions of decorative
+      // pixels while CSS scales the bitmap back to the viewport.
+      cv.width = Math.round(w * CANVAS_RENDER_SCALE)
+      cv.height = Math.round(h * CANVAS_RENDER_SCALE)
       cv.style.width = w + 'px'
       cv.style.height = h + 'px'
-      c2.setTransform(dpr, 0, 0, dpr, 0, 0)
+      c2.setTransform(CANVAS_RENDER_SCALE, 0, 0, CANVAS_RENDER_SCALE, 0, 0)
       auroraCanvas.width = Math.max(1, Math.round(w * AURORA_BUFFER_SCALE))
       auroraCanvas.height = Math.max(1, Math.round(h * AURORA_BUFFER_SCALE))
       lastAuroraPaint = Number.NEGATIVE_INFINITY
