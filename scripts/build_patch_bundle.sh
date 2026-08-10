@@ -178,6 +178,13 @@ else
   tar "${COMMON_EXCLUDES[@]}" -cf - -C "${REPO_ROOT}" . | tar -xf - -C "${SNAPSHOT_DIR}"
 fi
 
+if [[ ! -f "${REPO_ROOT}/react-ui/dist/index.html" ]]; then
+  fail "React production build is missing: ${REPO_ROOT}/react-ui/dist/index.html"
+  exit 1
+fi
+mkdir -p "${SNAPSHOT_DIR}/react-ui/dist"
+cp -a "${REPO_ROOT}/react-ui/dist/." "${SNAPSHOT_DIR}/react-ui/dist/"
+
 for script_name in install_patch.sh install_media_runtime.sh restore_code_snapshot.py verify_patch.sh rollback.sh set_site_ips.sh client_diagnostics.sh preflight_patch.sh; do
   if [[ -f "${REPO_ROOT}/scripts/${script_name}" ]]; then
     cp "${REPO_ROOT}/scripts/${script_name}" "${BUNDLE_DIR}/scripts/${script_name}"

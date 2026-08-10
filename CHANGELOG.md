@@ -6,6 +6,22 @@ Format loosely follows Keep a Changelog.
 
 ## Unreleased
 
+- **Legacy 0006 upgrade safety:** Alembic now accepts both PostgreSQL URLs and
+  libpq conninfo without leaking or mangling credentials, while preflight also
+  proves schema ownership, `eva_owner` role switching, and transactional DDL
+  before touching the live tree. Rollback records the original revision and
+  restores the complete owner-preserving dump only when the database actually
+  advanced.
+- **No silent evidence pruning:** an existing installation without an explicit
+  archive-retention policy is upgraded with pruning disabled and a warning,
+  instead of immediately applying the newer 14-day thumbnail default. Fresh
+  installations receive explicit 90-day row and 14-day thumbnail windows.
+- **Complete accepted UI payload:** patch snapshots now carry and explicitly
+  install `react-ui/dist`; the updater refuses a bundle without it, so an
+  otherwise successful upgrade cannot fall back to the legacy console.
+- **Durable workflow boundary:** an unfinished Protocol Deploy draft no longer
+  captures a new archive/video request merely because it mentions a channel,
+  webcam, alert, or time window.
 - **Office installer follow-up:** the Ubuntu 24.04 offline package input now
   includes `python3-dev`, so native Python dependencies have the matching
   `Python.h` headers on a clean appliance. After validating the generated TLS

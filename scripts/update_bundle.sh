@@ -279,8 +279,18 @@ printf 'Health URL:  %s\n' "${BASE_URL}"
 [[ -d "${APP_DIR}" ]] || stop "application directory not found: ${APP_DIR}"
 path_is_file "${ENV_FILE}" || stop "environment file not found: ${ENV_FILE}"
 [[ -x "${APP_DIR}/.venv/bin/python" ]] || stop "existing .venv is missing; adopt upgrade is not possible"
+ARCHIVE_RETENTION_POLICY_MISSING=false
+if [[ -z "$(read_env_value EVOSSEARCH_ARCHIVE_RETENTION_ENABLED)" \
+  && -z "$(read_env_value EVOSSEARCH_ARCHIVE_ROW_RETENTION_DAYS)" \
+  && -z "$(read_env_value EVOSSEARCH_ARCHIVE_THUMBNAIL_RETENTION_DAYS)" ]]; then
+  ARCHIVE_RETENTION_POLICY_MISSING=true
+  printf 'WARN: legacy config has no archive retention policy; this update will disable automatic pruning to prevent silent evidence loss.\n' >&2
+  printf '      Review retention in Settings after the archive has been validated.\n' >&2
+fi
 [[ -f "${SOURCE_DIR}/VERSION" ]] || stop "bundle VERSION is missing"
 [[ "$(tr -d '\r\n' < "${SOURCE_DIR}/VERSION")" == "${EXPECTED_VERSION}" ]] || stop "bundle VERSION is not ${EXPECTED_VERSION}"
+[[ -f "${SOURCE_DIR}/react-ui/dist/index.html" ]] \
+  || stop "React production build is missing from the offline bundle"
 MANIFEST_VERSION="$(sed -n 's/^version=//p' "${BUNDLE_DIR}/manifest.txt" | tail -n 1)"
 MANIFEST_STATUS="$(sed -n 's/^working_tree_status=//p' "${BUNDLE_DIR}/manifest.txt" | tail -n 1)"
 BUNDLE_COMMIT="$(sed -n 's/^git_commit=//p' "${BUNDLE_DIR}/manifest.txt" | tail -n 1)"
@@ -897,7 +907,6 @@ if [[ "${MODE}" == "user" ]]; then
     --exclude="${APP_BASE}/.env" \
     --exclude="${APP_BASE}/.env.*" \
     --exclude="${APP_BASE}/dist" \
-    --exclude="${APP_BASE}/*/dist" \
     --exclude="${APP_BASE}/__pycache__" \
     --exclude="${APP_BASE}/.pytest_cache" \
     --exclude="${APP_BASE}/node_modules" \
@@ -940,6 +949,11 @@ if [[ "${MODE}" == "user" ]]; then
   else
     tar "${COPY_EXCLUDES[@]}" -cf - -C "${SOURCE_DIR}" . | tar -xf - -C "${APP_DIR}"
   fi
+  [[ -f "${SOURCE_DIR}/react-ui/dist/index.html" ]] \
+    || stop "React production build is missing from ${SOURCE_DIR}/react-ui/dist"
+  rm -rf -- "${APP_DIR}/react-ui/dist"
+  mkdir -p "${APP_DIR}/react-ui/dist"
+  cp -a "${SOURCE_DIR}/react-ui/dist/." "${APP_DIR}/react-ui/dist/"
   ok "local code backup: ${BACKUP_DIR}"
 else
   as_root "${BUNDLE_DIR}/scripts/install_patch.sh" \
@@ -969,7 +983,7 @@ else
   as_root "${MEDIA_INSTALL[@]}"
 fi
 
-target_python - "${ENV_FILE}" "${EXPECTED_VERSION}" "${APP_DIR}/.eva-bundle-commit" "${BUNDLE_COMMIT}" "${TEMPORARY_AGENT_CONTEXT}" <<'PY'
+target_python - "${ENV_FILE}" "${EXPECTED_VERSION}" "${APP_DIR}/.eva-bundle-commit" "${BUNDLE_COMMIT}" "${TEMPORARY_AGENT_CONTEXT}" "${ARCHIVE_RETENTION_POLICY_MISSING}" <<'PY'
 import os
 import re
 import stat
@@ -982,6 +996,7 @@ version = sys.argv[2]
 marker_path = Path(sys.argv[3])
 bundle_commit = sys.argv[4]
 temporary_agent_context = sys.argv[5].strip()
+archive_retention_policy_missing = sys.argv[6].strip().lower() == "true"
 original = path.read_text(encoding="utf-8")
 replacement = f'EVOSSEARCH_APP_VERSION="{version}"'
 updated, count = re.subn(
@@ -1000,6 +1015,14 @@ if temporary_agent_context:
     )
     if count == 0:
         updated = updated.rstrip("\n") + "\n" + context_replacement + "\n"
+if archive_retention_policy_missing:
+    retention_replacement = "EVOSSEARCH_ARCHIVE_RETENTION_ENABLED=false"
+    updated = (
+        updated.rstrip("\n")
+        + "\n\n# Added by EVA AI upgrade safety: review retention before enabling pruning.\n"
+        + retention_replacement
+        + "\n"
+    )
 st = path.stat()
 fd, temp_name = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
 try:

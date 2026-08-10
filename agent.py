@@ -10351,7 +10351,7 @@ def _classify_tool_intents(user_text: Any, context: Mapping[str, Any]) -> List[s
     if (
         context.get("focus_video_summaries")
         or re.search(
-            r"\b(?:vlm|video|camera|alert|alerts|summary|summaries|notable|coverage|went quiet|what happened|report|incidents?|event|events)\b"
+            r"\b(?:vlm|video|camera|webcam|stream|alert|alerts|summary|summaries|notable|coverage|went quiet|what happened|report|incidents?|event|events)\b"
             r"|видео|камер|алерт|суммар|описан|событи|инцидент|что\s+произош|отч[её]т|покрыти|замолчал",
             text,
         )
@@ -10654,7 +10654,10 @@ def _inherit_followup_tool_context(
         if deployment
         else []
     )
-    if deployment and (
+    if deployment and not _operator_switches_from_deployment(
+        context,
+        user_text,
+    ) and (
         _looks_like_deployment_followup(user_text)
         or (
             str(deployment.get("deployment_stage") or "") == "inventory"
@@ -11182,16 +11185,79 @@ def _trusted_deployment_state_message(state: Mapping[str, Any]) -> str:
 
 
 def _looks_like_deployment_followup(user_text: Any) -> bool:
+    """Return true only for an unambiguous Protocol Deploy continuation.
+
+    An unfinished deployment is durable and may outlive the chat turn that
+    created it.  Generic operational words such as ``channel`` or ``alert``
+    therefore cannot be sufficient to resume it: they also occur in ordinary
+    archive and video-review requests.  Keep this recognizer deliberately
+    narrower than the deployment intent classifier.  Numeric channel choices
+    are handled separately against the trusted inventory allow-list.
+    """
+
     text = unicodedata.normalize("NFKC", str(user_text or "")).casefold()
     return bool(
         operator_requests_continuation(text)
+        or _operator_supplies_deployment_requirements(text)
         or re.search(
-            r"\b(?:deploy(?:ment)?|select|choose|channel|group|survey|baseline|"
-            r"routine|alert|severity|novelty|quiet\s+window|start\s+live|preview|apply)\b|"
-            r"депло|выбер|канал|групп|обзор|сцен|рутин|алерт|тревог|тих\w*\s+окн|примен",
+            r"\b(?:deploy(?:ment)?|deployment\s+wizard|protocol\s*:?[ ]*deploy|"
+            r"survey\s+(?:the\s+)?deployment|start\s+live|preview\s+(?:the\s+)?plan|"
+            r"apply\s+(?:the\s+)?(?:deployment|plan))\b|"
+            r"протокол\s*:?[ ]*депло[йя]|продолж\w*\s+депло[йя]|"
+            r"обзор\w*\s+депло[йя]|примен\w*\s+(?:депло[йя]|план)",
+            text,
+        )
+        or re.search(
+            r"\b(?:select|choose|use)\b.{0,48}\bchannels?\b|"
+            r"\b(?:group|ungroup)\b.{0,80}\b(?:channels?|\d{1,9})\b|"
+            r"\b(?:no|without)\s+groups?\b|"
+            r"(?:выбер|выбрат|использ).{0,48}канал|"
+            r"(?:сгрупп|групп\w*\s*:).{0,80}(?:канал|\d{1,9})|"
+            r"без\s+групп",
             text,
         )
     )
+
+
+def _operator_switches_from_deployment(
+    context: Mapping[str, Any],
+    user_text: Any,
+) -> bool:
+    """Fence a durable deploy draft from a new, explicit operator task.
+
+    Policy answers such as routine/alert/severity settings may naturally be
+    classified as video-related, so a non-deployment intent alone is not a
+    sufficient fence.  Research verbs and calendar/relative time scopes are:
+    those start a new evidence request and must win over stale workflow state.
+    """
+
+    intents = {
+        str(item)
+        for item in (context.get("tool_intents") or ())
+        if str(item)
+    }
+    if not intents or "deployment" in intents:
+        return False
+    if intents - {"video_research", "channel_inventory"}:
+        return True
+
+    text = unicodedata.normalize("NFKC", str(user_text or "")).casefold()
+    if re.search(
+        r"\b(?:describe|show|search|find|review|summari[sz]e|report|list|"
+        r"what\s+happened|what\s+was|activity|activities)\b|"
+        r"опиш|покаж|найд|ищи|поиск|сводк|отч[её]т|что\s+(?:было|произош)|активност",
+        text,
+    ):
+        return True
+    if re.search(
+        r"\b(?:today|yesterday|overnight|tonight|recent|previous|last|past|"
+        r"since|until)\b|"
+        r"сегодня|вчера|за\s+ночь|недавн|предыдущ|последн|с\s+какого|до\s+какого|"
+        r"\b\d{4}-\d{2}-\d{2}\b",
+        text,
+    ):
+        return True
+    return not _operator_supplies_deployment_requirements(text)
 
 
 def _deployment_channel_selection(
@@ -14228,7 +14294,13 @@ class AgentRunner:
             user_text,
             history_prefix,
         )
-        if "deployment" not in (turn_tool_context.get("tool_intents") or ()):
+        if (
+            "deployment" not in (turn_tool_context.get("tool_intents") or ())
+            and not _operator_switches_from_deployment(
+                turn_tool_context,
+                user_text,
+            )
+        ):
             # PostgreSQL history may omit raw tool rows. A terse UI-generated
             # channel/group reply must still resume the durable inventory
             # draft instead of falling through to ungrounded model prose.

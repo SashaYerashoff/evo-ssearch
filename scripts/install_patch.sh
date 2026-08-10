@@ -225,7 +225,6 @@ tar \
   --exclude="${APP_BASE}/.env" \
   --exclude="${APP_BASE}/.env.*" \
   --exclude="${APP_BASE}/dist" \
-  --exclude="${APP_BASE}/*/dist" \
   --exclude="${APP_BASE}/__pycache__" \
   --exclude="${APP_BASE}/.pytest_cache" \
   --exclude="${APP_BASE}/node_modules" \
@@ -263,6 +262,15 @@ if [[ "${SKIP_PG_DUMP}" != true ]]; then
     if [[ -n "${PG_DSN}" ]]; then
       if pg_dump --dbname="${PG_DSN}" --format=custom --file="${BACKUP_DIR}/postgres.dump"; then
         ok "created PostgreSQL dump from env DSN"
+        DB_REVISION="$(psql --no-psqlrc --tuples-only --no-align --dbname="${PG_DSN}" \
+          --command='SELECT version_num FROM public.alembic_version LIMIT 1' 2>/dev/null \
+          | head -n 1 || true)"
+        if [[ "${DB_REVISION}" =~ ^[A-Za-z0-9_.-]+$ ]]; then
+          printf '%s\n' "${DB_REVISION}" > "${BACKUP_DIR}/database_revision.txt"
+          ok "recorded pre-update database revision"
+        else
+          warn "could not record pre-update database revision"
+        fi
       else
         warn "pg_dump via env DSN failed; continuing with code/env backup"
         rm -f "${BACKUP_DIR}/postgres.dump"
@@ -274,6 +282,16 @@ if [[ "${SKIP_PG_DUMP}" != true ]]; then
         install -m 0600 "${LOCAL_DUMP}" "${BACKUP_DIR}/postgres.dump"
         rm -f "${LOCAL_DUMP}"
         ok "created PostgreSQL dump for local database ${PG_DATABASE}"
+        DB_REVISION="$(run_as_user postgres psql --no-psqlrc --tuples-only --no-align \
+          --dbname="${PG_DATABASE}" \
+          --command='SELECT version_num FROM public.alembic_version LIMIT 1' 2>/dev/null \
+          | head -n 1 || true)"
+        if [[ "${DB_REVISION}" =~ ^[A-Za-z0-9_.-]+$ ]]; then
+          printf '%s\n' "${DB_REVISION}" > "${BACKUP_DIR}/database_revision.txt"
+          ok "recorded pre-update database revision"
+        else
+          warn "could not record pre-update database revision"
+        fi
       else
         warn "local pg_dump failed; continuing with code/env backup"
         rm -f "${LOCAL_DUMP}"
@@ -338,6 +356,15 @@ if command -v rsync >/dev/null 2>&1; then
 else
   tar "${RSYNC_EXCLUDES[@]}" -cf - -C "${SOURCE_DIR}" . | tar -xf - -C "${APP_DIR}"
 fi
+
+REACT_BUILD_SOURCE="${SOURCE_DIR}/react-ui/dist"
+REACT_BUILD_TARGET="${APP_DIR}/react-ui/dist"
+[[ -f "${REACT_BUILD_SOURCE}/index.html" ]] \
+  || die "React production build is missing: ${REACT_BUILD_SOURCE}/index.html"
+rm -rf -- "${REACT_BUILD_TARGET}"
+mkdir -p "${REACT_BUILD_TARGET}"
+cp -a "${REACT_BUILD_SOURCE}/." "${REACT_BUILD_TARGET}/"
+ok "installed React production build"
 
 find "${APP_DIR}" \
   \( \

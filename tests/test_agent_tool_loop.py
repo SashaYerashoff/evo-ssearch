@@ -609,6 +609,86 @@ class AgentToolLoopTests(unittest.TestCase):
         self.assertEqual(numeric_only["tool_intents"], ["deployment"])
         self.assertEqual(numeric_only["deployment_selected_channel_ids"], [112, 118])
 
+    def test_unfinished_protocol_deploy_does_not_hijack_new_video_research(self):
+        survey_result = {
+            "deployment_id": "deploy-stale-1",
+            "stage": "surveyed",
+            "deployment_profile": "general",
+            "target_channel_count": 2,
+            "available_channel_ids": [112, 900001],
+            "selected_channel_ids": [112],
+            "groups": [],
+            "surveys": [
+                {
+                    "channel_id": 112,
+                    "title": "Zenbook webcam",
+                    "sample_count": 4,
+                    "survey": "SCENE: fixed desk view",
+                }
+            ],
+        }
+        text = (
+            "Hi! Describe yesterday cleaning activity from the direct usb "
+            "webcam channel"
+        )
+        context = agent._inherit_followup_tool_context(
+            _seed_turn_tool_context(text),
+            text,
+            [
+                {
+                    "role": "tool",
+                    "tool_name": "survey_deployment",
+                    "tool_result": json.dumps(survey_result),
+                }
+            ],
+        )
+
+        self.assertIn("video_research", context["tool_intents"])
+        self.assertNotIn("deployment", context["tool_intents"])
+        self.assertNotIn("deployment_id", context)
+        self.assertFalse(agent._looks_like_deployment_followup(text))
+        schema_names = {
+            row["function"]["name"]
+            for row in _select_relevant_tool_schemas(agent._TOOL_SCHEMAS, context)
+        }
+        self.assertIn("normalize_time_window", schema_names)
+        self.assertNotIn("configure_deployment", schema_names)
+
+        alert_research = (
+            "Show high-severity unexpected events from yesterday on the webcam channel"
+        )
+        alert_context = agent._inherit_followup_tool_context(
+            _seed_turn_tool_context(alert_research),
+            alert_research,
+            [
+                {
+                    "role": "tool",
+                    "tool_name": "survey_deployment",
+                    "tool_result": json.dumps(survey_result),
+                }
+            ],
+        )
+        self.assertIn("video_research", alert_context["tool_intents"])
+        self.assertNotIn("deployment_id", alert_context)
+
+        requirements = (
+            "CH 112 routine is desk work; alert if a person collapses with "
+            "high severity; novelty sensitivity high; quiet window 01:00-04:00."
+        )
+        resumed = agent._inherit_followup_tool_context(
+            _seed_turn_tool_context(requirements),
+            requirements,
+            [
+                {
+                    "role": "tool",
+                    "tool_name": "survey_deployment",
+                    "tool_result": json.dumps(survey_result),
+                }
+            ],
+        )
+        self.assertEqual(resumed["tool_intents"], ["deployment"])
+        self.assertEqual(resumed["deployment_id"], "deploy-stale-1")
+
     def test_maritime_scope_requires_operator_roles_and_carries_closed_ui_values(self):
         start_result = {
             "deployment_id": "deploy-port-1",

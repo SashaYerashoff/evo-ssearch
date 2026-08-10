@@ -70,7 +70,17 @@ _SECRET_MARKERS = ("PASSWORD", "SECRET", "TOKEN", "API_KEY", "DSN", "DATABASE_UR
 _VLM_ENDPOINT_RE = re.compile(r"^EVOSSEARCH_LM_PROFILE_(?!AGENT(?:_|$)).+_BASE_URL$")
 _ENV_REFERENCE_RE = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}")
 _INSTALLER_MANAGED_ENV_KEYS = frozenset(
-    {"EVOSSEARCH_APP_VERSION", "EVOSSEARCH_UI_MODE"}
+    {
+        "EVOSSEARCH_APP_VERSION",
+        "EVOSSEARCH_UI_MODE",
+        "EVOSSEARCH_ARCHIVE_RETENTION_ENABLED",
+    }
+)
+
+_ARCHIVE_RETENTION_POLICY_KEYS = (
+    "EVOSSEARCH_ARCHIVE_RETENTION_ENABLED",
+    "EVOSSEARCH_ARCHIVE_ROW_RETENTION_DAYS",
+    "EVOSSEARCH_ARCHIVE_THUMBNAIL_RETENTION_DAYS",
 )
 
 
@@ -427,6 +437,9 @@ def prepare_env_values(
             "EVOSSEARCH_PROBE_CAPTURE_WARMUP_SEC": "2.5",
             "EVOSSEARCH_ARCHIVE_DISK_MIN_FREE_GB": "2.0",
             "EVOSSEARCH_ARCHIVE_DISK_MIN_FREE_PERCENT": "5.0",
+            "EVOSSEARCH_ARCHIVE_RETENTION_ENABLED": "true",
+            "EVOSSEARCH_ARCHIVE_ROW_RETENTION_DAYS": "90",
+            "EVOSSEARCH_ARCHIVE_THUMBNAIL_RETENTION_DAYS": "14",
             "EVOSSEARCH_INFERENCE_QUEUE_ENABLED": "true",
             "EVOSSEARCH_INFERENCE_QUEUE_SPOOL_DIR": "/var/lib/eva-ai/inference-spool",
             "EVOSSEARCH_INFERENCE_QUEUE_CAPACITY": "200",
@@ -457,6 +470,17 @@ def prepare_env_values(
             "EVOSSEARCH_LM_PROFILE_VLM_ENABLED": "true",
             "EVOSSEARCH_LM_PROFILE_VLM_KIND": "vlm",
         })
+    elif not any(
+        str(resolution.existing.get(key) or "").strip()
+        for key in _ARCHIVE_RETENTION_POLICY_KEYS
+    ):
+        # Releases before the PostgreSQL archive introduced retention did not
+        # carry these keys.  Letting a new default silently become active on
+        # first boot can erase months of otherwise valid visual evidence.  An
+        # upgrade therefore starts conservatively and asks the administrator
+        # to opt in to a reviewed retention window later.
+        values["EVOSSEARCH_ARCHIVE_RETENTION_ENABLED"] = "false"
+        updates["EVOSSEARCH_ARCHIVE_RETENTION_ENABLED"] = "false"
     for key, value in defaults.items():
         add_missing(key, value)
 
@@ -696,6 +720,7 @@ def collect_preflight(
         options.source_dir / "migrations",
         options.source_dir / "static" / "js" / "app.js",
         options.source_dir / "templates" / "index.html",
+        options.source_dir / "react-ui" / "dist" / "index.html",
         options.source_dir / "scripts" / "preflight_patch.sh",
         options.source_dir / "scripts" / "install_patch.sh",
         options.source_dir / "scripts" / "verify_patch.sh",
@@ -818,6 +843,15 @@ def collect_preflight(
         )
     else:
         add("OK", f"existing environment will be preserved in place: {resolution.target}")
+    if resolution.existing and not any(
+        str(resolution.existing.get(key) or "").strip()
+        for key in _ARCHIVE_RETENTION_POLICY_KEYS
+    ):
+        add(
+            "WARN",
+            "legacy configuration has no explicit archive retention policy; "
+            "automatic pruning will be disabled during upgrade to prevent silent evidence loss",
+        )
 
     target_venv = options.app_dir / ".venv" / "bin" / "python"
     wheels = _wheelhouse_files(options.bundle_dir)
@@ -1089,8 +1123,16 @@ def _backup_file(path: Path) -> Path | None:
         return None
     timestamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
     backup = path.with_name(f"{path.name}.preinstall-{timestamp}.bak")
-    shutil.copy2(path, backup)
+    _copy2_with_ownership(path, backup)
     return backup
+
+
+def _copy2_with_ownership(source: Path, destination: Path) -> None:
+    """Copy a file as root without changing its original owner/group."""
+
+    source_stat = source.stat()
+    shutil.copy2(source, destination)
+    os.chown(destination, source_stat.st_uid, source_stat.st_gid)
 
 
 def _migration_environment(prepared: PreparedInstall) -> dict[str, str]:
@@ -1108,12 +1150,39 @@ def _verify_migration_capability(
 ) -> None:
     """Exercise Alembic's revision-table privileges without lasting mutation."""
 
-    sql = (
-        "BEGIN; "
-        "SELECT version_num FROM public.alembic_version LIMIT 1; "
-        "UPDATE public.alembic_version SET version_num = version_num; "
-        "ROLLBACK;"
-    )
+    sql = """
+        BEGIN;
+        SELECT version_num FROM public.alembic_version LIMIT 1;
+        UPDATE public.alembic_version SET version_num = version_num;
+        SET LOCAL ROLE eva_owner;
+        DO $eva_preflight$
+        DECLARE
+            expected_schemas text[] := ARRAY['agent', 'archive', 'audit', 'iam', 'jobs'];
+        BEGIN
+            IF EXISTS (
+                SELECT 1
+                FROM unnest(expected_schemas) AS expected(name)
+                LEFT JOIN pg_namespace namespace ON namespace.nspname = expected.name
+                WHERE namespace.oid IS NULL
+                   OR pg_get_userbyid(namespace.nspowner) <> current_user
+            ) THEN
+                RAISE EXCEPTION 'EVA schemas are absent or are not owned by eva_owner';
+            END IF;
+            IF EXISTS (
+                SELECT 1
+                FROM pg_class relation
+                JOIN pg_namespace namespace ON namespace.oid = relation.relnamespace
+                WHERE namespace.nspname = ANY(expected_schemas)
+                  AND relation.relkind IN ('r', 'p', 'S', 'v', 'm', 'i')
+                  AND pg_get_userbyid(relation.relowner) <> current_user
+            ) THEN
+                RAISE EXCEPTION 'EVA relations are not owned by eva_owner';
+            END IF;
+        END
+        $eva_preflight$;
+        CREATE TABLE archive.__eva_migration_preflight (id integer);
+        ROLLBACK;
+    """
     try:
         runner.run((
             "psql",
@@ -1124,8 +1193,9 @@ def _verify_migration_capability(
         ))
     except InstallerError as exc:
         raise InstallerError(
-            "privileged migration DSN cannot read and update "
-            "public.alembic_version; live files and service were not changed"
+            "privileged migration DSN cannot update public.alembic_version, "
+            "SET ROLE eva_owner, or modify EVA-owned schemas; live files and "
+            "service were not changed"
         ) from exc
 
 
@@ -1330,7 +1400,7 @@ def apply_install(prepared: PreparedInstall) -> Path:
         ), env=install_env)
         backup_dir = _latest_backup(options.backup_root)
         if env_preexisted and env_preinstall_backup is not None:
-            shutil.copy2(env_preinstall_backup, backup_dir / "eva-ai.env")
+            _copy2_with_ownership(env_preinstall_backup, backup_dir / "eva-ai.env")
             env_preinstall_backup.unlink(missing_ok=True)
         state = (
             f"created_at={datetime.now(timezone.utc).isoformat()}\n"
@@ -1392,9 +1462,9 @@ def apply_install(prepared: PreparedInstall) -> Path:
         # the *pre-orchestrator* env rather than the appended staging copy.
         if env_preinstall_backup is not None and env_preinstall_backup.is_file():
             if backup_dir is not None:
-                shutil.copy2(env_preinstall_backup, backup_dir / "eva-ai.env")
+                _copy2_with_ownership(env_preinstall_backup, backup_dir / "eva-ai.env")
             elif env_preexisted:
-                shutil.copy2(env_preinstall_backup, prepared.env.target)
+                _copy2_with_ownership(env_preinstall_backup, prepared.env.target)
             env_preinstall_backup.unlink(missing_ok=True)
         elif backup_dir is None and not env_preexisted:
             prepared.env.target.unlink(missing_ok=True)

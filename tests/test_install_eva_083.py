@@ -36,6 +36,7 @@ COMPLETE_ENV = {
     "EVOSSEARCH_LM_PROFILE_AGENT_MODEL": "qwen3.5-9b-mtp",
     "EVOSSEARCH_LM_PROFILE_VLM_BASE_URL": "http://vlm.internal:8001/v1",
     "EVOSSEARCH_LM_PROFILE_VLM_MODEL": "qwen/qwen3-vl-4b",
+    "EVOSSEARCH_ARCHIVE_RETENTION_ENABLED": "true",
 }
 
 
@@ -50,6 +51,7 @@ def make_source(root: Path) -> Path:
     source = root / "source"
     for relative in (
         "migrations",
+        "react-ui/dist",
         "static/js",
         "templates",
         "scripts/install_assets",
@@ -65,6 +67,7 @@ def make_source(root: Path) -> Path:
         "alembic.ini": "[alembic]\n",
         "static/js/app.js": "// static\n",
         "templates/index.html": "<!doctype html>\n",
+        "react-ui/dist/index.html": "<!doctype html><div id=\"root\"></div>\n",
         "scripts/preflight_patch.sh": "#!/bin/sh\nexit 0\n",
         "scripts/install_patch.sh": "#!/bin/sh\nexit 0\n",
         "scripts/verify_patch.sh": "#!/bin/sh\nexit 0\n",
@@ -212,6 +215,24 @@ class OfflineInstallerUnitTests(unittest.TestCase):
                 self.assertTrue(path.is_dir())
                 self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o750)
 
+    def test_preinstall_file_backup_preserves_owner_and_group(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            source = Path(tmp) / "eva-ai.env"
+            source.write_text("SETTING=value\n", encoding="utf-8")
+            source_stat = source.stat()
+
+            with patch.object(installer.os, "chown") as chown:
+                backup = installer._backup_file(source)
+
+            self.assertIsNotNone(backup)
+            assert backup is not None
+            self.assertEqual(backup.read_text(encoding="utf-8"), "SETTING=value\n")
+            chown.assert_called_once_with(
+                backup,
+                source_stat.st_uid,
+                source_stat.st_gid,
+            )
+
     def test_adopt_updates_only_managed_release_version(self):
         existing = dict(COMPLETE_ENV)
         existing.update({
@@ -241,6 +262,41 @@ class OfflineInstallerUnitTests(unittest.TestCase):
         self.assertIn(f"EVOSSEARCH_APP_VERSION='{installer.EXPECTED_VERSION}'", rendered)
         self.assertIn("EVOSSEARCH_UI_MODE='react'", rendered)
         self.assertIn('EVOSSEARCH_HOST="10.20.30.40"', rendered)
+
+    def test_legacy_adopt_disables_unconfigured_archive_retention(self):
+        existing = dict(COMPLETE_ENV)
+        existing.pop("EVOSSEARCH_ARCHIVE_RETENTION_ENABLED")
+        raw = env_text(existing, prefix="# legacy site without retention policy")
+        resolution = installer.EnvResolution(Path("/x/.env"), Path("/x/.env"), raw, existing)
+
+        values, updates, missing = installer.prepare_env_values(
+            resolution,
+            environ={},
+            non_interactive=True,
+        )
+        rendered = installer.render_env_update(raw, updates)
+
+        self.assertEqual(missing, [])
+        self.assertEqual(values["EVOSSEARCH_ARCHIVE_RETENTION_ENABLED"], "false")
+        self.assertEqual(updates["EVOSSEARCH_ARCHIVE_RETENTION_ENABLED"], "false")
+        self.assertIn("EVOSSEARCH_ARCHIVE_RETENTION_ENABLED='false'", rendered)
+
+    def test_legacy_adopt_preserves_explicit_archive_retention_window(self):
+        existing = dict(COMPLETE_ENV)
+        existing.pop("EVOSSEARCH_ARCHIVE_RETENTION_ENABLED")
+        existing["EVOSSEARCH_ARCHIVE_THUMBNAIL_RETENTION_DAYS"] = "30"
+        raw = env_text(existing)
+        resolution = installer.EnvResolution(Path("/x/.env"), Path("/x/.env"), raw, existing)
+
+        values, updates, missing = installer.prepare_env_values(
+            resolution,
+            environ={},
+            non_interactive=True,
+        )
+
+        self.assertEqual(missing, [])
+        self.assertNotIn("EVOSSEARCH_ARCHIVE_RETENTION_ENABLED", updates)
+        self.assertEqual(values["EVOSSEARCH_ARCHIVE_THUMBNAIL_RETENTION_DAYS"], "30")
 
     def test_noninteractive_configuration_accepts_environment_without_echoing_secrets(self):
         resolution = installer.EnvResolution(None, Path("/tmp/eva-ai.env"), "", {})
@@ -526,6 +582,9 @@ class OfflineInstallerUnitTests(unittest.TestCase):
         sql = command[command.index("--command") + 1]
         self.assertIn("SELECT version_num FROM public.alembic_version", sql)
         self.assertIn("UPDATE public.alembic_version SET version_num = version_num", sql)
+        self.assertIn("SET LOCAL ROLE eva_owner", sql)
+        self.assertIn("EVA schemas are absent or are not owned by eva_owner", sql)
+        self.assertIn("CREATE TABLE archive.__eva_migration_preflight", sql)
         self.assertIn("ROLLBACK", sql)
 
     def test_apply_staging_failure_restores_preexisting_env_without_backup_snapshot(self):

@@ -134,6 +134,19 @@ fi
 [[ -d "${BACKUP_DIR}" ]] || die "Backup directory not found: ${BACKUP_DIR}"
 [[ -f "${BACKUP_DIR}/code.tgz" ]] || die "Backup code archive not found: ${BACKUP_DIR}/code.tgz"
 
+read_state_var() {
+  local key="$1"
+  local state_file="${BACKUP_DIR}/offline-installer-state.txt"
+  local line
+  [[ -f "${state_file}" ]] || return 0
+  line="$(grep -E "^${key}=" "${state_file}" | tail -n 1 || true)"
+  [[ -n "${line}" ]] || return 0
+  printf '%s' "${line#*=}"
+}
+
+UNIT_PREEXISTED="$(read_state_var unit_preexisted)"
+ORIGINAL_UNIT_FILE="$(read_state_var unit_file)"
+
 read_env_var() {
   local key="$1"
   local file="$2"
@@ -177,13 +190,25 @@ else
 fi
 
 if [[ -f "${BACKUP_DIR}/eva-ai.env" ]]; then
-  install -D -m 0600 "${BACKUP_DIR}/eva-ai.env" "${ENV_FILE}"
+  install -d -m 0750 "$(dirname "${ENV_FILE}")"
+  cp -a -- "${BACKUP_DIR}/eva-ai.env" "${ENV_FILE}"
+  chmod 0600 "${ENV_FILE}"
   ok "restored env file"
 else
   warn "env backup not found; env restore skipped"
 fi
 
-if [[ -f "${BACKUP_DIR}/systemd_unit_path.txt" ]]; then
+if [[ "${UNIT_PREEXISTED}" == "false" ]]; then
+  if [[ -n "${ORIGINAL_UNIT_FILE}" ]]; then
+    [[ "${ORIGINAL_UNIT_FILE}" = /* && "${ORIGINAL_UNIT_FILE}" != "/" ]] \
+      || die "Refusing unsafe generated unit path from rollback state"
+    [[ "$(basename "${ORIGINAL_UNIT_FILE}")" == "${SERVICE_NAME}.service" ]] \
+      || die "Generated unit path does not match service ${SERVICE_NAME}"
+    rm -f -- "${ORIGINAL_UNIT_FILE}"
+    ok "removed service unit created by the failed installation"
+  fi
+  START_SERVICE=false
+elif [[ -f "${BACKUP_DIR}/systemd_unit_path.txt" ]]; then
   UNIT_PATH="$(cat "${BACKUP_DIR}/systemd_unit_path.txt")"
   UNIT_BACKUP="${BACKUP_DIR}/$(basename "${UNIT_PATH}")"
   if [[ -f "${UNIT_BACKUP}" ]]; then
@@ -211,7 +236,6 @@ if [[ -e "${APP_DIR}" ]]; then
     --exclude="${APP_BASE}/.env" \
     --exclude="${APP_BASE}/.env.*" \
     --exclude="${APP_BASE}/dist" \
-    --exclude="${APP_BASE}/*/dist" \
     --exclude="${APP_BASE}/__pycache__" \
     --exclude="${APP_BASE}/.pytest_cache" \
     --exclude="${APP_BASE}/node_modules" \
@@ -263,13 +287,44 @@ if [[ "${RESTORE_DB}" == true ]]; then
   fi
 
   if [[ -n "${PG_DSN}" ]]; then
-    pg_restore --clean --if-exists --no-owner "${BACKUP_DIR}/postgres.dump" \
-      | psql "${PG_DSN}" --set ON_ERROR_STOP=on
-    ok "restored PostgreSQL dump via env DSN"
+    DB_REVISION="$(cat "${BACKUP_DIR}/database_revision.txt" 2>/dev/null || true)"
+    CURRENT_DB_REVISION="$(psql --no-psqlrc --tuples-only --no-align --dbname="${PG_DSN}" \
+      --command='SELECT version_num FROM public.alembic_version LIMIT 1' 2>/dev/null \
+      | head -n 1 || true)"
+    if [[ "${DB_REVISION}" =~ ^[A-Za-z0-9_.-]+$ \
+       && "${CURRENT_DB_REVISION}" == "${DB_REVISION}" ]]; then
+      ok "database is already at the recorded pre-update revision; dump restore skipped"
+    else
+    DB_SUPERUSER="$(psql --no-psqlrc --tuples-only --no-align --dbname="${PG_DSN}" \
+      --command='SELECT rolsuper FROM pg_roles WHERE rolname = current_user' \
+      | head -n 1)"
+    if [[ "${DB_SUPERUSER}" == "t" ]]; then
+      psql --no-psqlrc --set ON_ERROR_STOP=on --dbname="${PG_DSN}" --command="
+        DROP SCHEMA IF EXISTS agent CASCADE;
+        DROP SCHEMA IF EXISTS archive CASCADE;
+        DROP SCHEMA IF EXISTS audit CASCADE;
+        DROP SCHEMA IF EXISTS iam CASCADE;
+        DROP SCHEMA IF EXISTS jobs CASCADE;
+        DROP TABLE IF EXISTS public.alembic_version CASCADE;
+      "
+      pg_restore --exit-on-error --dbname="${PG_DSN}" "${BACKUP_DIR}/postgres.dump"
+      ok "restored complete PostgreSQL dump with original ownership"
+    else
+      die "Database advanced beyond the recorded revision; exact dump restore requires a PostgreSQL superuser DSN"
+    fi
+    fi
   elif id postgres >/dev/null 2>&1; then
-    pg_restore --clean --if-exists --no-owner "${BACKUP_DIR}/postgres.dump" \
-      | run_as_user postgres psql --set ON_ERROR_STOP=on "${PG_DATABASE}"
-    ok "restored PostgreSQL dump to local database ${PG_DATABASE}"
+    run_as_user postgres psql --set ON_ERROR_STOP=on --dbname="${PG_DATABASE}" --command="
+      DROP SCHEMA IF EXISTS agent CASCADE;
+      DROP SCHEMA IF EXISTS archive CASCADE;
+      DROP SCHEMA IF EXISTS audit CASCADE;
+      DROP SCHEMA IF EXISTS iam CASCADE;
+      DROP SCHEMA IF EXISTS jobs CASCADE;
+      DROP TABLE IF EXISTS public.alembic_version CASCADE;
+    "
+    run_as_user postgres pg_restore --exit-on-error \
+      --dbname="${PG_DATABASE}" "${BACKUP_DIR}/postgres.dump"
+    ok "restored complete PostgreSQL dump to local database ${PG_DATABASE}"
   else
     die "No DSN and no postgres OS user available for database restore"
   fi

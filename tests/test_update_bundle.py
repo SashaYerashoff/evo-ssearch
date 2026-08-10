@@ -54,6 +54,12 @@ class UpdateBundleTests(unittest.TestCase):
         self.assertIn("WARN: active service reports %s while %s/VERSION is %s", SCRIPT)
         self.assertIn("--verified-adopt-existing-config", SCRIPT)
 
+    def test_legacy_update_disables_unconfigured_archive_retention(self):
+        self.assertIn("ARCHIVE_RETENTION_POLICY_MISSING=false", SCRIPT)
+        self.assertIn("legacy config has no archive retention policy", SCRIPT)
+        self.assertIn("EVOSSEARCH_ARCHIVE_RETENTION_ENABLED=false", SCRIPT)
+        self.assertIn("review retention before enabling pruning", SCRIPT)
+
     def test_adopt_update_never_migrates_or_dumps_database(self):
         self.assertIn("--no-migrate", SCRIPT)
         self.assertIn("--skip-pg-dump", SCRIPT)
@@ -211,14 +217,40 @@ class UpdateBundleTests(unittest.TestCase):
         for excluded in (".git", ".local", ".venv*", ".env", "dist", "*.sqlite3", "*.db", "*.log"):
             self.assertIn(f'--exclude="${{APP_BASE}}/{excluded}"', ROLLBACK_SCRIPT)
 
+    def test_manual_rollback_streams_custom_dump_and_removes_new_unit(self):
+        self.assertIn('pg_restore --exit-on-error', ROLLBACK_SCRIPT)
+        self.assertIn('database is already at the recorded pre-update revision; dump restore skipped', ROLLBACK_SCRIPT)
+        self.assertIn('DROP SCHEMA IF EXISTS archive CASCADE', ROLLBACK_SCRIPT)
+        self.assertIn('DROP TABLE IF EXISTS public.alembic_version CASCADE', ROLLBACK_SCRIPT)
+        self.assertIn('exact dump restore requires a PostgreSQL superuser DSN', ROLLBACK_SCRIPT)
+        self.assertIn('restored complete PostgreSQL dump with original ownership', ROLLBACK_SCRIPT)
+        self.assertIn('UNIT_PREEXISTED="$(read_state_var unit_preexisted)"', ROLLBACK_SCRIPT)
+        self.assertIn('removed service unit created by the failed installation', ROLLBACK_SCRIPT)
+        self.assertIn('START_SERVICE=false', ROLLBACK_SCRIPT)
+        self.assertIn('cp -a -- "${BACKUP_DIR}/eva-ai.env" "${ENV_FILE}"', ROLLBACK_SCRIPT)
+
+    def test_patch_backup_records_pre_update_database_revision(self):
+        self.assertIn('database_revision.txt', INSTALL_SCRIPT)
+        self.assertIn('SELECT version_num FROM public.alembic_version LIMIT 1', INSTALL_SCRIPT)
+
     def test_all_code_snapshots_exclude_runtime_private_and_large_trees(self):
         for source in (SCRIPT, INSTALL_SCRIPT, ROLLBACK_SCRIPT):
             for excluded in (
                 ".git", "*/.git", ".local", "*/.local", ".venv*", "*/.venv*",
-                ".env", ".env.*", "dist", "*/dist", "node_modules", "*/node_modules",
+                ".env", ".env.*", "dist", "node_modules", "*/node_modules",
                 "*.sqlite3", "*.db", "*.log",
             ):
                 self.assertIn(f'--exclude="${{APP_BASE}}/{excluded}"', source)
+            self.assertNotIn('--exclude="${APP_BASE}/*/dist"', source)
+
+    def test_update_installs_and_rolls_back_react_production_build(self):
+        self.assertIn('REACT_BUILD_SOURCE="${SOURCE_DIR}/react-ui/dist"', INSTALL_SCRIPT)
+        self.assertIn('installed React production build', INSTALL_SCRIPT)
+        self.assertIn('${SOURCE_DIR}/react-ui/dist/index.html', SCRIPT)
+        self.assertIn('${APP_DIR}/react-ui/dist', SCRIPT)
+        payload_check = SCRIPT.index('React production build is missing from the offline bundle')
+        confirmation = SCRIPT.index('Install %s now?')
+        self.assertLess(payload_check, confirmation)
 
     def test_restore_helper_deletes_new_code_but_keeps_runtime_data(self):
         helper = ROOT / "scripts" / "restore_code_snapshot.py"

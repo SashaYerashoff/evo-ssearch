@@ -8,6 +8,8 @@ from logging.config import fileConfig
 from alembic import context
 from sqlalchemy import engine_from_config, pool
 
+from eva_db.alembic_url import sqlalchemy_database_url
+
 config = context.config
 
 if config.config_file_name is not None:
@@ -26,11 +28,7 @@ def _database_url() -> str:
     )
     if not dsn:
         raise RuntimeError("EVA_DATABASE_DSN is required to run migrations")
-    if dsn.startswith("postgres://"):
-        dsn = "postgresql://" + dsn.removeprefix("postgres://")
-    if dsn.startswith("postgresql://"):
-        dsn = "postgresql+psycopg://" + dsn.removeprefix("postgresql://")
-    return dsn
+    return sqlalchemy_database_url(dsn)
 
 
 def run_migrations_offline() -> None:
