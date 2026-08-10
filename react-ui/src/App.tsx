@@ -393,9 +393,6 @@ export default function App() {
   const noAnim = isMotionReduced
   const navigation = (
     <MenuRailTrigger
-      active={section}
-      visibleSections={visibleSections}
-      showSettings={settingsAllowed}
       open={menuOpen}
       onToggle={() => setMenuOpen((value) => !value)}
     />

@@ -25,16 +25,12 @@ const NAV = [
 ] satisfies { id: SectionId; labelKey: TranslationKey; Icon: typeof IconPhotoSearch }[]
 
 type MenuRailTriggerProps = {
-  active: SectionId
-  visibleSections: SectionId[]
-  showSettings: boolean
   open: boolean
   onToggle: () => void
 }
 
-export function MenuRailTrigger({ active, visibleSections, showSettings, open, onToggle }: MenuRailTriggerProps) {
+export function MenuRailTrigger({ open, onToggle }: MenuRailTriggerProps) {
   const { t } = useI18n()
-  const items = NAV.filter(({ id }) => visibleSections.includes(id))
   return (
     <button
       className={`menu-rail-trigger ${open ? 'open' : ''}`}
@@ -44,22 +40,7 @@ export function MenuRailTrigger({ active, visibleSections, showSettings, open, o
       title={open ? t('nav.closeMenu') : t('nav.openMenu')}
       onClick={onToggle}
     >
-      {items.map(({ id, Icon }) => (
-        <span key={id} className={`menu-rail-icon ${active === id ? 'on' : ''}`} aria-hidden="true">
-          <Icon size={11} stroke={2} />
-        </span>
-      ))}
-      {showSettings && (
-        <>
-          <span className="menu-rail-sep" aria-hidden="true" />
-          <span className="menu-rail-icon" aria-hidden="true">
-            <IconSettings size={11} stroke={2} />
-          </span>
-        </>
-      )}
-      <span className="menu-rail-icon danger" aria-hidden="true">
-        <IconLogout size={11} stroke={2} />
-      </span>
+      <span className="menu-rail-label" aria-hidden="true">MENU</span>
     </button>
   )
 }
@@ -106,9 +87,6 @@ export function LeftRail({
       {open && <button className="menu-dismiss" onClick={() => onOpenChange(false)} aria-label={t('nav.closeMenu')} />}
       {showTrigger && (
         <MenuRailTrigger
-          active={active}
-          visibleSections={visibleSections}
-          showSettings={showSettings}
           open={open}
           onToggle={() => onOpenChange(!open)}
         />
