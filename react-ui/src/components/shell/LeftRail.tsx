@@ -40,7 +40,7 @@ export function MenuRailTrigger({ open, onToggle }: MenuRailTriggerProps) {
       title={open ? t('nav.closeMenu') : t('nav.openMenu')}
       onClick={onToggle}
     >
-      <span className="menu-rail-label" aria-hidden="true">MENU</span>
+      <span className="menu-rail-lines" aria-hidden="true" />
     </button>
   )
 }

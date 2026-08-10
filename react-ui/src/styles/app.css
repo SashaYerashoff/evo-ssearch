@@ -310,13 +310,25 @@
 }
 .menu-rail-trigger:hover,
 .menu-rail-trigger.open { border-color: var(--accent-line); background: var(--control-hover); }
-.menu-rail-label {
-  color: var(--accent); font-family: var(--mono); font-size: 9px; font-weight: 800;
-  line-height: 1; letter-spacing: .12em; writing-mode: vertical-rl; text-orientation: upright;
-  transition: color .14s ease, text-shadow .14s ease;
+.menu-rail-lines,
+.menu-rail-lines::before,
+.menu-rail-lines::after {
+  width: 13px; height: 1.5px; border-radius: 999px; background: var(--text-2);
+  transition: width .14s ease, background .14s ease, box-shadow .14s ease;
 }
-.menu-rail-trigger:hover .menu-rail-label,
-.menu-rail-trigger.open .menu-rail-label { color: var(--text); text-shadow: 0 0 10px var(--accent); }
+.menu-rail-lines { position: relative; display: block; }
+.menu-rail-lines::before,
+.menu-rail-lines::after { content: ''; position: absolute; left: 0; }
+.menu-rail-lines::before { top: -5px; }
+.menu-rail-lines::after { top: 5px; }
+.menu-rail-trigger:hover .menu-rail-lines,
+.menu-rail-trigger:hover .menu-rail-lines::before,
+.menu-rail-trigger:hover .menu-rail-lines::after,
+.menu-rail-trigger.open .menu-rail-lines,
+.menu-rail-trigger.open .menu-rail-lines::before,
+.menu-rail-trigger.open .menu-rail-lines::after {
+  width: 15px; background: var(--accent); box-shadow: 0 0 8px -2px var(--accent);
+}
 .menu-shell > .menu-rail-trigger {
   position: absolute; left: 0;
   top: calc(var(--workspace-tabs-top-padding) + var(--atp-tabrow-height) + var(--menu-rail-align-offset));
