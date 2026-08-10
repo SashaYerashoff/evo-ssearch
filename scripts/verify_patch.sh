@@ -145,6 +145,39 @@ check_endpoint() {
 check_endpoint "health" "/health" || RESULT=1
 check_endpoint "ready" "/ready" || RESULT=1
 
+check_react_ui() {
+  local body code asset asset_code
+  body="$(mktemp)"
+  code="$(curl "${CURL_OPTS[@]}" -o "${body}" -w '%{http_code}' "${BASE_URL}/" 2>/tmp/eva-patch-curl.err || true)"
+  if [[ "${code}" != "200" ]]; then
+    fail "React UI shell failed at ${BASE_URL}/ with HTTP ${code:-000}"
+    rm -f "${body}" /tmp/eva-patch-curl.err
+    return 1
+  fi
+  if ! grep -q '<div id="root"></div>' "${body}" \
+    || ! grep -q '/ui-assets/assets/' "${body}"
+  then
+    fail "root page is not the React command console (legacy or incomplete UI detected)"
+    rm -f "${body}" /tmp/eva-patch-curl.err
+    return 1
+  fi
+  asset="$(grep -Eo '/ui-assets/assets/[^"[:space:]>]+' "${body}" | head -n 1 || true)"
+  if [[ -z "${asset}" ]]; then
+    fail "React UI shell contains no hashed asset reference"
+    rm -f "${body}" /tmp/eva-patch-curl.err
+    return 1
+  fi
+  asset_code="$(curl "${CURL_OPTS[@]}" -o /dev/null -w '%{http_code}' "${BASE_URL}${asset}" 2>/tmp/eva-patch-curl.err || true)"
+  rm -f "${body}" /tmp/eva-patch-curl.err
+  if [[ "${asset_code}" != "200" ]]; then
+    fail "React UI asset ${asset} failed with HTTP ${asset_code:-000}"
+    return 1
+  fi
+  ok "React command console and hashed frontend asset are served"
+}
+
+check_react_ui || RESULT=1
+
 if [[ "${RESULT}" -eq 0 ]]; then
   ok "verification completed"
 else

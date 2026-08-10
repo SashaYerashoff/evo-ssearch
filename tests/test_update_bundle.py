@@ -11,6 +11,7 @@ SCRIPT = SCRIPT_PATH.read_text(encoding="utf-8")
 BUILD_SCRIPT = (ROOT / "scripts" / "build_patch_bundle.sh").read_text(encoding="utf-8")
 ROLLBACK_SCRIPT = (ROOT / "scripts" / "rollback.sh").read_text(encoding="utf-8")
 INSTALL_SCRIPT = (ROOT / "scripts" / "install_patch.sh").read_text(encoding="utf-8")
+VERIFY_SCRIPT = (ROOT / "scripts" / "verify_patch.sh").read_text(encoding="utf-8")
 
 
 class UpdateBundleTests(unittest.TestCase):
@@ -269,6 +270,9 @@ class UpdateBundleTests(unittest.TestCase):
         payload_check = SCRIPT.index('React production build is missing from the offline bundle')
         confirmation = SCRIPT.index('Install %s now?')
         self.assertLess(payload_check, confirmation)
+        self.assertIn('<div id="root"></div>', VERIFY_SCRIPT)
+        self.assertIn('/ui-assets/assets/', VERIFY_SCRIPT)
+        self.assertIn('React command console and hashed frontend asset are served', VERIFY_SCRIPT)
 
     def test_restore_helper_deletes_new_code_but_keeps_runtime_data(self):
         helper = ROOT / "scripts" / "restore_code_snapshot.py"
