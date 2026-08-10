@@ -7457,6 +7457,7 @@ def auth_login():
                 "sessionId": login.session_id,
                 "expiresAt": login.expires_at.isoformat(),
                 "csrfHeader": "X-CSRF-Token",
+                "csrfCookie": str(config.AUTH_CSRF_COOKIE),
             }
         )
     )
@@ -7500,6 +7501,7 @@ def auth_me():
             "sessionId": session_record.session_id,
             "expiresAt": session_record.expires_at.isoformat(),
             "csrfHeader": "X-CSRF-Token",
+            "csrfCookie": str(config.AUTH_CSRF_COOKIE),
         }
     )
 

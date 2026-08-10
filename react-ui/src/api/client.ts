@@ -1,9 +1,21 @@
 // Thin fetch wrapper for the EVA Flask backend (proxied by Vite to :5000).
 // Sends session cookie + X-CSRF-Token on mutating requests.
 
+let csrfCookieName = 'eva_csrf'
+
 function getCookie(name: string): string {
-  const m = document.cookie.match(new RegExp('(?:^|; )' + name + '=([^;]*)'))
+  const escaped = name.replace(/([.$?*|{}()[\]\\/+^])/g, '\\$1')
+  const m = document.cookie.match(new RegExp('(?:^|; )' + escaped + '=([^;]*)'))
   return m ? decodeURIComponent(m[1]) : ''
+}
+
+export function setCsrfCookieName(value: unknown): void {
+  const candidate = String(value || '').trim()
+  if (/^[A-Za-z0-9_.-]{1,128}$/.test(candidate)) csrfCookieName = candidate
+}
+
+export function getCsrfToken(): string {
+  return getCookie(csrfCookieName)
 }
 
 export const AUTH_EXPIRED_EVENT = 'eva:auth-expired'
@@ -68,7 +80,7 @@ async function request(
   if (json !== undefined) { headers['Content-Type'] = 'application/json'; body = JSON.stringify(json) }
   else if (form) { body = form }
   if (shouldAttachCsrf(method)) {
-    const csrf = getCookie('eva_csrf')
+    const csrf = getCsrfToken()
     if (csrf) headers['X-CSRF-Token'] = csrf
   }
   const res = await fetch(url, { method, headers, body, credentials: 'include' })

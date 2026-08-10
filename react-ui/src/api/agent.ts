@@ -1,7 +1,7 @@
 // SSE streaming client + REST for the EVA agent (ported from the original UI).
 // The chat endpoint needs a POST body, so EventSource can't be used — we read the
 // fetch stream manually and parse `data: {json}\n\n` frames.
-import { api } from './client'
+import { api, getCsrfToken } from './client'
 import type { AgentConsoleContext, ConsoleUiEffect } from '../ui-effects/consoleEffects'
 
 export interface AgentEvent {
@@ -17,11 +17,6 @@ export interface AgentEvent {
   error?: string
   message?: string
   [k: string]: any
-}
-
-function getCookie(name: string): string | null {
-  const m = document.cookie.match(new RegExp('(?:^|; )' + name.replace(/([.$?*|{}()[\]\\/+^])/g, '\\$1') + '=([^;]*)'))
-  return m ? decodeURIComponent(m[1]) : null
 }
 
 export function agentSubmissionText(message: string, imageB64?: string | null): string {
@@ -82,7 +77,7 @@ export async function streamAgent(
   onEvent: (e: AgentEvent) => void,
 ): Promise<void> {
   const headers: Record<string, string> = { 'Content-Type': 'application/json' }
-  const csrf = getCookie('eva_csrf')
+  const csrf = getCsrfToken()
   if (csrf) headers['X-CSRF-Token'] = csrf
 
   const res = await fetch('/agent/chat', {

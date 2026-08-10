@@ -1,4 +1,4 @@
-import { api } from './client'
+import { api, setCsrfCookieName } from './client'
 import type { AuthUser } from './types'
 
 export function mapUser(u: any): AuthUser {
@@ -17,12 +17,14 @@ export function mapUser(u: any): AuthUser {
 
 export async function login(username: string, password: string, remember = false): Promise<AuthUser> {
   const res = await api.postJson('/auth/login', { username, password, remember })
+  setCsrfCookieName(res?.csrfCookie)
   return mapUser({ ...res.user, currentSessionId: res.sessionId })
 }
 
 export async function me(): Promise<AuthUser | null> {
   try {
     const res = await api.get('/auth/me')
+    setCsrfCookieName(res?.csrfCookie)
     return res?.user ? mapUser({ ...res.user, currentSessionId: res.sessionId }) : null
   } catch {
     return null

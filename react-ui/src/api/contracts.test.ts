@@ -13,7 +13,7 @@ import {
   unknownChannelIds,
 } from './access'
 import { mapUser } from './auth'
-import { apiErrorMessage, shouldAttachCsrf } from './client'
+import { apiErrorMessage, getCsrfToken, setCsrfCookieName, shouldAttachCsrf } from './client'
 import { deriveLuxriotLinkStatus } from './luxriotStatus'
 import {
   incidentExportUrl,
@@ -506,6 +506,24 @@ describe('React/backend contract normalizers', () => {
     expect(shouldAttachCsrf('POST')).toBe(true)
     expect(shouldAttachCsrf('PATCH')).toBe(true)
     expect(shouldAttachCsrf('DELETE')).toBe(true)
+  })
+
+  it('uses the site-specific CSRF cookie announced by the auth API', () => {
+    const originalDocument = Object.getOwnPropertyDescriptor(globalThis, 'document')
+    Object.defineProperty(globalThis, 'document', {
+      configurable: true,
+      value: { cookie: 'eva_csrf=wrong; eva_tbilisi_repro_csrf=site-token' },
+    })
+    try {
+      setCsrfCookieName('eva_tbilisi_repro_csrf')
+      expect(getCsrfToken()).toBe('site-token')
+      setCsrfCookieName('invalid cookie name')
+      expect(getCsrfToken()).toBe('site-token')
+    } finally {
+      if (originalDocument) Object.defineProperty(globalThis, 'document', originalDocument)
+      else Reflect.deleteProperty(globalThis, 'document')
+      setCsrfCookieName('eva_csrf')
+    }
   })
 
   it('does not submit bookmark prompt fields without permission', () => {

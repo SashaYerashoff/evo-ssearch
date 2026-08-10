@@ -416,6 +416,11 @@ class HttpAuthRouteTests(unittest.TestCase):
     def test_login_me_and_logout(self) -> None:
         login, csrf_token = self._login()
 
+        self.assertEqual(
+            login.get_json()["csrfCookie"],
+            oldapp.config.AUTH_CSRF_COOKIE,
+        )
+
         session_header = next(
             value
             for value in login.headers.getlist("Set-Cookie")
@@ -430,6 +435,10 @@ class HttpAuthRouteTests(unittest.TestCase):
         self.assertEqual(
             me.get_json()["sessionId"],
             login.get_json()["sessionId"],
+        )
+        self.assertEqual(
+            me.get_json()["csrfCookie"],
+            oldapp.config.AUTH_CSRF_COOKIE,
         )
 
         missing_csrf = self.client.post("/auth/logout")

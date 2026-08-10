@@ -6,6 +6,12 @@ Format loosely follows Keep a Changelog.
 
 ## Unreleased
 
+- **Site-specific CSRF cookies work in React:** the authentication response now
+  publishes the configured non-secret CSRF cookie name, and the shared React
+  transport applies it to every mutation and agent stream. Adopted sites no
+  longer lose Incident Report and other writes when their cookie prefix differs
+  from the default `eva_csrf`.
+
 - **Bundled media is now part of the Python installer transaction:** when an
   offline bundle contains the self-contained runtime, its FFmpeg/OpenCV files
   and checksums are validated during read-only preflight and installed after
