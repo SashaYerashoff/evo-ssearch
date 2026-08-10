@@ -72,21 +72,50 @@
   background: var(--control-hover);
 }
 
-.btn.primary,
-.mon-btn.accent,
 .agent-send,
 .agent-badge,
-.usr-new,
 .seg-btn.on {
   color: var(--primary-text);
   background: linear-gradient(135deg, var(--accent), var(--accent-2));
 }
 
+.btn.primary,
+.mon-btn.accent,
+.usr-new,
+.agent-ear {
+  color: var(--accent);
+  background: color-mix(in srgb, var(--accent) 11%, var(--control));
+  border: 1px solid color-mix(in srgb, var(--accent-line) 72%, var(--line-2));
+  box-shadow: none;
+  filter: none;
+  transition: color .14s ease, background .14s ease, border-color .14s ease, box-shadow .14s ease, filter .14s ease;
+}
+
+.agent-ear.on {
+  box-shadow: none;
+  filter: none;
+}
+
 .btn.primary:hover,
 .mon-btn.accent:hover,
-.usr-new:hover {
-  filter: brightness(1.04);
+.usr-new:hover,
+.agent-ear:hover {
+  color: var(--accent);
+  filter: none;
+  background: color-mix(in srgb, var(--accent) 17%, var(--control-hover));
+  border-color: var(--accent-line);
+  box-shadow: 0 0 14px -9px var(--accent);
+}
+
+.btn.primary:active:not(:disabled),
+.mon-btn.accent:active:not(:disabled),
+.usr-new:active:not(:disabled),
+.agent-ear:active:not(:disabled) {
+  color: var(--primary-text);
   background: linear-gradient(135deg, var(--accent), var(--accent-2));
+  border-color: transparent;
+  box-shadow: var(--glow);
+  filter: brightness(1.04);
 }
 
 .set-modal,
