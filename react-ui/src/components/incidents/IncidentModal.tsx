@@ -206,8 +206,10 @@ export function IncidentModal({
     setBusyAction(action)
     setError('')
     try {
-      replaceIncident(await incidentsApi.get(id))
+      const updated = await incidentsApi.get(id)
+      replaceIncident(updated)
       await Promise.all([loadObservations(id), loadTemporalContext(id)])
+      onChanged?.(updated)
     } catch (exception: any) {
       setError(exception?.message || 'Incident refresh failed.')
     } finally {
@@ -236,8 +238,9 @@ export function IncidentModal({
     try {
       const updated = await incidentsApi.follow(id, followMode, ttlSeconds)
       setLocalExpiryMs(Date.now() + ttlSeconds * 1000)
-      if (updated) replaceIncident(updated)
-      else replaceIncident(await incidentsApi.get(id))
+      const next = updated || await incidentsApi.get(id)
+      replaceIncident(next)
+      onChanged?.(next)
     } catch (exception: any) {
       setError(exception?.message || 'EVA could not raise incident attention.')
     } finally {
@@ -252,8 +255,9 @@ export function IncidentModal({
     try {
       const updated = await incidentsApi.stopFollow(id)
       setLocalExpiryMs(null)
-      if (updated) replaceIncident(updated)
-      else replaceIncident(await incidentsApi.get(id))
+      const next = updated || await incidentsApi.get(id)
+      replaceIncident(next)
+      onChanged?.(next)
     } catch (exception: any) {
       setError(exception?.message || 'EVA could not stop incident follow.')
     } finally {
