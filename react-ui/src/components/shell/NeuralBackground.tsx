@@ -72,7 +72,9 @@ const AURORA_ALPHA = 0.08  // per-blob opacity (normal blending — overlaps sta
 // monitor refresh rate needlessly competes with local CUDA inference on demo hosts
 // where the display and VLM share a small GPU. Twenty frames per second remains
 // visually fluid at these speeds while leaving substantially more compositor time.
-const PAINT_INTERVAL_MS = 50
+const PAINT_INTERVAL_MS = 66
+const AURORA_REFRESH_MS = 750
+const AURORA_BUFFER_SCALE = 0.22
 
 export function NeuralBackground({ noAnim = false }: { noAnim?: boolean }) {
   const ref = useRef<HTMLCanvasElement>(null)
@@ -84,6 +86,10 @@ export function NeuralBackground({ noAnim = false }: { noAnim?: boolean }) {
     if (!ctx) return
     const cv = canvas       // stable non-null alias for use inside closures
     const c2 = ctx
+    const auroraCanvas = document.createElement('canvas')
+    const auroraContext = auroraCanvas.getContext('2d')
+    if (!auroraContext) return
+    const aurora2d = auroraContext
 
     const reduced = window.matchMedia?.('(prefers-reduced-motion: reduce)').matches ?? false
     const still = noAnim || reduced
@@ -98,6 +104,7 @@ export function NeuralBackground({ noAnim = false }: { noAnim?: boolean }) {
     let auroras: Aurora[] = []
     let raf = 0
     let last = 0
+    let lastAuroraPaint = Number.NEGATIVE_INFINITY
     let spawnAcc = 0
     // deterministic-ish PRNG so the layout is stable within a mount
     let seed = 1
@@ -107,7 +114,7 @@ export function NeuralBackground({ noAnim = false }: { noAnim?: boolean }) {
     }
 
     function build() {
-      const dpr = Math.min(window.devicePixelRatio || 1, 1.5)
+      const dpr = Math.min(window.devicePixelRatio || 1, 1.25)
       w = window.innerWidth
       h = window.innerHeight
       cv.width = Math.round(w * dpr)
@@ -115,6 +122,9 @@ export function NeuralBackground({ noAnim = false }: { noAnim?: boolean }) {
       cv.style.width = w + 'px'
       cv.style.height = h + 'px'
       c2.setTransform(dpr, 0, 0, dpr, 0, 0)
+      auroraCanvas.width = Math.max(1, Math.round(w * AURORA_BUFFER_SCALE))
+      auroraCanvas.height = Math.max(1, Math.round(h * AURORA_BUFFER_SCALE))
+      lastAuroraPaint = Number.NEGATIVE_INFINITY
 
       // scatter neurons on a jittered grid so they're evenly spread but organic.
       // if the ideal grid exceeds the node budget, grow the cell instead of cutting
@@ -181,6 +191,24 @@ export function NeuralBackground({ noAnim = false }: { noAnim?: boolean }) {
       }
     }
 
+    function paintAuroras(time: number) {
+      const scale = AURORA_BUFFER_SCALE
+      aurora2d.clearRect(0, 0, auroraCanvas.width, auroraCanvas.height)
+      for (const au of auroras) {
+        const cx = (w * 0.5 + Math.cos(au.ax + time * au.sx * 6.283) * w * 0.42) * scale
+        const cy = (h * 0.5 + Math.sin(au.ay + time * au.sy * 6.283) * h * 0.46) * scale
+        const radius = au.rad * scale
+        const gradient = aurora2d.createRadialGradient(cx, cy, 0, cx, cy, radius)
+        gradient.addColorStop(0, `rgba(${au.col[0]},${au.col[1]},${au.col[2]},${AURORA_ALPHA})`)
+        gradient.addColorStop(1, `rgba(${au.col[0]},${au.col[1]},${au.col[2]},0)`)
+        aurora2d.fillStyle = gradient
+        aurora2d.beginPath()
+        aurora2d.arc(cx, cy, radius, 0, Math.PI * 2)
+        aurora2d.fill()
+      }
+      lastAuroraPaint = time * 1000
+    }
+
     // a point safely off-screen, in line with a border neuron (its entry/exit doorway)
     function outPoint(i: number) {
       const n = nodes[i]
@@ -237,20 +265,11 @@ export function NeuralBackground({ noAnim = false }: { noAnim?: boolean }) {
 
       c2.clearRect(0, 0, w, h)
 
-      // aurora — slow breathing colour fields behind everything. Uses normal blending
-      // (NOT additive) so overlapping blobs never sum into a bright wash — the interface
-      // keeps its contrast no matter how the fields drift together.
-      for (const au of auroras) {
-        const cx = w * 0.5 + Math.cos(au.ax + time * au.sx * 6.283) * w * 0.42
-        const cy = h * 0.5 + Math.sin(au.ay + time * au.sy * 6.283) * h * 0.46
-        const g = c2.createRadialGradient(cx, cy, 0, cx, cy, au.rad)
-        g.addColorStop(0, `rgba(${au.col[0]},${au.col[1]},${au.col[2]},${AURORA_ALPHA})`)
-        g.addColorStop(1, `rgba(${au.col[0]},${au.col[1]},${au.col[2]},0)`)
-        c2.fillStyle = g
-        c2.beginPath()
-        c2.arc(cx, cy, au.rad, 0, Math.PI * 2)
-        c2.fill()
-      }
+      // The aurora moves over minutes, not frames. Render it into a small cached
+      // buffer and scale the bitmap instead of rasterizing five full-screen radial
+      // gradients on every animation tick.
+      if (now - lastAuroraPaint >= AURORA_REFRESH_MS) paintAuroras(time)
+      c2.drawImage(auroraCanvas, 0, 0, w, h)
 
       // wander the neurons a touch (topology stays; wires just breathe)
       if (!still) {
