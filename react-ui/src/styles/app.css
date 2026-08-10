@@ -283,7 +283,6 @@
   --workspace-tabs-top-padding: 14px;
   --atp-tabrow-height: 30px;
   --atp-panel-content-height: 80px;
-  --menu-rail-align-offset: 15px;
   --archive-card-width: calc((100cqw - var(--rail-w) - 132px) / 6);
   flex: 1; display: flex; min-height: 0; position: relative;
 }
@@ -331,7 +330,7 @@
 }
 .menu-shell > .menu-rail-trigger {
   position: absolute; left: 0;
-  top: calc(var(--workspace-tabs-top-padding) + var(--atp-tabrow-height) + var(--menu-rail-align-offset));
+  top: calc(var(--workspace-tabs-top-padding) + var(--atp-tabrow-height));
 }
 .menu-drawer {
   position: absolute; left: 0; top: 10px; bottom: 10px; z-index: 2;

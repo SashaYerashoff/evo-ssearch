@@ -15,7 +15,7 @@ import type { Probe } from './api/probes'
 import { api, API_FORBIDDEN_EVENT, AUTH_EXPIRED_EVENT } from './api/client'
 import { TopBar } from './components/shell/TopBar'
 import { StatusConsole } from './components/shell/StatusConsole'
-import { LeftRail, MenuRailTrigger, SECTION_LABEL_KEYS, type SectionId } from './components/shell/LeftRail'
+import { LeftRail, SECTION_LABEL_KEYS, type SectionId } from './components/shell/LeftRail'
 import { AgentEar } from './components/shell/AgentEar'
 import { AgentPanel, type AgentAction } from './components/shell/AgentPanel'
 import { ArchiveScreen } from './components/archive/ArchiveScreen'
@@ -391,12 +391,6 @@ export default function App() {
   async function handleLogout() { await apiLogout(); setMenuOpen(false); setUser(null) }
   const agentPresetGrid = agentOpen && !agentFull
   const noAnim = isMotionReduced
-  const navigation = (
-    <MenuRailTrigger
-      open={menuOpen}
-      onToggle={() => setMenuOpen((value) => !value)}
-    />
-  )
   return (
     <div className={`shell ${noAnim ? 'no-anim' : ''}`}>
       <NeuralBackground noAnim={noAnim} />
@@ -419,7 +413,7 @@ export default function App() {
           active={section}
           visibleSections={visibleSections}
           showSettings={settingsAllowed}
-          showTrigger={section === 'home'}
+          showTrigger
           open={menuOpen}
           onOpenChange={setMenuOpen}
           onNavigate={setSection}
@@ -430,7 +424,6 @@ export default function App() {
           <HomeScreen active={section === 'home'} serverStartedAtMs={serverStartedAtMs} />
           {section === 'archive' && (
             <ArchiveScreen
-              navigation={navigation}
               channels={channels}
               drive={drive}
               similarDrive={similarDrive}
@@ -445,7 +438,6 @@ export default function App() {
           )}
           {section === 'monitoring' && (
             <MonitoringScreen
-              navigation={navigation}
               channels={channels}
               drive={probeDrive}
               canOperate={hasPermission(user, PERMISSION.probesRun) && hasPermission(user, PERMISSION.captureManage)}
@@ -456,7 +448,6 @@ export default function App() {
           )}
           {section === 'video' && (
             <VideoScreen
-              navigation={navigation}
               channels={channels}
               drive={videoDrive}
               reviewOverlayOpen={!!summaryReview}
