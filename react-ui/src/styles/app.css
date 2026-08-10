@@ -301,31 +301,32 @@
 .menu-ear:hover, .menu-shell.open .menu-ear { filter: brightness(1.08); box-shadow: 0 0 26px -2px color-mix(in srgb, var(--accent) 82%, transparent); }
 .menu-ear .txt { writing-mode: vertical-rl; transform: rotate(180deg); font-size: 11px; font-weight: 700; letter-spacing: .18em; }
 .menu-header-button {
-  width: 100%; height: 56px; min-height: 56px;
+  width: 38px; min-width: 38px; height: 100%; min-height: 78px;
   display: flex; align-items: center;
-  flex-direction: row; justify-content: center; gap: 10px; padding: 0 14px;
-  color: var(--text-2);
-  background: color-mix(in srgb, var(--surface-raised) 88%, transparent);
-  border-radius: 0 11px 11px 0; border: 1px solid var(--line-2); border-left: 0;
-  box-shadow: var(--elev);
+  flex-direction: column; justify-content: center; gap: 7px; padding: 10px 4px;
+  color: var(--primary-text);
+  background: linear-gradient(135deg, var(--accent), var(--accent-2));
+  border-radius: 0 11px 11px 0; border: 0;
+  box-shadow: 0 0 22px -4px color-mix(in srgb, var(--accent) 76%, transparent);
   transition: opacity .14s ease, transform .16s ease, visibility 0s linear 0s,
     border-color .14s ease, background .14s ease;
 }
 .menu-header-button svg {
-  width: 32px; height: 32px; flex: 0 0 32px; padding: 6px; border-radius: 9px;
-  color: var(--accent); background: var(--accent-bg); border: 0;
+  width: 20px; height: 20px; flex: 0 0 20px; padding: 2px; border-radius: 0;
+  color: currentColor; background: transparent; border: 0;
 }
 .menu-header-button span {
-  color: var(--text-2); font-family: var(--mono); white-space: nowrap;
+  color: currentColor; font-family: var(--mono); white-space: nowrap;
+  writing-mode: vertical-rl; transform: rotate(180deg);
   font-size: 10.5px; font-weight: 750; line-height: 1; letter-spacing: .12em; text-align: center;
 }
 .menu-header-button:hover {
-  color: var(--text); border-color: var(--accent-line);
-  background: var(--control-hover); box-shadow: inset 3px 0 var(--accent);
+  color: var(--primary-text); filter: brightness(1.08);
+  box-shadow: 0 0 26px -2px color-mix(in srgb, var(--accent) 82%, transparent);
 }
 .home-menu-slot {
   position: absolute; top: 41px; left: 0; z-index: 61;
-  width: 108px; display: flex;
+  width: 38px; height: 96px; display: flex;
 }
 .menu-drawer {
   position: absolute; left: 0; top: 10px; bottom: 10px; z-index: 2;
@@ -387,11 +388,11 @@
 /* Tool tabs and their active controls live inside one shared panel. */
 .tool-tabs { display: flex; flex-direction: column; }
 .tool-tabs.with-leading {
-  display: grid; grid-template-columns: 92px minmax(0, 1fr); column-gap: 16px; align-items: stretch;
+  display: grid; grid-template-columns: 38px minmax(0, 1fr); column-gap: 10px; align-items: stretch;
 }
 .tool-tabs-leading {
-  position: relative; width: 108px; margin-left: -16px;
-  display: flex; align-items: flex-start; padding-top: 27px;
+  position: relative; width: 38px; margin-left: -16px;
+  display: flex; align-items: stretch; padding-top: 0;
 }
 /* tool tabs scroll away with the content — no sticky pin, no frosted backdrop band.
    Same plain header across Archive / Video / Monitoring. */
@@ -1240,6 +1241,7 @@
 .pc-head { display: flex; align-items: center; justify-content: space-between; }
 .pc-badge { font-size: 10px; font-weight: 700; letter-spacing: .06em; padding: 3px 8px; border-radius: 999px; }
 .pc-badge.running { color: var(--success); background: var(--success-bg); border: 1px solid color-mix(in srgb, var(--success) 45%, transparent); }
+.pc-badge.degraded { color: var(--danger); background: color-mix(in srgb, var(--danger) 12%, transparent); border: 1px solid color-mix(in srgb, var(--danger) 48%, transparent); }
 .pc-badge.paused { color: #f0b74f; background: rgba(240,160,48,0.12); border: 1px solid rgba(240,160,48,0.4); }
 .pc-badge.idle { color: var(--text-mut); background: var(--void-tile); border: 1px solid var(--line); }
 .pc-badge.disabled { color: #f87171; background: rgba(248,113,113,0.1); border: 1px solid rgba(248,113,113,0.4); }
@@ -1276,6 +1278,29 @@
 .pi-scores b { font-family: var(--mono); font-size: 17px; font-weight: 600; color: var(--text-2); }
 .pi-scores b.pos { color: var(--mon-accent); }
 .pi-scores b.mar { color: var(--text); }
+.pi-signal-meta { color: var(--text-mut); font-size: 11px; margin-top: -2px; }
+.pi-live-error { margin-top: 8px; }
+
+.probe-live-signal {
+  display: flex; flex-direction: column; gap: 9px; padding: 12px;
+  border: 1px solid var(--line-2); border-radius: 11px;
+  background: color-mix(in srgb, var(--void-tile) 86%, transparent);
+}
+.probe-live-signal.ready { border-color: color-mix(in srgb, var(--success) 38%, var(--line-2)); }
+.probe-live-signal.degraded { border-color: color-mix(in srgb, var(--danger) 52%, var(--line-2)); }
+.probe-live-head { display: flex; justify-content: space-between; gap: 10px; align-items: flex-start; }
+.probe-live-head > div { display: flex; flex-direction: column; gap: 3px; min-width: 0; }
+.probe-live-head span { color: var(--text); font-size: 11px; font-weight: 750; text-transform: uppercase; letter-spacing: .07em; }
+.probe-live-head b { color: var(--text-mut); font-size: 11px; font-weight: 550; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.probe-live-head i { color: var(--accent); font-family: var(--mono); font-size: 10px; font-style: normal; }
+.probe-live-values { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 7px; }
+.probe-live-values > div { display: grid; grid-template-columns: auto 1fr; gap: 2px 8px; align-items: baseline; padding: 8px 9px; border-radius: 9px; border: 1px solid var(--line); background: var(--space-0); }
+.probe-live-values span { color: var(--text-mut); font-family: var(--mono); font-size: 11px; font-weight: 750; }
+.probe-live-values b { color: var(--text); font-family: var(--mono); font-size: 16px; text-align: right; }
+.probe-live-values em { grid-column: 1 / -1; color: var(--text-mut); font-size: 9px; font-style: normal; text-align: right; }
+.probe-live-error { display: flex; gap: 7px; align-items: flex-start; color: var(--danger); font-size: 11px; line-height: 1.4; overflow-wrap: anywhere; }
+.probe-live-note { color: var(--text-mut); font-size: 10.5px; line-height: 1.4; }
+.probe-apply-status { padding: 7px 18px; color: var(--success); border-top: 1px solid var(--line); background: color-mix(in srgb, var(--success-bg) 70%, transparent); font-size: 11px; }
 
 /* configuration — one scannable key/value list in a quiet box */
 .pi-config { display: flex; flex-direction: column; border: 1px solid var(--line); border-radius: 10px; background: rgba(10,16,32,0.35); padding: 2px 13px; }

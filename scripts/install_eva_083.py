@@ -485,6 +485,20 @@ def prepare_env_values(
     for key, value in defaults.items():
         add_missing(key, value)
 
+    # 0.8.7 makes SigLIP2 the production semantic space.  Legacy env files did
+    # not name either the cache root or model revision, so merely copying the
+    # weights into the appliance would leave the runtime looking in the old
+    # per-user default cache.  Append only: an explicitly configured client
+    # model/cache is never replaced.
+    for key, value in {
+        "EVOSSEARCH_MODEL_CACHE_DIR": "/var/lib/eva-ai/models/huggingface",
+        "EVOSSEARCH_PRODUCTION_CLIP_MODEL": "google/siglip2-base-patch16-224",
+        "EVOSSEARCH_CLIP_MODEL": "google/siglip2-base-patch16-224",
+        "EVOSSEARCH_CLIP_MODEL_REVISION": "75de2d55ec2d0b4efc50b3e9ad70dba96a7b2fa2",
+        "EVOSSEARCH_EMBEDDER_FALLBACK_ENABLED": "false",
+    }.items():
+        add_missing(key, value)
+
     # Release identity and the accepted console belong to installed code, not
     # site topology.  Model endpoints, channels, credentials and tenant values
     # remain preserve/append-only.  The legacy console remains available at
@@ -691,6 +705,24 @@ def _wheelhouse_files(bundle_dir: Path) -> list[Path]:
         return []
     patterns = ("*.whl", "*.tar.gz", "*.zip")
     return sorted({path for pattern in patterns for path in wheelhouse.glob(pattern)})
+
+
+def _siglip2_cache_snapshot(cache_root: Path, revision: str) -> Path | None:
+    """Return a complete local SigLIP2 snapshot, never consulting the network."""
+
+    repository = cache_root / "models--google--siglip2-base-patch16-224"
+    snapshots = repository / "snapshots"
+    candidates: list[Path] = []
+    if revision:
+        candidates.append(snapshots / revision)
+    elif snapshots.is_dir():
+        candidates.extend(path for path in snapshots.iterdir() if path.is_dir())
+    for candidate in candidates:
+        if (candidate / "config.json").is_file() and any(
+            candidate.glob("*.safetensors")
+        ):
+            return candidate
+    return None
 
 
 def _media_runtime_findings(bundle_dir: Path) -> list[Finding]:
@@ -922,6 +954,25 @@ def collect_preflight(
         add("WARN", "no wheelhouse found; existing target venv would be reused without downloads")
     else:
         add("FAIL", "fresh install requires bundle/wheelhouse; online dependency downloads are forbidden")
+
+    clip_model = str(values.get("EVOSSEARCH_CLIP_MODEL") or "").strip().lower()
+    if "siglip2" in clip_model:
+        revision = str(values.get("EVOSSEARCH_CLIP_MODEL_REVISION") or "").strip()
+        target_cache = Path(
+            str(values.get("EVOSSEARCH_MODEL_CACHE_DIR") or "/var/lib/eva-ai/models/huggingface")
+        ).expanduser()
+        bundled_cache = options.bundle_dir / "models" / "huggingface"
+        target_snapshot = _siglip2_cache_snapshot(target_cache, revision)
+        bundled_snapshot = _siglip2_cache_snapshot(bundled_cache, revision)
+        if target_snapshot is not None:
+            add("OK", f"SigLIP2 is already cached locally at {target_snapshot}")
+        elif bundled_snapshot is not None:
+            add("OK", f"offline bundle contains SigLIP2 at {bundled_snapshot}")
+        else:
+            add(
+                "FAIL",
+                "SigLIP2 is configured but neither the target cache nor the offline bundle contains its weights",
+            )
 
     try:
         disk_path = options.app_dir.parent if options.app_dir.parent.exists() else Path("/")

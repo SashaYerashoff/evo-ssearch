@@ -20,6 +20,7 @@ import {
   type ProbeListCounts,
   type ProbeOrigin,
   type ProbeThresholdDefaults,
+  type ChannelStatus,
 } from '../../api/probes'
 import type { Channel } from '../../api/types'
 import { videoApi } from '../../api/video'
@@ -47,7 +48,7 @@ const ORIGINS: Array<{ value: ProbeOrigin; label: string }> = [
   { value: 'agent', label: 'Agent' },
   { value: 'auto', label: 'Background VLM' },
 ]
-const STATES: ProbeStatus[] = ['running', 'paused', 'idle', 'disabled']
+const STATES: ProbeStatus[] = ['running', 'degraded', 'paused', 'idle', 'disabled']
 
 function readBoardView(): 'grid' | 'list' {
   return window.localStorage.getItem(VIEW_STORAGE_KEY) === 'list' ? 'list' : 'grid'
@@ -62,8 +63,15 @@ function readCollapsed(): Set<string> {
   }
 }
 
-function statusOf(probe: Probe, runtime: Record<number, string>): ProbeStatus {
+function statusOf(
+  probe: Probe,
+  runtime: Record<number, string>,
+  semanticRuntime: Record<number, ChannelStatus> = {},
+): ProbeStatus {
   if (probe.enabled === false) return 'disabled'
+  if (probe.embedding_calibration_state && probe.embedding_calibration_state !== 'calibrated') return 'degraded'
+  const semantic = probe.channel_id != null ? semanticRuntime[probe.channel_id] : undefined
+  if (semantic?.semantic_state === 'degraded') return 'degraded'
   const state = probe.channel_id != null ? runtime[probe.channel_id] : undefined
   if (state === 'running') return 'running'
   if (state === 'paused') return 'paused'
@@ -126,6 +134,8 @@ export function MonitoringScreen({
   const [counts, setCounts] = useState<ProbeListCounts>({})
   const [probeDefaults, setProbeDefaults] = useState<ProbeThresholdDefaults>({ pos_floor: 0.05, margin: 0.02 })
   const [runtime, setRuntime] = useState<Record<number, string>>({})
+  const [semanticRuntime, setSemanticRuntime] = useState<Record<number, ChannelStatus>>({})
+  const [inspectedRuntime, setInspectedRuntime] = useState<ChannelStatus | null>(null)
   const [inspectId, setInspectId] = useState<string | null>(null)
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState<string | null>(null)
@@ -169,6 +179,48 @@ export function MonitoringScreen({
 
   useEffect(() => {
     let alive = true
+    const channelIds = [...new Set(
+      probes
+        .map((probe) => probe.channel_id)
+        .filter((channelId): channelId is number => channelId != null),
+    )]
+    if (!channelIds.length) {
+      setSemanticRuntime({})
+      return () => { alive = false }
+    }
+    const tick = async () => {
+      const values = await Promise.all(channelIds.map(async (channelId) => {
+        const status = await probesApi.status(channelId).catch(() => null)
+        return [channelId, status] as const
+      }))
+      if (!alive) return
+      const next: Record<number, ChannelStatus> = {}
+      for (const [channelId, status] of values) if (status) next[channelId] = status
+      setSemanticRuntime(next)
+    }
+    void tick()
+    const timer = window.setInterval(tick, 5_000)
+    return () => { alive = false; window.clearInterval(timer) }
+  }, [probes])
+
+  useEffect(() => {
+    let alive = true
+    const probe = probes.find((candidate) => candidate.id === inspectId)
+    if (!probe || probe.channel_id == null) {
+      setInspectedRuntime(null)
+      return () => { alive = false }
+    }
+    const tick = async () => {
+      const status = await probesApi.status(probe.channel_id!, probe.id).catch(() => null)
+      if (alive) setInspectedRuntime(status)
+    }
+    void tick()
+    const timer = window.setInterval(tick, 1_200)
+    return () => { alive = false; window.clearInterval(timer) }
+  }, [inspectId, probes])
+
+  useEffect(() => {
+    let alive = true
     const tick = async () => {
       const response = await videoApi.streams().catch(() => null)
       if (!alive || !response) return
@@ -205,18 +257,18 @@ export function MonitoringScreen({
   const filtered = useMemo(() => probes.filter((probe) => probeMatchesFilters(
     probe,
     { origins, states, query },
-    statusOf(probe, runtime),
+    statusOf(probe, runtime, semanticRuntime),
     probe.channel_id != null ? channelNames.get(probe.channel_id) || '' : '',
-  )), [probes, origins, states, query, runtime, channelNames])
+  )), [probes, origins, states, query, runtime, semanticRuntime, channelNames])
   const tree = useMemo(
-    () => buildProbeBoardTree(filtered, groups, channels, (probe) => statusOf(probe, runtime)),
-    [filtered, groups, channels, runtime],
+    () => buildProbeBoardTree(filtered, groups, channels, (probe) => statusOf(probe, runtime, semanticRuntime)),
+    [filtered, groups, channels, runtime, semanticRuntime],
   )
   const inspected = probes.find((probe) => probe.id === inspectId) || null
   const inspectedBookmarkBlocked = canManage
     && probeMutationRequiresBookmarkPermission(inspected, canCreateBookmarks)
   const filtersActive = origins.size > 0 || states.size > 0 || !!query.trim()
-  const runningCount = probes.filter((probe) => statusOf(probe, runtime) === 'running').length
+  const runningCount = probes.filter((probe) => statusOf(probe, runtime, semanticRuntime) === 'running').length
 
   const persistView = (next: 'grid' | 'list') => {
     setView(next)
@@ -298,16 +350,18 @@ export function MonitoringScreen({
     }
   }, [refresh])
 
-  const saveProbe = useCallback(async (input: ProbeInput) => {
+  const saveProbe = useCallback(async (input: ProbeInput): Promise<Probe | null> => {
     setBusy(true)
     setError(null)
     try {
       const response = await probesApi.save(input)
       if (response.error) throw new Error(response.error)
-      setEditing(null)
       await refresh()
+      setEditing({ probe: response.probe })
+      return response.probe
     } catch (exception: any) {
       setError(exception?.message || 'Save failed')
+      return null
     } finally {
       setBusy(false)
     }
@@ -487,7 +541,7 @@ export function MonitoringScreen({
                               <ProbeCard
                                 key={probe.id}
                                 probe={probe}
-                                status={statusOf(probe, runtime)}
+                                status={statusOf(probe, runtime, semanticRuntime)}
                                 selected={probe.id === inspectId}
                                 onSelect={() => setInspectId(probe.id)}
                                 onRun={canManage ? () => toggleProbeEnabled(probe) : undefined}
@@ -498,7 +552,7 @@ export function MonitoringScreen({
                         ) : (
                           <div className="probe-row-list">
                             {channel.probes.map((probe) => {
-                              const status = statusOf(probe, runtime)
+                              const status = statusOf(probe, runtime, semanticRuntime)
                               const hit = probe.last_hit || probe.recent_hits?.[0]
                               const ttl = probeTemporaryTtl(probe)
                               return (
@@ -535,7 +589,8 @@ export function MonitoringScreen({
             <button className="modal-close mon-inspect-close" onClick={() => setInspectId(null)}><IconX size={18} /></button>
             <ProbeInspector
               probe={inspected}
-              status={statusOf(inspected, runtime)}
+              status={statusOf(inspected, runtime, semanticRuntime)}
+              runtime={inspectedRuntime}
               busy={busy}
               settingsBlockedReason={inspectedBookmarkBlocked
                 ? 'This bookmarked probe requires bookmarks:create to edit.'

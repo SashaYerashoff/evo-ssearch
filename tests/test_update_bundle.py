@@ -188,6 +188,8 @@ class UpdateBundleTests(unittest.TestCase):
         self.assertIn("bundled OpenCV wheel is incompatible", SCRIPT)
         self.assertIn("--ffmpeg-archive FILE", BUILD_SCRIPT)
         self.assertIn("--opencv-wheel FILE", BUILD_SCRIPT)
+        self.assertIn("--media-runtime-dir DIR", BUILD_SCRIPT)
+        self.assertIn("Media runtime checksum verification failed", BUILD_SCRIPT)
 
     def test_system_opencv_preflight_removes_root_owned_temp_payload_as_root(self):
         helper = SCRIPT.index("remove_temp_path()")
@@ -232,6 +234,22 @@ class UpdateBundleTests(unittest.TestCase):
     def test_patch_backup_records_pre_update_database_revision(self):
         self.assertIn('database_revision.txt', INSTALL_SCRIPT)
         self.assertIn('SELECT version_num FROM public.alembic_version LIMIT 1', INSTALL_SCRIPT)
+
+    def test_patch_preserves_external_vlm_policy_and_probe_state(self):
+        for key in (
+            "EVOSSEARCH_LUXRIOT_SUMMARY_STATE_FILE",
+            "EVOSSEARCH_LUXRIOT_ROLLUP_CACHE_FILE",
+            "EVOSSEARCH_PROBE_CHANNEL_GROUPS_FILE",
+        ):
+            self.assertIn(key, INSTALL_SCRIPT)
+        self.assertIn('runtime-state.tsv', INSTALL_SCRIPT)
+        self.assertIn('restored runtime state', ROLLBACK_SCRIPT)
+
+    def test_patch_bundle_can_ship_siglip2_and_installer_places_it_in_cache(self):
+        self.assertIn('--siglip2-cache-repo', BUILD_SCRIPT)
+        self.assertIn('models--google--siglip2-base-patch16-224', BUILD_SCRIPT)
+        self.assertIn('models--google--siglip2-base-patch16-224', INSTALL_SCRIPT)
+        self.assertIn('installed offline SigLIP2 cache', INSTALL_SCRIPT)
 
     def test_all_code_snapshots_exclude_runtime_private_and_large_trees(self):
         for source in (SCRIPT, INSTALL_SCRIPT, ROLLBACK_SCRIPT):

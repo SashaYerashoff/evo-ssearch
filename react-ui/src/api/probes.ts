@@ -61,6 +61,7 @@ export interface Probe {
   image_probe?: ImageProbe | null
   roi_enabled?: boolean
   roi_norm?: RoiNorm | number[] | null
+  embedding_calibration_state?: 'calibrated' | 'recalibration_required' | 'embedding_space_mismatch' | string
   recent_hits?: ProbeHit[]
   last_hit?: ProbeHit
   [k: string]: any
@@ -100,10 +101,34 @@ export interface ProbeThresholdDefaults {
   embedding_backend?: string
   embedding_model?: string
   embedding_revision?: string
+  embedding_calibration_state?: string
 }
 
-// Live capture status for a channel (GET /probes/status).
-export interface ChannelStatus { channel_id: number; runtime_state?: string; last_snapshot_ms?: number; buffer_frames?: number }
+// Live capture + semantic-scoring status for a channel (GET /probes/status).
+// `live_signal` is deliberately pre-threshold: it lets an operator tune P/N/M
+// without first manufacturing a hit.
+export interface ProbeLiveSignal extends ProbeHit {
+  threshold_state?: 'hit' | 'below_pos' | 'below_margin' | 'below_both' | string
+}
+export interface ChannelStatus {
+  channel_id: number
+  runtime_state?: 'running' | 'paused' | 'idle' | string
+  semantic_state?: 'ready' | 'warming_up' | 'degraded' | string
+  semantic_error?: string | null
+  capture_error?: string | null
+  last_snapshot_ms?: number
+  buffer_frames?: number
+  frames?: number
+  time_range_ms?: number | [number, number] | null
+  first_timestamp_ms?: number | null
+  last_timestamp_ms?: number | null
+  live_signal?: ProbeLiveSignal | null
+  signal_history?: ProbeLiveSignal[]
+  embedding_backend?: string
+  embedding_model?: string
+  embedding_revision?: string
+  embedding_calibration_state?: string
+}
 
 export function probeRangeDurationMs(status: {
   time_range_ms?: number | [number, number] | null
@@ -199,7 +224,10 @@ export const probesApi = {
   remove: (id: string): Promise<{ success: boolean; error?: string }> => api.postJson('/probes/delete', { id }),
   run: (id: string): Promise<ProbeRunResult> => api.postJson('/probes/run', { id }),
   bench: (batch = 16): Promise<Benchmark & { error?: string }> => api.get('/probes/bench', { batch: String(batch) }),
-  status: (channelId: number): Promise<any> => api.get('/probes/status', { channel_id: String(channelId) }),
+  status: (channelId: number, probeId?: string): Promise<ChannelStatus> => api.get('/probes/status', {
+    channel_id: String(channelId),
+    ...(probeId ? { probe_id: probeId } : {}),
+  }),
   cast: (payload: CastInput): Promise<CastResult> => api.postJson('/probes/cast', payload),
   startCapture: (channelId: number, fps?: number): Promise<any> => api.postJson('/probes/start_capture', { channel_id: channelId, fps }),
   stopCapture: (channelId: number): Promise<any> => api.postJson('/probes/stop_capture', { channel_id: channelId }),

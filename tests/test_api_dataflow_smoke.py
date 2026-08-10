@@ -1593,6 +1593,70 @@ class ApiDataflowSmokeTests(unittest.TestCase):
                     self.assertLess(resp.status_code, 500)
                 self.assertIn(resp.status_code, allowed)
 
+    def test_probe_status_returns_prethreshold_live_pnm(self) -> None:
+        class Session:
+            def status(self):
+                return {
+                    "running": True,
+                    "probe_last_error": None,
+                    "capture_last_error": None,
+                }
+
+        probe = {
+            "id": "probe-live",
+            "name": "Person in headphones",
+            "channel_id": 7,
+            "positives": ["person wearing headphones"],
+            "negatives": ["person without headphones"],
+            "pos_floor": 0.5,
+            "margin": 0.1,
+        }
+        scores = {
+            "frames_indexed": 2,
+            "results": [
+                {"timestamp_ms": 1000, "pos_score": 0.42, "neg_score": 0.39, "margin": 0.03},
+                {"timestamp_ms": 2000, "pos_score": 0.47, "neg_score": 0.41, "margin": 0.06},
+            ],
+        }
+        with (
+            patch.object(oldapp.probes_store, "list_probes", return_value=[probe]),
+            patch.object(oldapp.probe_manager, "status", return_value={"frames": 2}),
+            patch.object(oldapp.probe_manager, "score_frames", return_value=scores),
+            patch.object(oldapp.luxriot_manager, "sessions", {7: Session()}),
+            patch("oldapp._probe_embedding_calibration_state", return_value="calibrated"),
+        ):
+            response = self.client.get(
+                "/probes/status?channel_id=7&probe_id=probe-live"
+            )
+
+        self.assertEqual(response.status_code, 200, response.get_json())
+        payload = response.get_json()
+        self.assertEqual(payload["runtime_state"], "running")
+        self.assertEqual(payload["semantic_state"], "ready")
+        self.assertEqual(payload["live_signal"]["pos_score"], 0.47)
+        self.assertEqual(payload["live_signal"]["threshold_state"], "below_both")
+        self.assertEqual(len(payload["signal_history"]), 2)
+
+    def test_probe_status_exposes_embedder_failure_instead_of_false_running(self) -> None:
+        class Session:
+            def status(self):
+                return {
+                    "running": True,
+                    "probe_last_error": "SigLIP2 model is not available offline",
+                }
+
+        with (
+            patch.object(oldapp.probe_manager, "status", return_value={"frames": 0}),
+            patch.object(oldapp.luxriot_manager, "sessions", {7: Session()}),
+        ):
+            response = self.client.get("/probes/status?channel_id=7")
+
+        self.assertEqual(response.status_code, 200, response.get_json())
+        payload = response.get_json()
+        self.assertEqual(payload["runtime_state"], "running")
+        self.assertEqual(payload["semantic_state"], "degraded")
+        self.assertIn("SigLIP2", payload["semantic_error"])
+
     def test_deployment_feature_flags_disable_unstable_surfaces_server_side(self) -> None:
         config.OFFLINE_VIDEO_ENABLED = False
         config.PROBE_SNAP_ENABLED = False

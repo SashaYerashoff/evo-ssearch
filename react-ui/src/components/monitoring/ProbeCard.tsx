@@ -25,7 +25,7 @@ export function gateText(p: Probe): string {
 
 export function lastHit(p: Probe) { return p.last_hit || p.recent_hits?.[0] }
 
-export type ProbeStatus = 'running' | 'paused' | 'idle' | 'disabled'
+export type ProbeStatus = 'running' | 'degraded' | 'paused' | 'idle' | 'disabled'
 
 export const PROBE_ORIGIN_LABELS = {
   operator: { label: 'Operator', short: 'OP' },

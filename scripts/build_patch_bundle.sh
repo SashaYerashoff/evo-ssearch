@@ -9,6 +9,8 @@ INCLUDE_WHEELHOUSE=false
 WHEELHOUSE_DIR=""
 FFMPEG_ARCHIVE=""
 OPENCV_WHEEL=""
+MEDIA_RUNTIME_DIR=""
+SIGLIP2_CACHE_REPO=""
 PYTHON_BIN="${PYTHON:-python3}"
 
 log() {
@@ -34,6 +36,12 @@ Options:
   --wheelhouse-dir DIR  Copy an existing wheelhouse directory into the bundle.
   --ffmpeg-archive FILE Include a BtbN linux64 FFmpeg .tar.xz payload.
   --opencv-wheel FILE   Include an x86_64 opencv-python-headless wheel.
+  --media-runtime-dir DIR
+                        Reuse an already checksummed runtime/ payload from a
+                        previously validated offline bundle.
+  --siglip2-cache-repo DIR
+                        Include the complete Hugging Face cache repository for
+                        google/siglip2-base-patch16-224 (blobs/refs/snapshots).
   --python-bin PATH     Python used for pip download. Default: $PYTHON or python3.
   -h, --help            Show this help.
 
@@ -71,6 +79,14 @@ while [[ $# -gt 0 ]]; do
       OPENCV_WHEEL="$2"
       shift 2
       ;;
+    --media-runtime-dir)
+      MEDIA_RUNTIME_DIR="$2"
+      shift 2
+      ;;
+    --siglip2-cache-repo)
+      SIGLIP2_CACHE_REPO="$2"
+      shift 2
+      ;;
     --python-bin)
       PYTHON_BIN="$2"
       shift 2
@@ -98,6 +114,11 @@ need_cmd tar
 need_cmd date
 need_cmd mktemp
 
+if [[ -n "${MEDIA_RUNTIME_DIR}" && ( -n "${FFMPEG_ARCHIVE}" || -n "${OPENCV_WHEEL}" ) ]]; then
+  fail "Use either --media-runtime-dir or --ffmpeg-archive/--opencv-wheel, not both"
+  exit 2
+fi
+
 if [[ -n "${FFMPEG_ARCHIVE}" || -n "${OPENCV_WHEEL}" ]]; then
   [[ -f "${FFMPEG_ARCHIVE}" ]] || {
     fail "FFmpeg archive not found: ${FFMPEG_ARCHIVE:-<not supplied>}"
@@ -108,6 +129,30 @@ if [[ -n "${FFMPEG_ARCHIVE}" || -n "${OPENCV_WHEEL}" ]]; then
     exit 1
   }
   need_cmd sha256sum
+fi
+
+if [[ -n "${MEDIA_RUNTIME_DIR}" ]]; then
+  for relative in SHA256SUMS manifest.txt ffmpeg/bin/ffmpeg ffmpeg/bin/ffprobe ffmpeg/LICENSE.txt; do
+    [[ -f "${MEDIA_RUNTIME_DIR}/${relative}" ]] || {
+      fail "Media runtime is incomplete: ${MEDIA_RUNTIME_DIR}/${relative}"
+      exit 1
+    }
+  done
+  [[ -n "$(find "${MEDIA_RUNTIME_DIR}/opencv" -maxdepth 1 -type f -name 'opencv_python_headless-*.whl' -print -quit)" ]] || {
+    fail "Media runtime has no OpenCV wheel: ${MEDIA_RUNTIME_DIR}/opencv"
+    exit 1
+  }
+  (cd "${MEDIA_RUNTIME_DIR}" && sha256sum -c SHA256SUMS >/dev/null) || {
+    fail "Media runtime checksum verification failed: ${MEDIA_RUNTIME_DIR}"
+    exit 1
+  }
+fi
+
+if [[ -n "${SIGLIP2_CACHE_REPO}" ]]; then
+  [[ -d "${SIGLIP2_CACHE_REPO}/blobs" && -d "${SIGLIP2_CACHE_REPO}/snapshots" ]] || {
+    fail "SigLIP2 cache repository is incomplete: ${SIGLIP2_CACHE_REPO}"
+    exit 1
+  }
 fi
 
 TMP_DIR="$(mktemp -d)"
@@ -272,6 +317,31 @@ if [[ -n "${FFMPEG_ARCHIVE}" ]]; then
     find ffmpeg opencv -type f -print0 | sort -z | xargs -0 sha256sum > SHA256SUMS
   )
   ok "media runtime included"
+elif [[ -n "${MEDIA_RUNTIME_DIR}" ]]; then
+  log "Reusing checksummed offline media runtime"
+  mkdir -p "${BUNDLE_DIR}/runtime"
+  if command -v rsync >/dev/null 2>&1; then
+    rsync -a "${MEDIA_RUNTIME_DIR}/" "${BUNDLE_DIR}/runtime/"
+  else
+    tar -cf - -C "${MEDIA_RUNTIME_DIR}" . | tar -xf - -C "${BUNDLE_DIR}/runtime"
+  fi
+  ok "validated media runtime included"
+fi
+
+if [[ -n "${SIGLIP2_CACHE_REPO}" ]]; then
+  SIGLIP2_TARGET="${BUNDLE_DIR}/models/huggingface/models--google--siglip2-base-patch16-224"
+  mkdir -p "$(dirname "${SIGLIP2_TARGET}")"
+  log "Including offline SigLIP2 model cache"
+  if command -v rsync >/dev/null 2>&1; then
+    rsync -a "${SIGLIP2_CACHE_REPO}/" "${SIGLIP2_TARGET}/"
+  else
+    tar -cf - -C "${SIGLIP2_CACHE_REPO}" . | tar -xf - -C "${SIGLIP2_TARGET}"
+  fi
+  [[ -n "$(find "${SIGLIP2_TARGET}/snapshots" -mindepth 1 -maxdepth 1 -type d -print -quit)" ]] || {
+    fail "SigLIP2 cache has no materialized snapshot"
+    exit 1
+  }
+  ok "SigLIP2 offline model included"
 fi
 
 {
@@ -286,11 +356,16 @@ fi
   else
     printf 'wheelhouse=not_included\n'
   fi
-  if [[ -n "${FFMPEG_ARCHIVE}" ]]; then
+  if [[ -n "${FFMPEG_ARCHIVE}" || -n "${MEDIA_RUNTIME_DIR}" ]]; then
     printf 'media_runtime=included\n'
     printf 'media_runtime_platform=linux-x86_64\n'
   else
     printf 'media_runtime=not_included\n'
+  fi
+  if [[ -n "${SIGLIP2_CACHE_REPO}" ]]; then
+    printf 'siglip2_model=included\n'
+  else
+    printf 'siglip2_model=not_included\n'
   fi
   if [[ -n "${GIT_STATUS}" ]]; then
     printf 'working_tree_status=dirty\n'

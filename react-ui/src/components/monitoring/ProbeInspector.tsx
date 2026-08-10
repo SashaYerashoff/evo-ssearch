@@ -6,7 +6,7 @@ import {
   IconSettings,
   IconTrash,
 } from '@tabler/icons-react'
-import type { Probe } from '../../api/probes'
+import type { ChannelStatus, Probe } from '../../api/probes'
 import { hitImageSrc } from '../../api/probes'
 import {
   gateText,
@@ -24,9 +24,10 @@ function fmtDateTime(ms?: number | null): string {
   return new Date(Number(ms)).toLocaleString([], { month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit', second: '2-digit' })
 }
 
-export function ProbeInspector({ probe, status, busy, settingsBlockedReason, onSettings, onRun, onDelete, onOpenParentAlert }: {
+export function ProbeInspector({ probe, status, runtime, busy, settingsBlockedReason, onSettings, onRun, onDelete, onOpenParentAlert }: {
   probe: Probe
   status: ProbeStatus
+  runtime?: ChannelStatus | null
   busy: boolean
   settingsBlockedReason?: string
   onSettings?: () => void
@@ -35,6 +36,7 @@ export function ProbeInspector({ probe, status, busy, settingsBlockedReason, onS
   onOpenParentAlert?: (probe: Probe) => void
 }) {
   const hit = lastHit(probe)
+  const signal = runtime?.live_signal || hit
   const src = hitImageSrc(hit)
   const origin = probeOrigin(probe)
   const originView = PROBE_ORIGIN_LABELS[origin]
@@ -60,10 +62,27 @@ export function ProbeInspector({ probe, status, busy, settingsBlockedReason, onS
       {/* what matters: the last signal, front and centre */}
       <div className="pi-sec">Last signal</div>
       <ProbeSparkline probe={probe} />
+      {runtime?.semantic_error && (
+        <div className="probe-live-error pi-live-error">
+          Embedding/scoring unavailable: {runtime.semantic_error}
+        </div>
+      )}
+      {!runtime?.semantic_error && probe.embedding_calibration_state && probe.embedding_calibration_state !== 'calibrated' && (
+        <div className="probe-live-error pi-live-error">
+          This probe was created in another embedding space. Review its live P/N/M and Apply it before allowing alerts or bookmarks.
+        </div>
+      )}
       <div className="pi-scores">
-        <div><span>Positive</span><b className="pos">{n3(hit?.pos_score)}</b></div>
-        <div><span>Negative</span><b>{n3(hit?.neg_score)}</b></div>
-        <div><span>Margin</span><b className="mar">{n3(hit?.margin)}</b></div>
+        <div><span>Positive</span><b className="pos">{n3(signal?.pos_score)}</b></div>
+        <div><span>Negative</span><b>{n3(signal?.neg_score)}</b></div>
+        <div><span>Margin</span><b className="mar">{n3(signal?.margin)}</b></div>
+      </div>
+      <div className="pi-signal-meta">
+        {signal
+          ? `${runtime?.live_signal ? 'Live pre-threshold sample' : 'Last threshold hit'} · ${String(runtime?.live_signal?.threshold_state || 'hit').replace(/_/g, ' ')}`
+          : runtime?.semantic_state === 'warming_up'
+            ? 'Waiting for indexed frames.'
+            : 'No score has been computed yet.'}
       </div>
 
       {/* how it's set up: one quiet scannable list */}

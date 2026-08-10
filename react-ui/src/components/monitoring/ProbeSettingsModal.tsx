@@ -9,6 +9,7 @@ import {
   probeMutationRequiresBookmarkPermission,
   probeRangeDurationMs,
   probesApi,
+  type ChannelStatus,
   type Probe,
   type ProbeInput,
   type ProbeThresholdDefaults,
@@ -84,7 +85,7 @@ export function ProbeSettingsModal({ probe, channels, busy, canControlCapture, c
   canCreateBookmarks: boolean
   defaults: ProbeThresholdDefaults
   onClose: () => void
-  onSave: (input: ProbeInput) => void
+  onSave: (input: ProbeInput) => Promise<Probe | null>
   onCasted?: () => void
 }) {
   const [d, setD] = useState<Draft>(() => fromProbe(probe, channels, defaults))
@@ -107,19 +108,18 @@ export function ProbeSettingsModal({ probe, channels, busy, canControlCapture, c
   // live preview + capture status of the selected channel
   const [bust, setBust] = useState(1)
   const [pvErr, setPvErr] = useState(true)
-  const [st, setSt] = useState<{
-    frames?: number
-    time_range_ms?: number | [number, number] | null
-    first_timestamp_ms?: number | null
-    last_timestamp_ms?: number | null
-  }>({})
+  const [st, setSt] = useState<ChannelStatus>({ channel_id: d.channel_id ?? 0 })
+  const [applyMessage, setApplyMessage] = useState<string | null>(null)
   useEffect(() => {
-    setBust((b) => b + 1); setPvErr(true); setSt({})
-    const poll = () => { if (d.channel_id != null) probesApi.status(d.channel_id).then(setSt).catch(() => {}) }
+    setBust((b) => b + 1); setPvErr(true); setSt({ channel_id: d.channel_id ?? 0 })
+    const poll = () => {
+      if (d.channel_id != null) probesApi.status(d.channel_id, d.id).then(setSt).catch(() => {})
+    }
     poll()
-    const t = window.setInterval(() => { setBust((b) => b + 1); poll() }, 4000)
-    return () => window.clearInterval(t)
-  }, [d.channel_id])
+    const preview = window.setInterval(() => setBust((b) => b + 1), 4000)
+    const signals = window.setInterval(poll, 1200)
+    return () => { window.clearInterval(preview); window.clearInterval(signals) }
+  }, [d.channel_id, d.id])
   const previewSrc = d.channel_id != null ? recentFrameUrl(d.channel_id, bust) : ''
 
   // ROI drawing on the preview
@@ -180,7 +180,7 @@ export function ProbeSettingsModal({ probe, channels, busy, canControlCapture, c
 
   async function stopStream() {
     if (d.channel_id == null) return
-    try { await probesApi.stopCapture(d.channel_id); setSt({}) } catch { /* ignore */ }
+    try { await probesApi.stopCapture(d.channel_id); setSt({ channel_id: d.channel_id }) } catch { /* ignore */ }
   }
 
   async function applyCast() {
@@ -219,6 +219,18 @@ export function ProbeSettingsModal({ probe, channels, busy, canControlCapture, c
   const rangeDurationMs = probeRangeDurationMs(st)
   const rangeLabel = rangeDurationMs != null ? `${Math.round(rangeDurationMs / 1000)}s` : 'N/A'
   const lastLabel = st.last_timestamp_ms ? new Date(st.last_timestamp_ms).toLocaleTimeString() : 'n/a'
+  const signal = st.live_signal
+  const signalTime = signal?.timestamp_ms
+    ? new Date(Number(signal.timestamp_ms)).toLocaleTimeString()
+    : null
+
+  async function applyProbe() {
+    setApplyMessage(null)
+    const saved = await onSave(buildInput())
+    if (!saved) return
+    setD((current) => ({ ...current, id: saved.id }))
+    setApplyMessage('Applied. Live P/N/M now follows the current stream.')
+  }
 
   return (
     <div className="scrim" onClick={onClose}>
@@ -303,6 +315,35 @@ export function ProbeSettingsModal({ probe, channels, busy, canControlCapture, c
             <button className="mon-btn" onClick={() => set({ pairs: [...d.pairs, { pos: '', neg: '' }] })}><IconPlus size={14} /> Add pair</button>
           </div>
           </div>{/* /probe-detect-card */}
+
+          <div className={`probe-live-signal ${st.semantic_state || 'warming_up'}`}>
+            <div className="probe-live-head">
+              <div>
+                <span>Live semantic signal</span>
+                <b>{st.semantic_state === 'degraded'
+                  ? 'Scorer unavailable'
+                  : signal
+                    ? `${String(signal.threshold_state || 'sample').replace(/_/g, ' ')} · ${signalTime || 'now'}`
+                    : d.id
+                      ? 'Waiting for the next indexed frame'
+                      : 'Apply the probe to start scoring'}</b>
+              </div>
+              <i>{st.embedding_backend || defaults.embedding_backend || 'embedding'}</i>
+            </div>
+            {st.semantic_error ? (
+              <div className="probe-live-error"><IconAlertTriangle size={15} /> {st.semantic_error}</div>
+            ) : (
+              <div className="probe-live-values">
+                <div><span>P</span><b>{signal?.pos_score == null ? '—' : Number(signal.pos_score).toFixed(3)}</b><em>floor {d.pos_floor.toFixed(3)}</em></div>
+                <div><span>N</span><b>{signal?.neg_score == null ? '—' : Number(signal.neg_score).toFixed(3)}</b><em>negative</em></div>
+                <div><span>M</span><b>{signal?.margin == null ? '—' : Number(signal.margin).toFixed(3)}</b><em>floor {d.margin.toFixed(3)}</em></div>
+              </div>
+            )}
+            {!st.semantic_error && st.embedding_calibration_state && st.embedding_calibration_state !== 'calibrated' && (
+              <div className="probe-live-error"><IconAlertTriangle size={15} /> Legacy thresholds are in shadow mode. Apply after reviewing the live SigLIP2 scores to reactivate alerts/bookmarks.</div>
+            )}
+            <div className="probe-live-note">Raw pre-threshold scores update from saved one-second embeddings; a hit or bookmark is raised only after the configured gates pass.</div>
+          </div>
 
           {advOpen && (
             <div className="probe-panel">
@@ -397,12 +438,13 @@ export function ProbeSettingsModal({ probe, channels, busy, canControlCapture, c
               className="mon-btn accent"
               disabled={busy || bookmarkMutationBlocked}
               title={bookmarkMutationBlocked ? 'Requires bookmarks:create' : undefined}
-              onClick={() => onSave(buildInput())}
+              onClick={applyProbe}
             >
-              <IconDeviceFloppy size={15} /> {busy ? 'Saving…' : 'Save probe'}
+              <IconDeviceFloppy size={15} /> {busy ? 'Applying…' : 'Apply probe'}
             </button>
           </div>
         </div>
+        {applyMessage && <div className="probe-apply-status">{applyMessage}</div>}
 
         {/* cast panel — copy this probe onto many channels */}
         {castOpen && (

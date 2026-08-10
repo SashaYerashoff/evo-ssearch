@@ -271,6 +271,21 @@ fi
 "${RESTORE_PYTHON}" "${RESTORE_HELPER}" --archive "${BACKUP_DIR}/code.tgz" --app-dir "${APP_DIR}"
 ok "restored exact code snapshot while preserving runtime data"
 
+RUNTIME_STATE_MANIFEST="${BACKUP_DIR}/runtime-state.tsv"
+RUNTIME_STATE_DIR="${BACKUP_DIR}/runtime-state"
+if [[ -f "${RUNTIME_STATE_MANIFEST}" ]]; then
+  while IFS=$'\t' read -r state_name state_path; do
+    [[ -n "${state_name}" && -n "${state_path}" ]] || continue
+    [[ "${state_path}" = /* && "${state_path}" != "/" ]] \
+      || die "Refusing unsafe runtime-state restore path: ${state_path}"
+    state_backup="${RUNTIME_STATE_DIR}/${state_name}"
+    [[ -f "${state_backup}" ]] \
+      || die "Runtime-state backup is missing: ${state_backup}"
+    install -D -m 0600 "${state_backup}" "${state_path}"
+    ok "restored runtime state ${state_name} to ${state_path}"
+  done < "${RUNTIME_STATE_MANIFEST}"
+fi
+
 if [[ "${RESTORE_DB}" == true ]]; then
   [[ "${EVA_PATCH_CONFIRM_DB_RESTORE:-}" == "yes" ]] || die "Database restore requires EVA_PATCH_CONFIRM_DB_RESTORE=yes"
   [[ -f "${BACKUP_DIR}/postgres.dump" ]] || die "PostgreSQL dump not found in ${BACKUP_DIR}"

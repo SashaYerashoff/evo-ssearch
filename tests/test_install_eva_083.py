@@ -48,6 +48,18 @@ def env_text(values=None, *, prefix=""):
     return "\n".join(rows) + "\n"
 
 
+def make_siglip_cache(cache_root: Path) -> Path:
+    snapshot = (
+        cache_root
+        / "models--google--siglip2-base-patch16-224/snapshots"
+        / "75de2d55ec2d0b4efc50b3e9ad70dba96a7b2fa2"
+    )
+    snapshot.mkdir(parents=True, exist_ok=True)
+    (snapshot / "config.json").write_text("{}\n", encoding="utf-8")
+    (snapshot / "model.safetensors").write_bytes(b"test")
+    return snapshot
+
+
 def make_source(root: Path) -> Path:
     source = root / "source"
     for relative in (
@@ -86,6 +98,7 @@ def make_source(root: Path) -> Path:
         path.write_text(content, encoding="utf-8")
         if path.suffix == ".sh":
             path.chmod(0o755)
+    make_siglip_cache(source / "models/huggingface")
     return source
 
 
@@ -106,6 +119,7 @@ def make_options(
         python.chmod(0o755)
     bundle = root / "bundle"
     bundle.mkdir()
+    make_siglip_cache(bundle / "models/huggingface")
     return installer.InstallerOptions(
         source_dir=source,
         bundle_dir=bundle,
@@ -235,7 +249,7 @@ class OfflineInstallerUnitTests(unittest.TestCase):
                 source_stat.st_gid,
             )
 
-    def test_adopt_updates_only_managed_release_version(self):
+    def test_adopt_updates_release_identity_and_appends_siglip_runtime_defaults(self):
         existing = dict(COMPLETE_ENV)
         existing.update({
             "EVOSSEARCH_APP_VERSION": "β 0.8.1",
@@ -257,6 +271,11 @@ class OfflineInstallerUnitTests(unittest.TestCase):
             {
                 "EVOSSEARCH_APP_VERSION": installer.EXPECTED_VERSION,
                 "EVOSSEARCH_UI_MODE": "react",
+                "EVOSSEARCH_MODEL_CACHE_DIR": "/var/lib/eva-ai/models/huggingface",
+                "EVOSSEARCH_PRODUCTION_CLIP_MODEL": "google/siglip2-base-patch16-224",
+                "EVOSSEARCH_CLIP_MODEL": "google/siglip2-base-patch16-224",
+                "EVOSSEARCH_CLIP_MODEL_REVISION": "75de2d55ec2d0b4efc50b3e9ad70dba96a7b2fa2",
+                "EVOSSEARCH_EMBEDDER_FALLBACK_ENABLED": "false",
             },
         )
         self.assertEqual(values["EVOSSEARCH_APP_VERSION"], installer.EXPECTED_VERSION)
@@ -264,6 +283,31 @@ class OfflineInstallerUnitTests(unittest.TestCase):
         self.assertIn(f"EVOSSEARCH_APP_VERSION='{installer.EXPECTED_VERSION}'", rendered)
         self.assertIn("EVOSSEARCH_UI_MODE='react'", rendered)
         self.assertIn('EVOSSEARCH_HOST="10.20.30.40"', rendered)
+
+    def test_adopt_preserves_explicit_embedding_model_and_cache(self):
+        existing = dict(COMPLETE_ENV)
+        existing.update({
+            "EVOSSEARCH_MODEL_CACHE_DIR": "/srv/eva/models",
+            "EVOSSEARCH_PRODUCTION_CLIP_MODEL": "site/model",
+            "EVOSSEARCH_CLIP_MODEL": "site/model",
+            "EVOSSEARCH_CLIP_MODEL_REVISION": "site-revision",
+            "EVOSSEARCH_EMBEDDER_FALLBACK_ENABLED": "true",
+        })
+        raw = env_text(existing)
+        resolution = installer.EnvResolution(Path("/x/.env"), Path("/x/.env"), raw, existing)
+
+        values, updates, missing = installer.prepare_env_values(
+            resolution,
+            environ={},
+            non_interactive=True,
+        )
+
+        self.assertEqual(missing, [])
+        self.assertEqual(values["EVOSSEARCH_MODEL_CACHE_DIR"], "/srv/eva/models")
+        self.assertEqual(values["EVOSSEARCH_CLIP_MODEL"], "site/model")
+        self.assertEqual(values["EVOSSEARCH_EMBEDDER_FALLBACK_ENABLED"], "true")
+        self.assertNotIn("EVOSSEARCH_MODEL_CACHE_DIR", updates)
+        self.assertNotIn("EVOSSEARCH_CLIP_MODEL", updates)
 
     def test_legacy_adopt_disables_unconfigured_archive_retention(self):
         existing = dict(COMPLETE_ENV)
@@ -346,8 +390,12 @@ class OfflineInstallerUnitTests(unittest.TestCase):
 
         self.assertEqual(missing, [])
         self.assertEqual(values["EVA_DATABASE_DSN"], "postgresql://api:expanded-password@db.internal/eva")
-        self.assertEqual(updates, {})
-        self.assertEqual(installer.render_env_update(raw, updates), raw)
+        self.assertNotIn("EVA_DATABASE_DSN", updates)
+        self.assertEqual(
+            updates["EVOSSEARCH_MODEL_CACHE_DIR"],
+            "/var/lib/eva-ai/models/huggingface",
+        )
+        self.assertIn("${EVA_API_PASSWORD}", installer.render_env_update(raw, updates))
 
     def test_noninteractive_missing_configuration_is_explicit(self):
         resolution = installer.EnvResolution(None, Path("/tmp/eva-ai.env"), "", {})
@@ -988,6 +1036,7 @@ class OfflineInstallerCliTests(unittest.TestCase):
             wheelhouse = bundle / "wheelhouse"
             wheelhouse.mkdir(parents=True)
             (wheelhouse / "offline-placeholder.whl").write_bytes(b"wheel")
+            make_siglip_cache(bundle / "models/huggingface")
             app = root / "new-app"
             env_file = root / "etc/eva-ai.env"
             unit_file = root / "eva-ai.service"

@@ -2235,6 +2235,36 @@ def get_probe_embedding_space() -> Dict[str, Any]:
         return _current_clip_embedding_space_locked()
 
 
+def _probe_embedding_calibration_state(probe: Mapping[str, Any]) -> str:
+    """Say whether stored P/N/M thresholds belong to the configured space.
+
+    This metadata-only check must work even when the offline model is absent,
+    otherwise the UI cannot distinguish an uncalibrated legacy probe from a
+    healthy probe that simply has not matched yet.
+    """
+
+    expected_model = str(config.CLIP_MODEL or '').strip()
+    if 'siglip2' not in expected_model.lower():
+        return 'calibrated'
+    stored_space = (
+        probe.get('embedding_space')
+        if isinstance(probe.get('embedding_space'), Mapping)
+        else {}
+    )
+    if not stored_space:
+        return 'recalibration_required'
+    compatible = embedding_spaces_match(
+        {
+            'backend': 'siglip2',
+            'model': expected_model,
+            'revision': str(config.CLIP_MODEL_REVISION or '').strip(),
+        },
+        stored_space,
+        allow_legacy_openai_clip=False,
+    )
+    return 'calibrated' if compatible else 'embedding_space_mismatch'
+
+
 def _build_index_metadata(embedder: str, additional: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     ensure_embedder_loaded(embedder)
     base: Dict[str, Any]
@@ -10225,6 +10255,12 @@ class _RealtimeProbeBookmarkRuntime:
                 continue
             if normalize_probe_origin(probe) != "operator":
                 continue
+            # A CLIP-era threshold must never create a SigLIP2 bookmark merely
+            # because the numeric ranges happen to overlap.  The definition is
+            # preserved and remains visible, but Apply must stamp/recalibrate
+            # it in the active embedding space before it regains authority.
+            if _probe_embedding_calibration_state(probe) != 'calibrated':
+                continue
             image_probe = probe.get("image_probe")
             if isinstance(image_probe, Mapping) and bool(image_probe.get("data")) and image_probe.get("enabled") is not False:
                 continue
@@ -16603,10 +16639,134 @@ def probes_query():
 @app.route('/probes/status', methods=['GET'])
 def probes_status():
     channel_id = request.args.get('channel_id', default=config.LUXRIOT_DEFAULT_CHANNEL_ID, type=int)
+    probe_id = str(request.args.get('probe_id') or '').strip()
+    context = _current_auth_context()
+    if (
+        _auth_enabled()
+        and context is not None
+        and not _can_access_context_channel(context, channel_id)
+    ):
+        return jsonify({'error': 'Access denied'}), 403
+
+    result: Dict[str, Any] = {'channel_id': int(channel_id)}
     try:
-        return jsonify(probe_manager.status(channel_id))
+        result.update(probe_manager.status(channel_id))
     except Exception as exc:
-        return jsonify({'error': str(exc)}), 500
+        result['buffer_error'] = str(exc)[:500]
+
+    # Capture health and semantic scoring health are deliberately separate.
+    # A camera can still be producing frames while the embedding model is
+    # unavailable; calling that state simply "running" made an unscored probe
+    # indistinguishable from a healthy probe with no hits.
+    session_status: Dict[str, Any] = {}
+    try:
+        with luxriot_manager.cache_lock:
+            session = luxriot_manager.sessions.get(int(channel_id))
+        if session is not None:
+            session_status = dict(session.status())
+    except Exception as exc:
+        session_status = {'status_error': str(exc)[:500]}
+    capture_running = bool(session_status.get('running'))
+    capture_paused = bool(session_status.get('paused'))
+    result['runtime_state'] = (
+        'paused' if capture_paused else 'running' if capture_running else 'idle'
+    )
+    result['capture_error'] = session_status.get('capture_last_error')
+    semantic_error = str(
+        session_status.get('probe_last_error')
+        or result.get('buffer_error')
+        or ''
+    ).strip()
+
+    if probe_id:
+        probe = _find_probe_by_id(probe_id)
+        if not probe:
+            return jsonify({'error': 'Probe not found'}), 404
+        if _to_int(probe.get('channel_id'), 0) != int(channel_id):
+            return jsonify({'error': 'Probe does not belong to this channel'}), 400
+        result['embedding_calibration_state'] = _probe_embedding_calibration_state(probe)
+        positives = _probe_text_values(probe.get('positives'))
+        negatives = _probe_text_values(probe.get('negatives'))
+        if positives and not semantic_error:
+            probe_roi_enabled, probe_roi_norm = _parse_probe_roi(probe)
+            now_ms = int(time.time() * 1000.0)
+            live_window_sec = max(
+                10.0,
+                min(120.0, _probe_float(probe.get('window_sec'), 60.0)),
+            )
+            try:
+                scored = probe_manager.score_frames(
+                    int(channel_id),
+                    positives,
+                    negatives,
+                    min_ts_ms=now_ms - int(live_window_sec * 1000.0),
+                    max_ts_ms=now_ms,
+                    roi_norm=probe_roi_norm if probe_roi_enabled else None,
+                    roi_padding=PROBE_ROI_PADDING,
+                )
+                if isinstance(scored, Mapping) and scored.get('error'):
+                    semantic_error = str(scored.get('error') or '')[:500]
+                raw_scores = (
+                    scored.get('results')
+                    if isinstance(scored, Mapping)
+                    else None
+                )
+                if isinstance(raw_scores, Sequence) and not isinstance(
+                    raw_scores, (str, bytes, bytearray)
+                ):
+                    pos_floor = _to_float(
+                        probe.get('pos_floor'), config.PROBE_POS_FLOOR_DEFAULT
+                    )
+                    margin_floor = _to_float(
+                        probe.get('margin'), config.PROBE_MARGIN_DEFAULT
+                    )
+                    live_history: List[Dict[str, Any]] = []
+                    for raw_score in raw_scores[-60:]:
+                        if not isinstance(raw_score, Mapping):
+                            continue
+                        p_score = _to_float(raw_score.get('pos_score'), 0.0)
+                        n_score = _to_float(raw_score.get('neg_score'), 0.0)
+                        margin_score = _to_float(raw_score.get('margin'), 0.0)
+                        below_pos = p_score < pos_floor
+                        below_margin = margin_score < margin_floor
+                        live_history.append(
+                            {
+                                'timestamp_ms': _to_int(raw_score.get('timestamp_ms'), 0),
+                                'pos_score': p_score,
+                                'neg_score': n_score,
+                                'margin': margin_score,
+                                'threshold_state': (
+                                    'below_both'
+                                    if below_pos and below_margin
+                                    else 'below_pos'
+                                    if below_pos
+                                    else 'below_margin'
+                                    if below_margin
+                                    else 'hit'
+                                ),
+                            }
+                        )
+                    if live_history:
+                        result['live_signal'] = live_history[-1]
+                        result['signal_history'] = live_history
+            except Exception as exc:
+                semantic_error = f'{type(exc).__name__}: {exc}'[:500]
+
+    result['semantic_error'] = semantic_error or None
+    if semantic_error:
+        result['semantic_state'] = 'degraded'
+    elif int(result.get('frames') or 0) <= 0:
+        result['semantic_state'] = 'warming_up'
+    else:
+        result['semantic_state'] = 'ready'
+    result['embedding_backend'] = (
+        'siglip2' if 'siglip2' in str(config.CLIP_MODEL or '').lower() else 'openai_clip'
+    )
+    result['embedding_model'] = str(config.CLIP_MODEL or '')
+    result['embedding_revision'] = str(config.CLIP_MODEL_REVISION or '')
+    response = jsonify(result)
+    response.headers['Cache-Control'] = 'no-cache, no-store, must-revalidate'
+    return response
 
 
 @app.route('/probes/start_capture', methods=['POST'])
@@ -17214,6 +17374,7 @@ def probes_list():
         # Probes stored before ``origin`` existed are backfilled on read so the
         # board can filter by authorship without a store rewrite.
         probe = annotate_probe_origin(raw_probe)
+        probe['embedding_calibration_state'] = _probe_embedding_calibration_state(probe)
         expires_at_ms = _to_optional_int(probe.get("expires_at_ms"))
         expired_temporary = bool(probe.get("temporary")) and (
             expires_at_ms is not None and expires_at_ms <= now_ms

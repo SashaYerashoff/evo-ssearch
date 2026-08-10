@@ -318,6 +318,58 @@ else
   START_SERVICE=false
 fi
 
+# Runtime policy is client data, not application code.  In particular the
+# channel alert criteria live in the Luxriot summary state on older installs
+# (newer PostgreSQL-backed installs are already covered by pg_dump).  Snapshot
+# configured external files after the service has stopped so a rollback cannot
+# silently preserve code while losing the operator's VLM alert policy.
+RUNTIME_STATE_DIR="${BACKUP_DIR}/runtime-state"
+RUNTIME_STATE_MANIFEST="${BACKUP_DIR}/runtime-state.tsv"
+install -d -m 0700 "${RUNTIME_STATE_DIR}"
+: > "${RUNTIME_STATE_MANIFEST}"
+
+backup_runtime_state_file() {
+  local label="$1"
+  local configured="$2"
+  local fallback="$3"
+  local source_path="${configured}"
+  if [[ -z "${source_path}" ]]; then
+    source_path="${APP_DIR}/${fallback}"
+  elif [[ "${source_path}" != /* ]]; then
+    source_path="${APP_DIR}/${source_path}"
+  fi
+  [[ "${source_path}" = /* && "${source_path}" != "/" ]] \
+    || die "Refusing unsafe runtime-state path for ${label}: ${source_path}"
+  if [[ -f "${source_path}" ]]; then
+    install -m 0600 "${source_path}" "${RUNTIME_STATE_DIR}/${label}"
+    printf '%s\t%s\n' "${label}" "${source_path}" >> "${RUNTIME_STATE_MANIFEST}"
+    ok "backed up runtime state ${label} from ${source_path}"
+  fi
+}
+
+backup_runtime_state_file \
+  "luxriot_summary_state.json" \
+  "$(read_env_var EVOSSEARCH_LUXRIOT_SUMMARY_STATE_FILE "${ENV_FILE}")" \
+  "luxriot_summary_state.json"
+backup_runtime_state_file \
+  "luxriot_rollups_cache.json" \
+  "$(read_env_var EVOSSEARCH_LUXRIOT_ROLLUP_CACHE_FILE "${ENV_FILE}")" \
+  "luxriot_rollups_cache.json"
+backup_runtime_state_file \
+  "probe_channel_groups.json" \
+  "$(read_env_var EVOSSEARCH_PROBE_CHANNEL_GROUPS_FILE "${ENV_FILE}")" \
+  "probe_channel_groups.json"
+backup_runtime_state_file \
+  "probes_store.json" \
+  "" \
+  "probes_store.json"
+
+if [[ ! -s "${RUNTIME_STATE_MANIFEST}" ]]; then
+  rm -f "${RUNTIME_STATE_MANIFEST}"
+  rmdir "${RUNTIME_STATE_DIR}" 2>/dev/null || true
+  warn "no file-backed runtime policy found; PostgreSQL backup remains authoritative"
+fi
+
 APP_OWNER="${EVA_APP_OWNER:-$(stat -c '%U:%G' "${APP_DIR}")}"
 log "Copying patch files from ${SOURCE_DIR} to ${APP_DIR}"
 
@@ -376,6 +428,25 @@ find "${APP_DIR}" \
   \) -prune \
   -o -exec chown "${APP_OWNER}" {} +
 ok "copied patch files"
+
+SIGLIP2_SOURCE="${BUNDLE_DIR}/models/huggingface/models--google--siglip2-base-patch16-224"
+if [[ -d "${SIGLIP2_SOURCE}/blobs" && -d "${SIGLIP2_SOURCE}/snapshots" ]]; then
+  MODEL_CACHE_DIR="$(read_env_var EVOSSEARCH_MODEL_CACHE_DIR "${ENV_FILE}")"
+  if [[ -z "${MODEL_CACHE_DIR}" ]]; then
+    MODEL_CACHE_DIR="/var/lib/eva-ai/models/huggingface"
+  elif [[ "${MODEL_CACHE_DIR}" != /* ]]; then
+    die "EVOSSEARCH_MODEL_CACHE_DIR must be absolute for offline model install"
+  fi
+  SIGLIP2_TARGET="${MODEL_CACHE_DIR}/models--google--siglip2-base-patch16-224"
+  install -d -m 0750 -o "${APP_OWNER%%:*}" -g "${APP_OWNER##*:}" "${MODEL_CACHE_DIR}" "${SIGLIP2_TARGET}"
+  if command -v rsync >/dev/null 2>&1; then
+    rsync -a "${SIGLIP2_SOURCE}/" "${SIGLIP2_TARGET}/"
+  else
+    tar -cf - -C "${SIGLIP2_SOURCE}" . | tar -xf - -C "${SIGLIP2_TARGET}"
+  fi
+  chown -R "${APP_OWNER}" "${SIGLIP2_TARGET}"
+  ok "installed offline SigLIP2 cache at ${SIGLIP2_TARGET}"
+fi
 
 if [[ -d "${BUNDLE_DIR}/wheelhouse" && -x "${APP_DIR}/.venv/bin/pip" ]]; then
   log "Installing offline wheels from bundle wheelhouse"
