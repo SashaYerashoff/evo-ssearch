@@ -1044,6 +1044,72 @@ class PostgresDetectionsStore(_TenantRepository):
             raise
         return [self._row_to_dict(row, include_vectors=include_vectors) for row in rows]
 
+    def resolve_vlm_snapshot_refs(
+        self,
+        refs: Sequence[str],
+    ) -> Dict[str, Dict[str, Any]]:
+        """Resolve durable ``<batch>:snapshot:<n>`` refs to archive rows.
+
+        L0 incident memory intentionally stores compact, stable batch references
+        instead of copying image payloads into the incident tables.  The review
+        board still needs a thumbnail, so resolve every requested batch in one
+        read-only query rather than issuing one archive query per incident card.
+        """
+
+        requested: set[tuple[str, int]] = set()
+        for raw_ref in refs or ():
+            match = re.fullmatch(r"(.+):snapshot:([1-9][0-9]*)", str(raw_ref or "").strip())
+            if not match:
+                continue
+            batch_id = match.group(1).strip()
+            if not batch_id or len(batch_id) > 200:
+                continue
+            requested.add((batch_id, int(match.group(2))))
+        if not requested:
+            return {}
+
+        batch_ids = sorted({batch_id for batch_id, _ in requested})
+        try:
+            with self.lock:
+                with self.pool.transaction(self._context(), readonly=True) as connection:
+                    rows = connection.execute(
+                        """
+                        SELECT
+                            id,
+                            event_timestamp_ms,
+                            payload_json->>'batch_id' AS batch_id,
+                            (payload_json->>'snapshot_index')::integer AS snapshot_index
+                        FROM archive.detections
+                        WHERE tenant_id = %s
+                          AND source = 'vlm_summary'
+                          AND payload_json->>'batch_id' = ANY(%s)
+                          AND COALESCE(payload_json->>'snapshot_index', '') ~ '^[1-9][0-9]*$'
+                          AND (thumbnail_b64 IS NOT NULL OR image_path IS NOT NULL)
+                        ORDER BY recorded_at_ms DESC, id DESC
+                        """,
+                        (self.tenant_id, batch_ids),
+                    ).fetchall()
+        except Exception as exc:
+            if _is_missing_archive_relation(exc):
+                raise _archive_not_ready(exc) from exc
+            raise
+
+        resolved: Dict[str, Dict[str, Any]] = {}
+        for row in rows:
+            batch_id = str(row[2] or "").strip()
+            snapshot_index = int(row[3] or 0)
+            if (batch_id, snapshot_index) not in requested:
+                continue
+            ref = f"{batch_id}:snapshot:{snapshot_index}"
+            resolved.setdefault(
+                ref,
+                {
+                    "detection_id": int(row[0]),
+                    "timestamp_ms": int(row[1] or 0) or None,
+                },
+            )
+        return resolved
+
     @staticmethod
     def _feedback_row_to_dict(row: Sequence[Any]) -> Dict[str, Any]:
         return {

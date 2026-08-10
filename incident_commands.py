@@ -1708,7 +1708,44 @@ class IncidentCommandService:
             public["summary"] = incident_narrative(public)
         return public
 
-    def public_review_record(self, record: Mapping[str, Any]) -> dict[str, Any]:
+    def public_review_records(
+        self,
+        records: list[Mapping[str, Any]],
+    ) -> list[dict[str, Any]]:
+        """Project a review page and resolve all compact image refs in one query."""
+
+        refs = list(
+            dict.fromkeys(
+                str(item.get("ref") or "").strip()
+                for record in records
+                for item in record.get("evidence_refs") or []
+                if isinstance(item, Mapping)
+                and str(item.get("kind") or "").strip().lower() == "vlm_snapshot"
+                and str(item.get("ref") or "").strip()
+            )
+        )
+        resolver = getattr(self.detections_store, "resolve_vlm_snapshot_refs", None)
+        resolved: Mapping[str, Mapping[str, Any]] = {}
+        if refs and callable(resolver):
+            try:
+                candidate = resolver(refs)
+                if isinstance(candidate, Mapping):
+                    resolved = candidate
+            except Exception:
+                # Incident text and lifecycle state remain useful if archive media
+                # is temporarily unavailable; keep the review endpoint operational.
+                resolved = {}
+        return [
+            self.public_review_record(record, resolved_snapshot_refs=resolved)
+            for record in records
+        ]
+
+    def public_review_record(
+        self,
+        record: Mapping[str, Any],
+        *,
+        resolved_snapshot_refs: Mapping[str, Mapping[str, Any]] | None = None,
+    ) -> dict[str, Any]:
         """Return the bounded projection used by the incident review board.
 
         The board may render hundreds of incidents.  Sending complete timelines,
@@ -1770,11 +1807,22 @@ class IncidentCommandService:
             "control": 6,
         }
         for item in evidence:
-            detection_id = self._optional_int(item.get("detection_id") or item.get("id"))
+            ref = str(item.get("ref") or "").strip()
+            resolved_ref = (
+                resolved_snapshot_refs.get(ref)
+                if ref and isinstance(resolved_snapshot_refs, Mapping)
+                else None
+            )
+            resolved_ref = resolved_ref if isinstance(resolved_ref, Mapping) else {}
+            detection_id = self._optional_int(
+                item.get("detection_id")
+                or item.get("id")
+                or resolved_ref.get("detection_id")
+            )
             if detection_id is None or detection_id <= 0:
                 continue
             role = str(item.get("role") or item.get("kind") or "evidence").lower()
-            timestamp = item_timestamp(item) or 0
+            timestamp = item_timestamp(item) or self._optional_int(resolved_ref.get("timestamp_ms")) or 0
             cover_candidates.append((role_priority.get(role, 7), -timestamp, detection_id, role))
         anchor = record.get("anchor_ref")
         if isinstance(anchor, Mapping):

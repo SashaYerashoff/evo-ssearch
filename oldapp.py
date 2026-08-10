@@ -3077,10 +3077,11 @@ def incident_list():
         return jsonify({"error": "incident_list_failed"}), 500
     service = _incident_command_service()
     records = [service.reconcile_expired_follow(record) for record in records]
-    public_records = [
-        service.public_review_record(record) if view == "review" else service.public_record(record)
-        for record in records
-    ]
+    public_records = (
+        service.public_review_records(records)
+        if view == "review"
+        else [service.public_record(record) for record in records]
+    )
     return jsonify(
         {
             "success": True,

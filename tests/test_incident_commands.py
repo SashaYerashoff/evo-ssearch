@@ -638,6 +638,49 @@ def test_operator_confirmed_ended_episode_stays_active_until_case_closure():
     assert review["observed_duration_ms"] == 20_000
 
 
+def test_review_page_resolves_compact_vlm_snapshot_refs_to_cover_images():
+    class _Detections:
+        def __init__(self):
+            self.calls = []
+
+        def resolve_vlm_snapshot_refs(self, refs):
+            self.calls.append(list(refs))
+            return {
+                "vlm-batch-1:snapshot:3": {
+                    "detection_id": 9300,
+                    "timestamp_ms": 30_000,
+                }
+            }
+
+    detections = _Detections()
+    service = IncidentCommandService(
+        _Store(),
+        detections,
+        object(),
+        _Runtime(),
+        wall_clock_ms=lambda: 90_000,
+    )
+    record = {
+        **_record(state="draft"),
+        "evidence_refs": [
+            {
+                "kind": "vlm_snapshot",
+                "ref": "vlm-batch-1:snapshot:3",
+                "role": "event",
+            }
+        ],
+    }
+
+    review = service.public_review_records([record])[0]
+
+    assert detections.calls == [["vlm-batch-1:snapshot:3"]]
+    assert review["cover"] == {
+        "detection_id": 9300,
+        "timestamp_ms": 30_000,
+        "role": "event",
+    }
+
+
 def test_expired_follow_is_durably_finalized_with_operator_result():
     store = _Store()
     store.record["follow_policy"] = {

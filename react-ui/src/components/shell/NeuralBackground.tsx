@@ -68,6 +68,11 @@ const AURORA_COLORS = [CYAN, VIOLET, BLUE, [120, 150, 245]] as const
 const AURORA_N = 5
 const AURORA_SPEED = 0.05  // fraction of a lissajous cycle per second-ish — extremely slow
 const AURORA_ALPHA = 0.08  // per-blob opacity (normal blending — overlaps stay bounded)
+// This is ambient, very slow motion. Painting full-screen radial gradients at the
+// monitor refresh rate needlessly competes with local CUDA inference on demo hosts
+// where the display and VLM share a small GPU. Twenty frames per second remains
+// visually fluid at these speeds while leaving substantially more compositor time.
+const PAINT_INTERVAL_MS = 50
 
 export function NeuralBackground({ noAnim = false }: { noAnim?: boolean }) {
   const ref = useRef<HTMLCanvasElement>(null)
@@ -102,7 +107,7 @@ export function NeuralBackground({ noAnim = false }: { noAnim?: boolean }) {
     }
 
     function build() {
-      const dpr = Math.min(window.devicePixelRatio || 1, 2)
+      const dpr = Math.min(window.devicePixelRatio || 1, 1.5)
       w = window.innerWidth
       h = window.innerHeight
       cv.width = Math.round(w * dpr)
@@ -222,6 +227,10 @@ export function NeuralBackground({ noAnim = false }: { noAnim?: boolean }) {
     }
 
     function draw(now: number) {
+      if (!still && last && now - last < PAINT_INTERVAL_MS) {
+        raf = requestAnimationFrame(draw)
+        return
+      }
       const dt = Math.min(0.05, last ? (now - last) / 1000 : 0.016)
       last = now
       const time = now / 1000
