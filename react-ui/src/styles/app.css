@@ -103,7 +103,7 @@
 .home-screen {
   position: absolute; inset: 0; overflow: hidden;
   display: flex; align-items: center; justify-content: center;
-  background: radial-gradient(900px 620px at 50% 40%, rgba(18,28,56,0.85), transparent 72%);
+  background: transparent;
   animation: splash-in .25s ease;
   pointer-events: none;   /* rail / agent stay clickable above it; the svg re-enables its own */
 }
