@@ -470,9 +470,9 @@
 .atp-tabpanel-content {
   flex: 1 1 auto; min-width: 0; min-height: var(--atp-panel-content-height);
   display: flex; align-items: center; padding: 12px 14px;
-  background: var(--panel); border: 1px solid var(--line-2); border-radius: 12px;
-  backdrop-filter: blur(14px); -webkit-backdrop-filter: blur(14px);
-  box-shadow: var(--elev);
+  background: transparent; border: 0; border-radius: 0;
+  backdrop-filter: none; -webkit-backdrop-filter: none;
+  box-shadow: none;
 }
 .atp-content-row { flex: 1 1 auto; min-width: 0; display: flex; align-items: stretch; gap: 8px; }
 .atp-open { flex: 1 1 auto; width: 100%; min-width: 0; }
