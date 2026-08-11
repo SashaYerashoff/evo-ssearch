@@ -37,10 +37,14 @@ export function MenuRailTrigger({ open, onToggle }: MenuRailTriggerProps) {
       aria-label={open ? t('nav.closeMenu') : t('nav.openMenu')}
       aria-expanded={open}
       aria-controls="eva-main-menu"
-      title={open ? t('nav.closeMenu') : t('nav.openMenu')}
-      onClick={onToggle}
-    >
-      <span className="menu-rail-lines" aria-hidden="true" />
+    title={open ? t('nav.closeMenu') : t('nav.openMenu')}
+    onClick={onToggle}
+  >
+      <span className="menu-rail-lines" aria-hidden="true">
+        <span />
+        <span />
+        <span />
+      </span>
     </button>
   )
 }
