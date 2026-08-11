@@ -4,9 +4,7 @@ import {
   IconAlertTriangle,
   IconFilter,
   IconLetterT,
-  IconLoader2,
   IconPhoto,
-  IconSearch,
   IconSparkles,
 } from '@tabler/icons-react'
 import type { Channel, Detection, ArchiveFilters } from '../../api/types'
@@ -452,13 +450,9 @@ export function ArchiveScreen({
           const v = textValue.trim()
           if (v && !textSearchPending) void runText(v)
         }}>
-          <input placeholder="describe an archived scene…" autoFocus={!agentTyping}
+          <input placeholder="describe an archived scene…" aria-label="Text query — press Enter to search" autoFocus={!agentTyping}
             value={textValue} readOnly={agentTyping} className={agentTyping ? 'agent-caret' : ''}
             onChange={(e) => setTextValue(e.target.value)} />
-          <button className="btn primary atp-search-submit" disabled={agentTyping || textSearchPending || !textValue.trim()}>
-            {textSearchPending ? <IconLoader2 className="spin" size={15} /> : <IconSearch size={15} />}
-            {textSearchPending ? 'Searching…' : 'Search'}
-          </button>
         </form>
         <span className="sr-only" role="status" aria-live="polite">
           {textSearchPending ? 'Semantic archive search in progress.' : ''}
