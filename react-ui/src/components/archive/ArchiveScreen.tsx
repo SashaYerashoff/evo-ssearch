@@ -436,13 +436,9 @@ export function ArchiveScreen({
       : scoreThreshold > 0
         ? `≥ ${formatArchiveScore(scoreThreshold)}`
         : 'All'
-  const textSummary = textSearchPending
-    ? 'Searching archive…'
-    : (q ? `“${q.length > 26 ? q.slice(0, 26) + '…' : q}”` : '—') + (scoreThreshold > 0 ? ` · ${scoreLabel}` : '')
-
   const TOOL_META: Record<typeof openTool, { Icon: any; label: string; summary: string }> = {
     filters: { Icon: IconFilter, label: 'Filters', summary: filtersSummary },
-    text: { Icon: IconLetterT, label: 'Text query', summary: textSummary },
+    text: { Icon: IconLetterT, label: 'Text query', summary: '—' },
     image: { Icon: IconPhoto, label: 'Image', summary: '—' },
   }
 
