@@ -15,6 +15,7 @@ import re
 import struct
 import time
 import urllib.request
+import urllib.parse
 import zlib
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -47,6 +48,23 @@ class VisionCanaryResult:
     ok: bool
     expected: str
     observed: str
+    latency_ms: float
+    error: str = ""
+
+
+@dataclass(frozen=True)
+class EndpointLivenessResult:
+    ok: bool
+    latency_ms: float
+    error: str = ""
+
+
+@dataclass(frozen=True)
+class EndpointWorkloadResult:
+    known: bool
+    busy: bool
+    processing: int
+    deferred: int
     latency_ms: float
     error: str = ""
 
@@ -191,16 +209,14 @@ def probe_vision(
         normalized_tokens = _normalized_answer(observed).split()
         if normalized_tokens[:2] == ["VISION", "OK"]:
             normalized_tokens = normalized_tokens[2:]
-        observed_code = normalized_tokens[0] if normalized_tokens else ""
         observed_colors = normalized_tokens[1:4]
-        matching_digits = sum(
-            left == right for left, right in zip(code, observed_code)
-        ) if len(observed_code) == len(code) and observed_code.isdigit() else 0
-        # OCR is not the workload under test. A healthy 4B may confuse one
-        # block digit while still proving that it received a fresh image.
-        # Strict random colour order plus >=3 matching nonce digits keeps the
-        # probability of a stale prior canary passing below 0.1%.
-        ok = observed_colors == colors and matching_digits >= 3
+        # OCR is not the workload under test and proved noisy enough on a 4B
+        # model to restart a healthy, busy endpoint.  The randomly permuted
+        # colour blocks remain fresh visual evidence; the digits are retained
+        # as advisory telemetry, but cannot devalidate vision by themselves.
+        # A stale encoder has only a 1/6 chance of matching one check's colour
+        # order and must evade several consecutive checks before recovery.
+        ok = observed_colors == colors
         return VisionCanaryResult(
             ok=ok,
             expected=expected,
@@ -213,6 +229,143 @@ def probe_vision(
             ok=False,
             expected=expected,
             observed="",
+            latency_ms=round((time.monotonic() - started) * 1000.0, 3),
+            error=f"{type(exc).__name__}: {exc}"[:500],
+        )
+
+
+def is_timeout_error(error: str) -> bool:
+    """Return whether a canary failure is compatible with queue saturation."""
+
+    normalized = str(error or "").strip().lower()
+    return any(
+        marker in normalized
+        for marker in ("timeout", "timed out", "deadline exceeded")
+    )
+
+
+def probe_openai_liveness(
+    base_url: str,
+    model: str,
+    *,
+    api_key: str = "",
+    timeout_sec: float = 3.0,
+) -> EndpointLivenessResult:
+    """Verify that the OpenAI endpoint is alive without entering its LM queue."""
+
+    headers: dict[str, str] = {}
+    if str(api_key).strip():
+        headers["Authorization"] = f"Bearer {str(api_key).strip()}"
+    request = urllib.request.Request(
+        str(base_url).rstrip("/") + "/models",
+        headers=headers,
+        method="GET",
+    )
+    started = time.monotonic()
+    try:
+        with urllib.request.urlopen(
+            request,
+            timeout=max(1.0, float(timeout_sec)),
+        ) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+        raw_models = payload.get("data") or payload.get("models") or []
+        model_ids = {
+            str(item.get("id") or item.get("name") or item.get("model") or "").strip()
+            for item in raw_models
+            if isinstance(item, Mapping)
+        }
+        expected_model = str(model or "").strip()
+        if expected_model and model_ids and expected_model not in model_ids:
+            return EndpointLivenessResult(
+                ok=False,
+                latency_ms=round((time.monotonic() - started) * 1000.0, 3),
+                error="configured_model_not_listed",
+            )
+        return EndpointLivenessResult(
+            ok=True,
+            latency_ms=round((time.monotonic() - started) * 1000.0, 3),
+        )
+    except Exception as exc:
+        return EndpointLivenessResult(
+            ok=False,
+            latency_ms=round((time.monotonic() - started) * 1000.0, 3),
+            error=f"{type(exc).__name__}: {exc}"[:500],
+        )
+
+
+def probe_openai_workload(
+    base_url: str,
+    *,
+    api_key: str = "",
+    timeout_sec: float = 2.0,
+) -> EndpointWorkloadResult:
+    """Read llama.cpp/vLLM queue gauges without entering the LM queue."""
+
+    parsed = urllib.parse.urlsplit(str(base_url).rstrip("/"))
+    metrics_path = parsed.path.rstrip("/")
+    if metrics_path.endswith("/v1"):
+        metrics_path = metrics_path[:-3]
+    metrics_url = urllib.parse.urlunsplit(
+        (parsed.scheme, parsed.netloc, f"{metrics_path}/metrics", "", "")
+    )
+    headers: dict[str, str] = {"Accept": "text/plain"}
+    if str(api_key).strip():
+        headers["Authorization"] = f"Bearer {str(api_key).strip()}"
+    request = urllib.request.Request(metrics_url, headers=headers, method="GET")
+    started = time.monotonic()
+    processing_names = {
+        "llamacpp:requests_processing",
+        "vllm:num_requests_running",
+    }
+    deferred_names = {
+        "llamacpp:requests_deferred",
+        "vllm:num_requests_waiting",
+    }
+    try:
+        with urllib.request.urlopen(
+            request,
+            timeout=max(1.0, float(timeout_sec)),
+        ) as response:
+            body = response.read().decode("utf-8", errors="replace")
+        processing = 0
+        deferred = 0
+        known = False
+        for raw_line in body.splitlines():
+            line = raw_line.strip()
+            if not line or line.startswith("#"):
+                continue
+            parts = line.split()
+            if len(parts) < 2:
+                continue
+            metric_name = parts[0].split("{", 1)[0]
+            if metric_name not in processing_names | deferred_names:
+                continue
+            try:
+                value = max(0, int(float(parts[-1])))
+            except (TypeError, ValueError):
+                continue
+            known = True
+            if metric_name in processing_names:
+                processing += value
+            else:
+                deferred += value
+        return EndpointWorkloadResult(
+            known=known,
+            # A running request is already consuming the only slot on common
+            # edge deployments.  Waiting only for a deferred request lets the
+            # watchdog race a live batch and create the queue it is meant to
+            # avoid.
+            busy=bool(known and (processing > 0 or deferred > 0)),
+            processing=processing,
+            deferred=deferred,
+            latency_ms=round((time.monotonic() - started) * 1000.0, 3),
+        )
+    except Exception as exc:
+        return EndpointWorkloadResult(
+            known=False,
+            busy=False,
+            processing=0,
+            deferred=0,
             latency_ms=round((time.monotonic() - started) * 1000.0, 3),
             error=f"{type(exc).__name__}: {exc}"[:500],
         )
@@ -252,8 +405,13 @@ def utc_now_iso() -> str:
 
 
 __all__ = [
+    "EndpointLivenessResult",
+    "EndpointWorkloadResult",
     "VisionCanaryResult",
     "build_control_png",
+    "is_timeout_error",
+    "probe_openai_liveness",
+    "probe_openai_workload",
     "probe_vision",
     "read_health_state",
     "utc_now_iso",

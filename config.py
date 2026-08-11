@@ -23,10 +23,17 @@ CONFIG_ENV_FILE_BEFORE_DOTENV = str(
     os.environ.get("EVOSSEARCH_CONFIG_ENV_FILE") or ""
 ).strip()
 
-# Load .env file if it exists
+# Load the same env file declared by the service when one is explicit.  A
+# systemd EnvironmentFile still wins because python-dotenv does not override
+# existing process variables, but direct/admin launches now inspect the same
+# file that Settings will update instead of an unrelated cwd ``.env``.
 try:
     from dotenv import load_dotenv
-    env_path = Path('.') / '.env'
+    env_path = (
+        Path(CONFIG_ENV_FILE_BEFORE_DOTENV).expanduser()
+        if CONFIG_ENV_FILE_BEFORE_DOTENV
+        else Path('.') / '.env'
+    )
     if env_path.exists():
         load_dotenv(env_path)
 except ImportError:
@@ -602,9 +609,9 @@ class Config:
         LUXRIOT_LIVE_SEGMENT_EVERY_N = 25
     LUXRIOT_LIVE_SEGMENT_EVERY_N = max(1, min(240, LUXRIOT_LIVE_SEGMENT_EVERY_N))
     try:
-        LUXRIOT_LIVE_SEGMENT_FPS = float(os.getenv('EVOSSEARCH_LUXRIOT_LIVE_SEGMENT_FPS', '3.0'))
+        LUXRIOT_LIVE_SEGMENT_FPS = float(os.getenv('EVOSSEARCH_LUXRIOT_LIVE_SEGMENT_FPS', '2.0'))
     except (TypeError, ValueError):
-        LUXRIOT_LIVE_SEGMENT_FPS = 3.0
+        LUXRIOT_LIVE_SEGMENT_FPS = 2.0
     LUXRIOT_LIVE_SEGMENT_FPS = max(0.2, min(10.0, LUXRIOT_LIVE_SEGMENT_FPS))
     try:
         LUXRIOT_SUMMARY_MAX_BATCH_FRAMES = int(
@@ -795,10 +802,10 @@ class Config:
     )
     try:
         LIVE_CLIP_BATCH_TIMEOUT_SEC = float(
-            os.getenv('EVOSSEARCH_LIVE_CLIP_BATCH_TIMEOUT_SEC', '15')
+            os.getenv('EVOSSEARCH_LIVE_CLIP_BATCH_TIMEOUT_SEC', '45')
         )
     except (TypeError, ValueError):
-        LIVE_CLIP_BATCH_TIMEOUT_SEC = 15.0
+        LIVE_CLIP_BATCH_TIMEOUT_SEC = 45.0
     LIVE_CLIP_BATCH_TIMEOUT_SEC = max(
         1.0,
         min(120.0, LIVE_CLIP_BATCH_TIMEOUT_SEC),
@@ -912,7 +919,13 @@ class Config:
             'EVOSSEARCH_LUXRIOT_L0_VISION_BUDGET_TOKENS', 5500, 512, 65536
         ),
         'LUXRIOT_L0_OUTPUT_BUDGET_TOKENS': (
-            'EVOSSEARCH_LUXRIOT_L0_OUTPUT_BUDGET_TOKENS', 1536, 256, 32768
+            'EVOSSEARCH_LUXRIOT_L0_OUTPUT_BUDGET_TOKENS', 512, 256, 32768
+        ),
+        'LUXRIOT_L0_HEARTBEAT_OUTPUT_TOKENS': (
+            'EVOSSEARCH_LUXRIOT_L0_HEARTBEAT_OUTPUT_TOKENS', 384, 256, 32768
+        ),
+        'LUXRIOT_L0_EVENT_OUTPUT_TOKENS': (
+            'EVOSSEARCH_LUXRIOT_L0_EVENT_OUTPUT_TOKENS', 512, 256, 32768
         ),
         'LUXRIOT_L0_INCIDENT_BUDGET_TOKENS': (
             'EVOSSEARCH_LUXRIOT_L0_INCIDENT_BUDGET_TOKENS', 900, 128, 16384
@@ -1053,7 +1066,10 @@ class Config:
     except (TypeError, ValueError):
         LUXRIOT_VECTOR_SIGNAL_TOP_HITS = 2
     LUXRIOT_VECTOR_SIGNAL_TOP_HITS = max(1, min(5, LUXRIOT_VECTOR_SIGNAL_TOP_HITS))
-    LUXRIOT_ROAD_CV_BATCH_SIGNALS = os.getenv('EVOSSEARCH_LUXRIOT_ROAD_CV_BATCH_SIGNALS', 'true').strip().lower() not in {'0', 'false', 'no', 'off'}
+    # Road geometry is an opt-in domain ray. Running it for every ordinary
+    # room/coastline channel adds seconds of CPU work to every L0 batch and can
+    # delay the visual model without adding meaningful evidence.
+    LUXRIOT_ROAD_CV_BATCH_SIGNALS = os.getenv('EVOSSEARCH_LUXRIOT_ROAD_CV_BATCH_SIGNALS', 'false').strip().lower() not in {'0', 'false', 'no', 'off'}
     try:
         LUXRIOT_ROAD_CV_BATCH_MAX_FRAMES = int(os.getenv('EVOSSEARCH_LUXRIOT_ROAD_CV_BATCH_MAX_FRAMES', '24'))
     except (TypeError, ValueError):
@@ -1072,7 +1088,11 @@ class Config:
         LUXRIOT_ROAD_SCENE_CALIBRATION_SAMPLES = 8
     LUXRIOT_ROAD_SCENE_CALIBRATION_SAMPLES = max(4, min(64, LUXRIOT_ROAD_SCENE_CALIBRATION_SAMPLES))
     # One VLM request must never exceed the bounded L0 delivery contract.
-    LUXRIOT_BATCH_SIZES = (12, 16)
+    # Keep this list in sync with the React stream-settings selector.  The
+    # explicit default must not depend on ordering: operators may deliberately
+    # choose a smaller batch to trade visual coverage for lower alert latency.
+    LUXRIOT_BATCH_SIZES = (4, 8, 12, 16)
+    LUXRIOT_DEFAULT_BATCH_SIZE = 12
     try:
         LUXRIOT_SUMMARY_RETENTION_DAYS = float(
             os.getenv('EVOSSEARCH_LUXRIOT_SUMMARY_RETENTION_DAYS', '7')
@@ -1090,7 +1110,7 @@ class Config:
     except (TypeError, ValueError):
         LUXRIOT_ROLLUP_RETENTION_DAYS = float(ARCHIVE_ROW_RETENTION_DAYS)
     LUXRIOT_ROLLUP_RETENTION_DAYS = max(0.0, LUXRIOT_ROLLUP_RETENTION_DAYS)
-    _SUMMARY_DEFAULT_BATCH = LUXRIOT_BATCH_SIZES[0] if LUXRIOT_BATCH_SIZES else 12
+    _SUMMARY_DEFAULT_BATCH = LUXRIOT_DEFAULT_BATCH_SIZE
     _SUMMARY_DEFAULT_LIMIT = int(
         max(
             600,
@@ -1278,6 +1298,36 @@ class Config:
     LUXRIOT_ROLLUP_SCHEDULER_SPACING_SEC = max(
         1.0,
         min(300.0, LUXRIOT_ROLLUP_SCHEDULER_SPACING_SEC),
+    )
+    try:
+        LUXRIOT_ROLLUP_L1_SETTLE_DELAY_SEC = float(
+            os.getenv('EVOSSEARCH_LUXRIOT_ROLLUP_L1_SETTLE_DELAY_SEC', '30')
+        )
+    except (TypeError, ValueError):
+        LUXRIOT_ROLLUP_L1_SETTLE_DELAY_SEC = 30.0
+    LUXRIOT_ROLLUP_L1_SETTLE_DELAY_SEC = max(
+        0.0,
+        min(1800.0, LUXRIOT_ROLLUP_L1_SETTLE_DELAY_SEC),
+    )
+    try:
+        LUXRIOT_ROLLUP_L2_SETTLE_DELAY_SEC = float(
+            os.getenv('EVOSSEARCH_LUXRIOT_ROLLUP_L2_SETTLE_DELAY_SEC', '120')
+        )
+    except (TypeError, ValueError):
+        LUXRIOT_ROLLUP_L2_SETTLE_DELAY_SEC = 120.0
+    LUXRIOT_ROLLUP_L2_SETTLE_DELAY_SEC = max(
+        0.0,
+        min(1800.0, LUXRIOT_ROLLUP_L2_SETTLE_DELAY_SEC),
+    )
+    try:
+        LUXRIOT_ROLLUP_L3_SETTLE_DELAY_SEC = float(
+            os.getenv('EVOSSEARCH_LUXRIOT_ROLLUP_L3_SETTLE_DELAY_SEC', '300')
+        )
+    except (TypeError, ValueError):
+        LUXRIOT_ROLLUP_L3_SETTLE_DELAY_SEC = 300.0
+    LUXRIOT_ROLLUP_L3_SETTLE_DELAY_SEC = max(
+        0.0,
+        min(1800.0, LUXRIOT_ROLLUP_L3_SETTLE_DELAY_SEC),
     )
     try:
         LUXRIOT_ROLLUP_SCHEDULER_BACKFILL_WINDOWS = int(

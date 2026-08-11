@@ -10,6 +10,7 @@ import { UsersTab } from './UsersTab'
 import { DiagnosticsTab } from './DiagnosticsTab'
 import { Dropdown } from '../shell/Dropdown'
 import { AppearanceModal } from '../appearance/AppearanceModal'
+import { buildSettingsPatch } from './settingsPatch'
 
 const DEFAULTS: Settings = {
   host: '0.0.0.0', port: 5000, debug: false,
@@ -77,6 +78,7 @@ export function SettingsModal({
   const [tab, setTab] = useState('server')
   const [loading, setLoading] = useState(true)
   const [saving, setSaving] = useState(false)
+  const [dirtyKeys, setDirtyKeys] = useState<Set<string>>(() => new Set())
   const [status, setStatus] = useState<{ msg: string; ok: boolean } | null>(null)
   const [settingsLoadError, setSettingsLoadError] = useState('')
   const [capacity, setCapacity] = useState<any>(null)
@@ -117,6 +119,7 @@ export function SettingsModal({
         .then((r) => {
           if (!r?.success || !r.settings) throw new Error('Settings response is incomplete')
           setS(mergeSettings(r.settings))
+          setDirtyKeys(new Set())
           setSettingsLoadError('')
         })
         .catch((error: any) => {
@@ -132,27 +135,43 @@ export function SettingsModal({
     void loadCapacity(false)
   }, [canReadSettings, loadCapacity, mergeSettings])
 
-  const patch = useCallback((k: string, v: any) => setS((x) => ({ ...x, [k]: v })), [])
-  const patchSev = (k: string, v: string) => setS((x) => ({ ...x, luxriotSeverityMap: { ...(x.luxriotSeverityMap || {}), [k]: v } }))
+  const patch = useCallback((k: string, v: any) => {
+    setS((x) => ({ ...x, [k]: v }))
+    setDirtyKeys((current) => new Set(current).add(k))
+  }, [])
+  const patchSev = (k: string, v: string) => {
+    setS((x) => ({ ...x, luxriotSeverityMap: { ...(x.luxriotSeverityMap || {}), [k]: v } }))
+    setDirtyKeys((current) => new Set(current).add('luxriotSeverityMap'))
+  }
 
   async function save() {
     setSaving(true); setStatus(null)
     try {
-      const payload: Settings = {}
-      for (const k of WRITABLE_KEYS) {
-        if (['luxriotPassword', 'vlmApiKey', 'agentApiKey'].includes(k) && !s[k]) continue // blank = keep current
-        if (s[k] !== undefined) payload[k] = s[k]
+      const payload = buildSettingsPatch(s, dirtyKeys, WRITABLE_KEYS)
+      if (!Object.keys(payload).length) throw new Error('No settings changed')
+      if (Number(s.minResults) > Number(s.maxResults)) throw new Error('Min results must not exceed max results')
+      if (Number(s.defaultResults) < Number(s.minResults) || Number(s.defaultResults) > Number(s.maxResults)) {
+        throw new Error('Default results must be between min and max results')
       }
-      if (Number(payload.minResults) > Number(payload.maxResults)) throw new Error('Min results must not exceed max results')
       const r = await settingsApi.save(payload)
       if (!r.success) throw new Error(r.error || 'Save failed')
       setS((current) => ({ ...current, luxriotPassword: '', vlmApiKey: '', agentApiKey: '' }))
-      setStatus({ msg: r.message || 'Settings saved. Some changes need a server restart.', ok: true })
+      setDirtyKeys(new Set())
+      const pending = r.pendingOrOverriddenKeys || []
+      const sourceUnknown = r.precedence?.declared_file_matches_project === false
+      const detail = pending.length
+        ? ` Restart required for ${pending.length} environment-backed change${pending.length === 1 ? '' : 's'}.`
+        : ''
+      const sourceWarning = sourceUnknown
+        ? ' Service env ownership is not declared; verify the systemd EnvironmentFile before restart.'
+        : ''
+      setStatus({ msg: `${r.message || 'Settings saved.'}${detail}${sourceWarning}`, ok: !sourceUnknown })
     } catch (e: any) { setStatus({ msg: e?.message || 'Save failed', ok: false }) }
     finally { setSaving(false) }
   }
   function reset() {
     setS((x) => ({ ...x, ...DEFAULTS, luxriotSeverityMap: { ...DEFAULTS.luxriotSeverityMap } }))
+    setDirtyKeys(new Set(WRITABLE_KEYS.filter((key) => !['luxriotPassword', 'vlmApiKey', 'agentApiKey'].includes(key))))
     setStatus({ msg: 'Reverted to defaults — press Save settings to persist.', ok: true })
   }
 
@@ -195,9 +214,9 @@ export function SettingsModal({
               href="/ui-assets/quick-start.html"
               target="_blank"
               rel="noreferrer"
-              title="Atvērt EVA AI operatora īso instrukciju"
+              title="Open the EVA AI operator quick-start guide"
             >
-              <IconHelpCircle size={15} /> Īsā instrukcija
+              <IconHelpCircle size={15} /> Operator guide
             </a>
             <button className="modal-close" onClick={onClose}><IconX size={18} /></button>
           </div>
@@ -229,6 +248,16 @@ export function SettingsModal({
             )}
             {!loading && settingsLoadError && (
               <div className="set-load-error">{settingsLoadError}. Showing safe defaults; saving is disabled until the live configuration can be read.</div>
+            )}
+            {!loading && !settingsLoadError && s.envPrecedence?.declared_file_matches_project === false && (
+              <div className="set-load-error">
+                The service configuration file is not declared. Settings can update {s.envFile || './.env'}, but a restart may load different process-level values.
+              </div>
+            )}
+            {!loading && activeId === 'models' && (
+              <div className="set-note" style={{ marginBottom: 12 }}>
+                Editing active profiles: VLM <b>{s.vlmProfileId || 'default'}</b>, Agent <b>{s.agentProfileId || 'default'}</b>. Other configured inference profiles are preserved.
+              </div>
             )}
             {!loading && !activeTab && (
               <div className="set-load-error">
@@ -318,7 +347,7 @@ export function SettingsModal({
           {activeTab && !activeTab.custom && canManageSettings && !loading && !settingsLoadError && (
             <div className="set-actions">
               <button className="mon-btn" onClick={reset}><IconRotate size={15} /> Reset to defaults</button>
-              <button className="mon-btn accent" disabled={saving} onClick={save}><IconDeviceFloppy size={15} /> {saving ? 'Saving…' : 'Save settings'}</button>
+              <button className="mon-btn accent" disabled={saving || dirtyKeys.size === 0} onClick={save}><IconDeviceFloppy size={15} /> {saving ? 'Saving…' : `Save settings${dirtyKeys.size ? ` (${dirtyKeys.size})` : ''}`}</button>
             </div>
           )}
         </div>

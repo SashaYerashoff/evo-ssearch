@@ -129,7 +129,6 @@ def _common_payload(arguments: Mapping[str, Any], result: Mapping[str, Any]) -> 
             "until_ms",
             "from_ts",
             "to_ts",
-            "depth",
         ),
     )
     channel_ids = arguments.get("channel_ids")
@@ -170,12 +169,58 @@ def _probe_payload(arguments: Mapping[str, Any], result: Mapping[str, Any]) -> d
 
 
 def _video_payload(arguments: Mapping[str, Any], result: Mapping[str, Any]) -> dict[str, Any]:
-    payload = _pick(arguments, result, keys=("depth", "relative_range", "since_hours"))
+    explicit_scope_keys = (
+        "relative_range",
+        "since_hours",
+        "from_ts",
+        "to_ts",
+        "since_ms",
+        "until_ms",
+    )
+    explicit_scope = any(
+        arguments.get(key) is not None and str(arguments.get(key)).strip() != ""
+        for key in explicit_scope_keys
+    )
+    payload = _pick(arguments, result, keys=("relative_range", "since_hours"))
+    # A passive read with the tool's implicit default window may navigate to
+    # Video, but must not overwrite the operator's current Live/L0 selection.
+    # When the operator supplied a period, project the server-resolved bounds
+    # so depth and time change together instead of producing Live + L1.
+    if explicit_scope:
+        payload.update(_pick(arguments, result, keys=("depth",)))
+        time_window = result.get("time_window")
+        if not isinstance(time_window, Mapping):
+            time_window = result.get("period")
+        if isinstance(time_window, Mapping):
+            since_ms = _integer_or_none(time_window.get("since_ms"))
+            until_ms = _integer_or_none(time_window.get("until_ms"))
+            if since_ms is None:
+                from_ts = _number_or_none(time_window.get("from_ts"))
+                since_ms = int(from_ts * 1000.0) if from_ts is not None else None
+            if until_ms is None:
+                to_ts = _number_or_none(time_window.get("to_ts"))
+                until_ms = int(to_ts * 1000.0) if to_ts is not None else None
+            if since_ms is not None and until_ms is not None and until_ms >= since_ms:
+                payload["since_ms"] = since_ms
+                payload["until_ms"] = until_ms
     payload["result_count"] = _sequence_count(
         result,
         ("summaries", "items", "results", "events", "bursts"),
     )
     return payload
+
+
+def _number_or_none(value: Any) -> float | None:
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    return number if number == number and abs(number) != float("inf") else None
+
+
+def _integer_or_none(value: Any) -> int | None:
+    number = _number_or_none(value)
+    return int(number) if number is not None else None
 
 
 def _pick(

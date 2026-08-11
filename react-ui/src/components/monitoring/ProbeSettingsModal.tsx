@@ -110,15 +110,30 @@ export function ProbeSettingsModal({ probe, channels, busy, canControlCapture, c
   const [pvErr, setPvErr] = useState(true)
   const [st, setSt] = useState<ChannelStatus>({ channel_id: d.channel_id ?? 0 })
   const [applyMessage, setApplyMessage] = useState<string | null>(null)
+  const previewTimerRef = useRef<number | null>(null)
+  const schedulePreview = (delayMs: number) => {
+    if (previewTimerRef.current != null) window.clearTimeout(previewTimerRef.current)
+    previewTimerRef.current = window.setTimeout(() => {
+      setPvErr(true)
+      setBust((value) => value + 1)
+    }, delayMs)
+  }
   useEffect(() => {
     setBust((b) => b + 1); setPvErr(true); setSt({ channel_id: d.channel_id ?? 0 })
     const poll = () => {
       if (d.channel_id != null) probesApi.status(d.channel_id, d.id).then(setSt).catch(() => {})
     }
     poll()
-    const preview = window.setInterval(() => setBust((b) => b + 1), 4000)
+    // Do not replace an in-flight <img> URL on a fixed interval.  A slow
+    // backend response would be cancelled by the next tick and the preview
+    // could remain blank forever.  onLoad/onError below schedules the normal
+    // cadence; this timer is only a bounded hung-request watchdog.
+    schedulePreview(12_000)
     const signals = window.setInterval(poll, 1200)
-    return () => { window.clearInterval(preview); window.clearInterval(signals) }
+    return () => {
+      if (previewTimerRef.current != null) window.clearTimeout(previewTimerRef.current)
+      window.clearInterval(signals)
+    }
   }, [d.channel_id, d.id])
   const previewSrc = d.channel_id != null ? recentFrameUrl(d.channel_id, bust) : ''
 
@@ -255,7 +270,8 @@ export function ProbeSettingsModal({ probe, channels, busy, canControlCapture, c
           <div className={`probe-preview ${pvErr ? 'err' : ''} ${d.roiOn ? 'roi-mode' : ''}`} ref={pvRef}
             onMouseDown={roiDown} onMouseMove={roiMove} onMouseUp={roiUp} onMouseLeave={roiUp}>
             {previewSrc && <img className={pvErr ? 'preview-pending' : undefined} src={previewSrc} alt="stream preview" draggable={false}
-              onLoad={() => setPvErr(false)} onError={() => setPvErr(true)} />}
+              onLoad={() => { setPvErr(false); schedulePreview(1_000) }}
+              onError={() => { setPvErr(true); schedulePreview(2_000) }} />}
             {pvErr && <div className="vid-overlay"><IconVideoOff size={18} /> PREVIEW UNAVAILABLE</div>}
             {d.roiOn && d.roi && (
               <div className="probe-roi-rect" style={{ left: pct(d.roi.x), top: pct(d.roi.y), width: pct(d.roi.w), height: pct(d.roi.h) }} />

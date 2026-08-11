@@ -645,6 +645,36 @@ class LuxriotCaptureApexDeciderTests(unittest.TestCase):
             self.assertEqual(calls[0]["start_ts"], float(closed_end - 2_700))
             self.assertEqual(calls[0]["end_ts"], float(closed_end) - 0.001)
 
+    def test_scheduled_rollup_reopens_recent_failed_semantic_window(self):
+        with tempfile.TemporaryDirectory() as temp:
+            manager = build_manager(Path(temp))
+            manager.rollup_windows["L1"] = 900
+            manager.rollup_scheduler_backfill_windows = 2
+            manager._put_cached_rollup_summary(
+                "l1-ch7-w900-90000",
+                "Semantic L1 aggregation failed.",
+                channel_id=7,
+                level="L1",
+                source_level="L0",
+                window_start=90_000.0,
+                window_end=90_900.0,
+                window_sec=900,
+                source_signature="failed-source",
+                summary_kind="degraded",
+                generation_status="failed",
+                generation_error="endpoint unavailable",
+                format_version=2,
+            )
+            calls = []
+            with patch.object(
+                manager,
+                "summary_rollups",
+                side_effect=lambda **kwargs: calls.append(kwargs) or {"levels": {}},
+            ):
+                manager._run_scheduled_rollup(7, "L1", 100_001.0)
+
+            self.assertEqual(calls[0]["start_ts"], 90_000.0)
+
     def test_l0_backpressure_ignores_normal_inflight_and_requires_saturated_queue(self):
         class StatusSession:
             def __init__(self, status):
@@ -782,6 +812,104 @@ class LuxriotCaptureApexDeciderTests(unittest.TestCase):
             manager.rollup_scheduler_max_deferral_windows = 0.0
             self.assertTrue(manager._rollup_deferral_exhausted((8, "L1"), "L1", 1_000.0))
 
+    def test_l1_source_watermark_waits_for_an_accepted_batch_past_boundary(self):
+        class StatusSession:
+            def __init__(self, logs):
+                self.logs = logs
+
+            def status(self):
+                return {
+                    "running": True,
+                    "summarization_enabled": True,
+                    "logs": list(self.logs),
+                }
+
+        with tempfile.TemporaryDirectory() as temp:
+            manager = build_manager(Path(temp))
+            manager.rollup_windows["L1"] = 900
+            session = StatusSession(
+                [{"batch_end_ms": 1_799_500}]
+            )
+            manager.sessions[7] = session
+
+            ready, watermark_ms, boundary = manager._rollup_l0_source_watermark_ready(
+                7,
+                "L1",
+                now=1_831.0,
+            )
+
+            self.assertFalse(ready)
+            self.assertEqual(watermark_ms, 1_799_500)
+            self.assertEqual(boundary, 1_800)
+
+            session.logs.append({"batch_end_ms": 1_801_000})
+            ready, watermark_ms, boundary = manager._rollup_l0_source_watermark_ready(
+                7,
+                "L1",
+                now=1_841.0,
+            )
+
+            self.assertTrue(ready)
+            self.assertEqual(watermark_ms, 1_801_000)
+            self.assertEqual(boundary, 1_800)
+
+    def test_l1_source_watermark_does_not_block_stopped_or_higher_level_work(self):
+        class StoppedSession:
+            def status(self):
+                return {
+                    "running": False,
+                    "summarization_enabled": True,
+                    "logs": [],
+                }
+
+        with tempfile.TemporaryDirectory() as temp:
+            manager = build_manager(Path(temp))
+            manager.sessions[7] = StoppedSession()
+
+            self.assertTrue(
+                manager._rollup_l0_source_watermark_ready(
+                    7,
+                    "L1",
+                    now=1_831.0,
+                )[0]
+            )
+
+    def test_l1_source_watermark_closes_a_stale_partial_window(self):
+        class StaleSession:
+            def status(self):
+                return {
+                    "running": True,
+                    "summarization_enabled": True,
+                    "summary_inflight": False,
+                    "summary_queue_depth": 0,
+                    "pending_frames": 0,
+                    "summary_max_window_sec": 60.0,
+                    "last_snapshot_at": 1_700.0,
+                    "logs": [{"batch_end_ms": 1_790_000}],
+                }
+
+        with tempfile.TemporaryDirectory() as temp:
+            manager = build_manager(Path(temp))
+            manager.rollup_windows["L1"] = 900
+            manager.sessions[7] = StaleSession()
+
+            ready, watermark_ms, boundary = manager._rollup_l0_source_watermark_ready(
+                7,
+                "L1",
+                now=1_831.0,
+            )
+
+            self.assertTrue(ready)
+            self.assertEqual(watermark_ms, 1_790_000)
+            self.assertEqual(boundary, 1_800)
+            self.assertTrue(
+                manager._rollup_l0_source_watermark_ready(
+                    7,
+                    "L2",
+                    now=7_321.0,
+                )[0]
+            )
+
     def test_rollup_scheduler_staggers_channels_deterministically(self):
         with tempfile.TemporaryDirectory() as temp:
             manager = build_manager(Path(temp))
@@ -793,8 +921,8 @@ class LuxriotCaptureApexDeciderTests(unittest.TestCase):
             ]
 
             self.assertGreater(len(set(due)), 20)
-            self.assertGreaterEqual(min(due), 1_800.0)
-            self.assertLess(max(due), 2_050.0)
+            self.assertGreaterEqual(min(due), 1_830.0)
+            self.assertLess(max(due), 2_080.0)
 
     def test_rollup_scheduler_initial_due_uses_next_level_boundary(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -805,10 +933,10 @@ class LuxriotCaptureApexDeciderTests(unittest.TestCase):
             l1_due = manager._rollup_initial_due(7, "L1", 10_000.0, 3)
             l2_due = manager._rollup_initial_due(7, "L2", 10_000.0, 3)
 
-            self.assertGreaterEqual(l1_due, 10_800.0)
-            self.assertLess(l1_due, 10_860.0)
-            self.assertGreaterEqual(l2_due, 10_800.0)
-            self.assertLess(l2_due, 10_860.0)
+            self.assertGreaterEqual(l1_due, 10_830.0)
+            self.assertLess(l1_due, 10_890.0)
+            self.assertGreaterEqual(l2_due, 10_920.0)
+            self.assertLess(l2_due, 10_980.0)
 
     def test_rollup_scheduler_ignores_history_only_channels(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -841,8 +969,8 @@ class LuxriotCaptureApexDeciderTests(unittest.TestCase):
                 channel_count=3,
             )
 
-            self.assertGreaterEqual(due, 10_800.0)
-            self.assertLess(due, 10_860.0)
+            self.assertGreaterEqual(due, 10_830.0)
+            self.assertLess(due, 10_890.0)
 
     def test_rollup_scheduler_catches_boundary_crossed_during_generation(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -859,7 +987,39 @@ class LuxriotCaptureApexDeciderTests(unittest.TestCase):
             )
 
             self.assertGreaterEqual(due, 10_850.0)
-            self.assertLess(due, 10_860.0)
+            self.assertLess(due, 10_890.0)
+
+    def test_rollup_scheduler_prioritizes_imminent_l1_over_ready_l2(self):
+        with tempfile.TemporaryDirectory() as temp:
+            manager = build_manager(Path(temp))
+            manager.rollup_scheduler_spacing_sec = 5.0
+
+            selected = manager._select_rollup_scheduler_due_item(
+                [
+                    (1_000.0, (7, "L2")),
+                    (1_021.0, (8, "L1")),
+                    (1_005.0, (9, "L3")),
+                ],
+                now=1_010.0,
+            )
+
+            self.assertEqual(selected, (1_021.0, (8, "L1")))
+
+    def test_rollup_scheduler_prioritizes_ready_levels_without_starving_future_l1(self):
+        with tempfile.TemporaryDirectory() as temp:
+            manager = build_manager(Path(temp))
+            manager.rollup_scheduler_spacing_sec = 5.0
+
+            selected = manager._select_rollup_scheduler_due_item(
+                [
+                    (1_000.0, (7, "L2")),
+                    (1_080.0, (8, "L1")),
+                    (1_005.0, (9, "L3")),
+                ],
+                now=1_010.0,
+            )
+
+            self.assertEqual(selected, (1_000.0, (7, "L2")))
 
     def test_selector_bias_is_a_channel_setting_with_reset(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -1146,6 +1306,93 @@ class LuxriotSummaryBackpressureTests(unittest.TestCase):
             self.assertEqual(entry["coalesced"], {"batches": 2, "omitted_frames": 4})
             normalized = manager._normalize_summary_log_entry(entry)
             self.assertEqual(normalized["coalesced"], {"batches": 2, "omitted_frames": 4})
+
+    def test_lm_response_timing_and_usage_reach_persisted_summary(self):
+        class TimedSummary(str):
+            def __new__(cls, value):
+                result = super().__new__(cls, value)
+                result.eva_response_meta = {
+                    "attempt_count": 1,
+                    "retried": False,
+                    "finish_reason": "stop",
+                    "admission_wait_ms": 2.5,
+                    "http_ms": 91.25,
+                    "prompt_tokens": 2300,
+                    "completion_tokens": 128,
+                    "total_tokens": 2428,
+                    "endpoint": "must-not-persist",
+                }
+                return result
+
+        with tempfile.TemporaryDirectory() as temp:
+            manager = build_manager(
+                Path(temp),
+                lm_callback=lambda _messages, _hint: TimedSummary("All calm."),
+            )
+            batch = manager.create_summary_batch(
+                channel_id=7,
+                run_id="run-7",
+                batch_size=4,
+                prompt="Describe.",
+                model_hint=None,
+                interval_sec=1.0,
+                frames=self._frames(100.0, 4),
+            )
+
+            normalized = manager._normalize_summary_log_entry(
+                manager.run_summary_batch(batch)
+            )
+
+        stats = normalized["lm_response_stats"]
+        self.assertEqual(stats["completion_tokens"], 128)
+        self.assertEqual(stats["http_ms"], 91.25)
+        self.assertNotIn("endpoint", stats)
+
+    def test_l0_generation_budget_is_shorter_for_heartbeat_than_event(self):
+        calls = []
+
+        def lm_callback(_messages, _hint, **kwargs):
+            calls.append(dict(kwargs))
+            return "All calm."
+
+        lm_callback.eva_workload_class = True
+        lm_callback.eva_max_tokens_override = True
+        with tempfile.TemporaryDirectory() as temp:
+            manager = build_manager(Path(temp), lm_callback=lm_callback)
+            heartbeat = manager.create_summary_batch(
+                channel_id=7,
+                run_id="run-7",
+                batch_size=4,
+                prompt="Describe.",
+                model_hint=None,
+                interval_sec=1.0,
+                frames=self._frames(100.0, 4),
+            )
+            heartbeat["lm_workload_class"] = "vlm"
+            heartbeat_entry = manager.run_summary_batch(heartbeat)
+
+            event = manager.create_summary_batch(
+                channel_id=7,
+                run_id="run-7",
+                batch_size=4,
+                prompt="Describe.",
+                model_hint=None,
+                interval_sec=1.0,
+                frames=self._frames(110.0, 4),
+            )
+            event["lm_workload_class"] = "alert"
+            event_entry = manager.run_summary_batch(event)
+
+        self.assertEqual(calls[0]["max_tokens_override"], 384)
+        self.assertEqual(calls[1]["max_tokens_override"], 512)
+        self.assertEqual(
+            heartbeat_entry["llm_input_stats"]["generation_output_mode"],
+            "heartbeat",
+        )
+        self.assertEqual(
+            event_entry["llm_input_stats"]["generation_output_mode"],
+            "event",
+        )
 
 
 def _capture_max_coalesce() -> int:
@@ -1441,6 +1688,36 @@ class LuxriotCaptureAttentionSignalTests(unittest.TestCase):
         self.assertEqual(companion_record["companion_of_timestamp_ms"], 101_000)
         apex_record = next(record for record in records if record["anchor_role"] == "burst_apex")
         self.assertEqual(apex_record["timestamp_ms"], 101_000)
+        self.assertEqual(companion_record["embedding_status"], "unavailable")
+
+    def test_archive_sampler_reuses_independent_semantic_embedding(self):
+        frames = [
+            {
+                "thumbnail": "frame-1",
+                "timestamp_ms": 100_000,
+                "clip_embedding": [0.25, 0.75],
+                "embedding_space": {
+                    "backend": "siglip2",
+                    "model": "google/siglip2-base-patch16-224",
+                    "dimension": 2,
+                },
+                "embedding_ref": "probe-buffer:7:41",
+                "embedding_status": "ready",
+            }
+        ]
+
+        records = LuxriotManager._summary_archive_frames(
+            frames,
+            batch_start_ms=100_000,
+            batch_end_ms=100_000,
+            sample_count=4,
+        )
+
+        self.assertEqual(len(records), 1)
+        self.assertEqual(records[0]["clip_embedding"], [0.25, 0.75])
+        self.assertEqual(records[0]["embedding_ref"], "probe-buffer:7:41")
+        self.assertEqual(records[0]["embedding_status"], "ready")
+        self.assertEqual(records[0]["embedding_space"]["backend"], "siglip2")
 
     def test_message_builder_appends_single_burst_companion_frame(self):
         import oldapp
@@ -1489,6 +1766,97 @@ class LuxriotCaptureAttentionSignalTests(unittest.TestCase):
 
 
 class LuxriotCaptureDispatchTests(unittest.TestCase):
+    def test_async_clip_dispatch_keeps_only_latest_pending_frame_per_channel(self):
+        started = threading.Event()
+        release = threading.Event()
+        executions = []
+        callbacks = []
+
+        with tempfile.TemporaryDirectory() as temp:
+            manager = build_manager(
+                Path(temp),
+                config_overrides={
+                    "LUXRIOT_CLIP_ASYNC_ENABLED": True,
+                    "LUXRIOT_CLIP_ASYNC_WORKERS": 2,
+                    "LUXRIOT_CLIP_ASYNC_QUEUE_CAPACITY": 8,
+                },
+            )
+
+            def work(label):
+                def run():
+                    executions.append(label)
+                    if label == "first":
+                        started.set()
+                        if not release.wait(timeout=3.0):
+                            raise RuntimeError("test embedding release timed out")
+                    return {"label": label}
+
+                return run
+
+            def callback(label):
+                def complete(result, error):
+                    callbacks.append((label, result, error))
+
+                return complete
+
+            self.assertTrue(
+                manager.submit_probe_embedding(
+                    7,
+                    work("first"),
+                    callback("first"),
+                )
+            )
+            self.assertTrue(started.wait(timeout=1.0))
+            self.assertTrue(
+                manager.submit_probe_embedding(
+                    7,
+                    work("second"),
+                    callback("second"),
+                )
+            )
+            self.assertTrue(
+                manager.submit_probe_embedding(
+                    7,
+                    work("third"),
+                    callback("third"),
+                )
+            )
+            self.assertEqual(
+                callbacks,
+                [("second", None, None)],
+            )
+
+            release.set()
+            deadline = time.monotonic() + 3.0
+            while time.monotonic() < deadline:
+                status = manager.probe_embedding_dispatch_status()
+                if (
+                    status["completed_total"] == 2
+                    and status["active_channels"] == 0
+                ):
+                    break
+                time.sleep(0.01)
+
+            manager.stop_probe_embedding_executor(wait=True)
+            self.assertEqual(executions, ["first", "third"])
+            self.assertEqual(
+                [(label, result) for label, result, _error in callbacks],
+                [
+                    ("second", None),
+                    ("first", {"label": "first"}),
+                    ("third", {"label": "third"}),
+                ],
+            )
+            self.assertTrue(all(error is None for _label, _result, error in callbacks))
+            status = manager.probe_embedding_dispatch_status()
+            self.assertEqual(status["submitted_total"], 3)
+            self.assertEqual(status["completed_total"], 2)
+            self.assertEqual(status["coalesced_total"], 1)
+            self.assertEqual(status["pending"], 0)
+            self.assertEqual(status["in_flight"], 0)
+            self.assertEqual(status["active_channels"], 0)
+            self.assertEqual(status["pending_latest_channels"], 0)
+
     def test_async_clip_dispatch_does_not_block_capture_bucket_rollover(self):
         started = threading.Event()
         release = threading.Event()
@@ -2097,6 +2465,42 @@ class LuxriotCaptureDispatchTests(unittest.TestCase):
             self.assertEqual(set(desired), {7, 8})
             self.assertEqual(state_store.max_active, 1)
 
+    def test_desired_live_session_status_reads_use_the_runtime_cache(self):
+        class CountingRuntimeStateStore(MemoryRuntimeStateStore):
+            def __init__(self):
+                super().__init__()
+                self.load_count = 0
+
+            def load_state(self, key):
+                self.load_count += 1
+                return super().load_state(key)
+
+        with tempfile.TemporaryDirectory() as temp:
+            state_store = CountingRuntimeStateStore()
+            state_store.save_state(
+                LuxriotManager.DESIRED_LIVE_SESSIONS_KEY,
+                {
+                    "version": 1,
+                    "sessions": {"7": {"enabled": True}},
+                },
+            )
+            manager = build_manager(
+                Path(temp),
+                runtime_state_store=state_store,
+            )
+            initial_load_count = state_store.load_count
+
+            first = manager._load_desired_live_sessions()
+            first[7]["enabled"] = False
+            second = manager._load_desired_live_sessions()
+            manager.streams_status()
+
+            self.assertEqual(
+                state_store.load_count,
+                initial_load_count + 1,
+            )
+            self.assertTrue(second[7]["enabled"])
+
     def test_channel_model_hint_is_restored_from_summary_state(self):
         with tempfile.TemporaryDirectory() as temp:
             state_store = MemoryRuntimeStateStore()
@@ -2200,6 +2604,50 @@ class LuxriotCaptureDispatchTests(unittest.TestCase):
                 "luxriot_rollup:112:l2:1783879200",
             ],
         )
+
+    def test_postgres_runtime_state_rollup_range_read_does_not_wait_for_writer_lock(self):
+        entered_transaction = threading.Event()
+        errors = []
+
+        class Cursor:
+            def fetchall(self):
+                return []
+
+        class Connection:
+            def execute(self, *_args, **_kwargs):
+                return Cursor()
+
+        class Transaction:
+            def __enter__(self):
+                entered_transaction.set()
+                return Connection()
+
+            def __exit__(self, *_args):
+                return False
+
+        class Pool:
+            def transaction(self, *_args, **_kwargs):
+                return Transaction()
+
+        store = PostgresRuntimeStateStore(Pool(), uuid4())
+
+        def read_rollups():
+            try:
+                store.list_rollups(channel_id=112)
+            except Exception as exc:  # pragma: no cover - assertion reports it
+                errors.append(exc)
+
+        store.lock.acquire()
+        try:
+            reader = threading.Thread(target=read_rollups)
+            reader.start()
+            reader.join(timeout=0.5)
+            self.assertFalse(reader.is_alive())
+            self.assertTrue(entered_transaction.is_set())
+        finally:
+            store.lock.release()
+        reader.join(timeout=1.0)
+        self.assertEqual(errors, [])
 
     def test_channel_inventory_refresh_failure_retains_and_marks_stale_cache(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -2482,6 +2930,47 @@ class LuxriotCaptureDispatchTests(unittest.TestCase):
             self.assertNotIn("Authorization", command_text)
             self.assertIn("pipe:0", command_text)
             self.assertNotIn("segment.mp4", command_text)
+
+    def test_live_segment_deadline_starts_again_when_authenticated_media_opens(self):
+        started_at = 100.0
+        timeout_sec = 67.0
+
+        self.assertEqual(
+            LuxriotCaptureSession._live_segment_process_deadline(
+                started_at,
+                timeout_sec,
+            ),
+            167.0,
+        )
+        self.assertEqual(
+            LuxriotCaptureSession._live_segment_process_deadline(
+                started_at,
+                timeout_sec,
+                108.0,
+            ),
+            175.0,
+        )
+        self.assertEqual(
+            LuxriotCaptureSession._live_segment_process_deadline(
+                started_at,
+                timeout_sec,
+                "invalid",
+            ),
+            167.0,
+        )
+
+    def test_live_segment_timeouts_allow_backpressure_but_bound_stalls(self):
+        hard_timeout, idle_timeout = (
+            LuxriotCaptureSession._live_segment_process_timeouts(
+                segment_seconds=60.0,
+                frame_limit=120,
+                fps=2.0,
+                read_timeout_sec=5.0,
+            )
+        )
+
+        self.assertEqual(hard_timeout, 127.0)
+        self.assertEqual(idle_timeout, 15.0)
 
     def test_ffmpeg_uses_intel_qsv_or_vaapi_decode_when_probe_passes(self):
         commands = []
@@ -3625,6 +4114,38 @@ class LuxriotCaptureDispatchTests(unittest.TestCase):
             self.assertEqual(session.last_live_segment_frames, 2)
             self.assertIsNone(session.last_live_segment_error)
 
+    def test_auto_capture_requires_a_slow_streak_and_retries_snapshot_after_live(self):
+        with tempfile.TemporaryDirectory() as temp:
+            manager = build_manager(
+                Path(temp),
+                config_overrides={"LUXRIOT_CAPTURE_SOURCE": "auto"},
+            )
+            session = LuxriotCaptureSession(
+                manager,
+                channel_id=7,
+                batch_size=4,
+                prompt="Describe activity.",
+                run_id="run-7",
+            )
+            threshold = session.snapshot_slow_threshold_sec
+
+            session._record_snapshot_result(threshold + 0.1, success=True)
+            self.assertEqual(session.snapshot_slow_streak, 1)
+            self.assertFalse(session._should_use_live_segment())
+
+            session._record_snapshot_result(0.1, success=True)
+            self.assertEqual(session.snapshot_slow_streak, 0)
+            self.assertFalse(session._should_use_live_segment())
+
+            session._record_snapshot_result(threshold + 0.1, success=True)
+            session._record_snapshot_result(threshold + 0.1, success=True)
+            self.assertEqual(session.snapshot_slow_streak, 2)
+            self.assertTrue(session._should_use_live_segment())
+
+            session._retry_snapshot_after_live_segment()
+            self.assertEqual(session.snapshot_slow_streak, 1)
+            self.assertFalse(session._should_use_live_segment())
+
     def test_auto_capture_falls_back_to_live_segment_after_snapshot_failure(self):
         with tempfile.TemporaryDirectory() as temp:
             manager = build_manager(
@@ -4413,6 +4934,21 @@ class LuxriotCaptureDispatchTests(unittest.TestCase):
                         "alert_severities": ["low", "normal"],
                         "bookmark_failed_count": 1,
                         "bookmark_last_error": "bookmark rejected",
+                        "latency_trace": {
+                            "summary_enqueued_at_ms": 90_000,
+                            "summary_dispatch_started_at_ms": 90_125,
+                            "inference_ms": 9_500,
+                            "archive_processing_ms": 84,
+                        },
+                        "llm_input_stats": {
+                            "prepare_ms": 42,
+                            "generation_output_tokens": 384,
+                        },
+                        "lm_response_stats": {
+                            "prompt_tokens": 3_900,
+                            "completion_tokens": 311,
+                            "finish_reason": "stop",
+                        },
                     },
                 ],
             },
@@ -4426,6 +4962,16 @@ class LuxriotCaptureDispatchTests(unittest.TestCase):
         self.assertEqual(compact["last_alert_counts"], {"low": 1, "normal": 1})
         self.assertEqual(compact["last_bookmark_failed_count"], 1)
         self.assertEqual(compact["last_bookmark_last_error"], "bookmark rejected")
+        self.assertEqual(compact["last_latency_trace"]["inference_ms"], 9_500)
+        self.assertEqual(compact["last_latency_trace"]["archive_processing_ms"], 84)
+        self.assertEqual(compact["last_llm_input_stats"]["prepare_ms"], 42)
+        self.assertEqual(
+            compact["last_llm_input_stats"]["generation_output_tokens"],
+            384,
+        )
+        self.assertEqual(compact["last_lm_response_stats"]["prompt_tokens"], 3_900)
+        self.assertEqual(compact["last_lm_response_stats"]["completion_tokens"], 311)
+        self.assertEqual(compact["last_lm_response_stats"]["finish_reason"], "stop")
         self.assertEqual(compact["snapshot_count"], 8)
         self.assertEqual(compact["snapshot_failed_count"], 1)
         self.assertEqual(compact["slow_snapshot_count"], 3)
@@ -5220,6 +5766,59 @@ class LuxriotCaptureDispatchTests(unittest.TestCase):
             self.assertNotIn("quiet lot overnight", routine_text)
             self.assertNotIn("keep drifting visible", routine_text)
             self.assertNotIn("parked maintenance vehicles", routine_text)
+
+    def test_cold_probe_text_prewarm_does_not_block_l0_scoring(self):
+        class ProbeStore:
+            @staticmethod
+            def list_probes():
+                return [
+                    {
+                        "id": "cold-probe",
+                        "name": "person near window",
+                        "channel_id": 7,
+                        "positives": ["person near window"],
+                        "negatives": ["empty window"],
+                        "enabled": True,
+                    }
+                ]
+
+        class ProbeManager:
+            scheduled = []
+
+            @staticmethod
+            def texts_cached(texts):
+                return False
+
+            @classmethod
+            def prewarm_texts_async(cls, texts):
+                cls.scheduled.append(list(texts))
+                return len(texts)
+
+            @staticmethod
+            def score_frames(*_args, **_kwargs):
+                raise AssertionError("cold text vectors must not block L0")
+
+        with tempfile.TemporaryDirectory() as temp:
+            manager = build_manager(Path(temp))
+            manager.probe_manager = ProbeManager()
+            manager.probes_store = ProbeStore()
+
+            started = time.monotonic()
+            signals, health = manager._clip_probe_vector_signals(
+                7,
+                [{"captured_at": 1.0}],
+                batch_start_ms=900,
+                batch_end_ms=1_100,
+            )
+
+        self.assertEqual(signals, [])
+        self.assertEqual(health["clip_probe_status"], "text_prewarm_pending")
+        self.assertEqual(health["clip_probe_prewarm_scheduled"], 2)
+        self.assertEqual(
+            ProbeManager.scheduled,
+            [["person near window", "empty window"]],
+        )
+        self.assertLess(time.monotonic() - started, 0.1)
 
     def test_auto_probe_scores_are_shadow_but_operator_scores_regulate_attention(self):
         class ProbeStore:
@@ -6146,9 +6745,19 @@ class LuxriotCaptureDispatchTests(unittest.TestCase):
                     },
                 )
 
-            rollups = manager.summary_rollups(7, run_selector="all", level_limit=10, synthesize=False)
+            with patch.object(
+                manager,
+                "_refresh_channel_memory_from_rollups",
+            ) as memory_refresh:
+                rollups = manager.summary_rollups(
+                    7,
+                    run_selector="all",
+                    level_limit=10,
+                    synthesize=False,
+                )
 
             self.assertEqual(calls, [])
+            memory_refresh.assert_not_called()
             row = rollups["levels"]["L1"][0]
             self.assertEqual(row["summary_kind"], "queued")
             self.assertIn("Semantic L1 aggregation is queued", row["summary"])
@@ -6282,6 +6891,50 @@ class LuxriotCaptureDispatchTests(unittest.TestCase):
             self.assertEqual(len(result["levels"]["L1"]), 1)
             self.assertIn("briefly left", result["levels"]["L1"][0]["summary"])
             self.assertEqual(result["levels"]["L1"][0]["generation_status"], "ready")
+
+    def test_durable_rollup_range_read_skips_duplicate_and_off_channel_hot_normalization(self):
+        with tempfile.TemporaryDirectory() as temp:
+            state_store = DurableRollupMemoryStateStore()
+            manager = build_manager(Path(temp), runtime_state_store=state_store)
+            window_start = 1_781_700_000.0
+            requested = {
+                "rollup_id": "l1-ch7-w900-1781700000",
+                "channel_id": 7,
+                "level": "L1",
+                "source_level": "L0",
+                "window_start": window_start,
+                "window_end": window_start + 900.0,
+                "window_sec": 900,
+                "summary": operator_rollup_response("A person worked at the desk."),
+                "summary_kind": "llm",
+                "generation_status": "ready",
+                "format_version": 2,
+                "created_at": window_start + 900.0,
+            }
+            state_store.save_rollup(requested)
+            manager.rollup_summary_cache[requested["rollup_id"]] = dict(requested)
+            for index in range(200):
+                other = dict(requested)
+                other["rollup_id"] = f"l1-ch112-w900-{1781700000 + index * 900}"
+                other["channel_id"] = 112
+                other["window_start"] = window_start + index * 900.0
+                other["window_end"] = other["window_start"] + 900.0
+                manager.rollup_summary_cache[other["rollup_id"]] = other
+
+            original_normalize = manager._normalize_cached_rollup_entry
+            with patch.object(
+                manager,
+                "_normalize_cached_rollup_entry",
+                wraps=original_normalize,
+            ) as normalize:
+                rows = manager._list_cached_rollups(
+                    channel_id=7,
+                    start_ts=window_start,
+                    end_ts=window_start + 900.0,
+                )
+
+            self.assertEqual(len(rows), 1)
+            self.assertEqual(normalize.call_count, 1)
 
     def test_081_semantic_cache_is_adopted_without_regeneration(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -6848,6 +7501,10 @@ class LuxriotCaptureDispatchTests(unittest.TestCase):
             self.assertNotIn("raw internal list", row["summary"])
             self.assertEqual(manager._rollup_scheduler_status["invalid_operator_contract"], 1)
             self.assertEqual(manager._rollup_scheduler_status["corrective_retries"], 1)
+            cached = manager._get_cached_rollup_record(row["rollup_id"])
+            self.assertIsNotNone(cached)
+            self.assertEqual(cached["generation_status"], "failed")
+            self.assertEqual(cached["generation_error"], "invalid_operator_contract")
 
     def test_rollup_contract_accepts_harmless_heading_drift_without_retry(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -7002,22 +7659,28 @@ class LuxriotCaptureDispatchTests(unittest.TestCase):
             self.assertEqual(manager._rollup_scheduler_status["corrective_retries"], 1)
             self.assertEqual(manager._rollup_scheduler_status["corrective_retry_successes"], 1)
 
-    def test_rollup_semantic_guard_retries_unsupported_coverage_claims(self):
+    def test_rollup_prompts_bound_operator_and_memory_output_by_level(self):
+        l1 = LuxriotManager._rollup_backend_instruction_text("L1")
+        l2 = LuxriotManager._rollup_backend_instruction_text("L2")
+        l3 = LuxriotManager._rollup_backend_instruction_text("L3")
+
+        self.assertIn("within 180 words", l1)
+        self.assertIn("at most 3 items", l1)
+        self.assertIn("within 260 words", l2)
+        self.assertIn("at most 5 items", l2)
+        self.assertIn("within 420 words", l3)
+        self.assertIn("at most 7 items", l3)
+
+    def test_rollup_semantic_guard_sanitizes_supported_rewrites_without_retry(self):
         with tempfile.TemporaryDirectory() as temp:
             calls = []
 
             def lm_callback(_messages, _model):
                 calls.append(1)
-                if len(calls) == 1:
-                    return operator_rollup_response(
-                        "Routine sampled window.",
-                        coverage="No blind spots or missing coverage were found.",
-                        takeaway="No safety or security concerns require operator review.",
-                    )
                 return operator_rollup_response(
                     "Routine sampled window.",
-                    coverage="No camera interruption was recorded in metadata; sampled frames are partial evidence.",
-                    takeaway="No immediate issue was identified in the sampled observations.",
+                    coverage="No blind spots or missing coverage were found.",
+                    takeaway="No safety or security concerns require operator review.",
                 )
 
             manager = build_manager(Path(temp), lm_callback=lm_callback)
@@ -7035,11 +7698,12 @@ class LuxriotCaptureDispatchTests(unittest.TestCase):
 
             row = manager.summary_rollups(7, run_selector="all")["levels"]["L1"][0]
 
-            self.assertEqual(len(calls), 2)
+            self.assertEqual(len(calls), 1)
             self.assertEqual(row["summary_kind"], "llm")
             self.assertNotIn("No blind spots", row["summary"])
-            self.assertEqual(manager._rollup_scheduler_status["semantic_guard_retries"], 1)
-            self.assertEqual(manager._rollup_scheduler_status["semantic_guard_retry_successes"], 1)
+            self.assertIn("sampled frames are partial evidence", row["summary"])
+            self.assertEqual(manager._rollup_scheduler_status["semantic_guard_retries"], 0)
+            self.assertEqual(manager._rollup_scheduler_status["semantic_guard_sanitized"], 1)
 
     def test_cached_rollup_with_unsupported_claim_is_rejected_for_regeneration(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -7069,7 +7733,7 @@ class LuxriotCaptureDispatchTests(unittest.TestCase):
             self.assertEqual(cached["summary_kind"], "degraded")
             self.assertEqual(cached["generation_status"], "semantic_guard_rejected")
 
-    def test_rollup_semantic_guard_sanitizes_persistent_overclaim_after_retry(self):
+    def test_rollup_semantic_guard_sanitizes_persistent_overclaim_without_retry(self):
         with tempfile.TemporaryDirectory() as temp:
             calls = []
 
@@ -7096,7 +7760,7 @@ class LuxriotCaptureDispatchTests(unittest.TestCase):
 
             row = manager.summary_rollups(7, run_selector="all")["levels"]["L1"][0]
 
-            self.assertEqual(len(calls), 2)
+            self.assertEqual(len(calls), 1)
             self.assertEqual(row["summary_kind"], "llm")
             self.assertNotIn("No blind spots", row["summary"])
             self.assertNotIn("confirm intent", row["summary"])
@@ -7919,6 +8583,37 @@ class LuxriotCaptureDispatchTests(unittest.TestCase):
 
             self.assertEqual(status["interval_sec"], 4.5)
             manager.stop_session(7)
+
+    def test_start_session_applies_supported_small_batch_without_fallback(self):
+        with tempfile.TemporaryDirectory() as temp:
+            manager = build_manager(
+                Path(temp),
+                config_overrides={
+                    "LUXRIOT_BATCH_SIZES": (4, 8, 12, 16),
+                    "LUXRIOT_DEFAULT_BATCH_SIZE": 12,
+                },
+            )
+
+            with patch.object(LuxriotCaptureSession, "start", return_value=None):
+                status = manager.start_session(7, batch_size=8)
+
+            self.assertEqual(status["batch_size"], 8)
+            manager.stop_session(7)
+
+    def test_start_session_rejects_unsupported_batch_instead_of_substituting(self):
+        with tempfile.TemporaryDirectory() as temp:
+            manager = build_manager(
+                Path(temp),
+                config_overrides={
+                    "LUXRIOT_BATCH_SIZES": (4, 8, 12, 16),
+                    "LUXRIOT_DEFAULT_BATCH_SIZE": 12,
+                },
+            )
+
+            with self.assertRaisesRegex(ValueError, "Unsupported batch_size 24"):
+                manager.start_session(7, batch_size=24)
+
+            self.assertNotIn(7, manager.sessions)
 
     def test_start_and_stop_session_update_desired_state(self):
         with tempfile.TemporaryDirectory() as temp:

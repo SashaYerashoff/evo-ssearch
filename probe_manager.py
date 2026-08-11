@@ -537,6 +537,9 @@ class ProbeManager:
         self._text_embedding_cache_lock = threading.Lock()
         self._text_embedding_encode_lock = threading.Lock()
         self._text_embedding_cache_limit = 512
+        self._text_prewarm_lock = threading.Lock()
+        self._text_prewarm_pending: Dict[str, str] = {}
+        self._text_prewarm_worker_active = False
         try:
             roi_query_budget = int(
                 getattr(config, "PROBE_ROI_QUERY_EMBED_BUDGET", 2)
@@ -647,18 +650,47 @@ class ProbeManager:
             "thumbnail": thumb,
         }
 
-    def _embed_texts(self, texts: Sequence[str]) -> np.ndarray:
-        prepared = [
+    @staticmethod
+    def _prepare_texts(texts: Sequence[str]) -> List[str]:
+        return [
             " ".join(str(text or "").split())
             for text in texts
             if " ".join(str(text or "").split())
         ]
+
+    def _text_cache_key(self, text: str, *, space_fingerprint: Optional[str] = None) -> str:
+        fingerprint = (
+            self._current_space_fingerprint()
+            if space_fingerprint is None
+            else str(space_fingerprint or "")
+        )
+        return f"{fingerprint}:{str(text or '').casefold()}"
+
+    def texts_cached(self, texts: Sequence[str]) -> bool:
+        """Return immediately; never enter the shared SigLIP encoder lock."""
+
+        prepared = self._prepare_texts(texts)
+        if not prepared:
+            return True
+        space_fingerprint = self._current_space_fingerprint()
+        with self._text_embedding_cache_lock:
+            return all(
+                self._text_cache_key(text, space_fingerprint=space_fingerprint)
+                in self._text_embedding_cache
+                for text in prepared
+            )
+
+    def _embed_texts(self, texts: Sequence[str]) -> np.ndarray:
+        prepared = self._prepare_texts(texts)
         if not prepared:
             return np.zeros((0, 0), dtype=np.float32)
         space_fingerprint = self._current_space_fingerprint()
 
         def cache_key(text: str) -> str:
-            return f"{space_fingerprint}:{text.casefold()}"
+            return self._text_cache_key(
+                text,
+                space_fingerprint=space_fingerprint,
+            )
 
         unique_missing: List[str] = []
         with self._text_embedding_cache_lock:
@@ -715,16 +747,78 @@ class ProbeManager:
     def prewarm_texts(self, texts: Sequence[str]) -> int:
         """Encode all unique probe phrases in one model call when possible."""
 
-        unique = list(
-            dict.fromkeys(
-                " ".join(str(text or "").split())
-                for text in texts
-                if " ".join(str(text or "").split())
-            )
-        )
+        unique = list(dict.fromkeys(self._prepare_texts(texts)))
         if unique:
             self._embed_texts(unique)
         return len(unique)
+
+    def prewarm_texts_async(self, texts: Sequence[str]) -> int:
+        """Queue cold text vectors without blocking the live L0 batch.
+
+        SigLIP image and text encoding share a model lifecycle lock. Continuous
+        one-Hz archive image indexing may therefore make a cold probe phrase
+        wait several seconds. A daemon, single-flight worker lets the current
+        L0 batch proceed without P/N/M and makes the vectors available to the
+        next batch instead of turning that encoder wait into VLM latency.
+        """
+
+        unique = list(dict.fromkeys(self._prepare_texts(texts)))
+        if not unique:
+            return 0
+        space_fingerprint = self._current_space_fingerprint()
+        with self._text_embedding_cache_lock:
+            missing = [
+                text
+                for text in unique
+                if self._text_cache_key(
+                    text,
+                    space_fingerprint=space_fingerprint,
+                )
+                not in self._text_embedding_cache
+            ]
+        if not missing:
+            return 0
+
+        scheduled = 0
+        start_worker = False
+        with self._text_prewarm_lock:
+            for text in missing:
+                key = self._text_cache_key(
+                    text,
+                    space_fingerprint=space_fingerprint,
+                )
+                if key in self._text_prewarm_pending:
+                    continue
+                self._text_prewarm_pending[key] = text
+                scheduled += 1
+            if scheduled and not self._text_prewarm_worker_active:
+                self._text_prewarm_worker_active = True
+                start_worker = True
+        if start_worker:
+            threading.Thread(
+                target=self._run_text_prewarm_worker,
+                name="eva-probe-text-prewarm",
+                daemon=True,
+            ).start()
+        return scheduled
+
+    def _run_text_prewarm_worker(self) -> None:
+        while True:
+            with self._text_prewarm_lock:
+                batch = list(self._text_prewarm_pending.items())
+                if not batch:
+                    self._text_prewarm_worker_active = False
+                    return
+            try:
+                self._embed_texts([text for _key, text in batch])
+            except Exception:
+                # The next L0 pass may schedule the phrases again. Probe text
+                # warmup is advisory and must never take down archive capture.
+                pass
+            finally:
+                with self._text_prewarm_lock:
+                    for key, _text in batch:
+                        self._text_prewarm_pending.pop(key, None)
 
     def score_current_frame(
         self,

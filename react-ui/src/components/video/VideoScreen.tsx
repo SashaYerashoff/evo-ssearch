@@ -74,6 +74,13 @@ function fmtAge(timestampMs: number): string {
   return `${Math.floor(seconds / 60)}m ago`
 }
 
+function fmtDurationMs(value: unknown): string {
+  const milliseconds = Number(value)
+  if (!Number.isFinite(milliseconds) || milliseconds < 0) return '—'
+  if (milliseconds < 1000) return `${Math.round(milliseconds)}ms`
+  return `${(milliseconds / 1000).toFixed(milliseconds < 10_000 ? 1 : 0)}s`
+}
+
 function formatDatetimeLocal(timestampSec: number): string {
   const date = new Date(timestampSec * 1000)
   if (!Number.isFinite(date.getTime())) return ''
@@ -449,6 +456,16 @@ export function VideoScreen({
   const selectorLabel = selectorEnabled
     ? `${selectorBias}${selectorSource ? ` · ${selectorSource}` : ''}`
     : 'off · midpoint'
+  const lastLatency = settingsRt?.video?.last_latency_trace || {}
+  const lastInputStats = settingsRt?.video?.last_llm_input_stats || {}
+  const lastResponseStats = settingsRt?.video?.last_lm_response_stats || {}
+  const enqueuedAt = Number(lastLatency.summary_enqueued_at_ms)
+  const dispatchedAt = Number(lastLatency.summary_dispatch_started_at_ms)
+  const queueWaitMs = Number.isFinite(enqueuedAt) && Number.isFinite(dispatchedAt)
+    ? Math.max(0, dispatchedAt - enqueuedAt)
+    : null
+  const responseTokens = Number(lastResponseStats.completion_tokens)
+  const responseFinish = String(lastResponseStats.finish_reason || '').trim()
 
   const loadStreams = useCallback(async () => {
     try { setStreams(await videoApi.streams()) } catch (e: any) { setError(e?.message || 'Streams failed') }
@@ -705,6 +722,10 @@ export function VideoScreen({
     try {
       const r = await videoApi.startCapture(buildCaptureInput(settingsChannelId, { batch, every }))
       if (!r.success) throw new Error(r.error || 'Start failed')
+      const effectiveBatch = Number(r.session?.batch_size)
+      const effectiveEvery = Number(r.session?.interval_sec)
+      if (Number.isFinite(effectiveBatch) && effectiveBatch > 0) setBatch(String(effectiveBatch))
+      if (Number.isFinite(effectiveEvery) && effectiveEvery > 0) setEvery(String(effectiveEvery))
       hydratedSettingsChannelRef.current = settingsChannelId
       setSettingsDirty(false)
       await loadStreams()
@@ -1009,6 +1030,16 @@ export function VideoScreen({
                       ? `${pendingFrames}/${runtimeBatch || '?'} frames${summaryQueueDepth ? ` · ${summaryQueueDepth} queued` : ''}${droppedFrames ? ` · ${droppedFrames} dropped` : ''}`
                       : 'idle'}
                   </b>
+                </div>
+                <div>
+                  <span>Last L0 path</span>
+                  <b>
+                    queue {fmtDurationMs(queueWaitMs)} · prepare {fmtDurationMs(lastInputStats.prepare_ms)} · VLM {fmtDurationMs(lastLatency.inference_ms)} · archive {fmtDurationMs(lastLatency.archive_processing_ms)}
+                  </b>
+                </div>
+                <div>
+                  <span>Last LM response</span>
+                  <b>{Number.isFinite(responseTokens) && responseTokens > 0 ? `${responseTokens} tok` : '—'}{responseFinish ? ` · ${responseFinish}` : ''}</b>
                 </div>
                 <div><span>Probe capture</span><b>{settingsRt?.probe?.running ? (settingsRt.probe.paused ? 'paused' : 'active') : 'idle'}</b></div>
                 <div><span>Last preview</span><b>{previewLoading ? 'opening' : previewError ? 'never' : fmtAge(previewReadyAt)}</b></div>

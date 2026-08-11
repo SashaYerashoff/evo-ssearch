@@ -13,7 +13,7 @@ import re
 import threading
 import time
 from collections import deque
-from concurrent.futures import Future, ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor
 from io import BytesIO
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Protocol, Sequence, Set, Tuple, cast
@@ -325,6 +325,12 @@ def _safe_error_text(value: object, max_len: int = 500) -> str:
 DEFAULT_BATCH_STATE_JSON_PROMPT = (
     "Machine-readable current-batch state for EVA memory, navigation, and alert actions:\n"
     "- Always append exactly one block at the end, prefixed with BATCH_STATE_JSON:.\n"
+    "- Keep the human-readable part before it to at most 80 words: one short sentence per requested section, "
+    "without repeating static scene inventory. Keep the JSON compact (one line is fine); "
+    "finish alerts, events, and observed_states before optional routine/memory detail.\n"
+    "- In BATCH_STATE_JSON the first two members MUST be version and alerts, in that order. Never emit cover, "
+    "scene, events, or prose before alerts inside the JSON object. Limit events to 6, observed_states to 8, "
+    "routines to 4, and memory_pass to 4 so the complete alert contract fits the output budget.\n"
     "- Snapshot indices are 1-based and must reference snapshots supplied in this request.\n"
     "- Snapshot indices are evidence references, not a batch-size checklist. List only the individual snapshots "
     "that visibly support the corresponding event, state, or alert; never fill 1..N merely because N snapshots "
@@ -352,9 +358,9 @@ DEFAULT_BATCH_STATE_JSON_PROMPT = (
     "BATCH_STATE_JSON:\n"
     "{\n"
     "  \"version\": 2,\n"
-    "  \"cover\": {\"snapshot_index\": 1, \"kind\": \"event\", "
-    "\"reason\": \"short visible reason\", \"confidence\": \"high\"},\n"
-    "  \"scene\": {\"status\": \"matched\", \"summary\": \"short current scene\"},\n"
+    "  \"alerts\": [{\"title\": \"Short event title\", \"description\": \"<= 240 chars, concrete and actionable\", "
+    "\"severity\": \"low\", \"state\": \"new\", \"channel_id\": {channel_id}, "
+    "\"timestamp_ms\": 0, \"snapshot_indices\": [1]}],\n"
     "  \"events\": [\n"
     "    {\"event_id\": \"short stable batch label\", \"label\": \"observable event\", "
     "\"state\": \"new\", \"snapshot_indices\": [1], "
@@ -365,23 +371,15 @@ DEFAULT_BATCH_STATE_JSON_PROMPT = (
     "    {\"key\": \"watched-state-key\", \"label\": \"watched entity or trigger\", "
     "\"state\": \"present\", \"snapshot_indices\": [1], \"evidence\": \"visible evidence\"}\n"
     "  ],\n"
+    "  \"cover\": {\"snapshot_index\": 1, \"kind\": \"event\", "
+    "\"reason\": \"short visible reason\", \"confidence\": \"high\"},\n"
+    "  \"scene\": {\"status\": \"matched\", \"summary\": \"short current scene\"},\n"
     "  \"routines\": [\n"
     "    {\"key\": \"routine-key\", \"label\": \"grounded recurring activity\", "
     "\"state\": \"continuing\", \"snapshot_indices\": [1], "
     "\"applies_to_event_keys\": []}\n"
     "  ],\n"
-    "  \"memory_pass\": [],\n"
-    "  \"alerts\": [\n"
-    "    {\n"
-    "      \"title\": \"Short event title\",\n"
-    "      \"description\": \"<= 240 chars, concrete and actionable\",\n"
-    "      \"severity\": \"low\",\n"
-    "      \"state\": \"new\",\n"
-    "      \"channel_id\": {channel_id},\n"
-    "      \"timestamp_ms\": 0,\n"
-    "      \"snapshot_indices\": [1]\n"
-    "    }\n"
-    "  ]\n"
+    "  \"memory_pass\": []\n"
     "}\n"
     "Alert candidates are defined by the Alert review policy and by visible immediate safety/security hazards. "
     "General hazards include physical violence, a person falling/collapsing or appearing to need urgent help, "
@@ -635,6 +633,8 @@ class ProbeManagerLike(Protocol):
         min_ts_ms: Optional[int] = None,
         max_ts_ms: Optional[int] = None,
     ) -> Mapping[str, Any]: ...
+    def texts_cached(self, texts: Sequence[str]) -> bool: ...
+    def prewarm_texts_async(self, texts: Sequence[str]) -> int: ...
 
 
 class ProbeStoreLike(Protocol):
@@ -1685,6 +1685,7 @@ class LuxriotCaptureSession:
         self.snapshot_count = 0
         self.snapshot_failed_count = 0
         self.slow_snapshot_count = 0
+        self.snapshot_slow_streak = 0
         self.last_snapshot_latency_sec: Optional[float] = None
         self.avg_snapshot_latency_sec: Optional[float] = None
         self.max_snapshot_latency_sec: Optional[float] = None
@@ -1886,16 +1887,26 @@ class LuxriotCaptureSession:
         if self.capture_source_mode == "live_segment":
             return True
         with self.lock:
-            slow_count = int(self.slow_snapshot_count)
+            slow_streak = int(self.snapshot_slow_streak)
             snapshot_count = int(self.snapshot_count)
             snapshot_failed_count = int(self.snapshot_failed_count)
-            last_latency = self.last_snapshot_latency_sec
-            threshold = float(self.snapshot_slow_threshold_sec)
-        return (snapshot_count <= 0 and snapshot_failed_count > 0) or slow_count > 0 or (
-            last_latency is not None
-            and threshold > 0
-            and float(last_latency) >= threshold
-        )
+        return (
+            snapshot_count <= 0
+            and snapshot_failed_count > 0
+        ) or slow_streak >= 2
+
+    def _retry_snapshot_after_live_segment(self) -> None:
+        """Let auto mode re-test a previously working snapshot endpoint."""
+
+        with self.lock:
+            if self.capture_source_mode != "auto" or self.snapshot_count <= 0:
+                return
+            # Retain one strike: a second slow retry returns immediately to the
+            # dense stream, while one healthy snapshot clears the streak.
+            self.snapshot_slow_streak = min(
+                1,
+                max(0, int(self.snapshot_slow_streak)),
+            )
 
     def _snapshot_unavailable_in_auto(self) -> bool:
         if self.capture_source_mode != "auto":
@@ -1970,6 +1981,68 @@ class LuxriotCaptureSession:
             "raw_frame_budget": int(raw_frame_budget),
             "byte_budget": int(byte_budget),
         }
+
+    @staticmethod
+    def _live_segment_process_deadline(
+        started_at: float,
+        timeout_sec: float,
+        stream_opened_at: Optional[object] = None,
+    ) -> float:
+        """Keep media time separate from authenticated stream setup time.
+
+        ``open_live_stream`` first obtains a short-lived Luxriot token and then
+        opens the media response.  The response pipe starts its segment window
+        only after those requests complete, so an ffmpeg deadline anchored to
+        the earlier subprocess launch can expire before the requested media
+        window has been delivered.  Retain the original launch bound while
+        extending it, once available, from the actual response-open instant.
+        """
+
+        launch_deadline = float(started_at) + max(0.001, float(timeout_sec))
+        try:
+            opened_at = float(stream_opened_at)  # type: ignore[arg-type]
+        except (TypeError, ValueError, OverflowError):
+            return launch_deadline
+        if not math.isfinite(opened_at) or opened_at < float(started_at):
+            return launch_deadline
+        return max(launch_deadline, opened_at + max(0.001, float(timeout_sec)))
+
+    @staticmethod
+    def _live_segment_process_timeouts(
+        *,
+        segment_seconds: float,
+        frame_limit: int,
+        fps: float,
+        read_timeout_sec: float,
+    ) -> Tuple[float, float]:
+        """Return hard and no-progress deadlines for an ffmpeg window.
+
+        Dense-frame processing can apply backpressure to ffmpeg and make a
+        healthy source take longer in wall time than the represented media
+        window.  The hard deadline therefore allows up to 2x nominal time,
+        while the shorter idle deadline still terminates a genuinely stalled
+        decoder or upstream response promptly.
+        """
+
+        normalized_fps = max(0.2, float(fps))
+        nominal_seconds = max(
+            1.0,
+            float(segment_seconds),
+            float(max(1, int(frame_limit))) / normalized_fps,
+        )
+        normalized_read_timeout = max(1.0, float(read_timeout_sec))
+        hard_timeout_sec = min(
+            180.0,
+            max(
+                6.0,
+                (nominal_seconds * 2.0) + normalized_read_timeout + 2.0,
+            ),
+        )
+        idle_timeout_sec = min(
+            hard_timeout_sec,
+            max(15.0, normalized_read_timeout + 5.0),
+        )
+        return float(hard_timeout_sec), float(idle_timeout_sec)
 
     def _mark_live_segment_inflight(self, budget: Mapping[str, Any]) -> None:
         with self.lock:
@@ -2140,6 +2213,7 @@ class LuxriotCaptureSession:
             self._flush_capture_apex_bucket()
             self._summarize_if_ready()
             if accepted > 0:
+                self._retry_snapshot_after_live_segment()
                 self._clear_capture_error()
             return accepted > 0
         except Exception as exc:
@@ -2189,6 +2263,7 @@ class LuxriotCaptureSession:
         )
         shared_state = state if isinstance(state, dict) else {}
         shared_state["response"] = response
+        shared_state["stream_opened_at_monotonic"] = time.monotonic()
         shared_state["source_anchor_ms"] = int(
             default_source_anchor_ms or int(time.time() * 1000)
         )
@@ -2336,10 +2411,18 @@ class LuxriotCaptureSession:
         read_timeout_sec = float(getattr(self.manager.config, "LUXRIOT_LIVE_SEGMENT_READ_TIMEOUT_SEC", 5.0))
         read_timeout_sec = max(1.0, min(30.0, read_timeout_sec))
         segment_bytes = int(budget["byte_budget"])
-        timeout_sec = max(6.0, segment_seconds + read_timeout_sec + 2.0, (float(frame_limit) / fps) + read_timeout_sec + 2.0)
-        timeout_sec = min(90.0, timeout_sec)
+        timeout_sec, progress_timeout_sec = self._live_segment_process_timeouts(
+            segment_seconds=segment_seconds,
+            frame_limit=frame_limit,
+            fps=fps,
+            read_timeout_sec=read_timeout_sec,
+        )
         rw_timeout_us = str(int(read_timeout_sec * 1_000_000))
         started = time.monotonic()
+        last_progress_at = started
+        progress_window_started = False
+        timeout_reason = "hard deadline"
+        timeout_observed_sec = timeout_sec
         accepted = 0
         decoded_frame_count = 0
         streamed_bytes = 0
@@ -2354,6 +2437,7 @@ class LuxriotCaptureSession:
             "bytes": 0,
             "error": None,
             "response": None,
+            "stream_opened_at_monotonic": None,
             "source_anchor_ms": int(time.time() * 1000),
             "timestamp_source": "capture_window_started_at",
         }
@@ -2560,6 +2644,7 @@ class LuxriotCaptureSession:
                         daemon=True,
                     )
                     if direct_local_capture:
+                        feed_state["stream_opened_at_monotonic"] = time.monotonic()
                         feed_state["source_anchor_ms"] = int(
                             time.time() * 1000
                         )
@@ -2578,13 +2663,44 @@ class LuxriotCaptureSession:
                     stdout_thread.start()
 
                     jpeg_buffer = bytearray()
-                    process_deadline = started + timeout_sec
+                    process_deadline = self._live_segment_process_deadline(
+                        started,
+                        timeout_sec,
+                        feed_state.get("stream_opened_at_monotonic"),
+                    )
                     while True:
+                        now = time.monotonic()
+                        process_deadline = self._live_segment_process_deadline(
+                            started,
+                            timeout_sec,
+                            feed_state.get("stream_opened_at_monotonic"),
+                        )
+                        if feed_ready.is_set() and not progress_window_started:
+                            try:
+                                opened_at = float(
+                                    feed_state.get("stream_opened_at_monotonic")
+                                )
+                            except (TypeError, ValueError, OverflowError):
+                                opened_at = now
+                            if not math.isfinite(opened_at):
+                                opened_at = now
+                            last_progress_at = max(last_progress_at, opened_at)
+                            progress_window_started = True
                         if self.stop_event.is_set():
                             stopped = True
                             close_window_io(terminate=True)
                             break
-                        if time.monotonic() >= process_deadline:
+                        if now >= process_deadline:
+                            timeout_reason = "hard deadline"
+                            timeout_observed_sec = timeout_sec
+                            close_window_io(terminate=True)
+                            raise subprocess.TimeoutExpired(cmd, timeout_sec)
+                        if (
+                            progress_window_started
+                            and now - last_progress_at >= progress_timeout_sec
+                        ):
+                            timeout_reason = "no decoded output"
+                            timeout_observed_sec = now - last_progress_at
                             close_window_io(terminate=True)
                             raise subprocess.TimeoutExpired(cmd, timeout_sec)
                         try:
@@ -2595,6 +2711,7 @@ class LuxriotCaptureSession:
                             continue
                         if chunk is stdout_sentinel:
                             break
+                        last_progress_at = time.monotonic()
                         jpeg_buffer.extend(chunk)
                         if len(jpeg_buffer) > 32 * 1024 * 1024:
                             raise RuntimeError("ffmpeg JPEG pipe exceeded the bounded frame buffer")
@@ -2627,20 +2744,38 @@ class LuxriotCaptureSession:
                             last_source_timestamp_ms = timestamp_ms
                             self._accept_captured_frame(image, timestamp_ms, summarize=False)
                             accepted += 1
+                            last_progress_at = time.monotonic()
                             # A newly crossed second may have finalized one apex.
                             # Dispatch complete summary batches while this same
                             # authenticated stream and ffmpeg process stay open.
                             self._summarize_if_ready()
+                            last_progress_at = time.monotonic()
 
                     if not stopped:
                         while True:
+                            now = time.monotonic()
+                            process_deadline = self._live_segment_process_deadline(
+                                started,
+                                timeout_sec,
+                                feed_state.get("stream_opened_at_monotonic"),
+                            )
                             if self.stop_event.is_set():
                                 stopped = True
                                 close_window_io(terminate=True)
                                 returncode = int(getattr(process, "returncode", 0) or 0)
                                 break
-                            remaining_timeout = process_deadline - time.monotonic()
+                            remaining_timeout = process_deadline - now
                             if remaining_timeout <= 0:
+                                timeout_reason = "hard deadline"
+                                timeout_observed_sec = timeout_sec
+                                close_window_io(terminate=True)
+                                raise subprocess.TimeoutExpired(cmd, timeout_sec)
+                            if (
+                                progress_window_started
+                                and now - last_progress_at >= progress_timeout_sec
+                            ):
+                                timeout_reason = "no decoded output"
+                                timeout_observed_sec = now - last_progress_at
                                 close_window_io(terminate=True)
                                 raise subprocess.TimeoutExpired(cmd, timeout_sec)
                             try:
@@ -2728,9 +2863,11 @@ class LuxriotCaptureSession:
                     self._flush_capture_apex_bucket()
                     self._summarize_if_ready()
                 if accepted > 0 and process_error is None:
+                    self._retry_snapshot_after_live_segment()
                     self._clear_capture_error()
                     return True
                 if accepted > 0:
+                    self._retry_snapshot_after_live_segment()
                     if process_error is not None:
                         self._set_capture_error(process_error)
                     return True
@@ -2753,7 +2890,16 @@ class LuxriotCaptureSession:
                 self.live_segment_failed_count += 1
                 self.last_live_segment_latency_sec = latency
                 self.last_live_segment_frames = accepted
-                self.last_live_segment_error = f"ffmpeg live segment timed out after {timeout_sec:.1f}s"
+                if timeout_reason == "no decoded output":
+                    self.last_live_segment_error = (
+                        "ffmpeg live segment stalled with no decoded output "
+                        f"for {timeout_observed_sec:.1f}s"
+                    )
+                else:
+                    self.last_live_segment_error = (
+                        "ffmpeg live segment reached its bounded hard deadline "
+                        f"after {timeout_observed_sec:.1f}s"
+                    )
             self._complete_live_segment_budget(
                 budget,
                 streamed_bytes=int(feed_state.get("bytes") or streamed_bytes),
@@ -3174,6 +3320,34 @@ class LuxriotCaptureSession:
             embedding_ref = str(
                 embedding.get("embedding_ref") or ""
             ).strip()
+            # Keep the already-computed semantic vector on the bounded frame
+            # object until its L0 archive row is written.  The summary archive
+            # used to decode and encode the same JPEG again after every VLM
+            # response, serially blocking this channel's next L0 batch for
+            # many seconds on CPU SigLIP.  Lists remain JSON-safe when the
+            # optional durable inference spool is enabled.
+            raw_embedding = embedding.get("embedding")
+            if hasattr(raw_embedding, "tolist"):
+                try:
+                    raw_embedding = raw_embedding.tolist()
+                except Exception:
+                    raw_embedding = None
+            if (
+                isinstance(raw_embedding, Sequence)
+                and not isinstance(raw_embedding, (str, bytes, bytearray))
+            ):
+                reusable_embedding: List[float] = []
+                try:
+                    reusable_embedding = [float(value) for value in raw_embedding]
+                except (TypeError, ValueError, OverflowError):
+                    reusable_embedding = []
+                if reusable_embedding and all(
+                    math.isfinite(value) for value in reusable_embedding
+                ):
+                    frame["clip_embedding"] = reusable_embedding
+            raw_embedding_space = embedding.get("embedding_space")
+            if isinstance(raw_embedding_space, Mapping):
+                frame["embedding_space"] = dict(raw_embedding_space)
             snapshot_id = str(
                 uuid5(
                     NAMESPACE_URL,
@@ -3659,6 +3833,7 @@ class LuxriotCaptureSession:
 
         if embedding_async:
             embedding_async = self.manager.submit_probe_embedding(
+                self.channel_id,
                 embedding_work,
                 embedding_complete,
             )
@@ -4147,8 +4322,13 @@ class LuxriotCaptureSession:
             else:
                 self.snapshot_failed_count += 1
             self.last_snapshot_latency_sec = latency
-            if latency >= float(self.snapshot_slow_threshold_sec):
+            slow = latency >= float(self.snapshot_slow_threshold_sec)
+            if slow:
                 self.slow_snapshot_count += 1
+            if success and not slow:
+                self.snapshot_slow_streak = 0
+            else:
+                self.snapshot_slow_streak += 1
 
     def _dispatch_summary_frames(
         self,
@@ -4999,6 +5179,7 @@ class LuxriotCaptureSession:
             snapshot_count = self.snapshot_count
             snapshot_failed_count = self.snapshot_failed_count
             slow_snapshot_count = self.slow_snapshot_count
+            snapshot_slow_streak = self.snapshot_slow_streak
             last_snapshot_at = self.last_snapshot_at
             active_capture_source = self.active_capture_source
             live_segment_count = self.live_segment_count
@@ -5121,6 +5302,7 @@ class LuxriotCaptureSession:
             "snapshot_count": snapshot_count,
             "snapshot_failed_count": snapshot_failed_count,
             "slow_snapshot_count": slow_snapshot_count,
+            "snapshot_slow_streak": snapshot_slow_streak,
             "snapshot_slow_threshold_sec": round(float(self.snapshot_slow_threshold_sec), 3),
             "last_snapshot_latency_sec": round(float(last_snapshot_latency_sec), 3)
             if last_snapshot_latency_sec is not None
@@ -5502,12 +5684,28 @@ class LuxriotManager:
             "completed_total": 0,
             "failed_total": 0,
             "rejected_total": 0,
+            "coalesced_total": 0,
             "callback_failed_total": 0,
             "pending": 0,
             "in_flight": 0,
             "stopped": False,
             "last_error": None,
         }
+        # A slow/shared GPU must not turn one-Hz observations into a stale FIFO.
+        # Keep one executing request and, at most, the newest pending request per
+        # channel. Cross-channel executions still meet in the shared CLIP
+        # microbatcher, while a recovering encoder resumes from fresh evidence.
+        self._probe_embedding_active_channels: Set[int] = set()
+        self._probe_embedding_pending_latest: Dict[
+            int,
+            Tuple[
+                Callable[[], Optional[Dict[str, Any]]],
+                Callable[
+                    [Optional[Dict[str, Any]], Optional[BaseException]],
+                    None,
+                ],
+            ],
+        ] = {}
         # Manager helpers are layered (status/prompt/rollup paths call compact
         # helpers that may need the same cache). A re-entrant lock prevents one
         # request/background callback from permanently owning the global state
@@ -5525,6 +5723,9 @@ class LuxriotManager:
         self._session_generations: Dict[int, str] = {}
         self._session_side_effect_locks: Dict[int, Any] = {}
         self._desired_live_sessions_lock = threading.RLock()
+        self._desired_live_sessions_cache: Optional[
+            Dict[int, Dict[str, Any]]
+        ] = None
         try:
             history_limit = int(getattr(config, "LUXRIOT_SUMMARY_HISTORY_LIMIT", 600))
         except Exception:
@@ -5761,6 +5962,12 @@ class LuxriotManager:
             attention_policy=self.incident_attention_policy,
         )
         try:
+            configured_output_budget = int(
+                getattr(config, "LUXRIOT_L0_OUTPUT_BUDGET_TOKENS", 512)
+            )
+            effective_generation_limit = int(
+                getattr(config, "LM_VIDEO_MAX_TOKENS", configured_output_budget)
+            )
             self.l0_prompt_budget = PromptEnvelopeBudget(
                 context_window_tokens=int(
                     getattr(config, "LUXRIOT_L0_CONTEXT_WINDOW_TOKENS", 16384)
@@ -5772,7 +5979,7 @@ class LuxriotManager:
                     getattr(config, "LUXRIOT_L0_VISION_BUDGET_TOKENS", 5500)
                 ),
                 max_output_tokens=int(
-                    getattr(config, "LUXRIOT_L0_OUTPUT_BUDGET_TOKENS", 1536)
+                    min(configured_output_budget, effective_generation_limit)
                 ),
                 max_incident_tokens=int(
                     getattr(config, "LUXRIOT_L0_INCIDENT_BUDGET_TOKENS", 900)
@@ -5783,9 +5990,35 @@ class LuxriotManager:
                 context_window_tokens=16384,
                 max_text_tokens=5000,
                 max_vision_tokens=5500,
-                max_output_tokens=1536,
+                max_output_tokens=512,
                 max_incident_tokens=900,
             )
+        self.l0_heartbeat_output_tokens = max(
+            256,
+            min(
+                int(self.l0_prompt_budget.max_output_tokens),
+                int(
+                    getattr(
+                        config,
+                        "LUXRIOT_L0_HEARTBEAT_OUTPUT_TOKENS",
+                        384,
+                    )
+                ),
+            ),
+        )
+        self.l0_event_output_tokens = max(
+            256,
+            min(
+                int(self.l0_prompt_budget.max_output_tokens),
+                int(
+                    getattr(
+                        config,
+                        "LUXRIOT_L0_EVENT_OUTPUT_TOKENS",
+                        512,
+                    )
+                ),
+            ),
+        )
         self.incident_prompt_planner = IncidentPromptEnvelopePlanner(
             self.incident_attention_policy,
             token_estimator=estimate_text_tokens,
@@ -5900,6 +6133,22 @@ class LuxriotManager:
         except Exception:
             scheduler_spacing = 5.0
         self.rollup_scheduler_spacing_sec = max(1.0, min(300.0, scheduler_spacing))
+        self.rollup_settle_delays: Dict[str, float] = {}
+        for level, default_delay in (("L1", 30.0), ("L2", 120.0), ("L3", 300.0)):
+            try:
+                configured_delay = float(
+                    getattr(
+                        config,
+                        f"LUXRIOT_ROLLUP_{level}_SETTLE_DELAY_SEC",
+                        default_delay,
+                    )
+                )
+            except (TypeError, ValueError):
+                configured_delay = default_delay
+            self.rollup_settle_delays[level] = max(
+                0.0,
+                min(1800.0, configured_delay),
+            )
         try:
             scheduler_backfill_windows = int(
                 getattr(config, "LUXRIOT_ROLLUP_SCHEDULER_BACKFILL_WINDOWS", 2)
@@ -7037,10 +7286,11 @@ class LuxriotManager:
 
         window_sec = max(1, int(self.rollup_windows[level]))
         offset = self._rollup_phase_offset(channel_id, level, channel_count)
+        settle_delay = float(self.rollup_settle_delays.get(level, 0.0))
         next_boundary = (math.floor(float(now) / window_sec) + 1) * window_sec
         return max(
             float(now) + self.rollup_scheduler_initial_delay_sec,
-            float(next_boundary) + offset,
+            float(next_boundary) + settle_delay + offset,
         )
 
     def _rollup_next_due(
@@ -7061,11 +7311,55 @@ class LuxriotManager:
 
         window_sec = max(1, int(self.rollup_windows[level]))
         phase_offset = self._rollup_phase_offset(channel_id, level, channel_count)
+        settle_delay = float(self.rollup_settle_delays.get(level, 0.0))
         boundary = math.floor(float(completed_at) / window_sec) * window_sec
-        next_due = float(boundary) + phase_offset
+        next_due = float(boundary) + settle_delay + phase_offset
         while next_due <= float(started_at):
             next_due += float(window_sec)
         return max(float(completed_at), next_due)
+
+    def _select_rollup_scheduler_due_item(
+        self,
+        due_items: Sequence[Tuple[float, Tuple[int, str]]],
+        *,
+        now: float,
+    ) -> Tuple[float, Tuple[int, str]]:
+        """Prefer closed L1 work over lower-frequency consolidation.
+
+        At hour boundaries L1 and L2 become due together.  Pure timestamp
+        ordering can start a long L2 generation seconds before the next L1,
+        delaying the operator's 15-minute memory path.  Give an imminent L1 a
+        short look-ahead window and otherwise prioritize already-due L1 over
+        L2/L3.  Future windows are never synthesized early: the scheduler will
+        still wait until the selected due timestamp.
+        """
+
+        if not due_items:
+            raise ValueError("due_items must not be empty")
+        current = float(now)
+        l1_lookahead_sec = max(
+            15.0,
+            min(60.0, float(self.rollup_scheduler_spacing_sec) * 6.0),
+        )
+        imminent_l1 = [
+            item
+            for item in due_items
+            if str(item[1][1]).upper() == "L1"
+            and float(item[0]) <= current + l1_lookahead_sec
+        ]
+        if imminent_l1:
+            return min(imminent_l1, key=lambda item: float(item[0]))
+        ready = [item for item in due_items if float(item[0]) <= current]
+        if ready:
+            level_priority = {"L1": 0, "L2": 1, "L3": 2}
+            return min(
+                ready,
+                key=lambda item: (
+                    level_priority.get(str(item[1][1]).upper(), 3),
+                    float(item[0]),
+                ),
+            )
+        return min(due_items, key=lambda item: float(item[0]))
 
     def _l0_backpressure_active(
         self,
@@ -7165,6 +7459,116 @@ class LuxriotManager:
             and float(now) - float(first_deferred_at) >= max_deferral_sec
         )
 
+    def _rollup_l0_source_watermark_ready(
+        self,
+        channel_id: int,
+        level: str,
+        now: Optional[float] = None,
+    ) -> Tuple[bool, Optional[int], int]:
+        """Return whether a closed L1 window has crossed the live L0 watermark.
+
+        A fixed settle delay is only a lower bound.  Under VLM load, batches
+        whose frames belong to the just-closed window can finish after that
+        delay.  Synthesizing L1 before one accepted L0 batch crosses the
+        boundary produces a useful-looking summary that is immediately marked
+        ``refresh_pending`` when those late batches arrive.
+
+        Per-channel summary workers preserve batch order, so an accepted batch
+        ending at or after the boundary is also a watermark proving that all
+        older queued batches have completed.  Broken or stopped streams remain
+        bounded by the scheduler's existing hard deferral ceiling.
+        """
+
+        normalized_level = str(level or "").strip().upper()
+        current = float(now if now is not None else time.time())
+        window_sec = max(1, int(self.rollup_windows.get(normalized_level, 1)))
+        closed_window_end = int(current // window_sec) * window_sec
+        if normalized_level != "L1" or closed_window_end <= 0:
+            return True, None, closed_window_end
+
+        with self.cache_lock:
+            session = self.sessions.get(int(channel_id))
+        if session is None:
+            return True, None, closed_window_end
+        try:
+            status = session.status()
+        except Exception:
+            return False, None, closed_window_end
+        if not isinstance(status, Mapping):
+            return False, None, closed_window_end
+        if not bool(status.get("running", True)):
+            return True, None, closed_window_end
+        if not bool(status.get("summarization_enabled", True)):
+            return True, None, closed_window_end
+
+        watermark_ms = _parse_optional_int(status.get("last_summary_batch_end_ms"))
+        raw_logs = status.get("logs")
+        if isinstance(raw_logs, Sequence) and not isinstance(
+            raw_logs,
+            (str, bytes, bytearray),
+        ):
+            for raw_log in raw_logs:
+                if not isinstance(raw_log, Mapping):
+                    continue
+                candidate = _parse_optional_int(raw_log.get("batch_end_ms"))
+                if candidate is not None and (
+                    watermark_ms is None or candidate > watermark_ms
+                ):
+                    watermark_ms = candidate
+        boundary_ms = int(closed_window_end * 1000)
+        last_snapshot_at = self._coerce_float(status.get("last_snapshot_at"))
+        no_pending_work = (
+            not bool(status.get("summary_inflight"))
+            and int(_parse_optional_int(status.get("summary_queue_depth")) or 0) <= 0
+            and int(_parse_optional_int(status.get("pending_frames")) or 0) <= 0
+        )
+        stale_grace_sec = max(
+            90.0,
+            float(self._coerce_float(status.get("summary_max_window_sec")) or 60.0)
+            + float(self.rollup_settle_delays.get("L1", 0.0)),
+        )
+        if (
+            no_pending_work
+            and last_snapshot_at is not None
+            and current - last_snapshot_at >= stale_grace_sec
+        ):
+            # A source that has produced no frame for a complete flush window
+            # cannot add another old batch unless work is still queued. Close
+            # its partial L1 window instead of retrying every ten seconds.
+            return True, watermark_ms, closed_window_end
+        return bool(watermark_ms is not None and watermark_ms >= boundary_ms), watermark_ms, closed_window_end
+
+    def _failed_rollup_retry_start(
+        self,
+        channel_id: int,
+        level: str,
+        now: float,
+    ) -> Optional[float]:
+        """Return the oldest recent semantic window that failed generation."""
+
+        normalized_level = str(level or "").strip().upper()
+        max_age_sec = 7 * 86400.0 if normalized_level == "L3" else 86400.0
+        cutoff = float(now) - max_age_sec
+        with self.cache_lock:
+            rows = [
+                dict(value)
+                for value in self.rollup_summary_cache.values()
+                if isinstance(value, Mapping)
+            ]
+        candidates = []
+        for row in rows:
+            if _parse_optional_int(row.get("channel_id")) != int(channel_id):
+                continue
+            if self._normalize_rollup_level(row.get("level")) != normalized_level:
+                continue
+            status = str(row.get("generation_status") or "").strip().lower()
+            if status not in {"failed", "review_unavailable"}:
+                continue
+            window_start = self._coerce_float(row.get("window_start"))
+            if window_start is not None and window_start >= cutoff:
+                candidates.append(float(window_start))
+        return min(candidates) if candidates else None
+
     def _run_scheduled_rollup(self, channel_id: int, level: str, now: float) -> Dict[str, Any]:
         window_sec = max(1, int(self.rollup_windows[level]))
         closed_window_end = int(float(now) // window_sec) * window_sec
@@ -7179,6 +7583,13 @@ class LuxriotManager:
             0.0,
             float(closed_window_end - (window_sec * lookback_windows)),
         )
+        failed_retry_start = self._failed_rollup_retry_start(
+            int(channel_id),
+            level,
+            float(now),
+        )
+        if failed_retry_start is not None:
+            scheduled_start = min(scheduled_start, failed_retry_start)
         return self.summary_rollups(
             channel_id=int(channel_id),
             run_selector="all",
@@ -7210,7 +7621,10 @@ class LuxriotManager:
             if not due_items:
                 self._rollup_scheduler_stop.wait(10.0)
                 continue
-            due_at, (channel_id, level) = min(due_items, key=lambda item: item[0])
+            due_at, (channel_id, level) = self._select_rollup_scheduler_due_item(
+                due_items,
+                now=time.time(),
+            )
             wait_sec = float(due_at) - time.time()
             if wait_sec > 0:
                 self._rollup_scheduler_stop.wait(min(10.0, wait_sec))
@@ -7289,6 +7703,61 @@ class LuxriotManager:
                         }
                     )
                 continue
+            source_ready, source_watermark_ms, source_window_end = (
+                self._rollup_l0_source_watermark_ready(
+                    channel_id,
+                    level,
+                )
+            )
+            source_deferral_exhausted = bool(
+                not source_ready
+                and self._rollup_deferral_exhausted(
+                    scheduler_key,
+                    level,
+                    time.time(),
+                )
+            )
+            if not source_ready and not source_deferral_exhausted:
+                deferred_at = time.time()
+                self._rollup_scheduler_deferred_since.setdefault(
+                    scheduler_key,
+                    deferred_at,
+                )
+                retry_at = deferred_at + max(
+                    10.0,
+                    self.rollup_scheduler_spacing_sec,
+                )
+                self._rollup_scheduler_due[scheduler_key] = retry_at
+                with self.cache_lock:
+                    self._rollup_scheduler_status[
+                        "jobs_deferred_for_source_watermark"
+                    ] = int(
+                        self._rollup_scheduler_status.get(
+                            "jobs_deferred_for_source_watermark"
+                        )
+                        or 0
+                    ) + 1
+                    self._rollup_scheduler_status.update(
+                        {
+                            "last_source_deferred_channel_id": int(channel_id),
+                            "last_source_deferred_level": level,
+                            "last_source_deferred_at": deferred_at,
+                            "last_source_retry_at": retry_at,
+                            "last_source_window_end": int(source_window_end),
+                            "last_source_watermark_ms": source_watermark_ms,
+                        }
+                    )
+                continue
+            if source_deferral_exhausted:
+                with self.cache_lock:
+                    self._rollup_scheduler_status[
+                        "jobs_forced_before_source_watermark"
+                    ] = int(
+                        self._rollup_scheduler_status.get(
+                            "jobs_forced_before_source_watermark"
+                        )
+                        or 0
+                    ) + 1
             l0_backpressure = self._l0_backpressure_active(
                 model_hint=rollup_model_hint,
             )
@@ -7908,81 +8377,150 @@ class LuxriotManager:
 
     def submit_probe_embedding(
         self,
+        channel_id: int,
         work: Callable[[], Optional[Dict[str, Any]]],
         callback: Callable[
             [Optional[Dict[str, Any]], Optional[BaseException]],
             None,
         ],
     ) -> bool:
-        """Run live CLIP work off the decoder thread with bounded admission."""
+        """Run CLIP off-thread with one active and one latest job per channel."""
 
         if not self._probe_embedding_async_enabled:
             return False
-        if not self._probe_embedding_capacity.acquire(blocking=False):
-            with self._probe_embedding_runtime_lock:
-                self._probe_embedding_runtime["rejected_total"] += 1
-                self._probe_embedding_runtime["last_error"] = (
-                    "clip async dispatch queue is full"
-                )
-            return False
+        normalized_channel = int(channel_id)
+        superseded_callback: Optional[
+            Callable[
+                [Optional[Dict[str, Any]], Optional[BaseException]],
+                None,
+            ]
+        ] = None
         with self._probe_embedding_runtime_lock:
             if bool(self._probe_embedding_runtime.get("stopped")):
-                self._probe_embedding_capacity.release()
                 return False
             self._probe_embedding_runtime["submitted_total"] += 1
-            self._probe_embedding_runtime["pending"] += 1
+            already_active = (
+                normalized_channel in self._probe_embedding_active_channels
+            )
+            if already_active:
+                previous = self._probe_embedding_pending_latest.get(
+                    normalized_channel
+                )
+                self._probe_embedding_pending_latest[normalized_channel] = (
+                    work,
+                    callback,
+                )
+                if previous is None:
+                    self._probe_embedding_runtime["pending"] += 1
+                else:
+                    superseded_callback = previous[1]
+                    self._probe_embedding_runtime["coalesced_total"] += 1
+            else:
+                self._probe_embedding_active_channels.add(normalized_channel)
+                self._probe_embedding_runtime["pending"] += 1
 
-        def run() -> Optional[Dict[str, Any]]:
+        if already_active:
+            if superseded_callback is not None:
+                try:
+                    # This observation never entered the encoder. Mark its
+                    # already-admitted frame unavailable without treating GPU
+                    # health as failed; the pending slot now holds newer data.
+                    superseded_callback(None, None)
+                except BaseException as exc:
+                    with self._probe_embedding_runtime_lock:
+                        self._probe_embedding_runtime[
+                            "callback_failed_total"
+                        ] += 1
+                        self._probe_embedding_runtime["last_error"] = (
+                            f"{type(exc).__name__}: {exc}"
+                        )[:500]
+            return True
+
+        if not self._probe_embedding_capacity.acquire(blocking=False):
             with self._probe_embedding_runtime_lock:
+                self._probe_embedding_active_channels.discard(
+                    normalized_channel
+                )
                 self._probe_embedding_runtime["pending"] = max(
                     0,
                     int(self._probe_embedding_runtime["pending"]) - 1,
                 )
-                self._probe_embedding_runtime["in_flight"] += 1
+                self._probe_embedding_runtime["rejected_total"] += 1
+                self._probe_embedding_runtime["last_error"] = (
+                    "clip async dispatch queue is full"
+                )
+            # Returning False would run expensive CLIP work synchronously on
+            # the decoder thread, exactly the failure mode this queue prevents.
             try:
-                return work()
-            finally:
+                callback(None, None)
+            except BaseException:
                 with self._probe_embedding_runtime_lock:
-                    self._probe_embedding_runtime["in_flight"] = max(
-                        0,
-                        int(
-                            self._probe_embedding_runtime["in_flight"]
-                        ) - 1,
-                    )
+                    self._probe_embedding_runtime["callback_failed_total"] += 1
+            return True
 
-        def complete(future: Future[Optional[Dict[str, Any]]]) -> None:
-            result: Optional[Dict[str, Any]] = None
-            error: Optional[BaseException] = None
+        def run_channel() -> None:
+            current_work = work
+            current_callback = callback
             try:
-                result = future.result()
-            except BaseException as exc:
-                error = exc
-            with self._probe_embedding_runtime_lock:
-                self._probe_embedding_runtime["completed_total"] += 1
-                if error is not None:
-                    self._probe_embedding_runtime["failed_total"] += 1
-                    self._probe_embedding_runtime["last_error"] = (
-                        f"{type(error).__name__}: {error}"
-                    )[:500]
-                else:
-                    self._probe_embedding_runtime["last_error"] = None
-            try:
-                callback(result, error)
-            except BaseException as exc:
-                with self._probe_embedding_runtime_lock:
-                    self._probe_embedding_runtime[
-                        "callback_failed_total"
-                    ] += 1
-                    self._probe_embedding_runtime["last_error"] = (
-                        f"{type(exc).__name__}: {exc}"
-                    )[:500]
+                while True:
+                    with self._probe_embedding_runtime_lock:
+                        self._probe_embedding_runtime["pending"] = max(
+                            0,
+                            int(self._probe_embedding_runtime["pending"]) - 1,
+                        )
+                        self._probe_embedding_runtime["in_flight"] += 1
+
+                    result: Optional[Dict[str, Any]] = None
+                    error: Optional[BaseException] = None
+                    try:
+                        result = current_work()
+                    except BaseException as exc:
+                        error = exc
+                    with self._probe_embedding_runtime_lock:
+                        self._probe_embedding_runtime["in_flight"] = max(
+                            0,
+                            int(self._probe_embedding_runtime["in_flight"]) - 1,
+                        )
+                        self._probe_embedding_runtime["completed_total"] += 1
+                        if error is not None:
+                            self._probe_embedding_runtime["failed_total"] += 1
+                            self._probe_embedding_runtime["last_error"] = (
+                                f"{type(error).__name__}: {error}"
+                            )[:500]
+                        else:
+                            self._probe_embedding_runtime["last_error"] = None
+                    try:
+                        current_callback(result, error)
+                    except BaseException as exc:
+                        with self._probe_embedding_runtime_lock:
+                            self._probe_embedding_runtime[
+                                "callback_failed_total"
+                            ] += 1
+                            self._probe_embedding_runtime["last_error"] = (
+                                f"{type(exc).__name__}: {exc}"
+                            )[:500]
+
+                    with self._probe_embedding_runtime_lock:
+                        pending = self._probe_embedding_pending_latest.pop(
+                            normalized_channel,
+                            None,
+                        )
+                        if pending is None:
+                            self._probe_embedding_active_channels.discard(
+                                normalized_channel
+                            )
+                            break
+                        current_work, current_callback = pending
             finally:
                 self._probe_embedding_capacity.release()
 
         try:
-            future = self._probe_embedding_executor.submit(run)
+            self._probe_embedding_executor.submit(run_channel)
         except RuntimeError as exc:
             with self._probe_embedding_runtime_lock:
+                self._probe_embedding_active_channels.discard(
+                    normalized_channel
+                )
                 self._probe_embedding_runtime["pending"] = max(
                     0,
                     int(self._probe_embedding_runtime["pending"]) - 1,
@@ -7993,16 +8531,21 @@ class LuxriotManager:
                 )[:500]
             self._probe_embedding_capacity.release()
             return False
-        future.add_done_callback(complete)
         return True
 
     def probe_embedding_dispatch_status(self) -> Dict[str, Any]:
         with self._probe_embedding_runtime_lock:
             runtime = dict(self._probe_embedding_runtime)
+            active_channels = len(self._probe_embedding_active_channels)
+            pending_latest_channels = len(
+                self._probe_embedding_pending_latest
+            )
         return {
             "enabled": bool(self._probe_embedding_async_enabled),
             "workers": int(self._probe_embedding_worker_count),
             "queue_capacity": int(self._probe_embedding_queue_capacity),
+            "active_channels": int(active_channels),
+            "pending_latest_channels": int(pending_latest_channels),
             **runtime,
         }
 
@@ -9060,6 +9603,16 @@ class LuxriotManager:
             "L2": "Describe hour-scale episodes, routine shifts, meaningful recurrence, and unresolved exceptions.",
             "L3": "Describe the longer operational pattern, repeated behavior, unresolved incidents, and coverage quality.",
         }.get(normalized_level, "Describe behavior and change across the complete period.")
+        operator_word_budget = {
+            "L1": 180,
+            "L2": 260,
+            "L3": 420,
+        }.get(normalized_level, 260)
+        memory_item_budget = {
+            "L1": 3,
+            "L2": 5,
+            "L3": 7,
+        }.get(normalized_level, 5)
         memory_authority = {
             "L1": (
                 "L1 memory authority is short-lived only: populate active_watchlist and preserved_deviations. "
@@ -9115,6 +9668,8 @@ class LuxriotManager:
                 else []
             ),
             "- Synthesize behavior over time; do not enumerate, concatenate, or paraphrase every source batch.",
+            f"- Keep all six operator-facing sections together within {operator_word_budget} words, excluding the required Period Overview metadata line.",
+            "- Use at most two short sentences per section; use no more than three bullets only when distinct events cannot be combined safely.",
             "- Use prose for the period narrative. Use bullets only for distinct observations, alerts, interruptions, or follow-up items.",
             "- Deduplicate repeated scene descriptions, names, boilerplate, and unchanged background.",
             "- Explain each alert's observable meaning and outcome; do not merely repeat severity counters.",
@@ -9145,7 +9700,7 @@ class LuxriotManager:
             "  \"alert_tuning_notes\": [\"what should/should not trigger next time\"],",
             "  \"ignore_as_routine\": [\"recurring benign activity/noise\"]",
             "}",
-            "Rules for MEMORY_UPDATE_JSON: keep every field concise; use [] or \"\" when absent; preserve real deviations even if the window is mostly routine.",
+            f"Rules for MEMORY_UPDATE_JSON: keep every field concise and every list to at most {memory_item_budget} items; use [] or \"\" when absent; preserve real deviations even if the window is mostly routine.",
             f"Level authority: {memory_authority}",
         ]
 
@@ -9791,6 +10346,8 @@ class LuxriotManager:
             "text_budget_tokens",
             "vision_budget_tokens",
             "output_budget_tokens",
+            "generation_output_tokens",
+            "generation_output_mode",
             "incident_budget_tokens",
             "estimated_vision_tokens",
             "estimated_context_tokens",
@@ -9829,6 +10386,56 @@ class LuxriotManager:
                 for key, item in vector_timing.items()
                 if isinstance(item, (int, float))
             }
+        return out
+
+    @staticmethod
+    def _compact_lm_response_stats(value: object) -> Dict[str, Any]:
+        if not isinstance(value, Mapping):
+            return {}
+        out: Dict[str, Any] = {}
+        for key in (
+            "attempt_count",
+            "retried",
+            "retry_reason",
+            "finish_reason",
+            "admission_wait_ms",
+            "http_ms",
+            "prompt_tokens",
+            "completion_tokens",
+            "total_tokens",
+        ):
+            item = value.get(key)
+            if isinstance(item, str):
+                out[key] = item[:160]
+            elif isinstance(item, (int, float, bool)) or item is None:
+                out[key] = item
+        attempts = value.get("attempts")
+        if isinstance(attempts, Sequence) and not isinstance(
+            attempts,
+            (str, bytes, bytearray),
+        ):
+            compact_attempts: List[Dict[str, Any]] = []
+            for attempt in attempts[:2]:
+                if not isinstance(attempt, Mapping):
+                    continue
+                compact_attempts.append(
+                    {
+                        str(key)[:40]: item
+                        for key, item in attempt.items()
+                        if key
+                        in {
+                            "admission_wait_ms",
+                            "http_ms",
+                            "finish_reason",
+                            "prompt_tokens",
+                            "completion_tokens",
+                            "total_tokens",
+                        }
+                        and isinstance(item, (str, int, float, bool))
+                    }
+                )
+            if compact_attempts:
+                out["attempts"] = compact_attempts
         return out
 
     @staticmethod
@@ -12763,31 +13370,59 @@ class LuxriotManager:
         health["clip_probe_query_count"] = 0
         health["clip_probe_reused_scores"] = 0
 
-        # New alert-derived probes continuously introduce fresh phrases. Encode
-        # all unique text for this channel in one SigLIP call before per-probe
-        # scoring; cache hits return without entering the shared image-encoder
-        # lifecycle lock.
-        prewarm_texts = getattr(self.probe_manager, "prewarm_texts", None)
+        # New alert-derived probes continuously introduce fresh phrases. Cold
+        # SigLIP text encoding shares a lifecycle lock with one-Hz archive image
+        # indexing, so it must not hold up the current L0 request. Queue missing
+        # phrases once and omit P/N/M from this batch; the following batch uses
+        # the cached vectors. Older ProbeManager-compatible implementations keep
+        # the synchronous path for API compatibility.
+        phrases: List[str] = []
+        for probe in active:
+            phrases.extend(
+                str(item).strip()
+                for item in (probe.get("positives") or [])
+                if str(item).strip()
+            )
+            phrases.extend(
+                str(item).strip()
+                for item in (probe.get("negatives") or [])
+                if str(item).strip()
+            )
+        texts_cached = getattr(self.probe_manager, "texts_cached", None)
+        prewarm_texts_async = getattr(
+            self.probe_manager,
+            "prewarm_texts_async",
+            None,
+        )
         prewarm_started = time.monotonic()
-        if callable(prewarm_texts):
-            phrases: List[str] = []
-            for probe in active:
-                phrases.extend(
-                    str(item).strip()
-                    for item in (probe.get("positives") or [])
-                    if str(item).strip()
-                )
-                phrases.extend(
-                    str(item).strip()
-                    for item in (probe.get("negatives") or [])
-                    if str(item).strip()
-                )
+        if callable(texts_cached) and callable(prewarm_texts_async):
             try:
-                health["clip_probe_prewarmed_texts"] = int(prewarm_texts(phrases))
+                if not bool(texts_cached(phrases)):
+                    health["clip_probe_prewarm_scheduled"] = int(
+                        prewarm_texts_async(phrases)
+                    )
+                    health["clip_probe_status"] = "text_prewarm_pending"
+                    health["clip_probe_prewarm_ms"] = round(
+                        (time.monotonic() - prewarm_started) * 1000.0,
+                        2,
+                    )
+                    return [], health
+                health["clip_probe_status"] = "ready"
             except Exception as exc:
                 health["clip_probe_prewarm_error"] = (
                     str(exc)[:160] or exc.__class__.__name__
                 )
+        else:
+            prewarm_texts = getattr(self.probe_manager, "prewarm_texts", None)
+            if callable(prewarm_texts):
+                try:
+                    health["clip_probe_prewarmed_texts"] = int(
+                        prewarm_texts(phrases)
+                    )
+                except Exception as exc:
+                    health["clip_probe_prewarm_error"] = (
+                        str(exc)[:160] or exc.__class__.__name__
+                    )
         health["clip_probe_prewarm_ms"] = round(
             (time.monotonic() - prewarm_started) * 1000.0,
             2,
@@ -14016,6 +14651,7 @@ class LuxriotManager:
             "snapshot_count",
             "snapshot_failed_count",
             "slow_snapshot_count",
+            "snapshot_slow_streak",
             "snapshot_slow_threshold_sec",
             "last_snapshot_latency_sec",
             "avg_snapshot_latency_sec",
@@ -14182,6 +14818,7 @@ class LuxriotManager:
             "state_transition_total": int(max(0, _parse_optional_int(entry.get("state_transition_total")) or 0)),
             "vector_signal": self._compact_vector_signal(entry.get("vector_signal")),
             "llm_input_stats": self._compact_llm_input_stats(entry.get("llm_input_stats")),
+            "lm_response_stats": self._compact_lm_response_stats(entry.get("lm_response_stats")),
             "signal_digest": signal_digest,
             **alert_meta,
         }
@@ -14201,6 +14838,12 @@ class LuxriotManager:
                 "alert_processing_started_at_ms",
                 "alert_processing_completed_at_ms",
                 "alert_processing_ms",
+                "archive_processing_started_at_ms",
+                "archive_processing_completed_at_ms",
+                "archive_processing_ms",
+                "summary_acceptance_started_at_ms",
+                "summary_acceptance_completed_at_ms",
+                "summary_acceptance_ms",
                 "bookmark_first_attempt_at_ms",
                 "bookmark_first_ack_at_ms",
                 "batch_end_to_bookmark_ack_ms",
@@ -14906,28 +15549,49 @@ class LuxriotManager:
         )
 
     def _load_desired_live_sessions(self) -> Dict[int, Dict[str, Any]]:
-        state_store = getattr(self, "runtime_state_store", None)
-        if state_store is None:
-            return {}
-        payload = state_store.load_state(self.DESIRED_LIVE_SESSIONS_KEY)
-        if not isinstance(payload, Mapping):
-            return {}
-        sessions_raw = payload.get("sessions")
-        if not isinstance(sessions_raw, Mapping):
-            return {}
-        desired: Dict[int, Dict[str, Any]] = {}
-        for raw_channel_id, raw_state in sessions_raw.items():
-            channel_id = _parse_optional_int(raw_channel_id)
-            if channel_id is None or channel_id <= 0 or not isinstance(raw_state, Mapping):
-                continue
-            normalized_state = dict(raw_state)
-            if "last_restore_error" in normalized_state:
-                normalized_state["last_restore_error"] = _safe_error_text(
-                    normalized_state.get("last_restore_error"),
-                    500,
-                )
-            desired[channel_id] = normalized_state
-        return desired
+        with self._desired_live_sessions_lock:
+            cached = self._desired_live_sessions_cache
+            if cached is not None:
+                return {
+                    int(channel_id): dict(state)
+                    for channel_id, state in cached.items()
+                }
+            state_store = getattr(self, "runtime_state_store", None)
+            if state_store is None:
+                self._desired_live_sessions_cache = {}
+                return {}
+            payload = state_store.load_state(self.DESIRED_LIVE_SESSIONS_KEY)
+            if not isinstance(payload, Mapping):
+                self._desired_live_sessions_cache = {}
+                return {}
+            sessions_raw = payload.get("sessions")
+            if not isinstance(sessions_raw, Mapping):
+                self._desired_live_sessions_cache = {}
+                return {}
+            desired: Dict[int, Dict[str, Any]] = {}
+            for raw_channel_id, raw_state in sessions_raw.items():
+                channel_id = _parse_optional_int(raw_channel_id)
+                if (
+                    channel_id is None
+                    or channel_id <= 0
+                    or not isinstance(raw_state, Mapping)
+                ):
+                    continue
+                normalized_state = dict(raw_state)
+                if "last_restore_error" in normalized_state:
+                    normalized_state["last_restore_error"] = _safe_error_text(
+                        normalized_state.get("last_restore_error"),
+                        500,
+                    )
+                desired[channel_id] = normalized_state
+            self._desired_live_sessions_cache = {
+                int(channel_id): dict(state)
+                for channel_id, state in desired.items()
+            }
+            return {
+                int(channel_id): dict(state)
+                for channel_id, state in desired.items()
+            }
 
     def _save_desired_live_sessions(self, sessions: Mapping[int, Mapping[str, Any]]) -> None:
         state_store = getattr(self, "runtime_state_store", None)
@@ -14943,6 +15607,12 @@ class LuxriotManager:
             },
         }
         state_store.save_state(self.DESIRED_LIVE_SESSIONS_KEY, payload)
+        with self._desired_live_sessions_lock:
+            self._desired_live_sessions_cache = {
+                int(channel_id): dict(state)
+                for channel_id, state in sessions.items()
+                if int(channel_id) > 0
+            }
 
     def _set_desired_live_session(
         self,
@@ -15446,6 +16116,73 @@ class LuxriotManager:
             return cast(Mapping[str, Any], payload)
         return None
 
+    @classmethod
+    def _extract_partial_json_marker_payload(
+        cls,
+        text: str,
+        marker: str,
+    ) -> Optional[Mapping[str, Any]]:
+        """Recover only complete top-level members from a truncated contract.
+
+        Small VLMs can hit their output cap after emitting valid early members
+        of BATCH_STATE_JSON.  The explicit marker establishes intent, while
+        JSONDecoder still requires every recovered member value to be complete;
+        unfinished arrays/objects and prose are never guessed or repaired.
+        """
+
+        haystack = str(text or "")
+        marker_text = str(marker or "").strip()
+        if not haystack or not marker_text:
+            return None
+        compact_marker = re.sub(r"[^A-Z0-9]+", "", marker_text.upper())
+        marker_patterns = {
+            "BATCHSTATEJSON": r"\bBATCH[\s_-]*STATE[\s_-]*JSON\s*:",
+            "ALERTSJSON": r"\bALERTS[\s_-]*JSON\s*:",
+            "MEMORYUPDATEJSON": r"\bMEMORY[\s_-]*UPDATE[\s_-]*JSON\s*:",
+        }
+        marker_match = re.search(
+            marker_patterns.get(compact_marker, re.escape(marker_text)),
+            haystack,
+            flags=re.IGNORECASE,
+        )
+        if marker_match is None:
+            return None
+        tail = haystack[marker_match.end() :].lstrip()
+        if not tail.startswith("{"):
+            return None
+        decoder = json.JSONDecoder()
+        cursor = 1
+        payload: Dict[str, Any] = {}
+        while cursor < len(tail):
+            while cursor < len(tail) and tail[cursor] in " \t\r\n,":
+                cursor += 1
+            if cursor >= len(tail) or tail[cursor] == "}":
+                break
+            try:
+                key, key_end = decoder.raw_decode(tail, cursor)
+            except Exception:
+                break
+            if not isinstance(key, str):
+                break
+            cursor = key_end
+            while cursor < len(tail) and tail[cursor].isspace():
+                cursor += 1
+            if cursor >= len(tail) or tail[cursor] != ":":
+                break
+            cursor += 1
+            while cursor < len(tail) and tail[cursor].isspace():
+                cursor += 1
+            try:
+                value, value_end = decoder.raw_decode(tail, cursor)
+            except Exception:
+                break
+            payload[key] = value
+            cursor = value_end
+        useful_keys = {"alerts", "events", "observed_states"}
+        if not useful_keys.intersection(payload):
+            return None
+        return payload
+
     @staticmethod
     def _extract_terminal_batch_state_fence(
         text: object,
@@ -15649,10 +16386,19 @@ class LuxriotManager:
             summary_raw,
             "BATCH_STATE_JSON:",
         )
+        partial_raw: Optional[Mapping[str, Any]] = None
+        if raw is None and marker_match is not None:
+            partial_raw = cls._extract_partial_json_marker_payload(
+                summary_raw,
+                "BATCH_STATE_JSON:",
+            )
+            raw = partial_raw
         if raw is None and terminal_fence is not None:
             raw = terminal_fence[0]
         contract_status = (
-            "parsed"
+            "partial_prefix"
+            if partial_raw is not None
+            else "parsed"
             if marker_match is not None and isinstance(raw, Mapping)
             else (
                 "parsed_terminal_fence"
@@ -15879,6 +16625,9 @@ class LuxriotManager:
 
         value = str(token or "").strip().lower()
         posture_aliases = {
+            "left": "leave",
+            "leaves": "leave",
+            "leaving": "leave",
             "move": "move",
             "moved": "move",
             "movement": "move",
@@ -15933,10 +16682,13 @@ class LuxriotManager:
                     "monitor",
                     "operator",
                     "require",
+                    "scene",
                     "severity",
                     "significant",
+                    "spot",
                     "trigger",
                     "visible",
+                    "you",
                 }
             ):
                 continue
@@ -15958,7 +16710,7 @@ class LuxriotManager:
             r"\b(?:"
             r"create\s+(?:an?\s+)?alert\s+if|"
             r"raise\s+(?:an?\s+)?alert\s+(?:if|when)|"
-            r"alert\s+(?:if|when)|"
+            r"alert\s+(?:if|when|is)|"
             r"bookmark\s+(?:if|when)|"
             r"watch\s+for|"
             r"detect"
@@ -16110,13 +16862,13 @@ class LuxriotManager:
             key: copy.deepcopy(batch_state.get(key))
             for key in (
                 "version",
-                "cover",
-                "scene",
+                "alerts",
                 "events",
                 "observed_states",
+                "cover",
+                "scene",
                 "routines",
                 "memory_pass",
-                "alerts",
             )
             if key in batch_state
         }
@@ -16155,6 +16907,7 @@ class LuxriotManager:
         if str(state.get("contract_status") or "") not in {
             "parsed",
             "parsed_terminal_fence",
+            "partial_prefix",
         }:
             return str(summary_text or ""), state
         candidates: List[Tuple[str, Mapping[str, Any]]] = []
@@ -16199,63 +16952,96 @@ class LuxriotManager:
         if not criteria:
             return str(summary_text or ""), state
 
-        best: Optional[Tuple[float, str, str, Mapping[str, Any]]] = None
+        matches: List[Tuple[float, str, str, Mapping[str, Any]]] = []
         for criterion in criteria:
+            best_for_criterion: Optional[
+                Tuple[float, str, str, Mapping[str, Any]]
+            ] = None
             for source, candidate_state in candidates:
                 score = self._operator_policy_event_match(criterion, candidate_state)
                 if score is None:
                     continue
                 candidate = (score, criterion, source, candidate_state)
-                if best is None or candidate[0] > best[0]:
-                    best = candidate
-        if best is None:
+                if (
+                    best_for_criterion is None
+                    or candidate[0] > best_for_criterion[0]
+                ):
+                    best_for_criterion = candidate
+            if best_for_criterion is not None:
+                matches.append(best_for_criterion)
+        if not matches:
             return str(summary_text or ""), state
 
-        score, criterion, reconciliation_source, event = best
-        snapshot_indices = [
-            int(index)
-            for index in (
-                _parse_optional_int(value)
-                for value in cast(Sequence[Any], event.get("snapshot_indices") or [])
+        reconciled_alerts: List[Dict[str, Any]] = []
+        reconciliation_sources: Set[str] = set()
+        seen_alerts: Set[Tuple[str, Tuple[int, ...]]] = set()
+        for score, criterion, reconciliation_source, event in matches:
+            snapshot_indices = [
+                int(index)
+                for index in (
+                    _parse_optional_int(value)
+                    for value in cast(
+                        Sequence[Any],
+                        event.get("snapshot_indices") or [],
+                    )
+                )
+                if index is not None and index > 0
+            ][:16]
+            if not snapshot_indices:
+                continue
+            label = self._truncate_text(
+                event.get("label") or criterion,
+                90,
             )
-            if index is not None and index > 0
-        ][:16]
-        if not snapshot_indices:
+            dedupe_key = (
+                " ".join(sorted(self._alert_policy_match_tokens(criterion))),
+                tuple(snapshot_indices),
+            )
+            if dedupe_key in seen_alerts:
+                continue
+            seen_alerts.add(dedupe_key)
+            event_summary = self._truncate_text(
+                event.get("summary") or event.get("label"),
+                180,
+            )
+            reconciled_alerts.append(
+                {
+                    "title": self._truncate_text(
+                        f"{label} — operator criterion",
+                        120,
+                    ),
+                    "description": self._truncate_text(
+                        "Current structured VLM event matched operator "
+                        f"criterion: {event_summary}",
+                        240,
+                    ),
+                    "severity": self._operator_alert_policy_severity(
+                        policy_text,
+                        criterion,
+                    ),
+                    "state": str(event.get("state") or "new").strip().lower(),
+                    "channel_id": int(channel_id),
+                    "timestamp_ms": 0,
+                    "snapshot_indices": snapshot_indices,
+                    "source": "backend_policy_reconciliation",
+                    "policy_criterion": self._truncate_text(criterion, 220),
+                    "policy_match_score": round(float(score), 3),
+                }
+            )
+            reconciliation_sources.add(reconciliation_source)
+            if len(reconciled_alerts) >= 8:
+                break
+        if not reconciled_alerts:
             return str(summary_text or ""), state
-        label = self._truncate_text(
-            event.get("label") or criterion,
-            90,
-        )
-        event_summary = self._truncate_text(
-            event.get("summary") or event.get("label"),
-            180,
-        )
-        alert = {
-            "title": self._truncate_text(
-                f"{label} — operator criterion",
-                120,
-            ),
-            "description": self._truncate_text(
-                f"Current structured VLM event matched operator criterion: {event_summary}",
-                240,
-            ),
-            "severity": self._operator_alert_policy_severity(
-                policy_text,
-                criterion,
-            ),
-            "state": str(event.get("state") or "new").strip().lower(),
-            "channel_id": int(channel_id),
-            "timestamp_ms": 0,
-            "snapshot_indices": snapshot_indices,
-            "source": "backend_policy_reconciliation",
-            "policy_criterion": self._truncate_text(criterion, 220),
-            "policy_match_score": round(float(score), 3),
-        }
-        state["alerts"] = [alert]
+        state["alerts"] = reconciled_alerts
         state["contract_status"] = "parsed_alert_reconciled"
         state["alert_reconciliation"] = {
-            "source": reconciliation_source,
-            "count": 1,
+            "source": (
+                next(iter(reconciliation_sources))
+                if len(reconciliation_sources) == 1
+                else "multiple_current_structured_sources"
+            ),
+            "count": len(reconciled_alerts),
         }
         return self._render_reconciled_batch_state_summary(
             summary_text,
@@ -16326,6 +17112,7 @@ class LuxriotManager:
         if str(state.get("contract_status") or "") not in {
             "parsed",
             "parsed_terminal_fence",
+            "partial_prefix",
         }:
             return str(summary_text or ""), state
         candidate = self._general_hazard_event_candidate(state.get("events"))
@@ -18884,8 +19671,33 @@ class LuxriotManager:
         start_ts: Optional[float],
         end_ts: Optional[float],
     ) -> List[Dict[str, Any]]:
+        cutoff = self._rollup_retention_cutoff()
+
+        def hot_entry_in_scope(value: object) -> bool:
+            if not isinstance(value, Mapping):
+                return False
+            if _parse_optional_int(value.get("channel_id")) != channel_id:
+                return False
+            created = self._coerce_float(value.get("created_at"))
+            if cutoff is not None and created is not None and created < cutoff:
+                return False
+            window_start = self._coerce_float(value.get("window_start"))
+            window_end = self._coerce_float(value.get("window_end"))
+            if start_ts is not None and (window_end is None or window_end < start_ts):
+                return False
+            if end_ts is not None and (window_start is None or window_start > end_ts):
+                return False
+            return True
+
         with self.cache_lock:
-            hot_entries = [dict(val) for val in self.rollup_summary_cache.values() if isinstance(val, Mapping)]
+            # The hot cache can contain months of rollups for every channel.
+            # Filter by cheap scalar fields before running the comparatively
+            # expensive semantic normalization on any row.
+            hot_entries = [
+                dict(value)
+                for value in self.rollup_summary_cache.values()
+                if hot_entry_in_scope(value)
+            ]
         entries: List[Dict[str, Any]] = []
         state_store = getattr(self, "runtime_state_store", None)
         durable_loader = getattr(state_store, "list_rollups", None)
@@ -18928,8 +19740,12 @@ class LuxriotManager:
         entries.extend(hot_entries)
         out: List[Dict[str, Any]] = []
         seen: Set[str] = set()
-        cutoff = self._rollup_retention_cutoff()
         for entry in entries:
+            # Durable rows are appended first and are authoritative.  Avoid
+            # normalizing their duplicate hot-cache copies a second time.
+            identity_hint = self._rollup_identity_key(entry)
+            if identity_hint and identity_hint in seen:
+                continue
             normalized = self._normalize_cached_rollup_entry(entry)
             if normalized is None:
                 continue
@@ -19616,6 +20432,30 @@ class LuxriotManager:
                     None,
                 )
 
+            # Several high-risk phrases have deterministic, evidence-preserving
+            # rewrites (for example "no blind spots" -> recorded-interruption
+            # metadata plus an explicit sampled-evidence caveat).  Apply those
+            # narrow rewrites before spending another model turn.  Semantic
+            # conflicts that cannot be repaired locally, such as erasing a
+            # non-empty event ledger, still take the corrective-generation path.
+            if contract_valid and semantic_issues:
+                sanitized_summary = self._sanitize_rollup_operator_overclaims(
+                    operator_summary,
+                    node,
+                )
+                if not self._rollup_grounding_guard_issues(
+                    sanitized_summary,
+                    node,
+                ):
+                    self._increment_rollup_status_counter(
+                        "semantic_guard_sanitized"
+                    )
+                    return (
+                        sanitized_summary,
+                        self._sanitize_rollup_memory_update(memory_update, node),
+                        None,
+                    )
+
             if not contract_valid:
                 self._increment_rollup_status_counter("invalid_operator_contract")
             if semantic_issues:
@@ -19989,6 +20829,34 @@ class LuxriotManager:
                 else:
                     node["summary_kind"] = "degraded"
                     node["generation_status"] = "failed" if generation_error else "degraded"
+                    if generation_error:
+                        self._put_cached_rollup_summary(
+                            rollup_id,
+                            fallback,
+                            channel_id=channel_id,
+                            level=level,
+                            source_level=source_level,
+                            window_start=self._coerce_float(node.get("window_start")),
+                            window_end=self._coerce_float(node.get("window_end")),
+                            window_sec=_parse_optional_int(node.get("window_sec")) or 0,
+                            item_count=_parse_optional_int(node.get("item_count")) or 0,
+                            frame_count=_parse_optional_int(node.get("frame_count")) or 0,
+                            source_tokens=source_tokens,
+                            run_ids=node.get("run_ids"),
+                            source_ids=node.get("source_ids"),
+                            source_signature=source_signature,
+                            highlights=node.get("highlights"),
+                            alert_counts=node.get("alert_counts"),
+                            alert_total=node.get("alert_total"),
+                            alert_severities=node.get("alert_severities"),
+                            signal_digest=node.get("signal_digest"),
+                            summary_kind="degraded",
+                            operator_summary=fallback,
+                            memory_update={},
+                            generation_status="failed",
+                            generation_error=generation_error,
+                            format_version=ROLLUP_OPERATOR_FORMAT_VERSION,
+                        )
                 if generation_error:
                     node["generation_error"] = generation_error
             remaining_budget -= 1
@@ -20826,6 +21694,21 @@ class LuxriotManager:
                 "thumbnail": thumbnail,
                 "is_cover": int(index + 1) == cover_snapshot_index,
             }
+            reusable_embedding = frame.get("clip_embedding")
+            if (
+                isinstance(reusable_embedding, Sequence)
+                and not isinstance(reusable_embedding, (str, bytes, bytearray))
+            ):
+                item["clip_embedding"] = list(reusable_embedding)
+            embedding_space = frame.get("embedding_space")
+            if isinstance(embedding_space, Mapping):
+                item["embedding_space"] = dict(embedding_space)
+            embedding_ref = str(frame.get("embedding_ref") or "").strip()
+            if embedding_ref:
+                item["embedding_ref"] = embedding_ref[:240]
+            embedding_status = str(frame.get("embedding_status") or "").strip().lower()
+            if embedding_status in {"pending", "ready", "unavailable"}:
+                item["embedding_status"] = embedding_status
             if item["is_cover"]:
                 item["cover_kind"] = str(
                     cast(Mapping[str, Any], cover_raw).get("kind") or "event"
@@ -20917,6 +21800,21 @@ class LuxriotManager:
                         "thumbnail": apex_thumbnail,
                         "is_cover": int(index + 1) == cover_snapshot_index,
                     }
+                    reusable_embedding = frame.get("clip_embedding")
+                    if (
+                        isinstance(reusable_embedding, Sequence)
+                        and not isinstance(reusable_embedding, (str, bytes, bytearray))
+                    ):
+                        apex_item["clip_embedding"] = list(reusable_embedding)
+                    embedding_space = frame.get("embedding_space")
+                    if isinstance(embedding_space, Mapping):
+                        apex_item["embedding_space"] = dict(embedding_space)
+                    embedding_ref = str(frame.get("embedding_ref") or "").strip()
+                    if embedding_ref:
+                        apex_item["embedding_ref"] = embedding_ref[:240]
+                    embedding_status = str(frame.get("embedding_status") or "").strip().lower()
+                    if embedding_status in {"pending", "ready", "unavailable"}:
+                        apex_item["embedding_status"] = embedding_status
                     if apex_item["is_cover"]:
                         apex_item["cover_kind"] = str(
                             cast(Mapping[str, Any], cover_raw).get("kind") or "event"
@@ -20964,6 +21862,10 @@ class LuxriotManager:
                         companion_snapshot_index is not None
                         and companion_snapshot_index == cover_snapshot_index
                     ),
+                    # The sharper companion is useful visual evidence but is
+                    # not the independently indexed one-Hz apex. Leave vector
+                    # backfill to archive search instead of blocking live L0.
+                    "embedding_status": "unavailable",
                 }
                 if companion_item["is_cover"]:
                     companion_item["cover_kind"] = str(
@@ -21314,7 +22216,26 @@ class LuxriotManager:
         estimated_input_tokens = int(
             _parse_optional_int(message_stats.get("estimated_context_tokens")) or 0
         )
-        reserved_output_tokens = int(self.l0_prompt_budget.max_output_tokens)
+        lm_workload_class = (
+            str(batch.get("lm_workload_class") or "vlm").strip().lower()
+            or "vlm"
+        )
+        event_generation = lm_workload_class in {"alert", "describe"}
+        generation_output_tokens = min(
+            int(self.l0_prompt_budget.max_output_tokens),
+            int(
+                self.l0_event_output_tokens
+                if event_generation
+                else self.l0_heartbeat_output_tokens
+            ),
+        )
+        reserved_output_tokens = int(generation_output_tokens)
+        llm_input_stats["generation_output_tokens"] = int(
+            generation_output_tokens
+        )
+        llm_input_stats["generation_output_mode"] = (
+            "event" if event_generation else "heartbeat"
+        )
         if (
             estimated_input_tokens + reserved_output_tokens
             > int(self.l0_prompt_budget.context_window_tokens)
@@ -21330,15 +22251,14 @@ class LuxriotManager:
         if warnings:
             llm_input_stats["warnings"] = warnings
         model_hint = str(batch.get("model_hint") or "").strip() or None
-        lm_workload_class = (
-            str(batch.get("lm_workload_class") or "vlm").strip().lower()
-            or "vlm"
-        )
         callback_supports_preflight = bool(
             getattr(self.lm_callback, "eva_generation_preflight", False)
         )
         callback_supports_workload = bool(
             getattr(self.lm_callback, "eva_workload_class", False)
+        )
+        callback_supports_max_tokens = bool(
+            getattr(self.lm_callback, "eva_max_tokens_override", False)
         )
         callback_kwargs: Dict[str, Any] = {}
         if callback_supports_preflight:
@@ -21347,6 +22267,8 @@ class LuxriotManager:
             )
         if callback_supports_workload:
             callback_kwargs["workload_class"] = lm_workload_class
+        if callback_supports_max_tokens:
+            callback_kwargs["max_tokens_override"] = generation_output_tokens
         inference_started_at_ms = int(time.time() * 1000.0)
         if callback_kwargs:
             summary = self.lm_callback(
@@ -21357,8 +22279,16 @@ class LuxriotManager:
         else:
             summary = self.lm_callback(messages, model_hint)
         inference_completed_at_ms = int(time.time() * 1000.0)
+        lm_response_stats = self._compact_lm_response_stats(
+            getattr(summary, "eva_response_meta", None)
+        )
+        summary = str(summary)
         batch_state = self._extract_batch_state(summary, frame_items)
-        if str(batch_state.get("contract_status") or "") == "parsed_terminal_fence":
+        if str(batch_state.get("contract_status") or "") in {
+            "parsed",
+            "parsed_terminal_fence",
+            "partial_prefix",
+        }:
             summary = self._render_reconciled_batch_state_summary(
                 summary,
                 batch_state,
@@ -21418,6 +22348,7 @@ class LuxriotManager:
                 self._coerce_float(batch.get("interval_sec")) or 1.0,
             ),
             "llm_input_stats": llm_input_stats,
+            "lm_response_stats": lm_response_stats,
         }
         latency_trace = dict(batch.get("latency_trace") or {}) if isinstance(
             batch.get("latency_trace"), Mapping
@@ -21460,6 +22391,7 @@ class LuxriotManager:
         return entry
 
     def accept_summary_entry(self, entry: Mapping[str, Any]) -> Dict[str, Any]:
+        acceptance_started_at_ms = int(time.time() * 1000.0)
         normalized = self._normalize_summary_log_entry(entry)
         if normalized is None:
             raise ValueError("invalid summary result")
@@ -21633,7 +22565,9 @@ class LuxriotManager:
                     if isinstance(incident_meta, Mapping):
                         accepted["incident_observation_admission"] = dict(incident_meta)
 
+            archive_processing_started_at_ms = int(time.time() * 1000.0)
             archive_meta = self._archive_summary_entry(accepted)
+            archive_processing_completed_at_ms = int(time.time() * 1000.0)
             accepted.pop("archive_frames", None)
             if archive_meta:
                 for key, value in archive_meta.items():
@@ -21652,6 +22586,29 @@ class LuxriotManager:
                         "batch_id",
                     }:
                         accepted[key] = value
+
+            acceptance_completed_at_ms = int(time.time() * 1000.0)
+            latency_trace = dict(accepted.get("latency_trace") or {}) if isinstance(
+                accepted.get("latency_trace"), Mapping
+            ) else {}
+            latency_trace.update(
+                {
+                    "archive_processing_started_at_ms": archive_processing_started_at_ms,
+                    "archive_processing_completed_at_ms": archive_processing_completed_at_ms,
+                    "archive_processing_ms": max(
+                        0,
+                        archive_processing_completed_at_ms
+                        - archive_processing_started_at_ms,
+                    ),
+                    "summary_acceptance_started_at_ms": acceptance_started_at_ms,
+                    "summary_acceptance_completed_at_ms": acceptance_completed_at_ms,
+                    "summary_acceptance_ms": max(
+                        0,
+                        acceptance_completed_at_ms - acceptance_started_at_ms,
+                    ),
+                }
+            )
+            accepted["latency_trace"] = latency_trace
 
             with self.cache_lock:
                 session = self.sessions.get(channel_id)
@@ -22657,16 +23614,38 @@ class LuxriotManager:
         update_desired: bool = True,
         session_generation: str = "",
     ) -> Dict[str, Any]:
-        sizes = list(getattr(self.config, "LUXRIOT_BATCH_SIZES", (12, 24, 36)))
-        default_size = sizes[0] if sizes else 12
+        configured_sizes = getattr(self.config, "LUXRIOT_BATCH_SIZES", None)
+        sizes = [
+            int(value)
+            for value in (configured_sizes or ())
+            if _parse_optional_int(value) is not None and int(value) > 0
+        ]
+        default_size = int(
+            getattr(
+                self.config,
+                "LUXRIOT_DEFAULT_BATCH_SIZE",
+                12 if 12 in sizes or not sizes else sizes[0],
+            )
+        )
+        if sizes and default_size not in sizes:
+            default_size = sizes[0]
         batch = default_size
-        try:
-            if batch_size:
+        if batch_size is not None and str(batch_size).strip() != "":
+            try:
                 candidate = int(batch_size)
-                if candidate in sizes:
-                    batch = candidate
-        except Exception:
-                batch = default_size
+            except (TypeError, ValueError) as exc:
+                raise ValueError("batch_size must be a positive integer") from exc
+            if candidate < 1:
+                raise ValueError("batch_size must be a positive integer")
+            # Production config supplies an explicit allow-list.  Small unit
+            # managers which omit it retain support for arbitrary positive
+            # batches used to exercise sealing/coalescing mechanics.
+            if sizes and candidate not in sizes:
+                allowed = ", ".join(str(value) for value in sizes)
+                raise ValueError(
+                    f"Unsupported batch_size {candidate}; choose one of: {allowed}"
+                )
+            batch = candidate
         prompt = prompt or ""
         normalized_model_hint = str(model_hint or "").strip() or None
         requested_interval_sec = self._normalize_capture_interval_sec(interval_sec)
@@ -23239,10 +24218,16 @@ class LuxriotManager:
             l1_nodes = l1_nodes[-level_limit:]
             l2_nodes = l2_nodes[-level_limit:]
             l3_nodes = l3_nodes[-level_limit:]
-        self._refresh_channel_memory_from_rollups(
-            channel_id,
-            [*l1_nodes, *l2_nodes, *l3_nodes],
-        )
+        # A read-only rollup request must remain read-only.  Refreshing channel
+        # memory walks historical semantic L1/L2 rows and persists each
+        # accepted update; doing that from agent DRILL/AGG reads can turn a
+        # simple lookup into many PostgreSQL writes and exhaust the tool
+        # deadline.  Synthesis already owns the memory-update side effect.
+        if synthesize:
+            self._refresh_channel_memory_from_rollups(
+                channel_id,
+                [*l1_nodes, *l2_nodes, *l3_nodes],
+            )
         stored_counts: Dict[str, int] = {}
         for entry in stored_rollups:
             level = str(entry.get("level") or "").strip().upper() or "UNKNOWN"
@@ -23329,10 +24314,28 @@ class LuxriotManager:
             frame_selection = LuxriotManager._compact_frame_selection(latest_log.get("frame_selection"))
             if frame_selection:
                 compact["last_frame_selection"] = frame_selection
+            latency_trace = latest_log.get("latency_trace")
+            if isinstance(latency_trace, Mapping):
+                compact["last_latency_trace"] = {
+                    str(key): int(value)
+                    for key, value in latency_trace.items()
+                    if isinstance(value, (int, float)) and float(value) >= 0
+                }
+            llm_input_stats = LuxriotManager._compact_llm_input_stats(
+                latest_log.get("llm_input_stats")
+            )
+            if llm_input_stats:
+                compact["last_llm_input_stats"] = llm_input_stats
+            lm_response_stats = LuxriotManager._compact_lm_response_stats(
+                latest_log.get("lm_response_stats")
+            )
+            if lm_response_stats:
+                compact["last_lm_response_stats"] = lm_response_stats
         for field in (
             "snapshot_count",
             "snapshot_failed_count",
             "slow_snapshot_count",
+            "snapshot_slow_streak",
             "snapshot_slow_threshold_sec",
             "last_snapshot_latency_sec",
             "avg_snapshot_latency_sec",
@@ -23392,11 +24395,20 @@ class LuxriotManager:
         return compact
 
     def streams_status(self) -> Dict[str, Any]:
+        status_started = time.perf_counter()
+        status_timing_ms: Dict[str, Any] = {}
+        desired_started = time.perf_counter()
         try:
             desired_live = self._load_desired_live_sessions()
         except Exception:
             desired_live = {}
+        status_timing_ms["desired_sessions"] = round(
+            max(0.0, (time.perf_counter() - desired_started) * 1000.0),
+            3,
+        )
+        cache_wait_started = time.perf_counter()
         with self.cache_lock:
+            cache_acquired = time.perf_counter()
             video_items = list(self.sessions.items())
             analytics_items = list(self.probe_sessions.items())
             shared_probe_channels = set(self.shared_probe_channels)
@@ -23409,10 +24421,31 @@ class LuxriotManager:
                 if isinstance(digest, Mapping)
             }
             rollup_scheduler_status = dict(self._rollup_scheduler_status)
-        video_streams = [
-            self._compact_stream_status("video", session.status(), paused)
-            for _, session in video_items
-        ]
+        cache_snapshot_finished = time.perf_counter()
+        status_timing_ms["manager_lock_wait"] = round(
+            max(0.0, (cache_acquired - cache_wait_started) * 1000.0),
+            3,
+        )
+        status_timing_ms["manager_snapshot"] = round(
+            max(0.0, (cache_snapshot_finished - cache_acquired) * 1000.0),
+            3,
+        )
+        video_streams: List[Dict[str, Any]] = []
+        video_status_ms: Dict[str, float] = {}
+        for channel_id, session in video_items:
+            session_started = time.perf_counter()
+            video_streams.append(
+                self._compact_stream_status(
+                    "video",
+                    session.status(),
+                    paused,
+                )
+            )
+            video_status_ms[str(int(channel_id))] = round(
+                max(0.0, (time.perf_counter() - session_started) * 1000.0),
+                3,
+            )
+        status_timing_ms["video_sessions"] = video_status_ms
         running_video_channels = {
             int(item.get("channel_id") or 0)
             for item in video_streams
@@ -23483,10 +24516,22 @@ class LuxriotManager:
             digest["desired"] = True
             digest.setdefault("running", False)
             digest.setdefault("last_restore_error", restore_errors.get(int(channel_id)))
-        analytics_streams = [
-            self._compact_stream_status("analytics", session.status(), paused)
-            for _, session in analytics_items
-        ]
+        analytics_streams: List[Dict[str, Any]] = []
+        analytics_status_ms: Dict[str, float] = {}
+        for channel_id, session in analytics_items:
+            session_started = time.perf_counter()
+            analytics_streams.append(
+                self._compact_stream_status(
+                    "analytics",
+                    session.status(),
+                    paused,
+                )
+            )
+            analytics_status_ms[str(int(channel_id))] = round(
+                max(0.0, (time.perf_counter() - session_started) * 1000.0),
+                3,
+            )
+        status_timing_ms["analytics_sessions"] = analytics_status_ms
         analytics_channels = {
             int(item.get("channel_id") or 0)
             for item in analytics_streams
@@ -23505,6 +24550,28 @@ class LuxriotManager:
                     paused=int(channel_id) in paused,
                 )
             )
+        attention_started = time.perf_counter()
+        attention_status = self.attention_status()
+        status_timing_ms["attention"] = round(
+            max(0.0, (time.perf_counter() - attention_started) * 1000.0),
+            3,
+        )
+        deep_review_started = time.perf_counter()
+        deep_review_status = self.rollup_l3_deep_status()
+        status_timing_ms["rollup_l3_deep_review"] = round(
+            max(0.0, (time.perf_counter() - deep_review_started) * 1000.0),
+            3,
+        )
+        backfill_started = time.perf_counter()
+        backfill_status = self.rollup_backfill_status()
+        status_timing_ms["rollup_backfill"] = round(
+            max(0.0, (time.perf_counter() - backfill_started) * 1000.0),
+            3,
+        )
+        status_timing_ms["total"] = round(
+            max(0.0, (time.perf_counter() - status_started) * 1000.0),
+            3,
+        )
         return {
             "video_streams": sorted(video_streams, key=lambda item: int(item.get("channel_id", 0))),
             "analytics_streams": sorted(analytics_streams, key=lambda item: int(item.get("channel_id", 0))),
@@ -23516,10 +24583,11 @@ class LuxriotManager:
             "running_total": len(video_streams) + len(analytics_streams),
             "capture_thread_total": len(video_streams) + len(analytics_items),
             "shared_analytics_count": sum(1 for item in analytics_streams if bool(item.get("shared_capture"))),
-            "attention": self.attention_status(),
+            "attention": attention_status,
             "rollup_scheduler": rollup_scheduler_status,
-            "rollup_l3_deep_review": self.rollup_l3_deep_status(),
-            "rollup_backfill": self.rollup_backfill_status(),
+            "rollup_l3_deep_review": deep_review_status,
+            "rollup_backfill": backfill_status,
+            "status_timing_ms": status_timing_ms,
         }
 
     def system_status_digest(

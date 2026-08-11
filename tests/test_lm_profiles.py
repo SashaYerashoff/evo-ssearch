@@ -94,7 +94,18 @@ class LmProfileRuntimeTests(unittest.TestCase):
             captured["headers"] = kwargs.get("headers")
             captured["json"] = kwargs.get("json")
             captured["timeout"] = kwargs.get("timeout")
-            return _Response({"choices": [{"message": {"content": "ok"}}]})
+            return _Response(
+                {
+                    "choices": [
+                        {"finish_reason": "stop", "message": {"content": "ok"}}
+                    ],
+                    "usage": {
+                        "prompt_tokens": 123,
+                        "completion_tokens": 17,
+                        "total_tokens": 140,
+                    },
+                }
+            )
 
         class AdmissionCapture:
             def admission(self, _resource, *, workload, **_kwargs):
@@ -122,6 +133,10 @@ class LmProfileRuntimeTests(unittest.TestCase):
         self.assertEqual(captured["timeout"], 321)
         self.assertEqual(captured["workload"], "rollup")
         self.assertEqual(captured["json"]["max_tokens"], 2048)
+        self.assertEqual(result.eva_response_meta["attempt_count"], 1)
+        self.assertEqual(result.eva_response_meta["finish_reason"], "stop")
+        self.assertEqual(result.eva_response_meta["prompt_tokens"], 123)
+        self.assertEqual(result.eva_response_meta["completion_tokens"], 17)
         self.assertEqual(
             captured["json"]["chat_template_kwargs"],
             {"enable_thinking": False},
@@ -268,6 +283,9 @@ class LmProfileRuntimeTests(unittest.TestCase):
         self.assertEqual(len(payloads), 2)
         self.assertEqual(payloads[1]["temperature"], 0.0)
         self.assertGreaterEqual(payloads[1]["repetition_penalty"], 1.12)
+        self.assertEqual(result.eva_response_meta["attempt_count"], 2)
+        self.assertTrue(result.eva_response_meta["retried"])
+        self.assertIn("retry_reason", result.eva_response_meta)
         self.assertIn(
             "Write each fact once",
             str(payloads[1]["messages"]),

@@ -34,7 +34,7 @@
    (kept off the many result cards for performance — their 0.92 panel already covers it) */
 .archive-toolbar,
 .mon-panel,
-.vid-preview-card, .vid-selected-card, .vid-feed-card, .vid-rt-card,
+.vid-preview-card, .vid-selected-card, .vid-rt-card,
 .set-section,
 .gate-card {
   backdrop-filter: blur(12px);
@@ -1000,12 +1000,13 @@
 .chat-assistant { display: flex; flex-direction: column; gap: 8px; max-width: 100%; }
 .chat-img { max-height: 200px; border-radius: 8px; margin-bottom: 6px; display: block; }
 .chat-status { display: inline-flex; align-items: center; gap: 8px; font-size: 13px; color: var(--text-mut); padding: 4px 2px; }
-.chat-bubble.md { max-width: 100%; }
-.chat-bubble.md .md-p { margin: 0 0 7px; }
+.chat-bubble.md { max-width: 100%; white-space: normal; line-height: 1.42; }
+.chat-bubble.md .md-p { margin: 0 0 9px; }
 .chat-bubble.md .md-p:last-child { margin-bottom: 0; }
-.chat-bubble.md .md-h { font-weight: 700; margin: 8px 0 5px; }
+.chat-bubble.md .md-h { font-weight: 700; margin: 10px 0 5px; line-height: 1.3; }
 .chat-bubble.md .md-h1 { font-size: 16px; } .chat-bubble.md .md-h2 { font-size: 15px; } .chat-bubble.md .md-h3, .chat-bubble.md .md-h4 { font-size: 14px; }
-.chat-bubble.md .md-ul { margin: 4px 0 8px; padding-left: 18px; } .chat-bubble.md li { margin: 2px 0; }
+.chat-bubble.md .md-ul { margin: 5px 0 10px; padding-left: 18px; } .chat-bubble.md li { margin: 2px 0; line-height: 1.4; }
+.chat-bubble.md .md-hr { height: 1px; margin: 10px 0; border: 0; background: var(--line); }
 .chat-bubble.md .md-code { background: var(--void-tile); border: 1px solid var(--line); border-radius: 5px; padding: 1px 5px; font-size: 12.5px; }
 .chat-bubble.md .md-pre { background: var(--void-tile); border: 1px solid var(--line); border-radius: 8px; padding: 10px 12px; overflow-x: auto; margin: 6px 0; }
 .chat-bubble.md a { color: var(--accent); }
@@ -1338,7 +1339,10 @@
 @media (min-width: 861px) {
   .probe-cols { height: clamp(420px, calc(90vh - 250px), 660px); }
   .probe-col-left, .probe-col-right { overflow: hidden; }
-  .probe-col-scroll { flex: 1 1 0; min-height: 0; overflow-y: auto; overflow-x: hidden; }
+  .probe-col-scroll {
+    flex: 1 1 0; min-height: 0; overflow-y: auto; overflow-x: hidden;
+    padding-right: 12px; scrollbar-gutter: stable;
+  }
   .probe-panel { margin-top: auto; }
 }
 @media (max-width: 860px) { .probe-cols { flex-direction: column; } }
@@ -1419,10 +1423,10 @@
 /* footer: enabled toggle on the left, actions on the right */
 .probe-footer { display: flex; align-items: center; justify-content: space-between; gap: 10px; padding: 13px 16px; border-top: 1px solid var(--line); flex: 0 0 auto; }
 .probe-footer-actions { display: flex; gap: 10px; }
-.mon-pairs { display: flex; flex-direction: column; gap: 8px; }
-.probe-pair-head { display: grid; grid-template-columns: 1fr 1fr 32px; gap: 8px; padding: 0 10px; color: var(--text-mut); font-size: 10px; font-weight: 700; letter-spacing: .06em; text-transform: uppercase; }
-.mon-pair { display: grid; grid-template-columns: 1fr 1fr auto; gap: 8px; align-items: center; }
-.mon-pair input { background: var(--void-tile); border: 1px solid var(--line-2); border-radius: 9px; color: var(--text); padding: 8px 10px; outline: none; font-size: 13px; }
+.mon-pairs { display: flex; flex-direction: column; gap: 8px; min-width: 0; }
+.probe-pair-head { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr) 32px; gap: 8px; min-width: 0; padding: 0 10px; color: var(--text-mut); font-size: 10px; font-weight: 700; letter-spacing: .06em; text-transform: uppercase; }
+.mon-pair { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr) 32px; gap: 8px; min-width: 0; align-items: center; }
+.mon-pair input { width: 100%; min-width: 0; background: var(--void-tile); border: 1px solid var(--line-2); border-radius: 9px; color: var(--text); padding: 8px 10px; outline: none; font-size: 13px; }
 .mon-pair input:focus { border-color: var(--mon-line); }
 .mon-icobtn { width: 32px; height: 32px; border-radius: 9px; display: grid; place-items: center; border: 1px solid var(--line-2); background: var(--void-tile); color: var(--text-2); }
 .mon-icobtn.danger:hover { color: var(--danger); border-color: rgba(248,113,113,0.4); }

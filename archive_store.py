@@ -1110,6 +1110,177 @@ class PostgresDetectionsStore(_TenantRepository):
             )
         return resolved
 
+    def resolve_vlm_snapshot_cover_refs(
+        self,
+        hints: Sequence[Mapping[str, Any]],
+    ) -> Dict[str, Dict[str, Any]]:
+        """Resolve card-cover refs without a tenant-wide JSON heap scan.
+
+        PostgreSQL row-level security cannot safely push the non-leakproof JSON
+        extraction used by ``resolve_vlm_snapshot_refs`` into the expression
+        index.  Under a busy archive that turns a small review-board read into a
+        multi-second heap scan.  Incident starts are trusted durable timestamps,
+        so first select candidate ids through the ordinary channel/time index,
+        then inspect only those bounded rows for exact batch/snapshot identity.
+        """
+
+        normalized: List[Tuple[str, str, int, int, int]] = []
+        seen_refs: set[str] = set()
+        for raw_hint in list(hints or ())[:500]:
+            if not isinstance(raw_hint, Mapping):
+                continue
+            ref = str(raw_hint.get("ref") or "").strip()
+            match = re.fullmatch(r"(.+):snapshot:([1-9][0-9]*)", ref)
+            if not match or ref in seen_refs:
+                continue
+            try:
+                channel_id = int(raw_hint.get("channel_id") or 0)
+                timestamp_ms = int(raw_hint.get("timestamp_ms") or 0)
+            except (TypeError, ValueError):
+                continue
+            batch_id = match.group(1).strip()
+            snapshot_index = int(match.group(2))
+            if (
+                channel_id < 1
+                or timestamp_ms < 1
+                or not batch_id
+                or len(batch_id) > 200
+            ):
+                continue
+            seen_refs.add(ref)
+            normalized.append(
+                (ref, batch_id, snapshot_index, channel_id, timestamp_ms)
+            )
+        if not normalized:
+            return {}
+
+        resolved: Dict[str, Dict[str, Any]] = {}
+
+        def resolve_window(
+            connection: Any,
+            request_indices: Sequence[int],
+            *,
+            before_ms: int,
+            after_ms: int,
+        ) -> None:
+            if not request_indices:
+                return
+            values_sql = ",".join(["(%s,%s,%s,%s)"] * len(request_indices))
+            params: List[Any] = []
+            for request_index in request_indices:
+                _ref, _batch_id, _snapshot_index, channel_id, timestamp_ms = (
+                    normalized[int(request_index)]
+                )
+                params.extend(
+                    (
+                        int(request_index),
+                        channel_id,
+                        max(0, timestamp_ms - before_ms),
+                        timestamp_ms + after_ms,
+                    )
+                )
+            params.append(self.tenant_id)
+            candidate_rows = connection.execute(
+                f"""
+                WITH requested(hint_id, channel_id, start_ms, end_ms) AS (
+                    VALUES {values_sql}
+                )
+                SELECT requested.hint_id, detections.id
+                FROM requested
+                JOIN archive.detections AS detections
+                  ON detections.tenant_id = %s
+                 AND detections.source = 'vlm_summary'
+                 AND detections.channel_id = requested.channel_id
+                 AND detections.event_timestamp_ms
+                     BETWEEN requested.start_ms AND requested.end_ms
+                """,
+                tuple(params),
+            ).fetchall()
+            candidate_ids = sorted(
+                {
+                    int(row[1])
+                    for row in candidate_rows
+                    if len(row) > 1 and int(row[1] or 0) > 0
+                }
+            )
+            if not candidate_ids:
+                return
+            detail_rows = connection.execute(
+                """
+                SELECT
+                    id,
+                    event_timestamp_ms,
+                    payload_json->>'batch_id' AS batch_id,
+                    payload_json->>'snapshot_index' AS snapshot_index,
+                    (thumbnail_b64 IS NOT NULL OR image_path IS NOT NULL)
+                        AS has_media
+                FROM archive.detections
+                WHERE tenant_id = %s
+                  AND id = ANY(%s)
+                """,
+                (self.tenant_id, candidate_ids),
+            ).fetchall()
+            details = {
+                int(row[0]): row
+                for row in detail_rows
+                if row and int(row[0] or 0) > 0
+            }
+            candidates_by_hint: Dict[int, List[Sequence[Any]]] = {}
+            for raw_hint_id, raw_detection_id in candidate_rows:
+                hint_id = int(raw_hint_id)
+                detail = details.get(int(raw_detection_id))
+                if detail is not None:
+                    candidates_by_hint.setdefault(hint_id, []).append(detail)
+            for request_index in request_indices:
+                ref, batch_id, snapshot_index, _channel_id, _timestamp_ms = (
+                    normalized[int(request_index)]
+                )
+                matches = [
+                    row
+                    for row in candidates_by_hint.get(int(request_index), [])
+                    if bool(row[4])
+                    and str(row[2] or "") == batch_id
+                    and str(row[3] or "") == str(snapshot_index)
+                ]
+                if not matches:
+                    continue
+                best = max(matches, key=lambda row: (int(row[1] or 0), int(row[0])))
+                resolved[ref] = {
+                    "detection_id": int(best[0]),
+                    "timestamp_ms": int(best[1] or 0) or None,
+                }
+
+        try:
+            with self.lock:
+                with self.pool.transaction(self._context(), readonly=True) as connection:
+                    all_indices = list(range(len(normalized)))
+                    resolve_window(
+                        connection,
+                        all_indices,
+                        before_ms=10_000,
+                        after_ms=90_000,
+                    )
+                    unresolved_indices = [
+                        index
+                        for index, item in enumerate(normalized)
+                        if item[0] not in resolved
+                    ]
+                    # A merged/late-arriving incident can place its first durable
+                    # evidence slightly outside the tight start window.  Widen
+                    # only those misses; never fall back to the tenant-wide JSON
+                    # scan that caused the review board timeout.
+                    resolve_window(
+                        connection,
+                        unresolved_indices,
+                        before_ms=60_000,
+                        after_ms=300_000,
+                    )
+        except Exception as exc:
+            if _is_missing_archive_relation(exc):
+                raise _archive_not_ready(exc) from exc
+            raise
+        return resolved
+
     @staticmethod
     def _feedback_row_to_dict(row: Sequence[Any]) -> Dict[str, Any]:
         return {
@@ -2238,9 +2409,12 @@ class PostgresRuntimeStateStore(_TenantRepository):
             ORDER BY (payload_json->>'window_start')::double precision ASC
             LIMIT %s
         """
-        with self.lock:
-            with self.pool.transaction(self._context(), readonly=True) as connection:
-                rows = connection.execute(query, tuple(params)).fetchall()
+        # PostgreSQL provides a consistent MVCC snapshot for this range read.
+        # Do not serialize it behind the repository's writer lock: background
+        # rollup/cache persistence can hold that lock for many seconds while
+        # the agent is only trying to inspect already-committed summaries.
+        with self.pool.transaction(self._context(), readonly=True) as connection:
+            rows = connection.execute(query, tuple(params)).fetchall()
         out: List[Dict[str, Any]] = []
         for row in rows:
             payload = _decode_json_value(row[0])

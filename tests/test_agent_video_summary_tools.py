@@ -618,6 +618,9 @@ class AgentVideoSummaryToolTests(unittest.TestCase):
         self.assertIn("Normalize a relative window once", scoped)
         self.assertIn("No coverage means unknown, not calm", scoped)
         self.assertIn("Chat write tools are preview-only", scoped)
+        self.assertIn("Lead with the useful finding in natural prose", scoped)
+        self.assertIn("Use a table only when the operator asks for one", scoped)
+        self.assertIn("Do not infer zero hits", scoped)
         self.assertNotIn("For broad calibration across many channels", scoped)
 
     def test_channel_ref_resolution_reads_channels_through_get_channels(self):
@@ -881,6 +884,7 @@ class AgentVideoSummaryToolTests(unittest.TestCase):
         self.assertEqual(compact["results_omitted_from_model"], 4)
         self.assertEqual(compact["vision_candidate_ids"], [101, 102])
         self.assertIn("Sphynx cat", compact["results"][0]["text_evidence_excerpt"])
+        self.assertEqual(compact["results"][0]["timestamp_utc"], "1970-01-01T00:01:41Z")
         self.assertEqual(
             compact["results"][0]["score_semantics"],
             "semantic_retrieval_ranking_not_probability",
@@ -921,6 +925,65 @@ class AgentVideoSummaryToolTests(unittest.TestCase):
         context["archive_vision_match_count"] = 1
         self.assertFalse(_archive_research_response_needs_recovery(positive, context))
 
+        trusted_tool_messages = [
+            {
+                "role": "tool",
+                "name": "describe_frame",
+                "content": __import__("json").dumps(
+                    {
+                        "source": "archive_candidate_batch",
+                        "verdicts": [
+                            {
+                                "detection_id": 501,
+                                "timestamp_ms": 1_781_389_900_000,
+                                "timestamp_utc": "2026-06-13T22:31:40Z",
+                            }
+                        ],
+                    }
+                ),
+            }
+        ]
+        self.assertFalse(
+            _archive_research_response_needs_recovery(
+                positive + " Detection #501 at 2026-06-13T22:31:40Z.",
+                context,
+                tool_messages=trusted_tool_messages,
+            )
+        )
+        mechanical = """### Archive Search Results
+**Finding:** Visual evidence was found for a sphynx cat.
+
+| ID | Verdict |
+|---|---|
+| 501 | match |
+
+**Coverage & Scope:** bounded.
+
+**Action:** No further action required unless you want more.
+"""
+        self.assertTrue(
+            _archive_research_response_needs_recovery(
+                mechanical,
+                context,
+                tool_messages=trusted_tool_messages,
+            )
+        )
+        context["operator_requests_structured_output"] = True
+        self.assertFalse(
+            _archive_research_response_needs_recovery(
+                mechanical,
+                context,
+                tool_messages=trusted_tool_messages,
+            )
+        )
+        self.assertTrue(
+            _archive_research_response_needs_recovery(
+                positive + " Detection #501 at 2026-06-13T13:42:00Z.",
+                context,
+                tool_messages=trusted_tool_messages,
+            )
+        )
+
     def test_archive_fallback_states_bounded_vision_scope(self):
         search = {
             "query": "sphynx cat",
@@ -959,9 +1022,37 @@ class AgentVideoSummaryToolTests(unittest.TestCase):
             tool_messages=tool_messages,
         )
 
-        self.assertIn("Vision batch: reviewed 8", text)
+        self.assertIn("visually confirmed 1 match", text)
         self.assertIn("#501 — match", text)
+        self.assertIn("Vision checked 8 of 24 ranked results", text)
         self.assertIn("not proof of absence across the whole archive", text)
+        self.assertNotIn("parser=", text)
+
+        many_matches = dict(vision)
+        many_matches.update(
+            {
+                "match_count": 8,
+                "no_match_count": 0,
+                "uncertain_count": 0,
+                "verdicts": [
+                    {
+                        "detection_id": index,
+                        "verdict": "match",
+                        "visible_evidence": "A hairless cat is visible.",
+                    }
+                    for index in range(501, 509)
+                ],
+            }
+        )
+        many_text = _format_archive_research_fallback(
+            {"user_query": "find sphynx cat"},
+            tool_messages=[
+                {"role": "tool", "name": "search_archive", "content": __import__("json").dumps(search)},
+                {"role": "tool", "name": "describe_frame", "content": __import__("json").dumps(many_matches)},
+            ],
+        )
+        self.assertIn("Other confirmed frames: #504, #505, #506, #507, #508", many_text)
+        self.assertEqual(many_text.count("A hairless cat is visible."), 3)
 
     def test_turn_context_carries_time_channel_and_vlm_evidence_defaults(self):
         context = _seed_turn_tool_context(

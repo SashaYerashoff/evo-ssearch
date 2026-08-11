@@ -204,6 +204,90 @@ class OfflineInstallerUnitTests(unittest.TestCase):
         second = installer.render_env_update(first, second_updates)
         self.assertEqual(second, first)
 
+    def test_inference_policy_fingerprint_covers_context_queue_and_gpu_without_secrets(self):
+        baseline = {
+            "EVOSSEARCH_LM_PROFILE_VLM_BASE_URL": "http://vlm.internal:8001/v1",
+            "EVOSSEARCH_LM_PROFILE_VLM_API_KEY": "SECRET-NOT-FOR-LOGS",
+            "EVOSSEARCH_AGENT_CONTEXT_LIMIT_TOKENS": "65536",
+            "EVOSSEARCH_INFERENCE_WORKER_COUNT": "3",
+            "CUDA_VISIBLE_DEVICES": "0,1",
+            "UNRELATED_SETTING": "one",
+        }
+        expected = installer.inference_policy_fingerprint(baseline)
+
+        unrelated = dict(baseline, UNRELATED_SETTING="two")
+        self.assertEqual(installer.inference_policy_fingerprint(unrelated), expected)
+        for key, value in (
+            ("EVOSSEARCH_LM_PROFILE_VLM_BASE_URL", "http://other:8001/v1"),
+            ("EVOSSEARCH_LM_PROFILE_VLM_API_KEY", "different-secret"),
+            ("EVOSSEARCH_AGENT_CONTEXT_LIMIT_TOKENS", "8192"),
+            ("EVOSSEARCH_INFERENCE_WORKER_COUNT", "1"),
+            ("CUDA_VISIBLE_DEVICES", "1"),
+        ):
+            changed = dict(baseline, **{key: value})
+            self.assertNotEqual(
+                installer.inference_policy_fingerprint(changed),
+                expected,
+            )
+
+    def test_existing_install_plan_preserves_inference_policy(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = make_source(root)
+            existing = dict(COMPLETE_ENV)
+            existing.update({
+                "EVOSSEARCH_AGENT_CONTEXT_LIMIT_TOKENS": "65536",
+                "EVOSSEARCH_INFERENCE_WORKER_COUNT": "3",
+                "CUDA_VISIBLE_DEVICES": "0,1",
+            })
+            env_file = root / "eva-ai.env"
+            env_file.write_text(env_text(existing), encoding="utf-8")
+            options = make_options(root, source, env_file=env_file, migrate=False)
+
+            prepared = installer.prepare_install(options, environ={})
+
+            self.assertEqual(
+                prepared.inference_policy_hash,
+                installer.inference_policy_fingerprint(existing),
+            )
+            self.assertFalse(any(
+                finding.level == "FAIL" and "inference policy" in finding.message
+                for finding in prepared.findings
+            ))
+            projected = installer.parse_env_text(
+                installer.render_env_update(prepared.env.raw, prepared.updates)
+            )
+            self.assertEqual(
+                installer.inference_policy_fingerprint(projected),
+                prepared.inference_policy_hash,
+            )
+
+    def test_apply_refuses_inference_policy_drift_before_mutation(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = make_source(root)
+            env_file = root / "eva-ai.env"
+            env_file.write_text(env_text(), encoding="utf-8")
+            options = make_options(root, source, env_file=env_file, migrate=False)
+            options.dry_run = False
+            prepared = installer.prepare_install(options, environ={})
+            drifted = dict(COMPLETE_ENV)
+            drifted["EVOSSEARCH_LM_PROFILE_VLM_MODEL"] = "unexpected-model"
+            env_file.write_text(env_text(drifted), encoding="utf-8")
+
+            with (
+                patch.object(installer.os, "geteuid", return_value=0),
+                patch.object(installer, "_ensure_service_account") as mutate_host,
+            ):
+                with self.assertRaisesRegex(
+                    installer.InstallerError,
+                    "Inference policy changed during apply preflight",
+                ):
+                    installer.apply_install(prepared)
+
+            mutate_host.assert_not_called()
+            self.assertFalse((root / "backups").exists())
+
     def test_fresh_runtime_directories_are_bounded_owned_and_private(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -369,7 +453,7 @@ class OfflineInstallerUnitTests(unittest.TestCase):
             "google/siglip2-base-patch16-224",
         )
         self.assertEqual(values["EVOSSEARCH_INFERENCE_QUEUE_ENABLED"], "true")
-        self.assertEqual(values["EVOSSEARCH_INFERENCE_WORKER_COUNT"], "1")
+        self.assertEqual(values["EVOSSEARCH_INFERENCE_WORKER_COUNT"], "3")
         rendered = installer.render_env_update("", updates)
         self.assertIn("EVO-SECRET-DO-NOT-PRINT", rendered)
 

@@ -1165,6 +1165,34 @@ class HttpAuthRouteTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200, response.get_json())
         self.assertEqual(start_session.call_args.kwargs["interval_sec"], 5.0)
 
+    def test_luxriot_start_capture_reports_invalid_batch_as_bad_request(self) -> None:
+        self.repository.identity = _Identity(
+            permissions=frozenset(
+                {
+                    Permission.CAPTURE_MANAGE.value,
+                    Permission.STREAMS_VIEW.value,
+                }
+            ),
+            allowed_channel_ids=frozenset({7}),
+        )
+        self.repository.users[USER_ID] = self.repository.identity
+        _, csrf_token = self._login()
+
+        with patch(
+            "oldapp.luxriot_manager.start_session",
+            side_effect=ValueError(
+                "Unsupported batch_size 24; choose one of: 4, 8, 12, 16"
+            ),
+        ):
+            response = self.client.post(
+                "/luxriot/start_capture",
+                headers={"X-CSRF-Token": csrf_token},
+                json={"channel_id": 7, "batch_size": 24},
+            )
+
+        self.assertEqual(response.status_code, 400, response.get_json())
+        self.assertIn("Unsupported batch_size 24", response.get_json()["error"])
+
     def test_scoped_detection_queries_require_owned_channel(self) -> None:
         self._login()
 

@@ -9868,7 +9868,11 @@ def _build_scoped_agent_system_prompt(
             "- Do not infer identity, intent, guilt, legality, intoxication, or medical state from video.\n"
             "- Never claim a write was applied without a tool result with status=applied or a trusted UI receipt.\n"
             "- Chat write tools are preview-only. Tell the operator to use UI Apply.\n"
-            "- Use markdown and summarize bounded results instead of dumping raw records."
+            "- Use markdown and summarize bounded results instead of dumping raw records.\n"
+            "- Reply in the operator's language. Lead with the useful finding in natural prose, as a capable colleague would.\n"
+            "- Do not mirror tool fields as a diagnostic report, use canned report headings, emoji status sections, repeated separators, or a generic follow-up menu.\n"
+            "- Use a compact list only when it improves scanning. Use a table only when the operator asks for one or must compare several records field by field.\n"
+            "- State scope and coverage once, after the finding. Do not infer zero hits merely because an evidence source is absent from the model-visible top rows."
         ),
     ]
 
@@ -9920,7 +9924,9 @@ def _build_scoped_agent_system_prompt(
             "- Resolve channel/time scope and report search coverage. Semantic matches rank attention, not factual confirmation.\n"
             "- Preserve source semantics: probe, semantic snapshot, VLM summary, and VLM alert are different evidence classes.\n"
             "- EVA batches up to nine diverse top candidates through describe_frame. Use those per-frame verdicts for conclusions.\n"
-            "- Positive and negative visual claims are symmetric: never say the event is absent when the vision batch is missing, unparsed, or uncertain."
+            "- Positive and negative visual claims are symmetric: never say the event is absent when the vision batch is missing, unparsed, or uncertain.\n"
+            "- Say what the vision batch confirmed first. Combine useful detection IDs compactly and summarize rejections instead of listing every one.\n"
+            "- Use only a server-formatted timestamp such as timestamp_utc, copied verbatim. Never convert timestamp_ms yourself; omit the event time if no formatted timestamp is present. Then add one bounded-coverage caveat."
         )
 
     if "help" in intents:
@@ -10475,8 +10481,17 @@ def _extract_archive_search_query(value: Any) -> Optional[str]:
             break
     if not candidate:
         return None
+    quoted_candidate = re.match(
+        r'^["“«]([^"”»]{1,500})["”»]',
+        candidate,
+    )
+    if quoted_candidate:
+        candidate = str(quoted_candidate.group(1) or "").strip()
     candidate = re.split(
         r"\b(?:during|within|over|from)\s+(?:the\s+)?(?:last|past)\b|"
+        r"\s+\bon\s+channel\s*#?\d+\b|"
+        r"\s+\bfrom\s+\d{4}-\d{2}-\d{2}\b|"
+        r"\s+\b(?:give|show|return)\s+(?:me\s+)?(?:the\s+)?(?:finding|result|answer)\b|"
         r"\b(?:за|в\s+течение)\s+(?:последн\w+)?\s*\d",
         candidate,
         maxsplit=1,
@@ -10486,6 +10501,20 @@ def _extract_archive_search_query(value: Any) -> Optional[str]:
     if not candidate or len(candidate) > 500:
         return None
     return candidate
+
+
+def _extract_operator_iso_window_args(value: Any) -> Optional[Dict[str, str]]:
+    """Copy one explicit ISO interval from operator text for server normalization."""
+
+    text = unicodedata.normalize("NFKC", str(value or "")).strip()
+    matches = re.findall(
+        r"\b\d{4}-\d{2}-\d{2}(?:[Tt]\d{2}:\d{2}(?::\d{2}(?:\.\d{1,6})?)?"
+        r"(?:[Zz]|[+-]\d{2}:?\d{2})?)?\b",
+        text,
+    )
+    if len(matches) != 2:
+        return None
+    return {"start_time": matches[0], "end_time": matches[1]}
 
 
 def _extract_vlm_alert_criterion(text: Any) -> Optional[str]:
@@ -10516,6 +10545,30 @@ def _seed_turn_tool_context(user_text: Any) -> Dict[str, Any]:
         "wants_video_evidence": _operator_wants_video_evidence(routing_text),
         "focus_video_summaries": _operator_focuses_video_summaries(routing_text),
         "vlm_alert_policy_request": _operator_requests_vlm_alert_policy(routing_text),
+        "operator_requests_structured_output": bool(
+            re.search(
+                r"\b(?:table|tabular|structured\s+report|audit\s+report)\b|"
+                r"таблиц|структурированн\w*\s+отч[её]т|аудиторск\w*\s+отч[её]т",
+                normalized_unicode,
+            )
+        ),
+        "operator_requests_all_channels": bool(
+            re.search(
+                r"\b(?:all|every)\s+(?:(?:active|available|authorized)\s+)?channels?\b|"
+                r"\bacross\s+(?:all|every)\s+(?:(?:active|available|authorized)\s+)?channels?\b|"
+                r"(?:по|на)\s+всем\s+(?:(?:активн|доступн|разреш[её]нн)\w*\s+)?канал|"
+                r"все\s+(?:(?:активн|доступн|разреш[её]нн)\w*\s+)?канал",
+                normalized_unicode,
+            )
+        ),
+        "latest_vlm_alerts_request": bool(
+            re.search(
+                r"\b(?:latest|recent|current)\b.{0,32}\b(?:vlm\s+)?alerts?\b|"
+                r"\b(?:vlm\s+)?alerts?\b.{0,32}\b(?:latest|recent|current)\b|"
+                r"(?:последн|свеж|текущ)\w*.{0,32}(?:vlm|влм)?[\s-]*алерт",
+                normalized_unicode,
+            )
+        ),
         "runtime_status_only": (
             (
                 any(term in normalized for term in runtime_terms)
@@ -10532,6 +10585,21 @@ def _seed_turn_tool_context(user_text: Any) -> Dict[str, Any]:
             normalized_unicode,
         )
     )
+    explicit_depth = re.search(
+        r"\b(?:at\s+)?(live|l[123])\s+(?:depth|level)\b|"
+        r"\b(?:depth|level)\s*[:=]?\s*(live|l[123])\b|"
+        r"\b(?:на\s+)?(?:глубин\w*|уровн\w*)\s*[:=]?\s*(live|l[123])\b|"
+        r"\b(live|l[123])\s+(?:глубин\w*|уровн\w*)\b",
+        normalized_unicode,
+    )
+    if explicit_depth:
+        requested_depth = str(
+            next((group for group in explicit_depth.groups() if group), "")
+        ).strip()
+        if requested_depth == "live":
+            context["requested_video_depth"] = "live"
+        elif requested_depth in {"l1", "l2", "l3"}:
+            context["requested_video_depth"] = requested_depth.upper()
     context["tool_intents"] = _classify_tool_intents(routing_text, context)
     if "archive_research" in context["tool_intents"]:
         archive_query = _extract_archive_search_query(routing_text)
@@ -10620,11 +10688,12 @@ def _seed_turn_tool_context(user_text: Any) -> Dict[str, Any]:
         user_text_value,
         flags=re.IGNORECASE,
     )
-    if channel_match:
+    if channel_match and not context.get("operator_requests_all_channels"):
         context["channel_id"] = int(channel_match.group(1))
-    explicit_calendar_range = len(
-        re.findall(r"\b\d{4}-\d{2}-\d{2}\b", user_text_value)
-    ) >= 2
+    operator_iso_window_args = _extract_operator_iso_window_args(user_text_value)
+    if operator_iso_window_args is not None:
+        context["operator_iso_window_args"] = operator_iso_window_args
+    explicit_calendar_range = operator_iso_window_args is not None
     parsed_relative_window = _parse_relative_window_seconds(user_text_value)
     if parsed_relative_window is not None and not explicit_calendar_range:
         # Keep the operator's phrase authoritative. Small local models can turn
@@ -10710,7 +10779,11 @@ def _inherit_followup_tool_context(
         context["inherited_operator_intent"] = True
         return context
 
-    video_scope = _matched_video_event_followup_scope(user_text, history)
+    video_scope = (
+        None
+        if context.get("operator_requests_all_channels")
+        else _matched_video_event_followup_scope(user_text, history)
+    )
     if video_scope is not None and "video_research" in (context.get("tool_intents") or ()):
         context["channel_id"] = video_scope["channel_id"]
         context["video_candidate_channel_ids"] = [video_scope["channel_id"]]
@@ -11436,13 +11509,33 @@ def _required_bounded_workflow_tool_call(
     available = _tool_schema_names(schemas)
     intents = {str(item) for item in (context.get("tool_intents") or ())}
     relative_range = str(context.get("operator_relative_range") or "").strip()
+    iso_window_args = (
+        context.get("operator_iso_window_args")
+        if isinstance(context.get("operator_iso_window_args"), Mapping)
+        else None
+    )
     time_window = context.get("time_window")
+
+    if (
+        iso_window_args
+        and not isinstance(time_window, Mapping)
+        and "normalize_time_window" in available
+        and intents.intersection({"incident_control", "counted_state", "archive_research"})
+    ):
+        return _ToolCall(
+            id=f"required-workflow-window-{uuid.uuid4().hex[:12]}",
+            name="normalize_time_window",
+            args={
+                "start_time": str(iso_window_args.get("start_time") or ""),
+                "end_time": str(iso_window_args.get("end_time") or ""),
+            },
+        )
 
     if (
         relative_range
         and not isinstance(time_window, Mapping)
         and "normalize_time_window" in available
-        and intents.intersection({"incident_control", "counted_state"})
+        and intents.intersection({"incident_control", "counted_state", "archive_research"})
     ):
         return _ToolCall(
             id=f"required-workflow-window-{uuid.uuid4().hex[:12]}",
@@ -11456,7 +11549,7 @@ def _required_bounded_workflow_tool_call(
         and context.get("archive_search_query")
         and "search_archive" in available
         and not (
-            relative_range
+            (relative_range or iso_window_args)
             and not isinstance(time_window, Mapping)
             and "normalize_time_window" in available
         )
@@ -11721,13 +11814,17 @@ def _required_video_research_tool_call(
     if (
         context.get("channel_id") is None
         and not context.get("video_inventory_completed")
-        and isinstance(context.get("time_window"), Mapping)
         and "list_video_summary_channels" in available
     ):
+        requested_depth = str(context.get("requested_video_depth") or "").strip()
         return _ToolCall(
             id=f"required-inventory-{uuid.uuid4().hex[:12]}",
             name="list_video_summary_channels",
-            args={},
+            args=(
+                {"depth": requested_depth}
+                if requested_depth in {"live", "L1", "L2", "L3"}
+                else {}
+            ),
         )
 
     candidates = [
@@ -11766,7 +11863,14 @@ def _required_video_research_tool_call(
             if isinstance(time_window, Mapping)
             else None
         )
-        depth = "L2" if duration_sec is not None and duration_sec >= 8 * 3600 else "L1"
+        requested_depth = str(context.get("requested_video_depth") or "").strip()
+        depth = (
+            requested_depth
+            if requested_depth in {"live", "L1", "L2", "L3"}
+            else "live"
+            if context.get("latest_vlm_alerts_request")
+            else "L2" if duration_sec is not None and duration_sec >= 8 * 3600 else "L1"
+        )
         return _ToolCall(
             id=f"required-summary-{remaining[0]}-{uuid.uuid4().hex[:8]}",
             name="get_video_summaries",
@@ -11788,6 +11892,11 @@ def _video_overview_research_plan_completed(context: Mapping[str, Any]) -> bool:
         str(item)
         for item in (context.get("active_skill_slugs") or ())
     }
+    explicit_cross_channel_summary_complete = bool(
+        active_skills == {"cross_channel_correlation"}
+        and str(context.get("requested_video_depth") or "").strip()
+        in {"live", "L1", "L2", "L3"}
+    )
     if active_skills.intersection(
         {
             "cross_channel_correlation",
@@ -11795,7 +11904,7 @@ def _video_overview_research_plan_completed(context: Mapping[str, Any]) -> bool:
             "video_event_check",
             "video_incident_timeline",
         }
-    ):
+    ) and not explicit_cross_channel_summary_complete:
         # These playbooks require a bounded evidence drill after the broad map.
         # Their normal per-turn tool budget and context guard still cap the work.
         return False
@@ -12051,9 +12160,12 @@ def _apply_turn_tool_context(tool_name: str, args: Dict[str, Any], context: Dict
                     prepared["to_ts"] = time_window.get("to_ts")
 
     channel_id = context.get("channel_id")
-    should_default_channel = not (
-        tool_name == "describe_frame"
-        and _has_any_arg(prepared, ("detection_id", "detection_ids", "image_path"))
+    should_default_channel = (
+        not context.get("operator_requests_all_channels")
+        and not (
+            tool_name == "describe_frame"
+            and _has_any_arg(prepared, ("detection_id", "detection_ids", "image_path"))
+        )
     )
     if should_default_channel and channel_id is not None and tool_name in {
         "get_video_summaries",
@@ -12835,6 +12947,11 @@ def _record_turn_signal_ledger(
                 "provenance_totals": result.get("provenance_totals"),
                 "returned_provenance_totals": result.get("returned_provenance_totals"),
                 "alert_episode_summary": result.get("alert_episode_summary"),
+                "semantic_status": result.get("semantic_status"),
+                "semantic_available_count": result.get("semantic_available_count"),
+                "semantic_pending_count": result.get("semantic_pending_count"),
+                "semantic_failed_count": result.get("semantic_failed_count"),
+                "source_counts": result.get("source_counts"),
             },
         )
         if evidence_frames or result.get("evidence_frame_totals") or result.get("totals"):
@@ -13140,6 +13257,9 @@ def _format_turn_signal_ledger_message(ledger: Mapping[str, Any]) -> Optional[st
     lines.append(
         "Answer discipline: report coverage/truncation/errors when present; separate visual evidence from summary text and CLIP candidates; cite docs for help answers; ask to narrow/continue when scope or tool budget is incomplete."
     )
+    lines.append(
+        "Final synthesis style: lead with the finding in natural prose; usually use one short paragraph, optional compact bullets, and one final coverage caveat. Do not reproduce ledger headings or field labels, use a table unless the operator asked for one, add a generic follow-up menu, infer zero source hits from a source missing in sampled rows, or convert timestamp_ms yourself; copy only server-formatted timestamps verbatim."
+    )
     message = "\n".join(lines)
     if len(message) > 6500:
         message = message[:6400].rstrip() + "\n[ledger truncated: use detailed tool results for specifics]"
@@ -13429,6 +13549,8 @@ def _format_video_event_followup_clarification(
 def _archive_research_response_needs_recovery(
     value: Any,
     context: Mapping[str, Any],
+    *,
+    tool_messages: Optional[Sequence[Mapping[str, Any]]] = None,
 ) -> bool:
     """Reject archive conclusions that outrun the bounded vision drill."""
 
@@ -13438,6 +13560,13 @@ def _archive_research_response_needs_recovery(
         return False
     text = unicodedata.normalize("NFKC", str(value or "")).casefold()
     if not text.strip():
+        return True
+    if _archive_response_has_untrusted_timestamp(value, tool_messages or ()):
+        return True
+    if (
+        not context.get("operator_requests_structured_output")
+        and _archive_response_is_mechanical(value)
+    ):
         return True
     definitive_negative = bool(
         re.search(
@@ -13488,6 +13617,77 @@ def _archive_research_response_needs_recovery(
     )
 
 
+def _archive_response_is_mechanical(value: Any) -> bool:
+    """Detect report-shaped synthesis that should fall back to compact prose."""
+
+    text = str(value or "")
+    canned_sections = re.findall(
+        r"(?im)^\s*(?:#{1,6}\s*)?(?:\*\*)?"
+        r"(?:archive\s+search\s+results?|findings?|coverage(?:\s*&\s*scope|\s+note)?|"
+        r"operator\s+notes?|action)(?:\*\*)?\s*:",
+        text,
+    )
+    bullet_count = len(re.findall(r"(?m)^\s*(?:[-*]|\d+[.)])\s+", text))
+    has_table = bool(
+        re.search(r"(?m)^\s*\|.+\|\s*$", text)
+        and re.search(r"(?m)^\s*\|?[\s:|-]*-[\s:|-]*\|?\s*$", text)
+    )
+    generic_menu = bool(
+        re.search(
+            r"(?i)would\s+you\s+like\s+to|no\s+further\s+action\s+required\s+unless|"
+            r"хотите,?\s+чтобы\s+я|дальнейш\w*\s+действи\w*\s+не\s+требу",
+            text,
+        )
+    )
+    return bool(has_table or len(canned_sections) >= 2 or bullet_count > 6 or generic_menu)
+
+
+def _archive_response_has_untrusted_timestamp(
+    value: Any,
+    tool_messages: Sequence[Mapping[str, Any]],
+) -> bool:
+    """Reject model-invented archive times while allowing server-formatted ones."""
+
+    trusted_minutes: set[str] = set()
+
+    def remember_text(candidate: Any) -> None:
+        match = re.search(r"\b(\d{4}-\d{2}-\d{2})[T ](\d{2}:\d{2})", str(candidate or ""))
+        if match:
+            trusted_minutes.add(f"{match.group(1)} {match.group(2)}")
+
+    def visit(candidate: Any) -> None:
+        if isinstance(candidate, Mapping):
+            for key, child in candidate.items():
+                name = str(key)
+                if name in {"timestamp_utc", "from_utc", "to_utc", "from_local", "to_local"}:
+                    remember_text(child)
+                elif name in {"timestamp_ms", "event_timestamp_ms", "recorded_at_ms"}:
+                    remember_text(_format_timestamp_ms_utc(child))
+                visit(child)
+        elif isinstance(candidate, Sequence) and not isinstance(candidate, (str, bytes, bytearray)):
+            for child in candidate:
+                visit(child)
+
+    for message in tool_messages:
+        if not isinstance(message, Mapping) or str(message.get("role") or "") != "tool":
+            continue
+        raw_content = message.get("content")
+        try:
+            payload = json.loads(raw_content) if isinstance(raw_content, str) else raw_content
+        except Exception:
+            continue
+        visit(payload)
+
+    claimed_minutes = {
+        f"{date_part} {minute_part}"
+        for date_part, minute_part in re.findall(
+            r"\b(\d{4}-\d{2}-\d{2})[T ](\d{2}:\d{2})(?::\d{2})?",
+            str(value or ""),
+        )
+    }
+    return bool(claimed_minutes and not claimed_minutes.issubset(trusted_minutes))
+
+
 def _format_archive_research_fallback(
     ledger: Mapping[str, Any],
     *,
@@ -13515,43 +13715,13 @@ def _format_archive_research_fallback(
 
     query = str(search_result.get("query") or query_text or "archive query").strip()
     count = _opt_int(search_result.get("count")) or 0
-    shown = _opt_int(search_result.get("results_returned_to_model")) or 0
-    lexical = _opt_int(search_result.get("lexical_match_count_in_returned")) or 0
     time_window = search_result.get("time_window") if isinstance(search_result.get("time_window"), Mapping) else {}
     coverage = search_result.get("coverage") if isinstance(search_result.get("coverage"), Mapping) else {}
     scanned = _opt_int(coverage.get("scanned_candidates"))
     total = _opt_int(coverage.get("total_candidates"))
-    lines = [
-        f"Результат архивного поиска: `{query}`"
-        if russian
-        else f"Archive search result: `{query}`"
-    ]
-    if time_window:
-        start = time_window.get("from_local") or time_window.get("from_utc")
-        end = time_window.get("to_local") or time_window.get("to_utc")
-        duration = time_window.get("duration_sec")
-        lines.append(
-            (f"- Период сервера: {start} — {end}; {duration} секунд."
-             if russian else f"- Server-resolved window: {start} — {end}; {duration} seconds.")
-        )
-    if search_result:
-        lines.append(
-            (
-                f"- SigLIP вернул {count} ранжированных кандидатов; модели показано {shown}. "
-                f"Текстовых совпадений среди возвращённых: {lexical}."
-                if russian
-                else f"- SigLIP returned {count} ranked candidates; {shown} were exposed to the agent. "
-                f"Lexical matches in the returned set: {lexical}."
-            )
-        )
-    if scanned is not None or total is not None:
-        lines.append(
-            (
-                f"- Retrieval coverage: просмотрено {scanned} из {total} совместимых индексированных кандидатов."
-                if russian
-                else f"- Retrieval coverage: scanned {scanned} of {total} compatible indexed candidates."
-            )
-        )
+    start = time_window.get("from_local") or time_window.get("from_utc")
+    end = time_window.get("to_local") or time_window.get("to_utc")
+    lines: List[str] = []
 
     vision_failed = bool(
         vision_result
@@ -13560,61 +13730,144 @@ def _format_archive_research_fallback(
             or str(vision_result.get("parse_status") or "") == "failed"
         )
     )
+    vision_parsed = bool(
+        vision_result
+        and str(vision_result.get("parse_status") or "") == "parsed"
+    )
     if vision_failed:
         candidate_count = _opt_int(vision_result.get("candidate_count")) or 0
         error_text = str(vision_result.get("error") or "visual verification failed")[:500]
-        lines.append(
-            (
-                f"- Vision-проверка {candidate_count} кандидатов была выполнена один раз и завершилась ошибкой: {error_text}"
-                if russian
-                else f"- Vision verification of {candidate_count} candidates was attempted once and failed: {error_text}"
+        if russian:
+            lines.append(
+                f"Архивный поиск нашёл {count} ранжированных кандидатов по запросу `{query}`, "
+                "но визуально подтвердить их не удалось. Поэтому я не могу честно утверждать "
+                "ни наличие, ни отсутствие события."
             )
-        )
-        lines.append(
-            (
-                "- Эти кандидаты остаются визуально непроверенными; по ним нельзя утверждать ни наличие, ни отсутствие события."
-                if russian
-                else "- These candidates remain visually unverified; neither presence nor absence can be concluded from them."
+            lines.append(
+                f"Единственная vision-проверка батча из {candidate_count} кадров завершилась ошибкой: {error_text}"
             )
-        )
-    elif vision_result:
+        else:
+            lines.append(
+                f"The archive search found {count} ranked candidates for `{query}`, but visual "
+                "verification failed, so I can honestly confirm neither presence nor absence."
+            )
+            lines.append(
+                f"Visual verification of the {candidate_count}-frame batch was attempted once and failed: {error_text}"
+            )
+    elif vision_parsed:
         candidate_count = _opt_int(vision_result.get("candidate_count")) or 0
         match_count = _opt_int(vision_result.get("match_count")) or 0
         no_match_count = _opt_int(vision_result.get("no_match_count")) or 0
         uncertain_count = _opt_int(vision_result.get("uncertain_count")) or 0
-        parse_status = str(vision_result.get("parse_status") or "unknown")
-        lines.append(
-            (
-                f"- Vision batch: проверено {candidate_count}; match={match_count}, "
-                f"no_match={no_match_count}, uncertain={uncertain_count}; parser={parse_status}."
-                if russian
-                else f"- Vision batch: reviewed {candidate_count}; match={match_count}, "
-                f"no_match={no_match_count}, uncertain={uncertain_count}; parser={parse_status}."
-            )
-        )
-        verdicts = vision_result.get("verdicts") if isinstance(vision_result.get("verdicts"), list) else []
-        for row in verdicts[:9]:
-            if not isinstance(row, Mapping) or row.get("verdict") not in {"match", "uncertain"}:
-                continue
+        if match_count > 0:
+            match_word = "match" if match_count == 1 else "matches"
+            frame_word = "кадре" if match_count == 1 else "кадрах"
             lines.append(
-                f"- #{row.get('detection_id')} — {row.get('verdict')}: "
+                (
+                    f"В проверенном батче я визуально подтвердила `{query}` в {match_count} {frame_word}."
+                    if russian
+                    else f"The reviewed batch visually confirmed {match_count} {match_word} for `{query}`."
+                )
+            )
+        elif uncertain_count > 0:
+            lines.append(
+                (
+                    f"Проверенный батч не дал надёжного подтверждения `{query}`; "
+                    f"неопределённых кадров: {uncertain_count}."
+                    if russian
+                    else f"The reviewed batch did not reliably confirm `{query}`; "
+                    f"{uncertain_count} frame(s) remained inconclusive."
+                )
+            )
+        else:
+            lines.append(
+                (
+                    f"Ни один из {candidate_count} проверенных кандидатов визуально не подтвердил `{query}`."
+                    if russian
+                    else f"None of the {candidate_count} reviewed candidates visually confirmed `{query}`."
+                )
+            )
+        verdicts = vision_result.get("verdicts") if isinstance(vision_result.get("verdicts"), list) else []
+        match_rows = [
+            row for row in verdicts
+            if isinstance(row, Mapping) and row.get("verdict") == "match"
+        ]
+        uncertain_rows = [
+            row for row in verdicts
+            if isinstance(row, Mapping) and row.get("verdict") == "uncertain"
+        ]
+        shown_rows = match_rows[:3] + uncertain_rows[:1]
+        for row in shown_rows:
+            verdict = "подтверждено" if row.get("verdict") == "match" else "неопределённо"
+            lines.append(
+                f"- #{row.get('detection_id')} — {verdict if russian else row.get('verdict')}: "
                 f"{str(row.get('visible_evidence') or '')[:320]}"
+            )
+        hidden_match_ids = [row.get("detection_id") for row in match_rows[3:]]
+        if hidden_match_ids:
+            lines.append(
+                (
+                    f"Ещё подтверждённые кадры: {', '.join(f'#{item}' for item in hidden_match_ids)}."
+                    if russian
+                    else f"Other confirmed frames: {', '.join(f'#{item}' for item in hidden_match_ids)}."
+                )
+            )
+        hidden_uncertain_ids = [row.get("detection_id") for row in uncertain_rows[1:]]
+        if hidden_uncertain_ids:
+            lines.append(
+                (
+                    f"Ещё неопределённые кадры: {', '.join(f'#{item}' for item in hidden_uncertain_ids)}."
+                    if russian
+                    else f"Other inconclusive frames: {', '.join(f'#{item}' for item in hidden_uncertain_ids)}."
+                )
+            )
+        if no_match_count or uncertain_count:
+            lines.append(
+                (
+                    f"Остальные проверенные кадры: не подтвердили запрос — {no_match_count}, "
+                    f"остались неопределёнными — {uncertain_count}."
+                    if russian
+                    else f"Other reviewed frames: {no_match_count} did not confirm the query and "
+                    f"{uncertain_count} remained inconclusive."
+                )
             )
     else:
         lines.append(
             (
-                "- Vision-проверка кандидатов не завершилась; делать вывод об отсутствии события нельзя."
+                f"Архивный поиск вернул {count} ранжированных кандидатов по запросу `{query}`, "
+                "но vision-проверка не завершилась; вывод об отсутствии события делать нельзя."
                 if russian
-                else "- Candidate vision verification did not complete; absence cannot be concluded."
+                else f"The archive search returned {count} ranked candidates for `{query}`, but "
+                "vision verification did not complete; absence cannot be concluded."
             )
         )
-    lines.append(
-        (
-            "Это вывод только по ограниченному vision-батчу лучших кандидатов, а не доказательство отсутствия во всём архиве."
-            if russian
-            else "This conclusion covers only the bounded vision batch of top candidates; it is not proof of absence across the whole archive."
-        )
+
+    window_note = " — ".join(str(item) for item in (start, end) if item) or (
+        "запрошенный период" if russian else "requested window"
     )
+    checked_count = _opt_int(vision_result.get("candidate_count")) if vision_parsed else 0
+    unchecked = max(0, count - int(checked_count or 0))
+    retrieval_note = (
+        f"поиск просмотрел {scanned} из {total} совместимых индексированных кадров"
+        if russian and (scanned is not None or total is not None)
+        else f"retrieval scanned {scanned} of {total} compatible indexed frames"
+        if scanned is not None or total is not None
+        else "retrieval coverage не указано"
+        if russian
+        else "retrieval coverage was not reported"
+    )
+    if russian:
+        lines.append(
+            f"Охват: период {window_note}; {retrieval_note}. Визуально проверено "
+            f"{int(checked_count or 0)} из {count} ранжированных результатов, ещё {unchecked} не проверены. "
+            "Это ограниченный результат, а не доказательство отсутствия события во всём архиве."
+        )
+    else:
+        lines.append(
+            f"Coverage: {window_note}; {retrieval_note}. Vision checked {int(checked_count or 0)} "
+            f"of {count} ranked results; {unchecked} were not reviewed. This is a bounded result, "
+            "not proof of absence across the whole archive."
+        )
     return "\n".join(lines)
 
 
@@ -13852,12 +14105,191 @@ def _format_deployment_preview_receipt(context: Mapping[str, Any]) -> str:
     return "\n".join(lines)
 
 
+def _format_video_summary_fallback(
+    ledger: Mapping[str, Any],
+) -> Optional[str]:
+    """Render a compact, human report from trusted summary receipts."""
+
+    query = str(ledger.get("user_query") or "")
+    russian = bool(re.search(r"[а-яё]", query, flags=re.IGNORECASE))
+    coverage_rows = [
+        row
+        for row in (ledger.get("coverage") or [])
+        if isinstance(row, Mapping)
+    ]
+    inventory = next(
+        (
+            row
+            for row in coverage_rows
+            if row.get("tool") == "list_video_summary_channels"
+        ),
+        None,
+    )
+    raw_channel_rows = [
+        row
+        for row in coverage_rows
+        if row.get("tool") == "get_video_summaries"
+        and _opt_int(row.get("channel_id")) is not None
+    ]
+    channel_rows_by_key: Dict[Tuple[int, str], Mapping[str, Any]] = {}
+    for row in raw_channel_rows:
+        channel_id = int(_opt_int(row.get("channel_id")) or 0)
+        depth = str(row.get("depth") or "").strip()
+        channel_rows_by_key.setdefault((channel_id, depth), row)
+    channel_rows = list(channel_rows_by_key.values())
+    if not channel_rows:
+        return None
+
+    findings_by_channel: Dict[int, List[Mapping[str, Any]]] = {}
+    for finding in ledger.get("summary_findings") or []:
+        if not isinstance(finding, Mapping):
+            continue
+        channel_id = _opt_int(finding.get("channel_id"))
+        if channel_id is None:
+            continue
+        findings_by_channel.setdefault(int(channel_id), []).extend(
+            item
+            for item in (finding.get("items") or [])[:2]
+            if isinstance(item, Mapping)
+        )
+
+    blocks: List[str] = []
+    if isinstance(inventory, Mapping):
+        active = int(_opt_int(inventory.get("active")) or 0)
+        inactive = int(_opt_int(inventory.get("inactive")) or 0)
+        errors = int(_opt_int(inventory.get("errors")) or 0)
+        unchecked = int(_opt_int(inventory.get("unchecked")) or 0)
+        blocks.append(
+            (
+                f"Проверка завершена по данным EVA: активных каналов — {active}, "
+                f"неактивных — {inactive}, ошибок — {errors}, не проверено — {unchecked}."
+            )
+            if russian
+            else (
+                f"EVA completed the check: {active} active, {inactive} inactive, "
+                f"{errors} errors, and {unchecked} unchecked channels."
+            )
+        )
+    else:
+        blocks.append(
+            "Проверка сводок завершена по сохранённым данным EVA."
+            if russian
+            else "The summary check completed against EVA's stored data."
+        )
+
+    any_partial = False
+    any_failed = False
+    for row in channel_rows[:8]:
+        channel_id = int(_opt_int(row.get("channel_id")) or 0)
+        depth = str(row.get("depth") or "").strip()
+        returned = int(_opt_int(row.get("entries")) or 0)
+        total = int(_opt_int(row.get("total_in_window")) or 0)
+        coverage_status = str(row.get("status") or "unknown").strip()
+        semantic_status = str(row.get("semantic_status") or "unknown").strip()
+        pending = int(_opt_int(row.get("semantic_pending_count")) or 0)
+        failed = int(_opt_int(row.get("semantic_failed_count")) or 0)
+        truncated = bool(row.get("truncated"))
+        any_partial = any_partial or semantic_status == "partial" or pending > 0
+        any_failed = any_failed or failed > 0
+
+        status_parts = [
+            (
+                f"{returned} из {total} окон"
+                if russian
+                else f"{returned} of {total} windows"
+            ),
+            (
+                f"охват: {coverage_status}"
+                if russian
+                else f"coverage: {coverage_status}"
+            ),
+            (
+                f"семантика: {semantic_status}"
+                if russian
+                else f"semantics: {semantic_status}"
+            ),
+        ]
+        if pending:
+            status_parts.append(
+                f"ожидают: {pending}" if russian else f"pending: {pending}"
+            )
+        if failed:
+            status_parts.append(
+                f"ошибок консолидации: {failed}"
+                if russian
+                else f"consolidation failures: {failed}"
+            )
+        if truncated:
+            status_parts.append("вывод усечён" if russian else "output truncated")
+
+        detail_lines: List[str] = []
+        for item in findings_by_channel.get(channel_id, [])[:2]:
+            summary = str(item.get("summary") or "").strip()
+            period_match = re.search(
+                r"###\s+Period Overview\s*(.*?)(?=\s*###\s+|$)",
+                summary,
+                flags=re.IGNORECASE | re.DOTALL,
+            )
+            if period_match:
+                summary = period_match.group(1)
+            summary = " ".join(summary.split())[:280]
+            if not summary:
+                continue
+            stamp = _format_epoch_minute(item.get("time")) or str(
+                item.get("time") or ""
+            ).strip()
+            prefix = f"{stamp}: " if stamp else ""
+            detail_lines.append(f"- {prefix}{summary}")
+
+        heading = f"**CH {channel_id}{f' · {depth}' if depth else ''}** — "
+        block = heading + "; ".join(status_parts) + "."
+        if detail_lines:
+            block += "\n" + "\n".join(detail_lines)
+        blocks.append(block)
+
+    if any_failed:
+        conclusion = (
+            "Итог: чтение уровней работает, но есть ошибки семантической консолидации; "
+            "эти окна нельзя считать здоровыми до повторной проверки."
+            if russian
+            else (
+                "Conclusion: level reads work, but semantic consolidation has failures; "
+                "those windows are not healthy until rechecked."
+            )
+        )
+    elif any_partial:
+        conclusion = (
+            "Итог: L0–L3 читаются без таймаута, но консолидация частично готова — "
+            "есть ещё открытые или ожидающие семантические окна."
+            if russian
+            else (
+                "Conclusion: L0-L3 reads complete without a timeout, but consolidation "
+                "is only partially ready because some semantic windows are still open or pending."
+            )
+        )
+    else:
+        conclusion = (
+            "Итог: доступные уровни читаются без таймаута; ошибок семантической консолидации в результате нет."
+            if russian
+            else (
+                "Conclusion: the available levels read without a timeout, and the result "
+                "contains no semantic-consolidation failures."
+            )
+        )
+    blocks.append(conclusion)
+    return "\n\n".join(blocks)
+
+
 def _format_completion_fallback(
     ledger: Mapping[str, Any],
     *,
     tool_messages: Optional[Sequence[Mapping[str, Any]]] = None,
 ) -> str:
     """Produce an evidence-only answer when the local model returns no conclusion."""
+
+    video_fallback = _format_video_summary_fallback(ledger)
+    if video_fallback:
+        return video_fallback
 
     query = str(ledger.get("user_query") or "")
     russian = bool(re.search(r"[а-яё]", query, flags=re.IGNORECASE))
@@ -14584,13 +15016,16 @@ class AgentRunner:
                     else None
                 ),
             }
-        try:
-            mentioned_channel_id = self._tools._resolve_channel_id(
-                {"channel_ref": user_text},
-                required=False,
-            )
-        except Exception:
+        if turn_tool_context.get("operator_requests_all_channels"):
             mentioned_channel_id = None
+        else:
+            try:
+                mentioned_channel_id = self._tools._resolve_channel_id(
+                    {"channel_ref": user_text},
+                    required=False,
+                )
+            except Exception:
+                mentioned_channel_id = None
         if mentioned_channel_id is not None:
             turn_tool_context["channel_id"] = mentioned_channel_id
 
@@ -15075,6 +15510,21 @@ class AgentRunner:
                     code = getattr(exc, "code", None)
                     if code:
                         error_payload["code"] = str(code)
+                        if (
+                            str(code) == "tool_timeout"
+                            and tc.name in _TURN_CACHEABLE_READ_TOOLS
+                        ):
+                            # Gateway timeouts cannot stop a handler already
+                            # running in its worker thread. Retrying the same
+                            # read immediately doubles the load and races the
+                            # still-running request, so end this turn cleanly.
+                            error_payload["retryable_in_turn"] = False
+                            error_payload["next_step_hint"] = (
+                                "This read timed out and may still be finishing server-side. "
+                                "Do not retry it in the same turn; report the timeout and let "
+                                "the operator retry after the service is warm."
+                            )
+                            stop_tool_loop_after_batch = True
                         if str(code) == "approval_required":
                             error_payload["next_step_hint"] = (
                                 "Do not retry with preview=false from chat. "
@@ -15334,6 +15784,7 @@ class AgentRunner:
         archive_recovery_needed = _archive_research_response_needs_recovery(
             final_text,
             turn_tool_context,
+            tool_messages=in_flight,
         )
         if (
             _final_response_is_incomplete(final_text)
@@ -16800,6 +17251,19 @@ def _detection_timestamp_ms(row: Mapping[str, Any]) -> int:
         if parsed is not None:
             return int(parsed)
     return 0
+
+
+def _format_timestamp_ms_utc(value: Any) -> Optional[str]:
+    timestamp_ms = _opt_int(value)
+    if timestamp_ms is None or timestamp_ms <= 0:
+        return None
+    try:
+        return time.strftime(
+            "%Y-%m-%dT%H:%M:%SZ",
+            time.gmtime(float(timestamp_ms) / 1000.0),
+        )
+    except (OverflowError, OSError, ValueError):
+        return None
 
 
 def _archive_payload(row: Mapping[str, Any]) -> Mapping[str, Any]:
@@ -18307,10 +18771,12 @@ def _compact_detection_for_model(r: Dict[str, Any]) -> Dict[str, Any]:
     detection_id = r.get("detection_id")
     if detection_id is None:
         detection_id = r.get("id")
+    timestamp_ms = _detection_timestamp_ms(r)
     row = {
         "id": r.get("id"),
         "detection_id": detection_id,
-        "timestamp_ms": _detection_timestamp_ms(r),
+        "timestamp_ms": timestamp_ms,
+        "timestamp_utc": _format_timestamp_ms_utc(timestamp_ms),
         "source": r.get("source"),
         "source_label": r.get("source_label") or _archive_source_label(r.get("source")),
         "archive_item_type": r.get("archive_item_type") or _archive_item_type(r.get("source")),
@@ -18360,11 +18826,13 @@ def _compact_search_result_for_model(r: Dict[str, Any]) -> Dict[str, Any]:
     if detection_id is None:
         detection_id = r.get("id")
     similarity = _search_result_score(r)
+    timestamp_ms = _detection_timestamp_ms(r)
     row: Dict[str, Any] = {
         "path": r.get("filepath") or r.get("path") or r.get("image_path"),
         "score": similarity,
         "similarity": similarity,
-        "timestamp_ms": _detection_timestamp_ms(r),
+        "timestamp_ms": timestamp_ms,
+        "timestamp_utc": _format_timestamp_ms_utc(timestamp_ms),
         "source": r.get("source"),
         "source_label": r.get("source_label") or _archive_source_label(r.get("source")),
         "archive_item_type": r.get("archive_item_type") or _archive_item_type(r.get("source")),
@@ -19848,6 +20316,7 @@ def _compact_tool_result_for_model(tool_name: str, result: Any) -> Any:
                         "detection_id": row.get("detection_id"),
                         "channel_id": row.get("channel_id"),
                         "timestamp_ms": row.get("timestamp_ms"),
+                        "timestamp_utc": _format_timestamp_ms_utc(row.get("timestamp_ms")),
                         "source": row.get("source"),
                         "image_url": row.get("image_url"),
                         "verdict": row.get("verdict"),

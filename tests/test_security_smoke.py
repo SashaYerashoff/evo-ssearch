@@ -115,8 +115,10 @@ class SecuritySmokeTests(unittest.TestCase):
         })
         written = []
         with (
-            patch("oldapp._write_env_file_atomic", side_effect=lambda text: written.append(text)),
-            patch("oldapp._preserve_additional_env_lines", return_value=""),
+            patch(
+                "oldapp._write_env_file_atomic",
+                side_effect=lambda text, path: written.append(text),
+            ),
             patch("oldapp.warm_start_embedder", return_value=None),
             patch("oldapp._env_values_different_from_started_process", return_value=[]),
             patch("oldapp._env_precedence_report", return_value={"declared_file_matches_project": True}),
@@ -129,6 +131,55 @@ class SecuritySmokeTests(unittest.TestCase):
         self.assertEqual(config.LM_PROFILES[config.LM_AGENT_PROFILE_ID]["model"], "agent-model")
         self.assertIn("EVOSSEARCH_LM_PROFILE_VLM_API_KEY=vlm-secret-new", written[0])
         self.assertIn("EVOSSEARCH_LM_PROFILE_AGENT_API_KEY=agent-secret-new", written[0])
+
+    def test_settings_patch_preserves_unrelated_profiles_and_skips_embedder_restart(self) -> None:
+        config.ADMIN_TOKEN = "settings-test-token"
+        config.SETTINGS_LOCAL_ONLY = False
+        headers = {"X-Admin-Token": "settings-test-token"}
+        existing = {
+            "EVOSSEARCH_LM_PROFILES": "vlm,agent,vlm_b,agent_b",
+            "EVOSSEARCH_LM_PROFILE_VLM_B_BASE_URL": "http://vlm-b.example/v1",
+            "EVOSSEARCH_LM_PROFILE_AGENT_B_MODEL": "agent-b-model",
+            "EVOSSEARCH_LUXRIOT_USERNAME": "old-user",
+            "EVA_DATABASE_DSN": "postgresql://preserve-without-returning",
+        }
+        written = []
+        with (
+            patch.object(config, "LUXRIOT_USERNAME", "old-user"),
+            patch("oldapp._settings_env_path", return_value=Path("/etc/eva-ai/eva-ai.env")),
+            patch("oldapp._read_env_file_map", return_value=existing),
+            patch(
+                "oldapp._write_env_file_atomic",
+                side_effect=lambda text, path: written.append((text, Path(path))),
+            ),
+            patch("oldapp.warm_start_embedder") as warmup,
+            patch("oldapp.reset_embedder_runtime_state") as reset_embedder,
+            patch("oldapp._env_values_different_from_started_process", return_value=[]),
+            patch(
+                "oldapp._env_precedence_report",
+                return_value={"declared_file_matches_project": True},
+            ),
+        ):
+            saved = self.client.post(
+                "/settings",
+                json={"luxriotUsername": "new-user"},
+                headers=headers,
+            )
+
+        self.assertEqual(saved.status_code, 200)
+        response = saved.get_json()
+        self.assertEqual(response["appliedFields"], ["luxriotUsername"])
+        self.assertEqual(response["writtenEnvKeys"], ["EVOSSEARCH_LUXRIOT_USERNAME"])
+        self.assertEqual(response["envFile"], "/etc/eva-ai/eva-ai.env")
+        self.assertEqual(written[0][1], Path("/etc/eva-ai/eva-ai.env"))
+        self.assertIn("EVOSSEARCH_LUXRIOT_USERNAME=new-user", written[0][0])
+        self.assertIn(
+            "EVOSSEARCH_LM_PROFILE_VLM_B_BASE_URL=http://vlm-b.example/v1",
+            written[0][0],
+        )
+        self.assertIn("EVA_DATABASE_DSN=postgresql://preserve-without-returning", written[0][0])
+        warmup.assert_not_called()
+        reset_embedder.assert_not_called()
 
     def test_env_editor_redacts_and_preserves_secrets(self) -> None:
         current = {

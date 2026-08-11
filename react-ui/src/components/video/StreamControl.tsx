@@ -18,7 +18,7 @@ import { ToolTabs } from '../shell/ToolTabs'
 import type { SummaryPeriod, SummaryResolution } from './summaryView'
 import { useI18n, type TranslationKey } from '../../i18n/I18nProvider'
 
-const BATCHES = ['4', '8', '12', '16', '24', '32']
+const BATCHES = ['4', '8', '12', '16']
 export const PERIODS: Array<{ v: SummaryPeriod; label: string }> = [
   { v: 'live', label: 'Live' },
   { v: 'today', label: 'Today' },

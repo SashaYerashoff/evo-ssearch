@@ -84,6 +84,8 @@ class IdentitySessionRecord:
 class PostgresIdentityRepository:
     """Tenant-isolated identity persistence using the shared bounded pool."""
 
+    _SESSION_LAST_SEEN_WRITE_INTERVAL_SECONDS = 30
+
     def __init__(
         self,
         pool: PsycopgPool,
@@ -654,7 +656,6 @@ class PostgresIdentityRepository:
                   AND s.expires_at > clock_timestamp()
                   AND u.is_active
                   AND (u.locked_until IS NULL OR u.locked_until <= clock_timestamp())
-                FOR UPDATE OF s
                 """,
                 (tenant, token_digest),
             ).fetchone()
@@ -672,8 +673,14 @@ class PostgresIdentityRepository:
                   AND token_hash = %s
                   AND revoked_at IS NULL
                   AND expires_at > clock_timestamp()
+                  AND last_seen_at < clock_timestamp()
+                      - (%s * INTERVAL '1 second')
                 """,
-                (tenant, token_digest),
+                (
+                    tenant,
+                    token_digest,
+                    self._SESSION_LAST_SEEN_WRITE_INTERVAL_SECONDS,
+                ),
             )
             identity = self._load_identity(connection, tenant, user_id)
             if not identity.is_active:

@@ -10,7 +10,7 @@ from unittest.mock import patch
 from luxriot_connector import DEFAULT_ALERTS_JSON_PROMPT, LuxriotManager
 
 
-def build_manager(directory: Path, alert_parser=None) -> LuxriotManager:
+def build_manager(directory: Path, alert_parser=None, **config_overrides: Any) -> LuxriotManager:
     config = SimpleNamespace(
         LUXRIOT_SYSTEM_PROMPT_DEFAULT="Describe only what is visible in the current frames.",
         LUXRIOT_ALERTS_JSON_PROMPT="",
@@ -36,6 +36,8 @@ def build_manager(directory: Path, alert_parser=None) -> LuxriotManager:
         LUXRIOT_USERNAME="",
         LUXRIOT_PASSWORD="",
     )
+    for key, value in config_overrides.items():
+        setattr(config, key, value)
     return LuxriotManager(
         config=config,
         lm_callback=lambda _messages, _model: "summary",
@@ -105,6 +107,77 @@ def install_channel_memory(manager: LuxriotManager, channel_id: int = 7) -> None
 
 
 class VlmAlertPromptContractTests(unittest.TestCase):
+    def test_l0_output_budget_cannot_exceed_actual_generation_limit(self):
+        with tempfile.TemporaryDirectory() as temp:
+            manager = build_manager(
+                Path(temp),
+                LUXRIOT_L0_OUTPUT_BUDGET_TOKENS=1536,
+                LM_VIDEO_MAX_TOKENS=512,
+            )
+
+        self.assertEqual(manager.l0_prompt_budget.max_output_tokens, 512)
+
+    def test_batch_contract_prioritizes_alerts_before_optional_memory(self):
+        schema = DEFAULT_ALERTS_JSON_PROMPT.split("BATCH_STATE_JSON:\n", 1)[1]
+
+        self.assertLess(schema.index('"alerts"'), schema.index('"events"'))
+        self.assertLess(schema.index('"alerts"'), schema.index('"memory_pass"'))
+        self.assertIn("at most 80 words", DEFAULT_ALERTS_JSON_PROMPT)
+        self.assertIn("Keep the JSON compact", DEFAULT_ALERTS_JSON_PROMPT)
+
+    def test_batch_state_recovers_complete_alert_from_truncated_json_prefix(self):
+        frames = [
+            {"thumbnail": "frame-one", "captured_at": 100.0},
+            {"thumbnail": "frame-two", "captured_at": 101.0},
+        ]
+        summary = (
+            "A person gives a thumbs-up gesture.\n"
+            "BATCH_STATE_JSON:\n"
+            '{"version":2,"alerts":[{"title":"Thumbs up","severity":"info",'
+            '"state":"new","channel_id":7,"timestamp_ms":0,'
+            '"snapshot_indices":[2]}],"events":['
+        )
+
+        state = LuxriotManager._extract_batch_state(summary, frames)
+
+        self.assertEqual(state["contract_status"], "partial_prefix")
+        self.assertEqual(len(state["alerts"]), 1)
+        self.assertEqual(state["alerts"][0]["title"], "Thumbs up")
+        self.assertEqual(state["alerts"][0]["snapshot_indices"], [2])
+
+    def test_truncated_event_prefix_can_reconcile_explicit_operator_alert(self):
+        frames = [
+            {"thumbnail": "frame-one", "captured_at": 100.0},
+            {"thumbnail": "frame-two", "captured_at": 101.0},
+        ]
+        summary = (
+            "A person gives a thumbs-up gesture.\n"
+            "BATCH_STATE_JSON:\n"
+            '{"version":2,"alerts":[],"events":[{"event_id":"thumbs_up",'
+            '"label":"person gives thumbs up","state":"new",'
+            '"snapshot_indices":[2],"summary":"Visible thumbs-up gesture",'
+            '"novelty":"novel","pass_up":true}],"observed_states":['
+        )
+        with tempfile.TemporaryDirectory() as temp:
+            manager = build_manager(Path(temp))
+            manager.update_prompt_settings(
+                channel_id=7,
+                alert_policy_prompt=(
+                    "Alert if a person shows a thumbs-up gesture, severity info."
+                ),
+            )
+            state = manager._extract_batch_state(summary, frames)
+
+            patched_summary, reconciled = manager._reconcile_operator_alert_contract(
+                7,
+                summary,
+                state,
+            )
+
+        self.assertEqual(state["contract_status"], "partial_prefix")
+        self.assertEqual(reconciled["contract_status"], "parsed_alert_reconciled")
+        self.assertEqual(reconciled["alerts"][0]["severity"], "info")
+        self.assertIn("BATCH_STATE_JSON:", patched_summary)
     def test_final_live_prompt_places_prior_memory_before_batch_state_contract(self):
         with tempfile.TemporaryDirectory() as temp:
             manager = build_manager(Path(temp))
@@ -270,6 +343,9 @@ class VlmAlertPromptContractTests(unittest.TestCase):
         self.assertEqual(state["observed_states"][0]["state"], "present")
         self.assertIn("BATCH_STATE_JSON:", canonical)
         self.assertNotIn("```", canonical)
+        rendered_json = canonical.split("BATCH_STATE_JSON:\n", 1)[1]
+        self.assertLess(rendered_json.index('"alerts"'), rendered_json.index('"events"'))
+        self.assertLess(rendered_json.index('"alerts"'), rendered_json.index('"cover"'))
 
     def test_batch_state_rejects_unrelated_terminal_json_fence(self):
         frames = [{"thumbnail": "frame-one", "captured_at": 100.0}]
@@ -446,6 +522,62 @@ class VlmAlertPromptContractTests(unittest.TestCase):
                 1,
             )
             self.assertNotIn("```", patched_summary)
+
+    def test_backend_reconciles_each_distinct_operator_criterion(self):
+        frames = [
+            {"thumbnail": f"frame-{index}", "captured_at": 100.0 + index}
+            for index in range(4)
+        ]
+        summary = (
+            "A cat and a person enter; the person makes two gestures.\n"
+            "BATCH_STATE_JSON:\n"
+            '{"version":2,"alerts":[],"events":['
+            '{"event_id":"cat_entry","label":"cat entering",'
+            '"state":"new","snapshot_indices":[1],'
+            '"summary":"Cat enters the scene."},'
+            '{"event_id":"person_entry","label":"person entering",'
+            '"state":"new","snapshot_indices":[2],'
+            '"summary":"Person enters the scene."},'
+            '{"event_id":"thumbs_up","label":"thumbs-up gesture",'
+            '"state":"new","snapshot_indices":[3],'
+            '"summary":"Person shows a thumbs-up gesture."},'
+            '{"event_id":"victory","label":"victory gesture",'
+            '"state":"new","snapshot_indices":[4],'
+            '"summary":"Person shows a victory gesture."}],'
+            '"observed_states":[],"cover":{"snapshot_index":3,'
+            '"kind":"event"},"scene":{"status":"matched"},'
+            '"routines":[],"memory_pass":[]}'
+        )
+        with tempfile.TemporaryDirectory() as temp:
+            manager = build_manager(Path(temp))
+            manager.update_prompt_settings(
+                channel_id=7,
+                alert_policy_prompt=(
+                    "Alert if cat entering or leaving scene, severity - high\n"
+                    "Alert if person entering or leaving scene, severity - info\n"
+                    "Alert if you spot a thumbs-up gesture, severity - info\n"
+                    "Alert is you spot a victory gesture, severity - normal"
+                ),
+            )
+            state = manager._extract_batch_state(summary, frames)
+            patched_summary, reconciled = manager._reconcile_operator_alert_contract(
+                7,
+                summary,
+                state,
+            )
+
+        self.assertEqual(reconciled["contract_status"], "parsed_alert_reconciled")
+        self.assertEqual(reconciled["alert_reconciliation"]["count"], 4)
+        self.assertEqual(
+            [alert["severity"] for alert in reconciled["alerts"]],
+            ["high", "info", "info", "normal"],
+        )
+        self.assertEqual(
+            [alert["snapshot_indices"] for alert in reconciled["alerts"]],
+            [[1], [2], [3], [4]],
+        )
+        rendered_json = patched_summary.split("BATCH_STATE_JSON:\n", 1)[1]
+        self.assertLess(rendered_json.index('"alerts"'), rendered_json.index('"events"'))
 
     def test_backend_alert_reconciliation_rejects_weak_object_only_match(self):
         frames = [

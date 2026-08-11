@@ -22,6 +22,7 @@ from oldapp import (
     _bound_rollup_messages,
     _attention_batch_from_event,
     _env_precedence_report,
+    _is_outdated_luxriot_json_prompt,
     _expired_stored_probe_lineage_payload,
     _store_vlm_summary_archive_frames,
     ProbesStore,
@@ -88,11 +89,32 @@ def _collect_frontend_and_backend_paths() -> Tuple[Set[str], Set[str]]:
 
 
 class ApiDataflowSmokeTests(unittest.TestCase):
+    def test_cover_first_shipped_batch_state_contract_is_upgraded(self) -> None:
+        old_contract = (
+            "Machine-readable current-batch state for EVA memory, navigation, and alert actions:\n"
+            "The alerts array contains current matches.\n"
+            "BATCH_STATE_JSON:\n"
+            '{"version":2,"cover":{},"scene":{},"alerts":[]}'
+        )
+        custom_contract = 'Return BATCH_STATE_JSON: {"cover":{},"alerts":[]}'
+        canonical_contract = (
+            "Machine-readable current-batch state for EVA memory, navigation, and alert actions:\n"
+            "In BATCH_STATE_JSON the first two members MUST be version and alerts.\n"
+            "BATCH_STATE_JSON:\n"
+            '{"version":2,"alerts":[],"cover":{}}'
+        )
+
+        self.assertTrue(_is_outdated_luxriot_json_prompt(old_contract))
+        self.assertFalse(_is_outdated_luxriot_json_prompt(custom_contract))
+        self.assertFalse(_is_outdated_luxriot_json_prompt(canonical_contract))
+
     def setUp(self) -> None:
         self.client = app.test_client()
         self._orig_auth_enabled = config.AUTH_ENABLED
         self._orig_admin_token = config.ADMIN_TOKEN
         self._orig_settings_local_only = config.SETTINGS_LOCAL_ONLY
+        self._orig_host = config.HOST
+        self._orig_port = config.PORT
         self._orig_offline_video_enabled = config.OFFLINE_VIDEO_ENABLED
         self._orig_probe_snap_enabled = config.PROBE_SNAP_ENABLED
         self._orig_indexed_folder_enabled = config.INDEXED_FOLDER_ENABLED
@@ -159,6 +181,8 @@ class ApiDataflowSmokeTests(unittest.TestCase):
         config.AUTH_ENABLED = self._orig_auth_enabled
         config.ADMIN_TOKEN = self._orig_admin_token
         config.SETTINGS_LOCAL_ONLY = self._orig_settings_local_only
+        config.HOST = self._orig_host
+        config.PORT = self._orig_port
         config.OFFLINE_VIDEO_ENABLED = self._orig_offline_video_enabled
         config.PROBE_SNAP_ENABLED = self._orig_probe_snap_enabled
         config.INDEXED_FOLDER_ENABLED = self._orig_indexed_folder_enabled
@@ -448,6 +472,14 @@ class ApiDataflowSmokeTests(unittest.TestCase):
                     "frame_index": 0,
                     "timestamp_ms": 100000,
                     "thumbnail": "frame-one",
+                    "clip_embedding": [1.0, 0.0],
+                    "embedding_space": {
+                        "backend": "siglip2",
+                        "model": "google/siglip2-base-patch16-224",
+                        "dimension": 2,
+                    },
+                    "embedding_ref": "probe-buffer:7:1",
+                    "embedding_status": "ready",
                     "width": 1280,
                     "height": 720,
                 },
@@ -456,6 +488,14 @@ class ApiDataflowSmokeTests(unittest.TestCase):
                     "frame_index": 11,
                     "timestamp_ms": 105000,
                     "thumbnail": "frame-two",
+                    "clip_embedding": [0.0, 1.0],
+                    "embedding_space": {
+                        "backend": "siglip2",
+                        "model": "google/siglip2-base-patch16-224",
+                        "dimension": 2,
+                    },
+                    "embedding_ref": "probe-buffer:7:2",
+                    "embedding_status": "ready",
                     "width": 1280,
                     "height": 720,
                 },
@@ -464,7 +504,10 @@ class ApiDataflowSmokeTests(unittest.TestCase):
 
         with (
             patch("oldapp.detections_store", store),
-            patch("oldapp._embed_thumbnail_b64", return_value=None),
+            patch(
+                "oldapp._embed_thumbnail_b64_with_space",
+                side_effect=AssertionError("live archive frame was embedded twice"),
+            ),
             patch("oldapp._apply_archive_retention", return_value={"ok": True}),
         ):
             result = _store_vlm_summary_archive_frames(entry)
@@ -478,6 +521,11 @@ class ApiDataflowSmokeTests(unittest.TestCase):
         self.assertEqual(store.records[2]["probe_id"], "vlm_alert:7")
         self.assertTrue(store.records[2]["bookmark_sent"])
         self.assertIn("run-7", store.records[0]["dedupe_key"])
+        self.assertEqual(store.records[0]["clip_vec"], [1.0, 0.0])
+        self.assertEqual(
+            store.records[0]["payload"]["embedding_ref"],
+            "probe-buffer:7:1",
+        )
 
     def test_cv_apex_and_companion_receive_independent_clip_embeddings(self) -> None:
         class Store:
@@ -1946,6 +1994,33 @@ class ApiDataflowSmokeTests(unittest.TestCase):
             self.assertEqual(snapshot_resp.headers.get("X-Image-Width"), "320")
             self.assertEqual(snapshot_resp.headers.get("X-Image-Height"), "180")
             self.assertEqual(snapshot_resp.data, b"mock-jpeg-bytes")
+
+    def test_host_only_settings_patch_keeps_visible_port_when_browser_sends_blank(self) -> None:
+        config.ADMIN_TOKEN = "unit-token"
+        headers = {"X-Admin-Token": "unit-token"}
+        with tempfile.TemporaryDirectory() as temp_dir:
+            env_path = Path(temp_dir) / ".env"
+            env_path.write_text(
+                "EVOSSEARCH_HOST=127.0.0.1\n"
+                "EVOSSEARCH_PORT=5081\n"
+                "EXTERNAL_SENTINEL=preserve-me\n",
+                encoding="utf-8",
+            )
+            with patch("oldapp._settings_env_path", return_value=env_path), patch(
+                "oldapp._write_completion_audit_or_error",
+                return_value=None,
+            ):
+                response = self.client.post(
+                    "/settings",
+                    headers=headers,
+                    json={"host": "0.0.0.0", "port": ""},
+                )
+
+            self.assertEqual(response.status_code, 200, response.get_json())
+            saved = oldapp._read_env_file_map(env_path)
+            self.assertEqual(saved["EVOSSEARCH_HOST"], "0.0.0.0")
+            self.assertEqual(saved["EVOSSEARCH_PORT"], "5081")
+            self.assertEqual(saved["EXTERNAL_SENTINEL"], "preserve-me")
 
     def test_luxriot_capture_flow_with_token_and_stubs(self) -> None:
         config.ADMIN_TOKEN = "unit-token"

@@ -2,6 +2,25 @@ import { api } from './client'
 
 export type Settings = Record<string, any>
 
+export interface SettingsPrecedence {
+  declared_file_matches_project?: boolean
+  declared_config_env_file?: string | null
+  different_process_and_file_keys?: string[]
+  source_confidence?: string
+}
+
+export interface SettingsSaveResult {
+  success: boolean
+  message?: string
+  error?: string
+  warning?: string
+  appliedFields?: string[]
+  writtenEnvKeys?: string[]
+  pendingOrOverriddenKeys?: string[]
+  envFile?: string
+  precedence?: SettingsPrecedence
+}
+
 export interface AuditEvent {
   timestamp?: string
   action?: string
@@ -113,11 +132,11 @@ export interface AuthSessionRow {
 
 export const settingsApi = {
   get: (): Promise<{ success: boolean; settings: Settings }> => api.get('/settings'),
-  save: (patch: Settings): Promise<{ success: boolean; message?: string; error?: string }> => api.postJson('/settings', patch),
+  save: (patch: Settings): Promise<SettingsSaveResult> => api.postJson('/settings', patch),
   archiveCapacity: (includeCurrent = false): Promise<any> =>
     api.get('/settings/archive_capacity', buildArchiveCapacityQuery(includeCurrent)),
-  getEnv: (): Promise<{ envText?: string; envVariables?: Record<string, string>; count?: number }> => api.get('/settings/env'),
-  saveEnv: (envText: string): Promise<{ success: boolean; message?: string; count?: number; error?: string }> => api.postJson('/settings/env', { envText }),
+  getEnv: (): Promise<{ success?: boolean; envText?: string; envVariables?: Record<string, string>; count?: number; envFile?: string; precedence?: SettingsPrecedence }> => api.get('/settings/env'),
+  saveEnv: (envText: string): Promise<SettingsSaveResult & { count?: number }> => api.postJson('/settings/env', { envText }),
   audit: async (params: Record<string, unknown>): Promise<{ success: boolean; events?: AuditEvent[]; nextCursor?: string | null; error?: string }> => {
     const response = await api.get('/audit/events', params)
     return { ...response, events: (response?.events || []).map(normalizeAuditEvent) }

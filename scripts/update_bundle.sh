@@ -357,6 +357,39 @@ target_python() {
   fi
 }
 
+inference_policy_fingerprint() {
+  # Hash values without printing credentials. Context limits are part of the
+  # protected site policy: a code/database update must not rewrite them.
+  target_python - "${ENV_FILE}" <<'PY'
+import hashlib
+import re
+import sys
+from pathlib import Path
+
+path = Path(sys.argv[1])
+values = {}
+for raw_line in path.read_text(encoding="utf-8").splitlines():
+    line = raw_line.strip()
+    if not line or line.startswith("#") or "=" not in line:
+        continue
+    key, value = line.split("=", 1)
+    key = key.strip()
+    if not (
+        key.startswith("EVOSSEARCH_LM_")
+        or key.startswith("EVOSSEARCH_AGENT_")
+        or key.startswith("EVOSSEARCH_INFERENCE_")
+        or key == "CUDA_VISIBLE_DEVICES"
+    ):
+        continue
+    value = value.strip()
+    if len(value) >= 2 and value[0] == value[-1] and value[0] in {"'", '"'}:
+        value = value[1:-1]
+    values[key] = value
+canonical = "".join(f"{key}={values[key]}\n" for key in sorted(values))
+print(hashlib.sha256(canonical.encode("utf-8")).hexdigest())
+PY
+}
+
 remove_temp_path() {
   local path="$1"
   if [[ "${MODE}" == "system" && "$(id -u)" -ne 0 ]]; then
@@ -464,7 +497,7 @@ if [[ "${APP_DIR}/.env" != "${ENV_FILE}" ]] && path_is_file "${APP_DIR}/.env"; t
 fi
 SERVED_AGENT_MODELS=()
 SERVED_AGENT_CONTEXT="UNKNOWN"
-TEMPORARY_AGENT_CONTEXT=""
+EFFECTIVE_AGENT_CONTEXT_FLOOR=""
 CONTEXT_FORCE_REQUIRED=false
 CONTEXT_UNKNOWN_REQUIRED=false
 CONTEXT_UNKNOWN_ACCEPTED=false
@@ -491,7 +524,7 @@ if [[ "${ENDPOINTS_UNDERSTOOD}" == true ]]; then
 fi
 if [[ "${CONFIGURED_AGENT_CONTEXT}" =~ ^[0-9]+$ ]] && (( CONFIGURED_AGENT_CONTEXT < EXPECTED_AGENT_CONTEXT )); then
   CONTEXT_FORCE_REQUIRED=true
-  TEMPORARY_AGENT_CONTEXT="${CONFIGURED_AGENT_CONTEXT}"
+  EFFECTIVE_AGENT_CONTEXT_FLOOR="${CONFIGURED_AGENT_CONTEXT}"
 fi
 if [[ -n "${AGENT_LM_BASE_URL}" ]]; then
   AGENT_MODELS_BODY="$(mktemp)"
@@ -528,9 +561,9 @@ PY
     fi
     if [[ "${SERVED_AGENT_CONTEXT}" =~ ^[0-9]+$ ]] && (( SERVED_AGENT_CONTEXT < EXPECTED_AGENT_CONTEXT )); then
       CONTEXT_FORCE_REQUIRED=true
-      if [[ -z "${TEMPORARY_AGENT_CONTEXT}" ]] \
-        || (( SERVED_AGENT_CONTEXT < TEMPORARY_AGENT_CONTEXT )); then
-        TEMPORARY_AGENT_CONTEXT="${SERVED_AGENT_CONTEXT}"
+      if [[ -z "${EFFECTIVE_AGENT_CONTEXT_FLOOR}" ]] \
+        || (( SERVED_AGENT_CONTEXT < EFFECTIVE_AGENT_CONTEXT_FLOOR )); then
+        EFFECTIVE_AGENT_CONTEXT_FLOOR="${SERVED_AGENT_CONTEXT}"
       fi
     elif [[ "${SERVED_AGENT_CONTEXT}" =~ ^[0-9]+$ ]]; then
       ok "agent inference context is ${SERVED_AGENT_CONTEXT} (required: ${EXPECTED_AGENT_CONTEXT})"
@@ -627,6 +660,10 @@ else
   printf 'WARN: EVOSSEARCH_LM_PROFILES is not set in %s; EVA runs on the single default LM profile.\n' "${ENV_FILE}" >&2
 fi
 ok "model/server preflight finished; no configuration was or will be modified"
+INFERENCE_POLICY_HASH_BEFORE="$(inference_policy_fingerprint)"
+[[ "${INFERENCE_POLICY_HASH_BEFORE}" =~ ^[0-9a-f]{64}$ ]] \
+  || stop "could not fingerprint the existing inference policy"
+ok "inference policy fingerprint captured: ${INFERENCE_POLICY_HASH_BEFORE}"
 
 say "Python dependency preflight (read-only)"
 printf 'Checking that the existing .venv can import every %s runtime dependency.\n' "${EXPECTED_VERSION}"
@@ -784,13 +821,13 @@ if [[ "${CONTEXT_FORCE_REQUIRED}" == true ]]; then
   printf 'WARN: this release is designed for an agent context of %s tokens.\n' "${EXPECTED_AGENT_CONTEXT}" >&2
   printf 'Configured in EVA: %s tokens\n' "${CONFIGURED_AGENT_CONTEXT}" >&2
   printf 'Reported by agent LM: %s tokens\n' "${SERVED_AGENT_CONTEXT}" >&2
-  printf 'Safe temporary EVA cap: %s tokens\n' "${TEMPORARY_AGENT_CONTEXT}" >&2
-  printf 'The agent will have less room for history and multi-step research until LM Studio is reconfigured.\n' >&2
-  printf 'Continue with the temporary context cap? [y/N]: '
+  printf 'Effective context floor observed: %s tokens\n' "${EFFECTIVE_AGENT_CONTEXT_FLOOR}" >&2
+  printf 'The updater will preserve this configuration exactly; adjust inference separately after the update if desired.\n' >&2
+  printf 'Continue without changing the inference configuration? [y/N]: '
   read -r CONTEXT_DECISION
   [[ "${CONTEXT_DECISION}" =~ ^([yY]|[yY][eE][sS])$ ]] \
     || stop "short-context update declined; nothing was changed"
-  ok "operator accepted temporary ${TEMPORARY_AGENT_CONTEXT}-token agent context"
+  ok "operator accepted the existing short-context inference configuration unchanged"
 fi
 
 if [[ "${MODE}" == "system" && "$(id -u)" -ne 0 ]]; then
@@ -983,7 +1020,7 @@ else
   as_root "${MEDIA_INSTALL[@]}"
 fi
 
-target_python - "${ENV_FILE}" "${EXPECTED_VERSION}" "${APP_DIR}/.eva-bundle-commit" "${BUNDLE_COMMIT}" "${TEMPORARY_AGENT_CONTEXT}" "${ARCHIVE_RETENTION_POLICY_MISSING}" <<'PY'
+target_python - "${ENV_FILE}" "${EXPECTED_VERSION}" "${APP_DIR}/.eva-bundle-commit" "${BUNDLE_COMMIT}" "${ARCHIVE_RETENTION_POLICY_MISSING}" <<'PY'
 import os
 import re
 import stat
@@ -995,8 +1032,7 @@ path = Path(sys.argv[1])
 version = sys.argv[2]
 marker_path = Path(sys.argv[3])
 bundle_commit = sys.argv[4]
-temporary_agent_context = sys.argv[5].strip()
-archive_retention_policy_missing = sys.argv[6].strip().lower() == "true"
+archive_retention_policy_missing = sys.argv[5].strip().lower() == "true"
 original = path.read_text(encoding="utf-8")
 replacement = f'EVOSSEARCH_APP_VERSION="{version}"'
 updated, count = re.subn(
@@ -1006,15 +1042,6 @@ updated, count = re.subn(
 )
 if count == 0:
     updated = original.rstrip("\n") + "\n" + replacement + "\n"
-if temporary_agent_context:
-    context_replacement = f"EVOSSEARCH_AGENT_CONTEXT_LIMIT_TOKENS={temporary_agent_context}"
-    updated, count = re.subn(
-        r"(?m)^[ \t]*EVOSSEARCH_AGENT_CONTEXT_LIMIT_TOKENS[ \t]*=.*$",
-        context_replacement,
-        updated,
-    )
-    if count == 0:
-        updated = updated.rstrip("\n") + "\n" + context_replacement + "\n"
 if archive_retention_policy_missing:
     retention_replacement = "EVOSSEARCH_ARCHIVE_RETENTION_ENABLED=false"
     updated = (
@@ -1041,6 +1068,11 @@ finally:
         pass
 marker_path.write_text(bundle_commit + "\n", encoding="utf-8")
 PY
+INFERENCE_POLICY_HASH_AFTER="$(inference_policy_fingerprint)"
+if [[ "${INFERENCE_POLICY_HASH_AFTER}" != "${INFERENCE_POLICY_HASH_BEFORE}" ]]; then
+  stop "inference policy changed during the code update; automatic rollback is armed"
+fi
+ok "inference policy fingerprint preserved: ${INFERENCE_POLICY_HASH_AFTER}"
 ok "code installed; database and runtime data were not changed"
 
 printf '\nRestart %s.service now? [Y/n]: ' "${SERVICE_NAME}"
@@ -1094,11 +1126,10 @@ if [[ "${POST_UPDATE_DEGRADED}" == true ]]; then
 fi
 printf 'URL: %s\n' "${BASE_URL}"
 printf 'Service: %s.service (%s systemd)\n' "${SERVICE_NAME}" "${MODE}"
-if [[ -n "${TEMPORARY_AGENT_CONTEXT}" ]]; then
-  printf 'Agent context: %s tokens (TEMPORARY FORCED CAP; target is %s)\n' \
-    "${TEMPORARY_AGENT_CONTEXT}" "${EXPECTED_AGENT_CONTEXT}"
-  printf 'Next: raise LM Studio context, then set EVOSSEARCH_AGENT_CONTEXT_LIMIT_TOKENS=%s and restart EVA.\n' \
-    "${EXPECTED_AGENT_CONTEXT}"
+if [[ -n "${EFFECTIVE_AGENT_CONTEXT_FLOOR}" ]]; then
+  printf 'Agent context: %s tokens observed (PRESERVED; target recommendation is %s)\n' \
+    "${EFFECTIVE_AGENT_CONTEXT_FLOOR}" "${EXPECTED_AGENT_CONTEXT}"
+  printf 'Inference was not changed. Reconfigure the server and EVA context separately after acceptance if desired.\n'
 elif [[ "${CONTEXT_UNKNOWN_ACCEPTED}" == true ]]; then
   printf 'Agent context: UNVERIFIED (operator accepted the warning)\n'
   printf 'WARN: EVA is up, but agent LM availability/context still requires manual verification.\n'

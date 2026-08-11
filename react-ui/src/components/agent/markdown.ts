@@ -26,7 +26,13 @@ export function renderMarkdown(src: string): string {
 
   const lines = text.split('\n')
   const out: string[] = []
+  const paragraphLines: string[] = []
   let inList = false
+  const flushParagraph = () => {
+    if (!paragraphLines.length) return
+    out.push(`<div class="md-p">${paragraphLines.join('<br>')}</div>`)
+    paragraphLines.length = 0
+  }
   const closeList = () => {
     if (inList) {
       out.push('</ul>')
@@ -34,12 +40,14 @@ export function renderMarkdown(src: string): string {
     }
   }
   const isSep = (s: string) => /^\s*\|?[\s:|-]*-[\s:|-]*\|?\s*$/.test(s) && s.includes('-')
+  const isRule = (s: string) => /^\s*(?:-{3,}|\*{3,}|_{3,})\s*$/.test(s)
   const cells = (s: string) => s.replace(/^\s*\|/, '').replace(/\|\s*$/, '').split('|').map((c) => c.trim())
 
   for (let i = 0; i < lines.length; i++) {
     const line = lines[i].trimEnd()
     // GFM table: header row + separator row + body rows.
     if (line.includes('|') && i + 1 < lines.length && isSep(lines[i + 1])) {
+      flushParagraph()
       closeList()
       const head = cells(line)
       let j = i + 2
@@ -56,25 +64,39 @@ export function renderMarkdown(src: string): string {
     }
     const h = line.match(/^(#{1,4})\s+(.*)$/)
     const li = line.match(/^[-*]\s+(.*)$/)
-    if (h) {
+    if (isRule(line)) {
+      flushParagraph()
+      closeList()
+      out.push('<hr class="md-hr">')
+    } else if (h) {
+      flushParagraph()
       closeList()
       const lvl = h[1].length
       out.push(`<div class="md-h md-h${lvl}">${h[2]}</div>`)
+    } else if (/^@@CODE_BLOCK_\d+@@$/.test(line.trim())) {
+      flushParagraph()
+      closeList()
+      out.push(line.trim())
     } else if (li) {
+      flushParagraph()
       if (!inList) {
         out.push('<ul class="md-ul">')
         inList = true
       }
       out.push(`<li>${li[1]}</li>`)
     } else if (line === '') {
+      flushParagraph()
       closeList()
-      out.push('')
     } else {
-      out.push(`<div class="md-p">${line}</div>`)
+      closeList()
+      paragraphLines.push(line)
     }
   }
+  flushParagraph()
   closeList()
-  let html = out.join('\n')
+  // Generated tags already carry block layout. Keeping source newlines here
+  // makes a pre-wrapped chat bubble render every separator as extra height.
+  let html = out.join('')
   // Restore code blocks.
   html = html.replace(/@@CODE_BLOCK_(\d+)@@/g, (_m, i) => blocks[Number(i)] || '')
   return html

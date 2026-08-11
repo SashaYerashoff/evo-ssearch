@@ -108,14 +108,15 @@ class UpdateBundleTests(unittest.TestCase):
         self.assertIn("while (( SECONDS < READY_DEADLINE ))", SCRIPT)
         self.assertIn('"${BASE_URL}/ready?load=1"', SCRIPT)
 
-    def test_agent_context_mismatch_requires_explicit_safe_force_before_update(self):
+    def test_agent_context_mismatch_requires_confirmation_but_is_not_rewritten(self):
         context_check = SCRIPT.index("Agent context compatibility decision")
         confirmation = SCRIPT.index("Install %s now?")
         self.assertLess(context_check, confirmation)
-        self.assertIn("Continue with the temporary context cap? [y/N]", SCRIPT)
+        self.assertIn("Continue without changing the inference configuration? [y/N]", SCRIPT)
         self.assertIn("short-context update declined; nothing was changed", SCRIPT)
-        self.assertIn("TEMPORARY FORCED CAP", SCRIPT)
-        self.assertIn("EVOSSEARCH_AGENT_CONTEXT_LIMIT_TOKENS={temporary_agent_context}", SCRIPT)
+        self.assertIn("Inference was not changed", SCRIPT)
+        self.assertNotIn("EVOSSEARCH_AGENT_CONTEXT_LIMIT_TOKENS={temporary_agent_context}", SCRIPT)
+        self.assertNotIn('key == "EVOSSEARCH_AGENT_CONTEXT_LIMIT_TOKENS"', SCRIPT)
 
     def test_agent_context_probe_uses_profile_auth_and_unknown_requires_confirmation(self):
         self.assertIn("EVOSSEARCH_LM_PROFILE_AGENT_API_KEY", SCRIPT)
@@ -134,6 +135,25 @@ class UpdateBundleTests(unittest.TestCase):
         self.assertNotIn("EVOSSEARCH_LM_PROFILE_AGENT_MODEL={", SCRIPT)
         self.assertNotIn('env "EVOSSEARCH_LM_PROFILE_AGENT_MODEL=', SCRIPT)
         self.assertIn("no configuration was or will be modified", SCRIPT)
+
+    def test_update_fingerprints_and_preserves_inference_policy(self):
+        self.assertIn("inference_policy_fingerprint()", SCRIPT)
+        for prefix in (
+            "EVOSSEARCH_LM_",
+            "EVOSSEARCH_AGENT_",
+            "EVOSSEARCH_INFERENCE_",
+        ):
+            self.assertIn(prefix, SCRIPT)
+        before = SCRIPT.index('INFERENCE_POLICY_HASH_BEFORE="$(inference_policy_fingerprint)"')
+        confirmation = SCRIPT.index("Install %s now?")
+        install = SCRIPT.index('"${BUNDLE_DIR}/scripts/install_patch.sh"')
+        after = SCRIPT.index('INFERENCE_POLICY_HASH_AFTER="$(inference_policy_fingerprint)"')
+        self.assertLess(before, confirmation)
+        self.assertLess(confirmation, install)
+        self.assertLess(install, after)
+        self.assertIn("inference policy changed during the code update", SCRIPT)
+        self.assertIn("automatic rollback is armed", SCRIPT)
+        self.assertIn("inference policy fingerprint preserved", SCRIPT)
 
     def test_model_preflight_describes_topology_and_warns_instead_of_stopping(self):
         preflight = SCRIPT.index("Model/server configuration preflight (read-only)")

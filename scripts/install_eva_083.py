@@ -78,6 +78,13 @@ _INSTALLER_MANAGED_ENV_KEYS = frozenset(
     }
 )
 
+_INFERENCE_POLICY_PREFIXES = (
+    "EVOSSEARCH_LM_",
+    "EVOSSEARCH_AGENT_",
+    "EVOSSEARCH_INFERENCE_",
+)
+_INFERENCE_POLICY_EXACT_KEYS = frozenset({"CUDA_VISIBLE_DEVICES"})
+
 _ARCHIVE_RETENTION_POLICY_KEYS = (
     "EVOSSEARCH_ARCHIVE_RETENTION_ENABLED",
     "EVOSSEARCH_ARCHIVE_ROW_RETENTION_DAYS",
@@ -157,6 +164,7 @@ class PreparedInstall:
     updates: dict[str, str]
     migration_dsn: str | None = field(default=None, repr=False)
     migration_dsn_source: str | None = None
+    inference_policy_hash: str | None = field(default=None, repr=False)
     findings: list[Finding] = field(default_factory=list)
     actions: list[PlanAction] = field(default_factory=list)
 
@@ -350,6 +358,45 @@ def render_env_update(raw: str, updates: Mapping[str, str]) -> str:
     return content
 
 
+def inference_policy_fingerprint(values: Mapping[str, str]) -> str:
+    """Hash the complete EVA-to-inference contract without exposing secrets.
+
+    An upgrade may inspect configured OpenAI-compatible endpoints, but it must
+    not alter their addresses, models, API keys, timeouts, concurrency,
+    context limits, queue policy, video budgets, or GPU visibility. Hashing
+    parsed values makes the guard insensitive to comments and quoting that do
+    not affect runtime behavior.
+    """
+
+    selected = {
+        str(key): str(value)
+        for key, value in values.items()
+        if (
+            str(key) in _INFERENCE_POLICY_EXACT_KEYS
+            or str(key).startswith(_INFERENCE_POLICY_PREFIXES)
+        )
+    }
+    canonical = "".join(f"{key}={selected[key]}\n" for key in sorted(selected))
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def _assert_inference_policy_file(
+    path: Path,
+    expected_hash: str,
+    *,
+    phase: str,
+) -> None:
+    if not path.is_file():
+        raise InstallerError(
+            f"Inference policy guard failed during {phase}: environment file is missing."
+        )
+    actual_hash = inference_policy_fingerprint(parse_env_text(path.read_text(encoding="utf-8")))
+    if actual_hash != expected_hash:
+        raise InstallerError(
+            f"Inference policy changed during {phase}; refusing to continue."
+        )
+
+
 def _prompt(spec: PromptSpec, *, input_fn: Callable[[str], str]) -> str:
     suffix = f" [{spec.default}]" if spec.default else ""
     label = f"{spec.label}{suffix}: "
@@ -444,7 +491,7 @@ def prepare_env_values(
             "EVOSSEARCH_INFERENCE_QUEUE_ENABLED": "true",
             "EVOSSEARCH_INFERENCE_QUEUE_SPOOL_DIR": "/var/lib/eva-ai/inference-spool",
             "EVOSSEARCH_INFERENCE_QUEUE_CAPACITY": "200",
-            "EVOSSEARCH_INFERENCE_WORKER_COUNT": "1",
+            "EVOSSEARCH_INFERENCE_WORKER_COUNT": "3",
             "EVOSSEARCH_DB_STRICT_RUNTIME_ROLES": "true",
             "EVOSSEARCH_ARCHIVE_STORE": "postgres",
             "EVOSSEARCH_EMBEDDER": "clip",
@@ -1043,6 +1090,15 @@ def build_plan(prepared: PreparedInstall) -> list[PlanAction]:
         ),
         PlanAction("configuration", env_action),
         PlanAction(
+            "inference",
+            (
+                "preserve the complete existing EVA inference policy; abort and roll back on "
+                "any endpoint/model/context/queue/GPU change"
+                if prepared.inference_policy_hash is not None
+                else "create the reviewed inference policy for a fresh installation"
+            ),
+        ),
+        PlanAction(
             "host",
             (
                 "preserve the account selected by the existing systemd unit and ensure target directories"
@@ -1468,6 +1524,18 @@ def apply_install(prepared: PreparedInstall) -> Path:
             "EVA_MIGRATION_DATABASE_DSN"
         )
 
+    if prepared.inference_policy_hash is not None:
+        policy_source = prepared.env.target if prepared.env.target.is_file() else prepared.env.source
+        if policy_source is None:
+            raise InstallerError(
+                "Inference policy guard has no environment source to verify before apply."
+            )
+        _assert_inference_policy_file(
+            policy_source,
+            prepared.inference_policy_hash,
+            phase="apply preflight",
+        )
+
     secret_values = [value for key, value in prepared.values.items() if is_secret_key(key)]
     migration_dsn = str(prepared.migration_dsn or "").strip()
     if migration_dsn:
@@ -1515,6 +1583,12 @@ def apply_install(prepared: PreparedInstall) -> Path:
             _atomic_write(prepared.env.target, env_content, 0o600)
         else:
             os.chmod(prepared.env.target, 0o600)
+        if prepared.inference_policy_hash is not None:
+            _assert_inference_policy_file(
+                prepared.env.target,
+                prepared.inference_policy_hash,
+                phase="environment staging",
+            )
 
         venv_python = options.app_dir / ".venv" / "bin" / "python"
         if not venv_python.is_file():
@@ -1559,6 +1633,12 @@ def apply_install(prepared: PreparedInstall) -> Path:
             "--no-verify",
         ), env=install_env)
         backup_dir = _latest_backup(options.backup_root)
+        if prepared.inference_policy_hash is not None:
+            _assert_inference_policy_file(
+                prepared.env.target,
+                prepared.inference_policy_hash,
+                phase="code installation",
+            )
         if env_preexisted and env_preinstall_backup is not None:
             _copy2_with_ownership(env_preinstall_backup, backup_dir / "eva-ai.env")
             env_preinstall_backup.unlink(missing_ok=True)
@@ -1611,6 +1691,12 @@ def apply_install(prepared: PreparedInstall) -> Path:
                 "--base-url", options.base_url,
                 "--timeout", "90",
             ))
+        if prepared.inference_policy_hash is not None:
+            _assert_inference_policy_file(
+                prepared.env.target,
+                prepared.inference_policy_hash,
+                phase="post-update verification",
+            )
         return backup_dir
     except Exception:
         if backup_dir is None:
@@ -1770,6 +1856,21 @@ def prepare_install(options: InstallerOptions, environ: Mapping[str, str] | None
         migration_dsn,
         migration_dsn_source,
     )
+    inference_policy_hash: str | None = None
+    if resolution.source is not None:
+        inference_policy_hash = inference_policy_fingerprint(resolution.existing)
+        projected = parse_env_text(render_env_update(resolution.raw, updates))
+        projected_hash = inference_policy_fingerprint(projected)
+        if projected_hash != inference_policy_hash:
+            findings.append(Finding(
+                "FAIL",
+                "upgrade plan would change the existing inference policy; no changes were made",
+            ))
+        else:
+            findings.append(Finding(
+                "OK",
+                f"existing inference policy is protected by fingerprint {inference_policy_hash}",
+            ))
     prepared = PreparedInstall(
         options=options,
         env=resolution,
@@ -1777,6 +1878,7 @@ def prepare_install(options: InstallerOptions, environ: Mapping[str, str] | None
         updates=updates,
         migration_dsn=migration_dsn,
         migration_dsn_source=migration_dsn_source,
+        inference_policy_hash=inference_policy_hash,
         findings=findings,
     )
     prepared.actions = build_plan(prepared)

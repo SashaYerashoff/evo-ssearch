@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import time
 import uuid
 from collections.abc import Callable, Mapping
@@ -36,6 +37,17 @@ _GENERIC_INCIDENT_KEYS = {
     "batch_state",
     "motion_peak",
 }
+
+_INCIDENT_COVER_ROLE_PRIORITY = {
+    "apex": 0,
+    "alert": 1,
+    "onset": 2,
+    "event": 3,
+    "post": 4,
+    "anchor": 5,
+    "control": 6,
+}
+_LOGGER = logging.getLogger(__name__)
 
 
 def _positive_ints(values: Any) -> list[int]:
@@ -1714,6 +1726,36 @@ class IncidentCommandService:
     ) -> list[dict[str, Any]]:
         """Project a review page and resolve all compact image refs in one query."""
 
+        cover_hints: list[dict[str, Any]] = []
+        for record in records:
+            channel_ids = _positive_ints(record.get("channel_ids"))
+            timestamp_ms = self._optional_int(record.get("possible_start_ms"))
+            candidates = [
+                (index, item)
+                for index, item in enumerate(record.get("evidence_refs") or [])
+                if isinstance(item, Mapping)
+                and str(item.get("kind") or "").strip().lower() == "vlm_snapshot"
+                and str(item.get("ref") or "").strip()
+            ]
+            if not channel_ids or timestamp_ms is None or not candidates:
+                continue
+            _, selected = min(
+                candidates,
+                key=lambda pair: (
+                    _INCIDENT_COVER_ROLE_PRIORITY.get(
+                        str(pair[1].get("role") or "evidence").lower(),
+                        7,
+                    ),
+                    pair[0],
+                ),
+            )
+            cover_hints.append(
+                {
+                    "ref": str(selected.get("ref") or "").strip(),
+                    "channel_id": channel_ids[0],
+                    "timestamp_ms": timestamp_ms,
+                }
+            )
         refs = list(
             dict.fromkeys(
                 str(item.get("ref") or "").strip()
@@ -1724,16 +1766,36 @@ class IncidentCommandService:
                 and str(item.get("ref") or "").strip()
             )
         )
+        fast_resolver = getattr(
+            self.detections_store,
+            "resolve_vlm_snapshot_cover_refs",
+            None,
+        )
         resolver = getattr(self.detections_store, "resolve_vlm_snapshot_refs", None)
         resolved: Mapping[str, Mapping[str, Any]] = {}
-        if refs and callable(resolver):
+        if cover_hints and callable(fast_resolver):
+            try:
+                candidate = fast_resolver(cover_hints)
+                if isinstance(candidate, Mapping):
+                    resolved = candidate
+            except Exception as exc:
+                # Incident text and lifecycle state remain useful if archive media
+                # is temporarily unavailable; keep the review endpoint operational.
+                _LOGGER.warning(
+                    "Incident review cover resolver failed: %s",
+                    type(exc).__name__,
+                )
+                resolved = {}
+        elif refs and callable(resolver):
             try:
                 candidate = resolver(refs)
                 if isinstance(candidate, Mapping):
                     resolved = candidate
-            except Exception:
-                # Incident text and lifecycle state remain useful if archive media
-                # is temporarily unavailable; keep the review endpoint operational.
+            except Exception as exc:
+                _LOGGER.warning(
+                    "Legacy incident review cover resolver failed: %s",
+                    type(exc).__name__,
+                )
                 resolved = {}
         return [
             self.public_review_record(record, resolved_snapshot_refs=resolved)
@@ -1797,15 +1859,6 @@ class IncidentCommandService:
         # Prefer a meaningful apex/alert frame over the archive anchor while still
         # retaining a deterministic fallback when only the anchor is available.
         cover_candidates: list[tuple[int, int, int, str]] = []
-        role_priority = {
-            "apex": 0,
-            "alert": 1,
-            "onset": 2,
-            "event": 3,
-            "post": 4,
-            "anchor": 5,
-            "control": 6,
-        }
         for item in evidence:
             ref = str(item.get("ref") or "").strip()
             resolved_ref = (
@@ -1823,13 +1876,13 @@ class IncidentCommandService:
                 continue
             role = str(item.get("role") or item.get("kind") or "evidence").lower()
             timestamp = item_timestamp(item) or self._optional_int(resolved_ref.get("timestamp_ms")) or 0
-            cover_candidates.append((role_priority.get(role, 7), -timestamp, detection_id, role))
+            cover_candidates.append((_INCIDENT_COVER_ROLE_PRIORITY.get(role, 7), -timestamp, detection_id, role))
         anchor = record.get("anchor_ref")
         if isinstance(anchor, Mapping):
             detection_id = self._optional_int(anchor.get("detection_id") or anchor.get("id"))
             if detection_id is not None and detection_id > 0:
                 timestamp = item_timestamp(anchor) or 0
-                cover_candidates.append((role_priority["anchor"], -timestamp, detection_id, "anchor"))
+                cover_candidates.append((_INCIDENT_COVER_ROLE_PRIORITY["anchor"], -timestamp, detection_id, "anchor"))
         cover = None
         if cover_candidates:
             _, negative_timestamp, detection_id, role = min(cover_candidates)

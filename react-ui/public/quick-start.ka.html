@@ -1,0 +1,134 @@
+<!doctype html>
+<html lang="ka">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>EVA AI — ოპერატორის მოკლე სახელმძღვანელო</title>
+  <style>
+    :root { color-scheme:light; --paper:#fff; --page:#eef2f6; --ink:#17212b; --muted:#5e6b78; --line:#cfd7df; --accent:#245d86; --soft:#edf5fa; --ok:#27734f; --ok-bg:#eef8f2; --warn-bg:#fff7e7; }
+    * { box-sizing:border-box; }
+    body { margin:0; background:var(--page); color:var(--ink); font:16px/1.65 Arial,"Noto Sans Georgian","Noto Sans",sans-serif; }
+    main { width:min(980px,calc(100% - 32px)); margin:28px auto 64px; background:var(--paper); border:1px solid var(--line); box-shadow:0 12px 36px rgba(25,42,56,.12); padding:46px 54px 56px; }
+    header { padding-bottom:24px; border-bottom:3px solid var(--accent); }
+    h1 { margin:6px 0 8px; font-size:clamp(30px,5vw,44px); line-height:1.2; }
+    h2 { margin:38px 0 14px; padding-bottom:7px; border-bottom:1px solid var(--line); color:#183e59; font-size:23px; }
+    p, li { max-width:84ch; }
+    a { color:var(--accent); }
+    code { font-family:"Noto Sans Mono",Consolas,monospace; font-size:.92em; background:#f3f5f7; border:1px solid var(--line); border-radius:4px; padding:2px 5px; }
+    .eyebrow { color:var(--accent); font-weight:700; letter-spacing:.05em; text-transform:uppercase; font-size:12px; }
+    .lead { color:var(--muted); margin:0; font-size:18px; }
+    .languages { margin-top:14px; font-size:14px; }
+    .languages a, .languages strong { margin-right:12px; }
+    .note { border:1px solid var(--line); border-left:4px solid var(--accent); padding:14px 17px; margin:16px 0; background:var(--soft); }
+    .ok { border-left-color:var(--ok); background:var(--ok-bg); }
+    .warn { border-left-color:#d3942b; background:var(--warn-bg); color:#54380d; }
+    .steps { counter-reset:step; display:grid; gap:11px; padding:0; }
+    .steps > li { list-style:none; padding:12px 14px 12px 52px; border:1px solid var(--line); position:relative; break-inside:avoid; }
+    .steps > li::before { counter-increment:step; content:counter(step); position:absolute; left:14px; top:12px; width:25px; height:25px; display:grid; place-items:center; border-radius:50%; background:var(--accent); color:#fff; font-weight:700; }
+    table { width:100%; border-collapse:collapse; margin:12px 0 18px; }
+    th, td { text-align:left; vertical-align:top; padding:9px 11px; border:1px solid var(--line); }
+    th { background:#edf2f5; color:#294a60; }
+    footer { margin-top:42px; padding-top:16px; border-top:1px solid var(--line); color:var(--muted); font-size:14px; }
+    @media (max-width:700px) { main { width:100%; margin:0; border:0; padding:28px 20px 42px; box-shadow:none; } }
+    @media print { body { background:#fff; font-size:11pt; } main { width:100%; margin:0; border:0; box-shadow:none; padding:0; } h2 { break-after:avoid; } a { color:inherit; } }
+  </style>
+</head>
+<body>
+<main>
+  <header>
+    <div class="eyebrow">EVA AI 0.8.7 · საპილოტე დანერგვა</div>
+    <h1>ოპერატორის მოკლე სახელმძღვანელო</h1>
+    <p class="lead">Luxriot Evo-ს დაკავშირება, არხების აღწერების გაშვება, ზონდებისა და VLM გაფრთხილებების შექმნა, მტკიცებულებების შემოწმება და EVA Agent-თან მუშაობა.</p>
+    <nav class="languages" aria-label="სახელმძღვანელოს ენა"><a href="quick-start.html" lang="en">English</a><strong>ქართული</strong><a href="quick-start.lv.html" lang="lv">Latviešu</a></nav>
+  </header>
+
+  <div class="note ok"><strong>დაიწყეთ აქედან.</strong> გახსენით <code>http://&lt;EVA-IP&gt;:5000</code> და შედით ადმინისტრატორის მიერ გაცემული ანგარიშით. არხების ანალიზის დაწყებამდე დააკავშირეთ Luxriot Evo. ინტერფეისის ენა იცვლება განყოფილებაში <strong>Appearance</strong>; კამერების სახელები, მტკიცებულებები, მოდელის აღწერები და საუბრები ავტომატურად არ ითარგმნება.</div>
+
+  <h2>1. Luxriot Evo-ს დაკავშირება</h2>
+  <ol class="steps">
+    <li>გახსენით <strong>MENU</strong>, შემდეგ <strong>Settings → Luxriot</strong>.</li>
+    <li><strong>Base URL</strong>-ში მიუთითეთ Evo HTTP API-ის მისამართი, მაგალითად <code>http://192.168.1.50:8080</code>, შემდეგ შეიყვანეთ Evo-ს მომხმარებელი და პაროლი.</li>
+    <li>დააჭირეთ <strong>Save settings</strong>. პაროლის ცარიელი ველი ნიშნავს „არსებული პაროლის შენარჩუნებას“ და არა მის წაშლას.</li>
+    <li>ქვედა სტატუსის ზოლში დაელოდეთ <strong>LUXRIOT CONNECTED</strong>-ს და ნულზე მეტ არხს. მწვანე სტატუსი ნიშნავს, რომ EVA-მ ახალი მონაცემები მიიღო.</li>
+    <li>თუ არხები არ ჩანს, შეამოწმეთ IP, API პორტი, ქსელური წვდომა და Evo-ს მომხმარებლის კამერების ნახვის უფლებები.</li>
+  </ol>
+  <div class="note warn"><strong>ყველა არხი ერთდროულად არ ჩართოთ.</strong> დაიწყეთ მცირე ჯგუფებით და აკონტროლეთ აღწერის დაყოვნება და GPU-ის დატვირთვა. PTZ-ის გადაადგილების შემდეგ EVA-ს ახალი ხედის დასადასტურებლად მოკლე სტაბილური ინტერვალი სჭირდება.</div>
+
+  <h2>2. ძირითადი განყოფილებები</h2>
+  <table>
+    <thead><tr><th>განყოფილება</th><th>დანიშნულება</th></tr></thead>
+    <tbody>
+      <tr><td><strong>Archive</strong></td><td>ვიზუალური მტკიცებულების ძებნა დროით, არხით, ტექსტით ან სურათით. შედეგიდან შეგიძლიათ მეზობელი კადრებისა და Luxriot-ის საარქივო ვიდეოს გახსნა.</td></tr>
+      <tr><td><strong>Stream summaries</strong></td><td><strong>Stream review</strong> აჩვენებს L0–L3 აღწერებს. <strong>Stream settings</strong> რთავს ან აჩერებს არხს და ხსნის prompt-ებისა და გაფრთხილებების პარამეტრებს.</td></tr>
+      <tr><td><strong>Probes</strong></td><td>სწრაფი სემანტიკური ყურადღების სიგნალები რეგულარულად ინდექსირებულ კადრებზე; ზონდს შეუძლია Luxriot bookmark-ის შექმნაც.</td></tr>
+      <tr><td><strong>Agent</strong></td><td>იკვლევს არქივს, აღწერებს, გაფრთხილებებს, ინციდენტებს და სისტემის მდგომარეობას. <strong>Operator ON</strong>-ის დროს აგენტს შეუძლია მხარდაჭერილი ეკრანების გახსნა.</td></tr>
+      <tr><td><strong>ქვედა სტატუსის ზოლი</strong></td><td>აჩვენებს Luxriot-ის მონაცემების სიახლეს, ხელმისაწვდომ არხებს, აგენტის მდგომარეობასა და ზონდებს.</td></tr>
+    </tbody>
+  </table>
+
+  <h2>3. არხის აღწერების გაშვება</h2>
+  <ol class="steps">
+    <li>გახსენით <strong>Stream summaries → Stream settings</strong> და აირჩიეთ არხი.</li>
+    <li>თავდაპირველად დატოვეთ რეკომენდებული batch და cadence. მოძრაობის ან ყურადღების სიგნალის ზრდისას EVA-ს შეუძლია კადრების სიმჭიდროვის გაზრდა.</li>
+    <li>დააჭირეთ <strong>Apply changes</strong>, შემდეგ <strong>Start summaries</strong>. <strong>Flush</strong> გამოიყენეთ მხოლოდ მაშინ, როცა არასრული batch დაუყოვნებლივ უნდა გაიგზავნოს.</li>
+    <li><strong>Stream review</strong>-ში აირჩიეთ არხი, დროის შუალედი და დონე: L0 დაკვირვებები, L1 15 წუთი, L2 ერთი საათი ან L3 რვა საათი. <strong>Auto</strong> შესაბამის სიღრმეს თვითონ ირჩევს.</li>
+  </ol>
+  <div class="note"><strong>როგორ წავიკითხოთ აღწერა.</strong> L0 არის ერთი ვიზუალური batch და მისი უშუალო VLM გადაწყვეტილება. L1–L3 ქვედა დონეებს აერთიანებს და დამოუკიდებელი ვიზუალური დაკვირვება არ არის. <strong>Burst</strong> ნიშნავს არხის ჩვეულებრივ დონეზე ძლიერ მოძრაობას. წარმომადგენლობით სურათზე დაჭერით გახსენით გაგზავნილი კადრები. <strong>BATCH_STATE_JSON</strong> მანქანურად წაკითხვადი მდგომარეობაა და ყოველდღიურ მუშაობაში მისი გახსნა საჭირო არ არის.</div>
+
+  <h2>4. სემანტიკური ზონდის შექმნა</h2>
+  <ol class="steps">
+    <li>გახსენით <strong>Probes</strong> და დააჭირეთ <strong>New probe</strong>.</li>
+    <li>აირჩიეთ არხი და გამოიყენეთ ოპერატიული სახელი, მაგალითად „პატარა გემი ნავსადგურის შესასვლელთან“.</li>
+    <li><strong>Positive scene</strong>-ში აღწერეთ საძებნი ხილული სიტუაცია. <strong>Negative look-alike</strong>-ში აღწერეთ ყველაზე მსგავსი ნორმალური ხედი, რომელიც უნდა ჩაიხშოს. მაგალითი: <code>small sailing craft crossing the harbour entrance</code> და <code>open water and breakwater with no nearby craft</code>.</li>
+    <li>თავდაპირველად დატოვეთ შემოთავაზებული Positive floor და Margin. ზღვრები შეცვალეთ მხოლოდ რეალური სწორი და მცდარი დამთხვევების შემოწმების შემდეგ.</li>
+    <li>საჭიროების შემთხვევაში ჩართეთ Luxriot bookmark-ები და მიუთითეთ severity, cooldown და deduplication.</li>
+    <li>ROI გამოიყენეთ მხოლოდ ფიქსირებული ხედისთვის. ერთი ROI სხვადასხვა PTZ preset-ზე ბრმად არ გადაიტანოთ.</li>
+  </ol>
+  <div class="note warn"><strong>ზონდის დამთხვევა ფაქტი არ არის.</strong> ის ყურადღებას ავიწროებს და შეიძლება კადრების სიხშირე გაზარდოს. უსაფრთხოებასთან დაკავშირებული დასკვნა ვიზუალურ მტკიცებულებაში ან VLM აღწერაში გადაამოწმეთ.</div>
+
+  <h2>5. VLM გაფრთხილების შექმნა</h2>
+  <ol class="steps">
+    <li>გახსენით <strong>Stream summaries → Stream settings</strong>, აირჩიეთ არხი და დააჭირეთ <strong>Prompts &amp; alerts</strong>.</li>
+    <li><strong>Alerts</strong>-ში აღწერეთ ხილული კრიტერიუმები, მნიშვნელობა და საჭირო გამონაკლისები. გამოიყენეთ დაკვირვებადი მოქმედება, გეომეტრია და მოძრაობის მიმართულება; ნუ გამოიგონებთ ვინაობას ან განზრახვას.</li>
+    <li>მაგალითი: <code>HIGH: two vessels are converging on crossing trajectories near the harbour entrance. Do not alert on perspective-only overlap when motion history shows safe separation.</code></li>
+    <li>თუ მოვლენა Evo-ში უნდა გამოჩნდეს, ჩართეთ bookmark-ები და შეარჩიეთ მოვლენის ხანგრძლივობის შესაბამისი cooldown.</li>
+    <li>შეამოწმეთ გაფრთხილების badge, წარმომადგენლობითი და მეზობელი კადრები, ასევე bookmark-ის დრო. ბუნდოვანი კრიტერიუმი ტექსტში გაასწორეთ და მხოლოდ threshold-ს ნუ შეამცირებთ.</li>
+  </ol>
+  <div class="note"><strong>Stream და Alerts სხვადასხვა მიზანს ემსახურება.</strong> Stream prompt განმარტავს სცენის ინტერპრეტაციას; მონიტორინგისა და განგაშის კრიტერიუმები უნდა იყოს <strong>Alerts</strong>-ში.</div>
+
+  <h2>6. არქივის ძებნა და ინციდენტი</h2>
+  <ul>
+    <li><strong>Archive</strong>-ში აირჩიეთ არხები, მტკიცებულების წყაროები და დროის შუალედი. <strong>Text query</strong> სემანტიკურ ძებნას ასრულებს.</li>
+    <li>შედეგის გახსნით შეამოწმეთ მეზობელი კადრები. <strong>Play archive video</strong> Evo-სგან შესაბამის დროს ვიდეოს ითხოვს; მომზადებას შეიძლება რამდენიმე ათეული წამი დასჭირდეს.</li>
+    <li><strong>Report incident</strong> ამზადებს ინციდენტს დასაწყისით, დასასრულით, თანმიმდევრული მტკიცებულებებითა და აღწერით. შენახვამდე ოპერატორმა ყველაფერი უნდა გადაამოწმოს.</li>
+    <li>ვიზუალურად მცდარი გაფრთხილებისთვის გამოიყენეთ <strong>Report false positive</strong>. უკუკავშირი ზონდებისა და გაფრთხილებების შემდგომი გამართვისთვის ინახება.</li>
+  </ul>
+
+  <h2>7. EVA Agent-თან მუშაობა</h2>
+  <p>კარგ მოთხოვნაში მითითებულია <strong>არხი ან ჯგუფი</strong>, ზუსტი <strong>დროის შუალედი</strong> და საჭირო <strong>მტკიცებულება ან შედეგის ფორმა</strong>.</p>
+  <ul>
+    <li><code>Show high and critical VLM alerts on Harbour Gate West during the last two hours. Include evidence timestamps.</code></li>
+    <li><code>Search the last three days for small sailing craft entering the harbour. Show the six strongest visual matches.</code></li>
+    <li><code>Build an incident report around this alert, including the first approach, closest point, and final separation.</code></li>
+    <li><code>Check stream health for the selected eight channels and list coverage gaps without guessing what happened during missing video.</code></li>
+  </ul>
+  <div class="note"><strong>Operator ON</strong> აგენტს მხარდაჭერილ ეკრანებზე ნავიგაციის უფლებას აძლევს; <strong>Operator OFF</strong> ამას ბლოკავს. მოსთხოვეთ აგენტს დაკვირვებული მტკიცებულების, დასკვნისა და დაფარვის ხარვეზების მკაფიო გამიჯვნა. ინსტრუმენტის გამოძახება ადასტურებს, რომ ძებნა შესრულდა, მაგრამ არა იმას, რომ საბოლოო ტექსტის ყველა მტკიცება ჭეშმარიტია.</div>
+
+  <h2>8. ცვლის დაწყებამდე სწრაფი შემოწმება</h2>
+  <ol class="steps">
+    <li>Luxriot მწვანე ხდება მხოლოდ ახალი მონაცემების მიღების შემდეგ.</li>
+    <li>საჭირო არხები ჩანს და არჩეულ არხს მიმდინარე preview აქვს.</li>
+    <li>სატესტო არხი L0 აღწერას ქმნის კონფიგურირებული მაქსიმალური batch-window-ის ფარგლებში.</li>
+    <li>სატესტო ზონდი მიმდინარე კადრებს აჩვენებს და მისი ჩართვა/გამორთვა შესაძლებელია.</li>
+    <li>არქივის ძებნა ნამდვილ სურათს აბრუნებს; Evo playback სწორ დროსთან ახლოს ვიდეოს ხსნის.</li>
+    <li>აგენტს შეუძლია არხების მდგომარეობის შემოწმება და დაკარგული ვიდეოს პერიოდში მოვლენების არ გამოგონება.</li>
+  </ol>
+
+  <footer>
+    <strong>სად ვიპოვოთ ეს სახელმძღვანელო</strong><br>
+    EVA: <strong>MENU → Settings → Operator guide</strong><br>
+    პირდაპირი მისამართი: <code>http://&lt;EVA-IP&gt;:5000/ui-assets/quick-start.ka.html</code>
+  </footer>
+</main>
+</body>
+</html>

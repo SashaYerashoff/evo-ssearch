@@ -21,7 +21,7 @@ from agent import (
     _apply_turn_tool_context,
     _AgentLMClient,
 )
-from agent_security import ToolExecutionContext
+from agent_security import ToolExecutionContext, ToolTimeoutError
 
 
 class _FakeStore:
@@ -260,6 +260,95 @@ class AgentToolLoopTests(unittest.TestCase):
         sweep["active_skill_slugs"] = ["multi_channel_event_sweep"]
         self.assertEqual(agent._turn_tool_call_limit(sweep), 12)
 
+    def test_latest_alerts_across_all_channels_inventory_then_drill_l0(self):
+        text = "Show the latest VLM alerts across all channels."
+        context = _seed_turn_tool_context(text)
+
+        self.assertTrue(context["operator_requests_all_channels"])
+        self.assertTrue(context["latest_vlm_alerts_request"])
+        self.assertNotIn("channel_id", context)
+        schemas = _select_relevant_tool_schemas(agent._TOOL_SCHEMAS, context)
+        call = agent._required_video_research_tool_call(context, schemas)
+        self.assertIsNotNone(call)
+        self.assertEqual(call.name, "list_video_summary_channels")
+
+        context.update({
+            "video_inventory_completed": True,
+            "video_inventory_requires_confirmation": False,
+            "video_candidate_channel_ids": [112, 118],
+            "time_window": {"from_ts": 100.0, "to_ts": 200.0, "duration_sec": 100.0},
+        })
+        schemas = _select_relevant_tool_schemas(agent._TOOL_SCHEMAS, context)
+        call = agent._required_video_research_tool_call(context, schemas)
+        self.assertIsNotNone(call)
+        self.assertEqual(call.name, "get_video_summaries")
+        self.assertEqual(call.args["channel_id"], 112)
+        self.assertEqual(call.args["depth"], "live")
+
+        prepared = _apply_turn_tool_context(
+            "get_video_summaries",
+            {"depth": "L1"},
+            context,
+        )
+        self.assertNotIn("channel_id", prepared)
+
+    def test_compare_all_available_channels_inventories_scope_and_honors_l3_depth(self):
+        text = (
+            "Compare the video summaries from all available channels for the "
+            "last 24 hours at L3 depth."
+        )
+        context = _seed_turn_tool_context(text)
+
+        self.assertTrue(context["operator_requests_all_channels"])
+        self.assertEqual(context["requested_video_depth"], "L3")
+        self.assertIn(
+            "cross_channel_correlation",
+            agent._extract_requested_skill_slugs(text),
+        )
+        context["active_skill_slugs"] = ["cross_channel_correlation"]
+        context["skill_tool_names"] = sorted(
+            agent._skill_tool_names(context["active_skill_slugs"])
+        )
+        schemas = _select_relevant_tool_schemas(agent._TOOL_SCHEMAS, context)
+
+        first = agent._required_video_research_tool_call(context, schemas)
+        self.assertIsNotNone(first)
+        self.assertEqual(first.name, "normalize_time_window")
+        context["time_window"] = {
+            "from_ts": 100.0,
+            "to_ts": 86_500.0,
+            "duration_sec": 86_400.0,
+        }
+        schemas = _select_relevant_tool_schemas(agent._TOOL_SCHEMAS, context)
+        inventory = agent._required_video_research_tool_call(context, schemas)
+        self.assertIsNotNone(inventory)
+        self.assertEqual(inventory.name, "list_video_summary_channels")
+        self.assertEqual(inventory.args["depth"], "L3")
+
+        context.update(
+            {
+                "video_inventory_completed": True,
+                "video_inventory_requires_confirmation": False,
+                "video_candidate_channel_ids": [112, 118],
+            }
+        )
+        schemas = _select_relevant_tool_schemas(agent._TOOL_SCHEMAS, context)
+        detail = agent._required_video_research_tool_call(context, schemas)
+        self.assertIsNotNone(detail)
+        self.assertEqual(detail.name, "get_video_summaries")
+        self.assertEqual(detail.args["channel_id"], 112)
+        self.assertEqual(detail.args["depth"], "L3")
+
+        russian = _seed_turn_tool_context(
+            "Сравни видео-сводки по всем доступным каналам за последние 24 часа "
+            "на глубине L3."
+        )
+        self.assertTrue(russian["operator_requests_all_channels"])
+        self.assertEqual(russian["requested_video_depth"], "L3")
+
+        context["video_detail_completed_channel_ids"] = [112, 118]
+        self.assertTrue(agent._video_overview_research_plan_completed(context))
+
     def test_required_bounded_workflows_use_grounded_short_paths(self):
         counted = _seed_turn_tool_context(
             "On channel 112 during the last hour, how many times did a person leave the workstation?"
@@ -308,6 +397,53 @@ class AgentToolLoopTests(unittest.TestCase):
         self.assertEqual(call.args["query"], "sphynx cat")
         self.assertEqual(call.args["channel_id"], 112)
         self.assertGreaterEqual(call.args["limit"], 6)
+
+        absolute_archive = _seed_turn_tool_context(
+            'Search the video-description archive for "sphynx cat" on Channel 112 '
+            'from 2026-08-09T21:46:30Z to 2026-08-10T21:47:55Z. '
+            'Give me the finding concisely.'
+        )
+        self.assertEqual(absolute_archive["archive_search_query"], "sphynx cat")
+        self.assertEqual(
+            absolute_archive["operator_iso_window_args"],
+            {
+                "start_time": "2026-08-09T21:46:30Z",
+                "end_time": "2026-08-10T21:47:55Z",
+            },
+        )
+        absolute_schemas = _select_relevant_tool_schemas(
+            agent._TOOL_SCHEMAS,
+            absolute_archive,
+        )
+        absolute_call = agent._required_bounded_workflow_tool_call(
+            absolute_archive,
+            absolute_schemas,
+        )
+        self.assertEqual(absolute_call.name, "normalize_time_window")
+        self.assertEqual(
+            absolute_call.args,
+            absolute_archive["operator_iso_window_args"],
+        )
+        absolute_archive["time_window"] = {
+            "from_ts": 1_786_311_990,
+            "to_ts": 1_786_398_475,
+            "since_ms": 1_786_311_990_000,
+            "until_ms": 1_786_398_475_000,
+        }
+        absolute_call = agent._required_bounded_workflow_tool_call(
+            absolute_archive,
+            absolute_schemas,
+        )
+        self.assertEqual(absolute_call.name, "search_archive")
+        absolute_args = _apply_turn_tool_context(
+            absolute_call.name,
+            absolute_call.args,
+            absolute_archive,
+        )
+        self.assertEqual(absolute_args["query"], "sphynx cat")
+        self.assertEqual(absolute_args["channel_id"], 112)
+        self.assertEqual(absolute_args["since_ms"], 1_786_311_990_000)
+        self.assertEqual(absolute_args["until_ms"], 1_786_398_475_000)
 
         archive.update(
             {
@@ -1403,6 +1539,35 @@ class AgentToolLoopTests(unittest.TestCase):
         self.assertIn("attempted once and failed", final_text)
         self.assertIn("neither presence nor absence", final_text)
 
+    def test_timed_out_archive_read_is_not_retried_in_same_turn(self):
+        class TimeoutArchiveTools(_FakeTools):
+            def execute(self, name, args, progress_cb=None):
+                self.calls += 1
+                self.call_args.append((name, dict(args)))
+                raise ToolTimeoutError("tool exceeded its 180s timeout")
+
+        runner = AgentRunner.__new__(AgentRunner)
+        runner.store = _FakeStore()
+        runner._lm_client = _FakeLMClient(tool_rounds=0)
+        runner._tools = TimeoutArchiveTools()
+        runner._ps = object()
+        runner._ds = object()
+        runner._lxm = object()
+
+        events = [
+            json.loads(item.removeprefix("data: ").strip())
+            for item in runner.stream_chat(
+                "session-1",
+                "Search the archive for a red car",
+            )
+            if item.startswith("data: ")
+        ]
+
+        self.assertEqual(runner._tools.calls, 1)
+        result = next(item for item in events if item.get("type") == "tool_result")
+        self.assertEqual(result["result"]["code"], "tool_timeout")
+        self.assertFalse(result["result"]["retryable_in_turn"])
+
     def test_tool_failure_log_has_correlation_but_no_private_payload(self):
         with self.assertLogs("agent", level="WARNING") as captured:
             agent._log_turn_tool_failure(
@@ -1578,7 +1743,8 @@ class AgentToolLoopTests(unittest.TestCase):
                 "build_research_batch", "describe_frame",
             },
             "cross_channel_correlation": {
-                "normalize_time_window", "get_video_summaries", "get_detections",
+                "normalize_time_window", "list_video_summary_channels",
+                "get_video_summaries", "get_detections",
                 "get_visual_window_signals", "describe_frame",
             },
             "multi_channel_event_sweep": {
@@ -2023,6 +2189,81 @@ class AgentToolLoopTests(unittest.TestCase):
         self.assertIn("CH 112", final_text)
         self.assertNotIn("Let me fetch", final_text)
 
+    def test_video_fallback_is_human_compact_and_keeps_each_channel(self):
+        ledger = {
+            "user_query": "Сравни все каналы за сутки на уровне L3",
+            "coverage": [
+                {
+                    "tool": "list_video_summary_channels",
+                    "active": 2,
+                    "inactive": 1,
+                    "errors": 0,
+                    "unchecked": 0,
+                },
+                {
+                    "tool": "get_video_summaries",
+                    "channel_id": 112,
+                    "depth": "L3",
+                    "entries": 4,
+                    "total_in_window": 4,
+                    "status": "covered",
+                    "semantic_status": "partial",
+                    "semantic_pending_count": 1,
+                },
+                {
+                    "tool": "get_video_summaries",
+                    "channel_id": 118,
+                    "depth": "L3",
+                    "entries": 4,
+                    "total_in_window": 4,
+                    "status": "covered",
+                    "semantic_status": "ready",
+                    "semantic_pending_count": 0,
+                },
+                {
+                    "tool": "get_video_summaries",
+                    "channel_id": 112,
+                    "depth": "L3",
+                    "entries": 4,
+                    "total_in_window": 4,
+                    "status": "covered",
+                    "semantic_status": "partial",
+                    "semantic_pending_count": 1,
+                },
+            ],
+            "summary_findings": [
+                {
+                    "channel_id": 112,
+                    "depth": "L3",
+                    "items": [
+                        {
+                            "time": 1_786_000_000,
+                            "summary": "### Period Overview\nWorkspace activity remained intermittent.",
+                        }
+                    ],
+                },
+                {
+                    "channel_id": 118,
+                    "depth": "L3",
+                    "items": [
+                        {
+                            "time": 1_786_000_100,
+                            "summary": "### Period Overview\nTraffic remained visible at the intersection.",
+                        }
+                    ],
+                },
+            ],
+        }
+
+        text = agent._format_completion_fallback(ledger)
+
+        self.assertIn("**CH 112 · L3**", text)
+        self.assertIn("**CH 118 · L3**", text)
+        self.assertEqual(text.count("**CH 112 · L3**"), 1)
+        self.assertIn("частично готова", text)
+        self.assertNotIn("Модель не сформировала", text)
+        self.assertNotIn("Returned summary samples", text)
+
     def test_final_transport_failure_retries_then_returns_and_persists_tool_fallback(self):
         class BrokenFinalLM(_FakeLMClient):
             def __init__(self):
@@ -2390,6 +2631,7 @@ class AgentToolLoopTests(unittest.TestCase):
 
         self.assertIn("Internal per-turn signal ledger", final_prompt)
         self.assertIn("Evidence/frame signals", final_prompt)
+        self.assertIn("Final synthesis style: lead with the finding in natural prose", final_prompt)
         self.assertIn("/detections/thumbnail/42", final_prompt)
         self.assertNotIn("RAW_THUMBNAIL_SHOULD_NOT_LEAK", final_prompt)
         self.assertNotIn("RAW_PRIVATE_NOTE_SHOULD_NOT_LEAK", final_prompt)

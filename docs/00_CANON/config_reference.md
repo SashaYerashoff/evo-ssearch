@@ -80,7 +80,7 @@ EVOSSEARCH_AUTH_COOKIE_SECURE=true   # when TLS terminates at app or proxy
 | `EVOSSEARCH_LUXRIOT_FFMPEG_HWACCEL` (`auto`) | `auto` probes QSV, then Intel VAAPI, and uses the first working hardware decode/VPP path; any channel-level failure is retried in software. Use `qsv`, `vaapi`, or `software`/`off` to force a guarded backend |
 | `EVOSSEARCH_LUXRIOT_FFMPEG_INTEL_DEVICE` (auto-discovered) | Optional Intel DRM render node such as `/dev/dri/renderD128`. Auto-discovery verifies PCI vendor `0x8086` and never selects the NVIDIA render node. The legacy `...QSV_DEVICE` name remains a compatibility alias |
 | `EVOSSEARCH_LUXRIOT_LIVE_SEGMENT_SECONDS` (`60`) | Bounded lifetime of one incremental dense-capture pipe. Summaries are emitted inside the window; the longer lease amortizes recorder-open latency |
-| `EVOSSEARCH_LUXRIOT_LIVE_SEGMENT_FPS` (`3`) | Raw dense candidates per source-second before one CV apex is selected |
+| `EVOSSEARCH_LUXRIOT_LIVE_SEGMENT_FPS` (`2`) | Raw dense candidates per source-second before one CV apex is selected |
 | `EVOSSEARCH_LUXRIOT_CAPTURE_REQUEST_TIMEOUT_SEC` (`5`) | Short timeout for per-frame snapshot capture; prevents stale UI when Luxriot stalls |
 | `EVOSSEARCH_LUXRIOT_LIVE_SEGMENT_READ_TIMEOUT_SEC` (`5`) | HTTP read timeout passed to ffmpeg live-segment capture |
 | `EVOSSEARCH_LUXRIOT_MAX_BUFFER_FRAMES` (`180`) | Per-channel frame buffer cap |
@@ -135,6 +135,7 @@ provide recorder archive playback or an Evo bookmark destination.
 | `EVOSSEARCH_LUXRIOT_ROLLUP_SCHEDULER_ENABLED` (`true`) | Build closed L1–L3 windows in the background instead of waiting for the first operator view |
 | `EVOSSEARCH_LUXRIOT_ROLLUP_SCHEDULER_INITIAL_DELAY_SEC` (`30`) | Startup grace before staggered rollup work begins |
 | `EVOSSEARCH_LUXRIOT_ROLLUP_SCHEDULER_SPACING_SEC` (`5`) | Minimum start-to-start spacing between channel/level rollup jobs (inference time counts toward it); after the fast startup pass, recurring jobs align to canonical L1/L2/L3 window boundaries and deterministic channel phases spread fleet load |
+| `EVOSSEARCH_LUXRIOT_ROLLUP_L1_SETTLE_DELAY_SEC` (`30`) / `_L2_` (`120`) / `_L3_` (`300`) | Watermark grace after a canonical window closes. It lets late L0/L1/L2 results land before their parent is synthesized, avoiding immediate `refresh_pending` regeneration; deterministic channel phase is added after this grace |
 | `EVOSSEARCH_LUXRIOT_ROLLUP_SCHEDULER_BACKFILL_WINDOWS` (`2`) | Maximum newest missing windows synthesized by one scheduled level job while cached windows are skipped |
 | `EVOSSEARCH_LUXRIOT_ROLLUP_SCHEDULER_MAX_DEFERRAL_WINDOWS` (`2`) | Maximum time, in target-level windows, that a saturated L0 queue may defer rollups before one job is admitted anyway; `0` disables deferral |
 | `EVOSSEARCH_LUXRIOT_ROLLUP_SCHEDULER_MAX_DEFERRAL_SEC` (`180`) | Absolute ceiling on that L0 deferral. This keeps L1 semantic windows from starving on a continuously busy shared model; `0` leaves only the window-based ceiling |
@@ -175,7 +176,7 @@ thresholds, alert policy, live sampling, or the live routine context.
 |---|---|
 | `EVOSSEARCH_LM_PROFILES` | e.g. `agent,vlm` |
 | `EVOSSEARCH_LM_PROFILE_<ID>_*` | Per-profile base URL / model / timeout / kind `[FIELD]` |
-| `EVOSSEARCH_LM_MAX_INFLIGHT` (`1`) | Endpoint-scoped in-process admission capacity fallback; clamped to 1–64 and valid only with the required single Gunicorn worker. The port appliance writes `8` per agent/VLM profile to match its vLLM `--max-num-seqs 8`; one protected lane remains reserved for interactive/alert work |
+| `EVOSSEARCH_LM_MAX_INFLIGHT` (`1`) | Endpoint-scoped in-process admission capacity fallback; clamped to 1–64 and valid only with the required single Gunicorn worker. The port appliance writes `4` per agent/VLM profile to match its vLLM `--max-num-seqs 4`; one protected lane remains reserved for interactive/alert work, leaving up to three concurrent live L0 requests |
 | `EVOSSEARCH_LM_PROFILE_<ID>_MAX_INFLIGHT` | Per-profile admission override, falling back to `EVOSSEARCH_LM_MAX_INFLIGHT`; profiles sharing an endpoint use the smallest configured capacity |
 | Shared-endpoint protected lane | With capacity >1, EVA keeps one physical request slot free for interactive agent or fast-alert work. L0 and L1–L3 cannot borrow it; capacity-one backends remain serial and do not deadlock |
 | LM admission order | On a shared endpoint: interactive agent, realtime alert, live L0, then L1-L3/background rollup. Rollups do not own a protected slot; the port topology should still route them to the separate agent/CPU endpoint |
@@ -185,7 +186,8 @@ thresholds, alert policy, live sampling, or the live routine context.
 | `EVOSSEARCH_INCIDENT_MAINTENANCE_ENABLED` (`true`) | Reconcile expired Follow leases durably even when a channel produces no new L0 batch |
 | `EVOSSEARCH_INCIDENT_MAINTENANCE_INTERVAL_SEC` (`15`) | Bounded background reconciliation interval, clamped to 1–300 seconds |
 | `EVOSSEARCH_LUXRIOT_L0_CONTEXT_WINDOW_TOKENS` (`16384`) | Measurable L0 context envelope used by the prompt planner |
-| `EVOSSEARCH_LUXRIOT_L0_TEXT_BUDGET_TOKENS` / `_VISION_BUDGET_TOKENS` / `_OUTPUT_BUDGET_TOKENS` (`5000/5500/1536`) | Separate L0 budgets. Alert criteria and `BATCH_STATE_JSON` are protected atomic blocks; incident context is semantically compacted first |
+| `EVOSSEARCH_LUXRIOT_L0_TEXT_BUDGET_TOKENS` / `_VISION_BUDGET_TOKENS` / `_OUTPUT_BUDGET_TOKENS` (`5000/5500/512`) | Separate L0 envelope ceilings. Alert criteria and `BATCH_STATE_JSON` are protected atomic blocks; incident context is semantically compacted first |
+| `EVOSSEARCH_LUXRIOT_L0_HEARTBEAT_OUTPUT_TOKENS` / `_EVENT_OUTPUT_TOKENS` (`384/512`) | Per-request generation caps below the L0 envelope ceiling. Routine batches stay short enough to preserve freshness; event/manual descriptions retain room for distinct alerts and episode state |
 | `EVOSSEARCH_LUXRIOT_L0_INCIDENT_BUDGET_TOKENS` (`900`) | Sub-budget shared by at most four incident contexts in an L0 request; incidents 5–8 remain scheduler state only |
 | `EVOSSEARCH_LUXRIOT_L0_VISION_TOKENS_PER_IMAGE_ESTIMATE` (`300`) | Conservative accounting estimate per selected frame for telemetry and fail-before-send budget checks |
 | `EVOSSEARCH_LM_VLM_BALANCER_ENABLED` | Static channel→profile routing across multiple VLM hosts |
@@ -217,7 +219,7 @@ thresholds, alert policy, live sampling, or the live routine context.
 |---|---|
 | `EVOSSEARCH_INFERENCE_QUEUE_ENABLED` (`false`) | Durable summary queue. Code default stays off for unconfigured development; the clean appliance installer enables it |
 | `EVOSSEARCH_INFERENCE_QUEUE_CAPACITY` (`200`) | Max queued batches |
-| `EVOSSEARCH_INFERENCE_WORKER_COUNT` (`0`) | Local worker threads |
+| `EVOSSEARCH_INFERENCE_WORKER_COUNT` (`0`; appliance preset `3`) | Local durable inference workers. The appliance uses three ordinary L0 workers against four vLLM slots, preserving one admission lane for interactive/alert work. Existing update installs retain their explicit value. |
 | `EVOSSEARCH_INFERENCE_QUEUE_TENANT_ID` / `_SPOOL_DIR` | Tenant + spool |
 
 ## Frame archive & retention
@@ -284,8 +286,8 @@ markers reach the model via `VECTOR_SIGNALS_JSON.capture_attention`.
 | `EVOSSEARCH_LUXRIOT_ATTENTION_EPISODE_DISPATCH_ENABLED` (`false`) | Experimental sparse coordinator-owned VLM dispatch; normally off because L0 delivery is owned by the bounded per-channel batch accumulator |
 | `EVOSSEARCH_LUXRIOT_ATTENTION_EMBED_ALL_CHANNELS` (`false`) | Produce CLIP embeddings for every enabled live video channel, independently of alerts and VLM admission |
 | `EVOSSEARCH_LUXRIOT_ATTENTION_EMBEDDING_CADENCE_MS` (`1000`) | Durable semantic-index cadence. Port preset invariant is one embedding-backed snapshot per second/channel; changing VLM cadence never changes this archive path |
-| `EVOSSEARCH_LUXRIOT_CLIP_ASYNC_ENABLED` (`true`) / `_WORKERS` (`8`) / `_QUEUE_CAPACITY` (`64`) | Bounded decoder-to-CLIP dispatch. Keeps synchronous embedding latency from backpressuring ffmpeg capture; one worker can wait per channel while the shared CLIP batcher combines cross-channel requests |
-| `EVOSSEARCH_LIVE_CLIP_BATCH_SIZE` (`8`) / `_BATCH_WAIT_MS` (`75`) / `_BATCH_QUEUE_CAPACITY` (`128`) / `_BATCH_TIMEOUT_SEC` (`15`) | Cross-channel CLIP microbatch execution. Every submitted cadence slot receives one result or an explicit error; batching is not sampling |
+| `EVOSSEARCH_LUXRIOT_CLIP_ASYNC_ENABLED` (`true`) / `_WORKERS` (`8`) / `_QUEUE_CAPACITY` (`64`) | Bounded decoder-to-CLIP dispatch. Keeps synchronous embedding latency from backpressuring ffmpeg capture. Each channel has at most one executing request and one latest pending request; older pending observations are explicitly counted as coalesced instead of becoming a stale FIFO |
+| `EVOSSEARCH_LIVE_CLIP_BATCH_SIZE` (`8`) / `_BATCH_WAIT_MS` (`75`) / `_BATCH_QUEUE_CAPACITY` (`128`) / `_BATCH_TIMEOUT_SEC` (`45`) | Cross-channel CLIP microbatch execution. The timeout covers measured shared-GPU tail latency; latest-only per-channel dispatch bounds backlog while durable cadence counters expose omitted slots |
 | `EVOSSEARCH_SEMANTIC_SNAPSHOT_ARCHIVE_ENABLED` (`true`) | Persist every cadence embedding+thumbnail as `source=semantic_snapshot`, whether or not a probe/alert matched |
 | `EVOSSEARCH_SEMANTIC_SNAPSHOT_ARCHIVE_QUEUE` (`512`) / `_BATCH_SIZE` (`32`) | Bounded asynchronous PostgreSQL writer for semantic snapshots; backpressure and write failures are exposed as archive gaps |
 | `EVOSSEARCH_LUXRIOT_ATTENTION_STORAGE_ENABLED` (`false`) | Require PostgreSQL attention telemetry (`20260726_0008`) |
@@ -316,7 +318,7 @@ links, P/N/M semantics, and the deployed office profile.
 
 | Var (default) | Notes |
 |---|---|
-| `EVOSSEARCH_LUXRIOT_ROAD_CV_BATCH_SIGNALS` (`true`) | Adds bounded road-motion cues to L0 vector signals from the current batch |
+| `EVOSSEARCH_LUXRIOT_ROAD_CV_BATCH_SIGNALS` (`false`) | Opt-in road-domain ray that adds bounded road-motion cues to L0; leave disabled for ordinary indoor/maritime channels because it adds CPU latency |
 | `EVOSSEARCH_LUXRIOT_ROAD_CV_BATCH_MAX_FRAMES` (`24`) | Max frames sampled per L0 batch for road-CV cue extraction |
 | `EVOSSEARCH_LUXRIOT_ROAD_CV_BATCH_MAX_EDGE` (`240`) | Max edge used for L0 batch road-CV cue extraction |
 | `EVOSSEARCH_LUXRIOT_ROAD_SCENE_CALIBRATION_SAMPLES` (`8`) | Per-channel auto-scene samples required before high-confidence frozen road direction can enable wrong-way/cross-flow cues |

@@ -681,6 +681,64 @@ def test_review_page_resolves_compact_vlm_snapshot_refs_to_cover_images():
     }
 
 
+def test_review_page_prefers_time_bounded_cover_resolver():
+    class _Detections:
+        def __init__(self):
+            self.hints = []
+
+        def resolve_vlm_snapshot_cover_refs(self, hints):
+            self.hints = [dict(item) for item in hints]
+            return {
+                "vlm-batch-1:snapshot:3": {
+                    "detection_id": 9300,
+                    "timestamp_ms": 30_000,
+                }
+            }
+
+        def resolve_vlm_snapshot_refs(self, _refs):
+            raise AssertionError("slow tenant-wide resolver must not run")
+
+    detections = _Detections()
+    service = IncidentCommandService(
+        _Store(),
+        detections,
+        object(),
+        _Runtime(),
+        wall_clock_ms=lambda: 90_000,
+    )
+    record = {
+        **_record(state="draft"),
+        "possible_start_ms": 10_000,
+        "evidence_refs": [
+            {
+                "kind": "vlm_snapshot",
+                "ref": "vlm-batch-1:snapshot:3",
+                "role": "event",
+            },
+            {
+                "kind": "vlm_snapshot",
+                "ref": "vlm-batch-later:snapshot:8",
+                "role": "post",
+            },
+        ],
+    }
+
+    review = service.public_review_records([record])[0]
+
+    assert detections.hints == [
+        {
+            "ref": "vlm-batch-1:snapshot:3",
+            "channel_id": 112,
+            "timestamp_ms": 10_000,
+        }
+    ]
+    assert review["cover"] == {
+        "detection_id": 9300,
+        "timestamp_ms": 30_000,
+        "role": "event",
+    }
+
+
 def test_expired_follow_is_durably_finalized_with_operator_result():
     store = _Store()
     store.record["follow_policy"] = {

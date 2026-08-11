@@ -1,5 +1,6 @@
 import base64
 import threading
+import time
 import unittest
 from io import BytesIO
 from unittest.mock import patch
@@ -141,12 +142,43 @@ class ProbeManagerAttentionTests(unittest.TestCase):
                 ["bright foreground"],
                 ["dark background"],
             )
-
         self.assertEqual(
             batch_calls,
             [["bright foreground", "dark background"]],
         )
         self.assertEqual(scalar_calls, [])
+
+    def test_async_text_prewarm_never_blocks_caller_and_populates_cache(self):
+        encoder_started = threading.Event()
+        release_encoder = threading.Event()
+
+        def embed_texts(texts):
+            encoder_started.set()
+            release_encoder.wait(timeout=2.0)
+            return np.asarray([[1.0, 0.0] for _text in texts], dtype=np.float32)
+
+        manager = ProbeManager(
+            embed_image_fn=lambda _image: np.asarray([1.0, 0.0], dtype=np.float32),
+            embed_text_fn=lambda _text: np.asarray([1.0, 0.0], dtype=np.float32),
+            embed_texts_fn=embed_texts,
+            jpeg_encoder=lambda _image, **_kwargs: "jpeg",
+        )
+        started = time.monotonic()
+        scheduled = manager.prewarm_texts_async(["person near window"])
+        elapsed = time.monotonic() - started
+
+        self.assertEqual(scheduled, 1)
+        self.assertLess(elapsed, 0.1)
+        self.assertTrue(encoder_started.wait(timeout=1.0))
+        self.assertFalse(manager.texts_cached(["person near window"]))
+
+        release_encoder.set()
+        deadline = time.monotonic() + 2.0
+        while time.monotonic() < deadline:
+            if manager.texts_cached(["person near window"]):
+                break
+            time.sleep(0.01)
+        self.assertTrue(manager.texts_cached(["person near window"]))
 
     def test_frame_metadata_keeps_cache_hits_off_embedding_space_reader(self):
         space_calls = []

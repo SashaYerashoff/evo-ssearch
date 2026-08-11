@@ -1,0 +1,136 @@
+<!doctype html>
+<html lang="lv">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>EVA AI — operatora īsā instrukcija</title>
+  <style>
+    :root { color-scheme:light; --paper:#fff; --page:#eef2f6; --ink:#17212b; --muted:#5e6b78; --line:#cfd7df; --accent:#245d86; --soft:#edf5fa; --ok:#27734f; --ok-bg:#eef8f2; --warn:#8a5a12; --warn-bg:#fff7e7; }
+    * { box-sizing:border-box; }
+    body { margin:0; background:var(--page); color:var(--ink); font:16px/1.55 Arial,"Noto Sans",sans-serif; }
+    main { width:min(980px,calc(100% - 32px)); margin:28px auto 64px; background:var(--paper); border:1px solid var(--line); box-shadow:0 12px 36px rgba(25,42,56,.12); padding:46px 54px 56px; }
+    header { padding-bottom:24px; border-bottom:3px solid var(--accent); }
+    h1 { margin:6px 0 8px; font-size:clamp(30px,5vw,44px); line-height:1.12; }
+    h2 { margin:38px 0 14px; padding-bottom:7px; border-bottom:1px solid var(--line); color:#183e59; font-size:23px; }
+    h3 { margin:20px 0 7px; color:#244c68; }
+    p, li { max-width:84ch; }
+    a { color:var(--accent); }
+    code, kbd { font-family:"Noto Sans Mono",Consolas,monospace; font-size:.92em; background:#f3f5f7; border:1px solid var(--line); border-radius:4px; padding:2px 5px; }
+    .eyebrow { color:var(--accent); font-weight:700; letter-spacing:.08em; text-transform:uppercase; font-size:12px; }
+    .lead { color:var(--muted); margin:0; font-size:18px; }
+    .languages { margin-top:14px; font-size:14px; }
+    .languages a, .languages strong { margin-right:12px; }
+    .note { border:1px solid var(--line); border-left:4px solid var(--accent); padding:14px 17px; margin:16px 0; background:var(--soft); }
+    .ok { border-left-color:var(--ok); background:var(--ok-bg); }
+    .warn { border-left-color:#d3942b; background:var(--warn-bg); color:#54380d; }
+    .steps { counter-reset:step; display:grid; gap:11px; padding:0; }
+    .steps > li { list-style:none; padding:12px 14px 12px 52px; border:1px solid var(--line); position:relative; break-inside:avoid; }
+    .steps > li::before { counter-increment:step; content:counter(step); position:absolute; left:14px; top:12px; width:25px; height:25px; display:grid; place-items:center; border-radius:50%; background:var(--accent); color:#fff; font-weight:700; }
+    table { width:100%; border-collapse:collapse; margin:12px 0 18px; }
+    th, td { text-align:left; vertical-align:top; padding:9px 11px; border:1px solid var(--line); }
+    th { background:#edf2f5; color:#294a60; }
+    footer { margin-top:42px; padding-top:16px; border-top:1px solid var(--line); color:var(--muted); font-size:14px; }
+    @media (max-width:700px) { main { width:100%; margin:0; border:0; padding:28px 20px 42px; box-shadow:none; } }
+    @media print { body { background:#fff; font-size:11pt; } main { width:100%; margin:0; border:0; box-shadow:none; padding:0; } h2 { break-after:avoid; } a { color:inherit; } }
+  </style>
+</head>
+<body>
+<main>
+  <header>
+    <div class="eyebrow">EVA AI 0.8.7 · ostas pilotprojekts</div>
+    <h1>Operatora īsā instrukcija</h1>
+    <p class="lead">Luxriot Evo pieslēgšana, kanālu apraksti, zondes, VLM brīdinājumi, arhīva izpēte un darbs ar EVA aģentu.</p>
+    <nav class="languages" aria-label="Instrukcijas valoda"><a href="quick-start.html" lang="en">English</a><a href="quick-start.ka.html" lang="ka">ქართული</a><strong>Latviešu</strong></nav>
+  </header>
+
+  <div class="note ok"><strong>Sāciet šeit.</strong> Pārlūkā atveriet <code>http://&lt;EVA-IP&gt;:5000</code> un piesakieties ar administratora izsniegtajiem datiem. Vispirms pieslēdziet Luxriot Evo; tikai pēc tam ieslēdziet kanālu analīzi. Saskarnes valodu var mainīt sadaļā <strong>Appearance</strong>. Kameru nosaukumi, pierādījumi, modeļu apraksti un sarunas netiek automātiski tulkotas.</div>
+
+  <h2>1. Luxriot Evo pieslēgšana</h2>
+  <ol class="steps">
+    <li>Atveriet sānu <strong>MENU</strong>, pēc tam <strong>Settings → Luxriot</strong>.</li>
+    <li>Laukā <strong>Base URL</strong> norādiet Evo HTTP API adresi, piemēram, <code>http://192.168.1.50:8080</code>. Ievadiet Evo lietotājvārdu un paroli.</li>
+    <li>Nospiediet <strong>Save settings</strong>. Tukšs paroles lauks nozīmē “saglabāt esošo paroli”, nevis to izdzēst.</li>
+    <li>Apakšējā statusa rindā sagaidiet <strong>LUXRIOT CONNECTED</strong> un kanālu skaitu, kas nav nulle. Zaļš statuss nozīmē, ka EVA nesen saņēma datus, nevis tikai saglabāja adresi.</li>
+    <li>Ja kanāli neparādās, pārbaudiet IP adresi, API portu, tīkla sasniedzamību un Evo lietotāja tiesības skatīt vajadzīgās kameras.</li>
+  </ol>
+  <div class="note warn"><strong>Neieslēdziet visus kanālus vienlaikus.</strong> Izvēlieties paredzētos 6–8 kanālus un palaidiet tos nelielās grupās, vērojot aprakstu aizkavi un GPU slodzi. PTZ pagrieziens vai tūres presets maina skatu; EVA vajag īsu stabilu intervālu jaunā skata apstiprināšanai.</div>
+
+  <h2>2. Galvenās sadaļas</h2>
+  <table>
+    <thead><tr><th>Sadaļa</th><th>Kam tā paredzēta</th></tr></thead>
+    <tbody>
+      <tr><td><strong>Archive</strong></td><td>Vizuālo pierādījumu meklēšana pēc laika, kanāla, teksta vai attēla. Rezultātā var apskatīt blakus kadrus un Evo arhīva video.</td></tr>
+      <tr><td><strong>Stream summaries</strong></td><td><strong>Stream review</strong> rāda L0–L3 aprakstus; <strong>Stream settings</strong> palaiž un aptur kanālu un atver promptu un brīdinājumu iestatījumus.</td></tr>
+      <tr><td><strong>Probes</strong></td><td>Ātras semantiskās uzmanības zondes, kas pārbauda regulāri indeksētos kadrus un var veidot Luxriot grāmatzīmes.</td></tr>
+      <tr><td><strong>Agent</strong></td><td>Izpēta arhīvu, aprakstus, brīdinājumus, incidentus un sistēmas stāvokli. Režīmā <strong>Operator ON</strong> aģents var atvērt atbalstītos saskarnes skatus.</td></tr>
+      <tr><td><strong>Apakšējā statusa rinda</strong></td><td>Luxriot savienojuma svaigums, pieejamo kanālu skaits, aģenta stāvoklis un zondes.</td></tr>
+    </tbody>
+  </table>
+
+  <h2>3. Kanāla aprakstu palaišana</h2>
+  <ol class="steps">
+    <li>Atveriet <strong>Stream summaries → Stream settings</strong> un izvēlieties kanālu.</li>
+    <li>Sākumā saglabājiet ieteikto batch un cadence konfigurāciju. EVA pati palielina kadru blīvumu kustības un uzmanības signālu laikā.</li>
+    <li>Nospiediet <strong>Apply changes</strong>, pēc tam <strong>Start summaries</strong>. <strong>Flush</strong> izmantojiet tikai tad, ja nepilns batch jānosūta nekavējoties.</li>
+    <li>Sadaļā <strong>Stream review</strong> izvēlieties kanālu, periodu un līmeni: L0 novērojumi, L1 15 minūtes, L2 viena stunda vai L3 astoņas stundas. <strong>Auto</strong> izvēlas periodam piemērotu dziļumu.</li>
+  </ol>
+  <div class="note"><strong>Apraksta lasīšana.</strong> L0 ir viena vizuālā batch novērojums un tiešais VLM brīdinājuma lēmums. L1–L3 apkopo zemākos līmeņus un nav neatkarīgi vizuāli novērojumi. <strong>Burst</strong> nozīmē kustību virs kanāla ierastā līmeņa. Noklikšķiniet uz reprezentatīvā attēla, lai atvērtu batch kadrus arhīvā. <strong>BATCH_STATE_JSON</strong> ir mašīnlasāms stāvoklis un ikdienas darbā nav jāatver.</div>
+
+  <h2>4. Semantiskās zondes izveide</h2>
+  <ol class="steps">
+    <li>Atveriet <strong>Probes</strong> un nospiediet <strong>New probe</strong>.</li>
+    <li>Izvēlieties kanālu un piešķiriet operatīvu nosaukumu, piemēram, “mazs kuģis ostas vārtos”.</li>
+    <li><strong>Positive scene</strong> aprakstiet meklējamo redzamo situāciju. <strong>Negative look-alike</strong> aprakstiet līdzīgāko normālo skatu, kas jāslāpē. Piemērs: <code>small sailing craft crossing the harbour entrance</code> pret <code>open water and breakwater with no nearby craft</code>.</li>
+    <li>Pirmajā reizē saglabājiet piedāvātos Positive floor un Margin. Sliekšņus mainiet tikai pēc reālu trāpījumu un kļūdu apskates.</li>
+    <li>Ja nepieciešams, ieslēdziet Luxriot grāmatzīmes, norādiet severity, cooldown un deduplication, pēc tam saglabājiet zondi.</li>
+    <li>ROI izmantojiet tikai fiksētam kameras skatam. Vienu ROI nedrīkst akli lietot dažādiem PTZ presetiem.</li>
+  </ol>
+  <div class="note warn"><strong>Zondes trāpījums nav fakts.</strong> Tas sašaurina uzmanību un var palielināt kadru blīvumu. Drošības secinājumus apstipriniet vizuālajos pierādījumos vai VLM aprakstā.</div>
+
+  <h2>5. VLM brīdinājuma izveide</h2>
+  <ol class="steps">
+    <li>Atveriet <strong>Stream summaries → Stream settings</strong>, izvēlieties kanālu un nospiediet <strong>Prompts &amp; alerts</strong>.</li>
+    <li>Cilnē <strong>Alerts</strong> aprakstiet redzamus kritērijus, nozīmīgumu un svarīgus izņēmumus. Izmantojiet redzamu rīcību, ģeometriju un kustības virzienu; neizdomājiet identitāti.</li>
+    <li>Piemērs: <code>HIGH: two vessels are converging on crossing trajectories near the harbour entrance. Do not alert on perspective-only overlap when motion history shows safe separation.</code></li>
+    <li>Ja notikumam jāparādās Evo, ieslēdziet grāmatzīmes un norādiet notikuma ilgumam atbilstošu cooldown.</li>
+    <li>Pārbaudiet brīdinājuma badge, reprezentatīvo kadru, blakus kadrus un grāmatzīmes laiku. Neskaidru kritēriju izlabojiet tekstā, nevis tikai pazeminiet slieksni.</li>
+  </ol>
+  <div class="note"><strong>Stream un Alerts nav viens un tas pats.</strong> Stream prompts izskaidro, kā interpretēt ainu. Novērošanas un trauksmes kritēriji jāglabā sadaļā <strong>Alerts</strong>.</div>
+
+  <h2>6. Arhīva meklēšana un incidents</h2>
+  <ul>
+    <li>Sadaļā <strong>Archive</strong> izvēlieties vienu vai vairākus kanālus, pierādījumu avotus un laika periodu. <strong>Text query</strong> veic semantisku meklēšanu.</li>
+    <li>Atveriet rezultātu, lai apskatītu blakus kadrus. <strong>Play archive video</strong> pieprasa Evo ierakstu ap pierādījuma laiku; sagatavošana var ilgt vairākus desmitus sekunžu.</li>
+    <li><strong>Report incident</strong> sagatavo incidentu ar sākumu, beigām, secīgiem pierādījumiem un aprakstu. Pirms saglabāšanas viss jāpārbauda operatoram.</li>
+    <li><strong>Report false positive</strong> izmantojiet vizuāli nepareizam brīdinājumam. Atsauksme tiek saglabāta vēlākai zondes un brīdinājuma regulēšanai.</li>
+  </ul>
+
+  <h2>7. Darbs ar EVA aģentu</h2>
+  <p>Labs pieprasījums nosauc <strong>kanālu vai grupu</strong>, precīzu <strong>laika periodu</strong> un vajadzīgo <strong>pierādījumu vai rezultāta formu</strong>.</p>
+  <ul>
+    <li><code>Show high and critical VLM alerts on Harbour Gate West during the last two hours. Include evidence timestamps.</code></li>
+    <li><code>Search the last three days for small sailing craft entering the harbour. Show the six strongest visual matches.</code></li>
+    <li><code>Build an incident report around this alert, including the first approach, closest point, and final separation.</code></li>
+    <li><code>Check stream health for the selected eight channels and list coverage gaps without guessing what happened during missing video.</code></li>
+  </ul>
+  <div class="note"><strong>Operator ON</strong> ļauj aģentam vadīt atbalstītos saskarnes skatus; <strong>Operator OFF</strong> to bloķē. Lūdziet aģentam skaidri nošķirt novērotus pierādījumus, secinājumus un pārklājuma trūkumus. Instrumentu izsaukums pierāda, ka meklēšana tika veikta, nevis ka katrs gala teksta apgalvojums ir patiess.</div>
+
+  <h2>8. Ātrā pārbaude pirms darba</h2>
+  <ol class="steps">
+    <li>Luxriot statuss kļūst zaļš tikai pēc svaigu datu saņemšanas.</li>
+    <li>Redzami paredzētie kanāli, un izvēlētajam kanālam ir aktuāls preview.</li>
+    <li>Testa kanāls izveido L0 aprakstu ne vēlāk par konfigurēto batch maksimālo logu.</li>
+    <li>Testa zonde rāda aktuālus kadrus un to var ieslēgt un izslēgt.</li>
+    <li>Arhīva meklēšana atgriež īstu attēlu; Evo playback atver video ap pareizo laiku.</li>
+    <li>Aģents spēj pārbaudīt kanālu stāvokli, neizdomājot notikumus laikā, kad video nebija pieejams.</li>
+  </ol>
+
+  <footer>
+    <strong>Kur atrast šo instrukciju</strong><br>
+    EVA: <strong>MENU → Settings → Īsā instrukcija</strong><br>
+    Servera darbvirsmā: <code>~/Desktop/EVA AI Operator Quick Start.html</code><br>
+    Tiešā adrese: <code>http://&lt;EVA-IP&gt;:5000/ui-assets/quick-start.lv.html</code>
+  </footer>
+</main>
+</body>
+</html>

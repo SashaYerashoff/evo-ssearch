@@ -17,13 +17,14 @@ Goal: compare candidate events across channels and propose possible links with e
 
 Tools:
 - `normalize_time_window`
+- `list_video_summary_channels`
 - `get_video_summaries`
 - `get_detections`
 - `get_visual_window_signals`
 - `describe_frame`
 
 Default order:
-1. Normalize the period with `normalize_time_window` and resolve all mentioned channels.
+1. Normalize the period with `normalize_time_window`. Resolve mentioned channels directly; when the operator asks for all/available channels, enumerate the authorized scope with `list_video_summary_channels` first.
 2. Build per-channel event candidates using VLM summaries first (`get_video_summaries`) and VLM archive frames second (`get_detections` with `source="vlm_summary"`/`source="vlm_alert"`).
 3. Use `get_visual_window_signals` only as a weak ranking cue when searching for candidate appearances across channels.
 4. Compare candidate events by time proximity, direction of movement, object/person description, color, make/model when visible, and repeated distinctive features.

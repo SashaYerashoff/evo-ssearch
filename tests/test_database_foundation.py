@@ -1,7 +1,9 @@
 import importlib
 import os
 import sys
+import threading
 import unittest
+from contextlib import nullcontext
 from pathlib import Path
 from unittest.mock import patch
 
@@ -230,6 +232,67 @@ class RuntimeRoleSafetyTests(unittest.TestCase):
 
 
 class ArchiveChannelFilterTests(unittest.TestCase):
+    def test_incident_cover_resolver_uses_bounded_time_index_then_ids(self):
+        class _Rows:
+            def __init__(self, rows):
+                self.rows = rows
+
+            def fetchall(self):
+                return list(self.rows)
+
+        class _Connection:
+            def __init__(self):
+                self.calls = []
+
+            def execute(self, sql, params):
+                self.calls.append((sql, params))
+                if "WITH requested" in sql:
+                    return _Rows([(0, 701)])
+                if "id = ANY" in sql:
+                    return _Rows([(701, 30_000, "vlm-batch-1", "3", True)])
+                raise AssertionError(sql)
+
+        class _Pool:
+            def __init__(self, connection):
+                self.connection = connection
+
+            def transaction(self, *_args, **_kwargs):
+                return nullcontext(self.connection)
+
+        connection = _Connection()
+        store = object.__new__(PostgresDetectionsStore)
+        store.tenant_id = "f3c3533e-bf17-46a1-a543-696d95b8cf6f"
+        store.lock = threading.RLock()
+        store.pool = _Pool(connection)
+
+        resolved = store.resolve_vlm_snapshot_cover_refs(
+            [
+                {
+                    "ref": "vlm-batch-1:snapshot:3",
+                    "channel_id": 112,
+                    "timestamp_ms": 10_000,
+                }
+            ]
+        )
+
+        self.assertEqual(
+            resolved,
+            {
+                "vlm-batch-1:snapshot:3": {
+                    "detection_id": 701,
+                    "timestamp_ms": 30_000,
+                }
+            },
+        )
+        first_sql, first_params = connection.calls[0]
+        self.assertIn("detections.channel_id = requested.channel_id", first_sql)
+        self.assertIn("BETWEEN requested.start_ms AND requested.end_ms", first_sql)
+        self.assertNotIn("payload_json->>'batch_id'", first_sql)
+        self.assertEqual(first_params[-1], store.tenant_id)
+        second_sql, second_params = connection.calls[1]
+        self.assertIn("id = ANY", second_sql)
+        self.assertEqual(second_params, (store.tenant_id, [701]))
+
     def test_multi_channel_scope_builds_parameterized_in_clause(self):
         store = object.__new__(PostgresDetectionsStore)
         store.tenant_id = "f3c3533e-bf17-46a1-a543-696d95b8cf6f"

@@ -1948,7 +1948,7 @@ def _get_live_clip_batcher() -> ImageEmbeddingBatcher:
                     getattr(config, "LIVE_CLIP_BATCH_QUEUE_CAPACITY", 128)
                 ),
                 request_timeout_sec=float(
-                    getattr(config, "LIVE_CLIP_BATCH_TIMEOUT_SEC", 15.0)
+                    getattr(config, "LIVE_CLIP_BATCH_TIMEOUT_SEC", 45.0)
                 ),
                 autostart=False,
             )
@@ -2431,7 +2431,7 @@ def home():
     )
 
     luxriot_batch_options = '\n                            '.join(
-        f'<option value="{size}" {"selected" if size == config.LUXRIOT_BATCH_SIZES[0] else ""}>{size}</option>'
+        f'<option value="{size}" {"selected" if size == config.LUXRIOT_DEFAULT_BATCH_SIZE else ""}>{size}</option>'
         for size in config.LUXRIOT_BATCH_SIZES
     )
 
@@ -2522,7 +2522,7 @@ def serve_app_js():
     """Serve app.js with non-secret runtime defaults injected."""
     js_path = Path(__file__).resolve().parent / 'static' / 'js' / 'app.js'
     js = js_path.read_text(encoding='utf-8')
-    luxriot_default_batch = config.LUXRIOT_BATCH_SIZES[0] if config.LUXRIOT_BATCH_SIZES else 12
+    luxriot_default_batch = config.LUXRIOT_DEFAULT_BATCH_SIZE
     js = js.replace('{luxriot_default_channel}', str(config.LUXRIOT_DEFAULT_CHANNEL_ID))
     js = js.replace('{luxriot_snapshot_interval}', str(config.LUXRIOT_SNAPSHOT_INTERVAL))
     js = js.replace('{luxriot_snapshot_max_edge}', str(config.LUXRIOT_SNAPSHOT_MAX_EDGE))
@@ -4521,6 +4521,17 @@ def _with_concise_retry_instruction(
     return retry_messages
 
 
+class _LMChatText(str):
+    """String-compatible LM result carrying bounded, credential-free timing."""
+
+    eva_response_meta: Dict[str, Any]
+
+    def __new__(cls, value: object, response_meta: Optional[Mapping[str, Any]] = None):
+        instance = super().__new__(cls, str(value or ""))
+        instance.eva_response_meta = dict(response_meta or {})
+        return instance
+
+
 def _call_lm_chat(
     messages: List[Dict[str, Any]],
     model_override: Optional[str] = None,
@@ -4613,8 +4624,13 @@ def _call_lm_chat(
             return text[:500]
         return "empty error response"
 
+    attempt_stats: List[Dict[str, Any]] = []
+
     def _perform(request_payload: Mapping[str, Any]) -> Mapping[str, Any]:
         response: Optional[requests.Response] = None
+        admission_started = time.perf_counter()
+        admission_wait_ms = 0.0
+        request_started = admission_started
         try:
             with _lm_admission_controller.admission(
                 resource,
@@ -4622,8 +4638,13 @@ def _call_lm_chat(
                 capacity=capacity,
                 timeout=float(profile.get("timeout") or config.LM_TIMEOUT),
             ):
+                admission_wait_ms = max(
+                    0.0,
+                    (time.perf_counter() - admission_started) * 1000.0,
+                )
                 if preflight is not None:
                     preflight()
+                request_started = time.perf_counter()
                 response = requests.post(
                     endpoint,
                     headers=headers,
@@ -4648,7 +4669,32 @@ def _call_lm_chat(
                 f"(model {request_payload['model']}): {exc}"
             ) from exc
         data = response.json()
-        return data if isinstance(data, Mapping) else {}
+        mapped = data if isinstance(data, Mapping) else {}
+        usage = mapped.get("usage") if isinstance(mapped, Mapping) else None
+        choices = mapped.get("choices") if isinstance(mapped, Mapping) else None
+        finish_reason = ""
+        if (
+            isinstance(choices, Sequence)
+            and not isinstance(choices, (str, bytes, bytearray))
+            and choices
+            and isinstance(choices[0], Mapping)
+        ):
+            finish_reason = str(choices[0].get("finish_reason") or "").strip()
+        attempt: Dict[str, Any] = {
+            "admission_wait_ms": round(admission_wait_ms, 2),
+            "http_ms": round(
+                max(0.0, (time.perf_counter() - request_started) * 1000.0),
+                2,
+            ),
+            "finish_reason": finish_reason[:40],
+        }
+        if isinstance(usage, Mapping):
+            for key in ("prompt_tokens", "completion_tokens", "total_tokens"):
+                parsed = _to_optional_int(usage.get(key))
+                if parsed is not None and parsed >= 0:
+                    attempt[key] = int(parsed)
+        attempt_stats.append(attempt)
+        return mapped
 
     data = _perform(payload)
     content_text, finish_reason = _lm_response_text(data)
@@ -4672,7 +4718,33 @@ def _call_lm_chat(
     # Re-check after generation so a watchdog transition which happened while
     # a long batch was running cannot race a stale result into L0 memory.
     _assert_visual_health("postflight")
-    return content_text or "(empty response from model)"
+    result_text = content_text or "(empty response from model)"
+    response_meta: Dict[str, Any] = {
+        "attempt_count": len(attempt_stats),
+        "retried": len(attempt_stats) > 1,
+        "attempts": attempt_stats[:2],
+        "finish_reason": str(finish_reason or "")[:40],
+    }
+    if issue:
+        response_meta["retry_reason"] = str(issue)[:160]
+    if attempt_stats:
+        response_meta["admission_wait_ms"] = round(
+            sum(float(item.get("admission_wait_ms") or 0.0) for item in attempt_stats),
+            2,
+        )
+        response_meta["http_ms"] = round(
+            sum(float(item.get("http_ms") or 0.0) for item in attempt_stats),
+            2,
+        )
+        for key in ("prompt_tokens", "completion_tokens", "total_tokens"):
+            values = [
+                int(item[key])
+                for item in attempt_stats
+                if isinstance(item.get(key), int)
+            ]
+            if values:
+                response_meta[key] = sum(values)
+    return _LMChatText(result_text, response_meta)
 
 
 def _call_video_understanding(
@@ -5240,9 +5312,43 @@ OUTDATED_LUXRIOT_ALERTS_JSON_PROMPTS = {
     PREVIOUS_LUXRIOT_ALERTS_JSON_PROMPT_DEFAULT_V2.strip(),
     PREVIOUS_LUXRIOT_ALERTS_JSON_PROMPT_DEFAULT.strip(),
 }
+
+
+def _is_outdated_luxriot_json_prompt(value: object) -> bool:
+    """Recognize shipped machine contracts without replacing custom ones.
+
+    The first unified BATCH_STATE_JSON contract was persisted as a per-channel
+    override by the prompt modal.  Exact-set migration only knew older
+    ALERTS_JSON contracts, so upgraded channels kept the verbose cover-first
+    schema forever.  That schema often exhausted a small VLM completion before
+    reaching ``alerts``.  Its stable header and cover-before-alert ordering are
+    specific enough to distinguish it from an operator-authored contract.
+    """
+
+    normalized = str(value or "").strip()
+    if not normalized:
+        return False
+    if normalized in OUTDATED_LUXRIOT_ALERTS_JSON_PROMPTS:
+        return True
+    if not normalized.startswith(
+        "Machine-readable current-batch state for EVA memory, navigation, and alert actions:"
+    ):
+        return False
+    if "first two members MUST be version and alerts" in normalized:
+        return False
+    schema_start = normalized.rfind("BATCH_STATE_JSON:")
+    schema = normalized[schema_start:] if schema_start >= 0 else normalized
+    cover_position = schema.find('"cover"')
+    alerts_position = schema.find('"alerts"')
+    return (
+        "BATCH_STATE_JSON:" in normalized
+        and cover_position >= 0
+        and alerts_position > cover_position
+    )
 PREVIOUS_LUXRIOT_SYSTEM_PROMPT_DEFAULT = (
     "You are a CCTV operator assistant for Luxriot.\n"
-    "Return Markdown with exactly these sections and order:\n"
+    "Return Markdown with exactly these sections and order. Use one short sentence per section and no more than "
+    "80 words total before BATCH_STATE_JSON; do not repeat unchanged scene inventory:\n"
     "### Scene description\n"
     "1-2 short paragraphs describing stable scene context.\n"
     "### Activity description\n"
@@ -5302,7 +5408,8 @@ LUXRIOT_SYSTEM_PROMPT_DEFAULT = (
     "Separate visibly reinforced routine from deviations and novelty. Novelty raises preservation priority, "
     "not alert severity.\n"
     "### Worth to remember\n"
-    "List only grounded items useful for later consolidation, especially unresolved events and rare deviations.\n"
+    "List only grounded items useful for later consolidation, especially unresolved events and rare deviations; "
+    "write 'None' when there is nothing worth preserving.\n"
     "Rules: keep human-readable prose factual and concise; avoid repetition; do not infer intent, identity, "
     "legality, or safety outside sampled evidence. The backend appends current-observation, homeostasis, "
     "alert-policy, and unified BATCH_STATE_JSON instructions; follow that final output contract."
@@ -5316,7 +5423,7 @@ if (
     config.LUXRIOT_SYSTEM_PROMPT_DEFAULT = LUXRIOT_SYSTEM_PROMPT_DEFAULT
 
 current_json_prompt = str(getattr(config, 'LUXRIOT_ALERTS_JSON_PROMPT', '') or '').strip()
-if (not current_json_prompt) or (current_json_prompt in OUTDATED_LUXRIOT_ALERTS_JSON_PROMPTS):
+if (not current_json_prompt) or _is_outdated_luxriot_json_prompt(current_json_prompt):
     config.LUXRIOT_ALERTS_JSON_PROMPT = LUXRIOT_ALERTS_JSON_PROMPT_DEFAULT
 
 luxriot_manager = LuxriotManager(
@@ -5356,7 +5463,9 @@ try:
             )
             luxriot_manager.alert_policy_prompt = migrated_policy
             changed_prompt_defaults = True
-        if str(luxriot_manager.default_json_alert_prompt or '').strip() in OUTDATED_LUXRIOT_ALERTS_JSON_PROMPTS:
+        if _is_outdated_luxriot_json_prompt(
+            luxriot_manager.default_json_alert_prompt
+        ):
             luxriot_manager.default_json_alert_prompt = LUXRIOT_ALERTS_JSON_PROMPT_DEFAULT
             changed_prompt_defaults = True
         desired_rollup_prompts = {
@@ -5436,7 +5545,9 @@ try:
                         channel_overrides.pop('stream_system_prompt', None)
                     channel_overrides['alert_policy_prompt'] = migrated_policy
                     channel_changed = True
-            if str(channel_overrides.get('json_alert_prompt') or '').strip() in OUTDATED_LUXRIOT_ALERTS_JSON_PROMPTS:
+            if _is_outdated_luxriot_json_prompt(
+                channel_overrides.get('json_alert_prompt')
+            ):
                 channel_overrides['json_alert_prompt'] = LUXRIOT_ALERTS_JSON_PROMPT_DEFAULT
                 channel_changed = True
             rollup_overrides_raw = channel_overrides.get('rollup_prompts')
@@ -6735,11 +6846,17 @@ def _check_vlm_vision_health(
         and 0 < failures < failure_threshold
         and last_success_recent
     )
+    busy_grace = bool(
+        status == "busy"
+        and bool(state.get("endpoint_liveness_ok"))
+        and last_success_recent
+    )
     healthy = bool(
         not stale
         and (
             (status == "healthy" and bool(state.get("ok")))
             or suspect_grace
+            or busy_grace
         )
     )
     if stale:
@@ -6756,6 +6873,7 @@ def _check_vlm_vision_health(
         consecutive_failures=state.get("consecutive_failures"),
         failure_threshold=failure_threshold,
         suspect_grace=suspect_grace,
+        busy_grace=busy_grace,
         latency_ms=state.get("latency_ms"),
         error=state.get("error"),
         state_file=configured_path,
@@ -10722,10 +10840,29 @@ def _vlm_summary_frame_records(entry: Mapping[str, Any]) -> Tuple[List[Dict[str,
         anchor_role = str(raw_frame.get("anchor_role") or "sample").strip().lower() or "sample"
         width = _to_optional_int(raw_frame.get("width"))
         height = _to_optional_int(raw_frame.get("height"))
-        clip_vec, embedding_space = _embed_thumbnail_b64_with_space(
-            thumbnail_b64,
-            "clip",
+        clip_vec = raw_frame.get("clip_embedding")
+        embedding_space = (
+            dict(raw_frame.get("embedding_space") or {})
+            if isinstance(raw_frame.get("embedding_space"), Mapping)
+            else {}
         )
+        embedding_ref = str(raw_frame.get("embedding_ref") or "").strip()
+        embedding_status = str(
+            raw_frame.get("embedding_status") or ""
+        ).strip().lower()
+        # Legacy/manual archive entries may still need an embedding. Live L0
+        # frames, however, already went through the independent semantic
+        # cadence. Never make the next L0 wait for a duplicate encode when a
+        # reusable vector/ref exists or that asynchronous encode is pending.
+        if (
+            clip_vec is None
+            and not embedding_ref
+            and embedding_status not in {"pending", "ready", "unavailable"}
+        ):
+            clip_vec, embedding_space = _embed_thumbnail_b64_with_space(
+                thumbnail_b64,
+                "clip",
+            )
         frame_payload = {
             **base_payload,
             "source": "vlm_summary",
@@ -10740,6 +10877,10 @@ def _vlm_summary_frame_records(entry: Mapping[str, Any]) -> Tuple[List[Dict[str,
             "is_cover": bool(raw_frame.get("is_cover")),
             "embedding_space": embedding_space,
         }
+        if embedding_ref:
+            frame_payload["embedding_ref"] = embedding_ref[:240]
+        if embedding_status:
+            frame_payload["embedding_status"] = embedding_status[:40]
         for provenance_key in (
             "source_frame_index",
             "source_timestamp_ms",
@@ -15853,6 +15994,18 @@ def luxriot_start_capture():
         if audit_error is not None:
             return audit_error
         return jsonify({'success': True, 'session': status})
+    except ValueError as exc:
+        audit_error = _write_completion_audit_or_error(
+            action="luxriot.capture.start.completed",
+            result="failure",
+            target_type="luxriot_capture",
+            target_id=str(channel_id),
+            channel_id=channel_id,
+            details={"reason": type(exc).__name__},
+        )
+        if audit_error is not None:
+            return audit_error
+        return jsonify({'error': str(exc)}), 400
     except Exception as exc:
         audit_error = _write_completion_audit_or_error(
             action="luxriot.capture.start.completed",
@@ -18120,6 +18273,15 @@ ENV_PREFIX = "EVOSSEARCH_"
 _ENV_SAFE_VALUE_RE = re.compile(r"^[A-Za-z0-9_./:@%+=,-]*$")
 
 
+def _settings_env_path() -> Path:
+    """Return the env file owned by this process' declared service config."""
+
+    declared = str(
+        getattr(config, "CONFIG_ENV_FILE_BEFORE_DOTENV", "") or ""
+    ).strip()
+    return Path(declared).expanduser() if declared else Path(".env")
+
+
 def _bool_to_env(value: Any) -> str:
     return "true" if bool(value) else "false"
 
@@ -18196,7 +18358,10 @@ def _quote_env_value(value: Any) -> str:
 
 
 def _write_env_file_atomic(content: str, path: Union[str, Path] = ".env") -> None:
-    env_path = Path(path)
+    # Keep an already-resolved/path-like writer intact.  Apart from avoiding a
+    # redundant pathlib conversion, this makes the boundary straightforward to
+    # audit and stub without constructing nested path wrappers.
+    env_path = path if hasattr(path, "write_text") else Path(path)
     if not hasattr(env_path, "with_name"):
         env_path.write_text(content, encoding="utf-8")
         return
@@ -18451,9 +18616,13 @@ def _runtime_env_map() -> Dict[str, str]:
     return env
 
 
-def _effective_env_map() -> Dict[str, str]:
+def _effective_env_map(
+    file_path: Optional[Union[str, Path]] = None,
+) -> Dict[str, str]:
     runtime_map = _runtime_env_map()
-    file_map = _read_env_file_map(".env")
+    file_map = _read_env_file_map(
+        _settings_env_path() if file_path is None else file_path
+    )
     merged = dict(runtime_map)
     for key, value in file_map.items():
         if key.startswith(ENV_PREFIX) and key not in merged:
@@ -18465,11 +18634,16 @@ def _env_precedence_report(
     file_map: Optional[Mapping[str, str]] = None,
     process_keys: Optional[Iterable[str]] = None,
     process_value_hashes: Optional[Mapping[str, str]] = None,
-    file_path: Union[str, Path] = ".env",
+    file_path: Optional[Union[str, Path]] = None,
 ) -> Dict[str, Any]:
     """Describe effective configuration ownership without returning values."""
 
-    project_map = dict(file_map) if isinstance(file_map, Mapping) else _read_env_file_map(file_path)
+    resolved_file_path = _settings_env_path() if file_path is None else Path(file_path)
+    project_map = (
+        dict(file_map)
+        if isinstance(file_map, Mapping)
+        else _read_env_file_map(resolved_file_path)
+    )
     frozen_process_keys = set(
         process_keys
         if process_keys is not None
@@ -18500,14 +18674,14 @@ def _env_precedence_report(
             aligned_keys.append(key)
         else:
             different_keys.append(key)
-    effective_keys = set(_effective_env_map())
+    effective_keys = set(_effective_env_map(resolved_file_path))
     runtime_default_keys = sorted(effective_keys.difference(project_keys).difference(process_env_keys))
     process_only_keys = sorted(process_env_keys.difference(project_keys))
     declared_env_file = str(getattr(config, "CONFIG_ENV_FILE_BEFORE_DOTENV", "") or "").strip()
     declared_matches_project = False
     if declared_env_file:
         try:
-            declared_matches_project = Path(declared_env_file).resolve(strict=False) == Path(file_path).resolve(strict=False)
+            declared_matches_project = Path(declared_env_file).resolve(strict=False) == resolved_file_path.resolve(strict=False)
         except Exception:
             declared_matches_project = False
     return {
@@ -18545,8 +18719,126 @@ def _env_values_different_from_started_process(values: Mapping[str, str]) -> Lis
     return sorted(different)
 
 
-def _preserve_additional_env_lines(known_keys: Set[str]) -> str:
-    existing_map = _read_env_file_map(".env")
+_SETTINGS_ENV_KEYS_BY_FIELD: Dict[str, Tuple[str, ...]] = {
+    "host": ("EVOSSEARCH_HOST",),
+    "port": ("EVOSSEARCH_PORT",),
+    "debug": ("EVOSSEARCH_DEBUG",),
+    "embedder": ("EVOSSEARCH_EMBEDDER",),
+    "clipModel": ("EVOSSEARCH_CLIP_MODEL",),
+    "dinoModel": ("EVOSSEARCH_DINO_MODEL",),
+    "dinoEmbedDim": ("EVOSSEARCH_EMB_DIM_DINO",),
+    "dinoWeightsPath": ("EVOSSEARCH_DINO_WEIGHTS_PATH",),
+    "dinoDevice": ("EVOSSEARCH_DINO_DEVICE",),
+    "indexMode": ("EVOSSEARCH_INDEX_MODE",),
+    "fusionEnabled": ("EVOSSEARCH_FUSION_ENABLED",),
+    "fusionAlpha": ("EVOSSEARCH_FUSION_ALPHA",),
+    "rerankEnabled": ("EVOSSEARCH_RERANK_ENABLED",),
+    "rerankTopK": ("EVOSSEARCH_RERANK_TOP_K",),
+    "segmentsEnabled": ("EVOSSEARCH_DINO_SEGMENTS_ENABLED",),
+    "segmentMinPatches": ("EVOSSEARCH_DINO_SEGMENT_MIN_PATCHES",),
+    "segmentThreshold": ("EVOSSEARCH_DINO_HEATMAP_THRESHOLD",),
+    "luxriotBaseUrl": ("EVOSSEARCH_LUXRIOT_BASE_URL",),
+    "luxriotUsername": ("EVOSSEARCH_LUXRIOT_USERNAME",),
+    "luxriotPassword": ("EVOSSEARCH_LUXRIOT_PASSWORD",),
+    "luxriotDefaultChannelId": ("EVOSSEARCH_LUXRIOT_DEFAULT_CHANNEL_ID",),
+    "luxriotSnapshotInterval": ("EVOSSEARCH_LUXRIOT_SNAPSHOT_INTERVAL",),
+    "luxriotSnapshotMaxEdge": ("EVOSSEARCH_LUXRIOT_SNAPSHOT_MAX_EDGE",),
+    "luxriotMaxBufferFrames": ("EVOSSEARCH_LUXRIOT_MAX_BUFFER_FRAMES",),
+    "luxriotSummaryRetentionDays": ("EVOSSEARCH_LUXRIOT_SUMMARY_RETENTION_DAYS",),
+    "luxriotSummaryHistoryLimit": ("EVOSSEARCH_LUXRIOT_SUMMARY_HISTORY_LIMIT",),
+    "luxriotSummaryArchiveFramesPerBatch": (
+        "EVOSSEARCH_LUXRIOT_SUMMARY_ARCHIVE_FRAMES_PER_BATCH",
+    ),
+    "luxriotAutoBookmarks": ("EVOSSEARCH_LUXRIOT_AUTO_BOOKMARKS",),
+    "luxriotSeverityMap": (
+        "EVOSSEARCH_LUXRIOT_SEV_INFO",
+        "EVOSSEARCH_LUXRIOT_SEV_LOW",
+        "EVOSSEARCH_LUXRIOT_SEV_NORMAL",
+        "EVOSSEARCH_LUXRIOT_SEV_HIGH",
+        "EVOSSEARCH_LUXRIOT_SEV_CRITICAL",
+    ),
+    "probeBookmarkCooldownSec": ("EVOSSEARCH_PROBE_BOOKMARK_COOLDOWN_SEC",),
+    "probeBookmarkDedupeWindowSec": (
+        "EVOSSEARCH_PROBE_BOOKMARK_DEDUPE_WINDOW_SEC",
+    ),
+    "probeBookmarkSimHigh": ("EVOSSEARCH_PROBE_BOOKMARK_SIM_HIGH",),
+    "probeBookmarkMarginDelta": ("EVOSSEARCH_PROBE_BOOKMARK_MARGIN_DELTA",),
+    "probeBookmarkScoreDelta": ("EVOSSEARCH_PROBE_BOOKMARK_SCORE_DELTA",),
+    "probeBookmarkMaxFrameGap": ("EVOSSEARCH_PROBE_BOOKMARK_MAX_FRAME_GAP",),
+    "archiveRetentionEnabled": ("EVOSSEARCH_ARCHIVE_RETENTION_ENABLED",),
+    "archiveMaxRecords": ("EVOSSEARCH_ARCHIVE_MAX_RECORDS",),
+    "archiveRowRetentionDays": ("EVOSSEARCH_ARCHIVE_ROW_RETENTION_DAYS",),
+    "archiveThumbnailRetentionDays": (
+        "EVOSSEARCH_ARCHIVE_THUMBNAIL_RETENTION_DAYS",
+    ),
+    "archiveRetentionPruneIntervalSec": (
+        "EVOSSEARCH_ARCHIVE_RETENTION_PRUNE_INTERVAL_SEC",
+    ),
+    "archiveRetentionBatchSize": ("EVOSSEARCH_ARCHIVE_RETENTION_BATCH_SIZE",),
+    "archiveEstimateChannels": ("EVOSSEARCH_ARCHIVE_ESTIMATE_CHANNELS",),
+    "archiveEstimateFramesPerBatch": (
+        "EVOSSEARCH_ARCHIVE_ESTIMATE_FRAMES_PER_BATCH",
+    ),
+    "archiveEstimateAvgJpegKb": ("EVOSSEARCH_ARCHIVE_ESTIMATE_AVG_JPEG_KB",),
+    "archiveEstimateProbeRecordsPerChannelDay": (
+        "EVOSSEARCH_ARCHIVE_ESTIMATE_PROBE_RECORDS_PER_CHANNEL_DAY",
+    ),
+    "minResults": ("EVOSSEARCH_MIN_RESULTS",),
+    "maxResults": ("EVOSSEARCH_MAX_RESULTS",),
+    "defaultResults": ("EVOSSEARCH_DEFAULT_RESULTS",),
+    "batchSize": ("EVOSSEARCH_BATCH_SIZE",),
+    "thumbnailQuality": ("EVOSSEARCH_THUMBNAIL_QUALITY",),
+    "indexFolderName": ("EVOSSEARCH_INDEX_FOLDER",),
+    "maxCommentLength": ("EVOSSEARCH_MAX_COMMENT_LENGTH",),
+    "maxFileSize": ("EVOSSEARCH_MAX_FILE_SIZE_MB",),
+}
+
+
+def _settings_env_keys_for_fields(
+    fields: Iterable[str],
+    *,
+    vlm_profile_id: str,
+    agent_profile_id: str,
+) -> Set[str]:
+    """Resolve the exact env keys owned by a Settings patch."""
+
+    normalized_fields = {str(field) for field in fields}
+    keys: Set[str] = set()
+    for field in normalized_fields:
+        keys.update(_SETTINGS_ENV_KEYS_BY_FIELD.get(field, ()))
+    for prefix, profile_id, selector_key in (
+        ("vlm", vlm_profile_id, "EVOSSEARCH_LM_VLM_PROFILE_ID"),
+        ("agent", agent_profile_id, "EVOSSEARCH_LM_AGENT_PROFILE_ID"),
+    ):
+        suffixes = {
+            f"{prefix}BaseUrl": "BASE_URL",
+            f"{prefix}Model": "MODEL",
+            f"{prefix}ApiKey": "API_KEY",
+            f"{prefix}Timeout": "TIMEOUT",
+        }
+        touched = normalized_fields.intersection(suffixes)
+        if not touched:
+            continue
+        keys.update(
+            {
+                "EVOSSEARCH_LM_PROFILES",
+                selector_key,
+                _lm_profile_env_key(profile_id, "KIND"),
+                _lm_profile_env_key(profile_id, "ENABLED"),
+            }
+        )
+        for field in touched:
+            keys.add(_lm_profile_env_key(profile_id, suffixes[field]))
+    return keys
+
+
+def _preserve_additional_env_lines(
+    known_keys: Set[str],
+    file_path: Optional[Union[str, Path]] = None,
+) -> str:
+    existing_map = _read_env_file_map(
+        _settings_env_path() if file_path is None else file_path
+    )
     extra_evos = [
         f"{key}={_quote_env_value(value)}"
         for key, value in sorted(existing_map.items())
@@ -18611,7 +18903,7 @@ def _archive_capacity_estimate(
         1,
         int(channels if channels is not None else getattr(config, "ARCHIVE_ESTIMATE_CHANNELS", 50)),
     )
-    default_batch = config.LUXRIOT_BATCH_SIZES[0] if config.LUXRIOT_BATCH_SIZES else 12
+    default_batch = config.LUXRIOT_DEFAULT_BATCH_SIZE
     batch = max(1, int(batch_size if batch_size is not None else default_batch))
     interval = max(
         0.2,
@@ -18791,14 +19083,16 @@ def get_settings_env():
     if guard is not None:
         return guard
     try:
-        env_map = _redact_env_map(_effective_env_map())
-        precedence = _env_precedence_report()
+        env_path = _settings_env_path()
+        env_map = _redact_env_map(_effective_env_map(env_path))
+        precedence = _env_precedence_report(file_path=env_path)
         return jsonify(
             {
                 'success': True,
                 'envVariables': env_map,
                 'envText': _serialize_env_map(env_map),
                 'count': len(env_map),
+                'envFile': str(env_path),
                 'precedence': precedence,
             }
         )
@@ -18817,6 +19111,7 @@ def save_settings_env():
         return guard
     data = _json_body()
     try:
+        env_path = _settings_env_path()
         parsed_from_text = _parse_env_editor_text(data.get('envText', ''))
         if parsed_from_text:
             target_env = parsed_from_text
@@ -18832,8 +19127,11 @@ def save_settings_env():
         if not target_env:
             return jsonify({'success': False, 'error': 'No EVOSSEARCH_* entries to save'}), 400
 
-        target_env = _restore_redacted_env_secrets(target_env, _effective_env_map())
-        existing_map = _read_env_file_map(".env")
+        target_env = _restore_redacted_env_secrets(
+            target_env,
+            _effective_env_map(env_path),
+        )
+        existing_map = _read_env_file_map(env_path)
         preserved_other = {
             key: value
             for key, value in existing_map.items()
@@ -18843,7 +19141,10 @@ def save_settings_env():
         merged_map.update(target_env)
 
         header = "# evo-ssearch Configuration\n# Managed by settings env editor\n\n"
-        _write_env_file_atomic(header + _serialize_env_map(merged_map) + "\n")
+        _write_env_file_atomic(
+            header + _serialize_env_map(merged_map) + "\n",
+            env_path,
+        )
 
         audit_error = _write_completion_audit_or_error(
             action="settings.env.write.completed",
@@ -18854,11 +19155,14 @@ def save_settings_env():
         if audit_error is not None:
             return audit_error
         pending_or_overridden_keys = _env_values_different_from_started_process(target_env)
-        precedence = _env_precedence_report(file_map=merged_map)
-        message = 'Environment variables saved to .env. Restart the server to apply changes.'
+        precedence = _env_precedence_report(
+            file_map=merged_map,
+            file_path=env_path,
+        )
+        message = f'Environment variables saved to {env_path}. Restart the server to apply changes.'
         if pending_or_overridden_keys and not precedence.get("declared_file_matches_project"):
             message = (
-                'Environment variables saved to .env. Some values differ from the running process; '
+                f'Environment variables saved to {env_path}. Some values differ from the running process; '
                 'restart may apply them, but the service environment source is not declared and must be checked.'
             )
         return jsonify(
@@ -18866,6 +19170,7 @@ def save_settings_env():
                 'success': True,
                 'message': message,
                 'count': len(target_env),
+                'envFile': str(env_path),
                 'pendingOrOverriddenKeys': pending_or_overridden_keys,
                 'precedence': precedence,
             }
@@ -18894,6 +19199,8 @@ def get_settings():
         index_mode = _normalize_index_mode_for_policy(config.INDEX_MODE)
         vlm_profile = _resolve_lm_profile(kind="vlm")
         agent_profile = _resolve_lm_profile(kind="agent")
+        env_path = _settings_env_path()
+        precedence = _env_precedence_report(file_path=env_path)
         settings = {
             'host': config.HOST,
             'port': config.PORT,
@@ -18944,11 +19251,13 @@ def get_settings():
             'batchSize': config.BATCH_SIZE,
             'thumbnailQuality': config.THUMBNAIL_QUALITY,
             'vlmBaseUrl': str(vlm_profile.get('base_url') or ''),
+            'vlmProfileId': str(vlm_profile.get('id') or ''),
             'vlmModel': str(vlm_profile.get('model') or ''),
             'vlmApiKey': '',
             'vlmApiKeySet': bool(vlm_profile.get('api_key')),
             'vlmTimeout': int(vlm_profile.get('timeout') or config.LM_TIMEOUT),
             'agentBaseUrl': str(agent_profile.get('base_url') or ''),
+            'agentProfileId': str(agent_profile.get('id') or ''),
             'agentModel': str(agent_profile.get('model') or ''),
             'agentApiKey': '',
             'agentApiKeySet': bool(agent_profile.get('api_key')),
@@ -18986,7 +19295,13 @@ def get_settings():
                 'deferred': True,
                 'backend': getattr(detections_store, "backend", "unknown"),
             },
-            'envCount': len(_effective_env_map()),
+            'envCount': len(_effective_env_map(env_path)),
+            'envFile': str(env_path),
+            'envPrecedence': precedence,
+            'lmProfiles': [
+                _public_lm_profile(profile)
+                for profile in _configured_lm_profiles().values()
+            ],
         }
         return jsonify({'success': True, 'settings': settings})
     except Exception as e:
@@ -19006,13 +19321,26 @@ def save_settings():
         data = _json_body()
         if not data:
             return jsonify({'success': False, 'error': 'No data provided'}), 400
+        # A number input may transiently submit an empty string while a sibling
+        # field is being edited. Blank means omitted under PATCH semantics; it
+        # must not enter submitted_fields or overwrite the persisted port.
+        if data.get('port') is None or str(data.get('port')).strip() == '':
+            data.pop('port', None)
+        submitted_fields = frozenset(str(key) for key in data.keys())
+        env_path = _settings_env_path()
 
         global active_embedder, clip_model, clip_preprocess, clip_processor, clip_backend_kind, clip_runtime_model, dino_encoder, probe_bookmark_gate, _agent_runner, _agent_runtime_model_override
 
-        required_fields = ['host', 'port', 'debug', 'clipModel', 'minResults', 'maxResults', 'defaultResults']
-        for field in required_fields:
-            if field not in data:
-                return jsonify({'success': False, 'error': f'Missing required field: {field}'}), 400
+        # PATCH semantics: omitted fields retain their current effective value.
+        # This prevents a form loaded before another admin change from replaying
+        # stale values across every settings group.
+        data.setdefault('host', config.HOST)
+        data.setdefault('port', config.PORT)
+        data.setdefault('debug', config.DEBUG)
+        data.setdefault('clipModel', config.CLIP_MODEL)
+        data.setdefault('minResults', config.MIN_RESULTS)
+        data.setdefault('maxResults', config.MAX_RESULTS)
+        data.setdefault('defaultResults', config.DEFAULT_RESULTS)
         debug_enabled = _coerce_bool(data.get('debug', config.DEBUG), config.DEBUG)
         experimental_embedders_enabled = _experimental_embedding_models_enabled()
 
@@ -19482,17 +19810,47 @@ EVOSSEARCH_ALLOWED_ROOTS={os.pathsep.join(config.ALLOWED_ROOTS)}
             parsed_env_content[_lm_profile_env_key(profile_id, "API_KEY")] = str(profile.get("api_key") or "")
             parsed_env_content[_lm_profile_env_key(profile_id, "TIMEOUT")] = str(profile.get("timeout") or config.LM_TIMEOUT)
             parsed_env_content[_lm_profile_env_key(profile_id, "ENABLED")] = "true"
-        known_env_keys = set(parsed_env_content.keys())
+        env_keys_to_write = _settings_env_keys_for_fields(
+            submitted_fields,
+            vlm_profile_id=vlm_profile_id,
+            agent_profile_id=agent_profile_id,
+        )
+        if not env_keys_to_write:
+            return jsonify(
+                {'success': False, 'error': 'No recognized settings fields provided'}
+            ), 400
+        existing_env_content = _read_env_file_map(env_path)
+        if existing_env_content:
+            persisted_env_content = dict(existing_env_content)
+        else:
+            # First-run bootstrap still needs a complete file. Subsequent
+            # Settings saves are surgical overlays on the service-owned file.
+            persisted_env_content = dict(parsed_env_content)
+        for key in env_keys_to_write:
+            if key in parsed_env_content:
+                persisted_env_content[key] = parsed_env_content[key]
+        if "EVOSSEARCH_LM_PROFILES" in env_keys_to_write:
+            merged_profile_ids: List[str] = []
+            for raw_ids in (
+                existing_env_content.get("EVOSSEARCH_LM_PROFILES", ""),
+                parsed_env_content.get("EVOSSEARCH_LM_PROFILES", ""),
+            ):
+                for profile_id in str(raw_ids or "").split(","):
+                    normalized_id = profile_id.strip()
+                    if normalized_id and normalized_id not in merged_profile_ids:
+                        merged_profile_ids.append(normalized_id)
+            persisted_env_content["EVOSSEARCH_LM_PROFILES"] = ",".join(
+                merged_profile_ids
+            )
         env_content = (
             "# evo-ssearch Configuration\n"
             "# Generated by settings panel\n\n"
-            + _serialize_env_map(parsed_env_content)
-            + _preserve_additional_env_lines(known_env_keys)
+            + _serialize_env_map(persisted_env_content)
         )
         if not env_content.endswith("\n"):
             env_content += "\n"
 
-        _write_env_file_atomic(env_content)
+        _write_env_file_atomic(env_content, env_path)
 
         config.HOST = data['host']
         config.PORT = port
@@ -19525,9 +19883,12 @@ EVOSSEARCH_ALLOWED_ROOTS={os.pathsep.join(config.ALLOWED_ROOTS)}
         config.LM_PROFILES = updated_lm_profiles
         config.LM_VLM_PROFILE_ID = vlm_profile_id
         config.LM_AGENT_PROFILE_ID = agent_profile_id
-        with _agent_runner_lock:
-            _agent_runtime_model_override = None
-            _agent_runner = None
+        if submitted_fields.intersection(
+            {'agentBaseUrl', 'agentModel', 'agentApiKey', 'agentTimeout'}
+        ):
+            with _agent_runner_lock:
+                _agent_runtime_model_override = None
+                _agent_runner = None
         app.config["MAX_CONTENT_LENGTH"] = max(1, int(config.MAX_FILE_SIZE_MB)) * 1024 * 1024
         config.FUSION_ENABLED = fusion_enabled
         config.FUSION_ALPHA = fusion_alpha
@@ -19567,13 +19928,24 @@ EVOSSEARCH_ALLOWED_ROOTS={os.pathsep.join(config.ALLOWED_ROOTS)}
         config.PROBE_BOOKMARK_MARGIN_DELTA = probe_bookmark_margin_delta
         config.PROBE_BOOKMARK_SCORE_DELTA = probe_bookmark_score_delta
         config.PROBE_BOOKMARK_MAX_FRAME_GAP = probe_bookmark_max_frame_gap
-        probe_bookmark_gate = _ProbeBookmarkGate()
+        if submitted_fields.intersection(
+            {
+                'probeBookmarkCooldownSec',
+                'probeBookmarkDedupeWindowSec',
+                'probeBookmarkSimHigh',
+                'probeBookmarkMarginDelta',
+                'probeBookmarkScoreDelta',
+                'probeBookmarkMaxFrameGap',
+            }
+        ):
+            probe_bookmark_gate = _ProbeBookmarkGate()
 
         active_embedder = embedder
         if active_embedder == 'fusion' and not config.FUSION_ENABLED:
             active_embedder = 'clip'
-        reset_embedder_runtime_state()
+        warmup_warning = None
         if embedder_state_changed:
+            reset_embedder_runtime_state()
             try:
                 probe_manager.clear_all()
             except Exception:
@@ -19582,10 +19954,20 @@ EVOSSEARCH_ALLOWED_ROOTS={os.pathsep.join(config.ALLOWED_ROOTS)}
                 detection_clip_shard_cache.clear()
             except Exception:
                 pass
-        warmup_warning = warm_start_embedder()
-        message = 'Settings saved successfully. Restart the server if issues persist.'
-        pending_or_overridden_keys = _env_values_different_from_started_process(parsed_env_content)
-        precedence = _env_precedence_report(file_map=parsed_env_content)
+            warmup_warning = warm_start_embedder()
+        written_env_values = {
+            key: persisted_env_content[key]
+            for key in env_keys_to_write
+            if key in persisted_env_content
+        }
+        message = f'Settings saved to {env_path}.'
+        pending_or_overridden_keys = _env_values_different_from_started_process(
+            written_env_values
+        )
+        precedence = _env_precedence_report(
+            file_map=persisted_env_content,
+            file_path=env_path,
+        )
         if pending_or_overridden_keys:
             if precedence.get("declared_file_matches_project"):
                 message = (
@@ -19600,6 +19982,9 @@ EVOSSEARCH_ALLOWED_ROOTS={os.pathsep.join(config.ALLOWED_ROOTS)}
         payload: Dict[str, Any] = {
             'success': True,
             'message': message,
+            'appliedFields': sorted(submitted_fields),
+            'writtenEnvKeys': sorted(written_env_values),
+            'envFile': str(env_path),
             'pendingOrOverriddenKeys': pending_or_overridden_keys,
             'precedence': precedence,
         }
@@ -19610,7 +19995,7 @@ EVOSSEARCH_ALLOWED_ROOTS={os.pathsep.join(config.ALLOWED_ROOTS)}
                 warmup_warning,
             )
             payload['warning'] = 'Embedder warmup failed; restart or check server logs.'
-        audit_details = _audit_key_details("fields", data.keys())
+        audit_details = _audit_key_details("fields", submitted_fields)
         audit_details.update(
             {
                 "embedder": embedder,
@@ -19954,8 +20339,17 @@ def agent_session(session_id: str):
     return jsonify(session)
 
 
+_background_shutdown_lock = threading.Lock()
+_background_shutdown_started = False
+
+
 @atexit.register
 def _shutdown_background_workers() -> None:
+    global _background_shutdown_started
+    with _background_shutdown_lock:
+        if _background_shutdown_started:
+            return
+        _background_shutdown_started = True
     global _audit_db_pool, _audit_reader, _audit_writer, _control_plane_db_pool
     global _archive_db_pool
     global _identity_repository

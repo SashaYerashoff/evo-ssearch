@@ -168,6 +168,12 @@ class EvaAgentToolAdapterTests(unittest.TestCase):
             client_ip="192.0.2.10",
         )
 
+    def test_archive_search_timeout_covers_cold_bounded_fanout(self):
+        self.assertEqual(
+            self.adapter.gateway.registry.get("search_archive").policy.timeout_seconds,
+            180.0,
+        )
+
     def test_lookup_help_uses_trusted_context_not_model_args(self):
         operator_context = ToolExecutionContext(
             actor_id="361fe45f-f277-42f8-ae35-eaa0fc81cf38",

@@ -120,7 +120,7 @@ def test_predeploy_gate_runs_react_tests_and_production_build():
 
 def test_port_profile_has_bounded_queue_and_context():
     assert installer.PORT_ENV["EVOSSEARCH_INFERENCE_QUEUE_ENABLED"] == "true"
-    assert installer.PORT_ENV["EVOSSEARCH_INFERENCE_WORKER_COUNT"] == "1"
+    assert installer.PORT_ENV["EVOSSEARCH_INFERENCE_WORKER_COUNT"] == "3"
     assert installer.PORT_ENV["EVOSSEARCH_AGENT_CONTEXT_LIMIT_TOKENS"] == "32768"
     assert installer.PORT_ENV["EVOSSEARCH_AGENT_CONTEXT_HARD_TOKENS"] == "30000"
     assert installer.PORT_ENV["EVOSSEARCH_LM_VIDEO_REPETITION_PENALTY"] == "1.08"
@@ -133,7 +133,8 @@ def test_port_vlm_uses_stable_vision_backend_and_content_watchdog(tmp_path):
     assert "--gpu-memory-utilization 0.72" in source
     assert "--max-num-seqs 4" in source
     assert "--enforce-eager" not in source
-    assert "ExecStartPost={app_dir}/.venv/bin/python {app_dir}/scripts/wait_openai_endpoint.py --timeout 240" in source
+    assert "ExecStartPost={app_dir}/.venv/bin/python {app_dir}/scripts/wait_openai_endpoint.py --timeout 720" in source
+    assert "TimeoutStartSec=780" in source
     assert "eva-vlm-vision-watchdog.timer" in source
     assert "OnFailure=eva-vlm-vision-recover.service" in source
 
@@ -153,8 +154,8 @@ def test_port_vlm_uses_stable_vision_backend_and_content_watchdog(tmp_path):
         "EVA_BACKUP_PASSWORD": "e" * 64,
     }
     values = installer.render_runtime_env(answers, {}, passwords)
-    assert values["EVOSSEARCH_LM_PROFILE_AGENT_MAX_INFLIGHT"] == "8"
-    assert values["EVOSSEARCH_LM_PROFILE_VLM_MAX_INFLIGHT"] == "8"
+    assert values["EVOSSEARCH_LM_PROFILE_AGENT_MAX_INFLIGHT"] == "4"
+    assert values["EVOSSEARCH_LM_PROFILE_VLM_MAX_INFLIGHT"] == "4"
     assert values["EVOSSEARCH_LM_VISION_HEALTH_STATE_FILE"] == str(
         answers.data_root / "state" / "vlm-vision-health.json"
     )

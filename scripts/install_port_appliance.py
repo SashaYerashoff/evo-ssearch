@@ -105,7 +105,9 @@ PORT_ENV = {
     "EVOSSEARCH_ARCHIVE_ESTIMATE_CHANNELS": "8",
     "EVOSSEARCH_INFERENCE_QUEUE_ENABLED": "true",
     "EVOSSEARCH_INFERENCE_QUEUE_CAPACITY": "200",
-    "EVOSSEARCH_INFERENCE_WORKER_COUNT": "1",
+    # vLLM exposes four slots; admission reserves one for interactive/alert
+    # work, so three durable workers may consume ordinary L0 concurrently.
+    "EVOSSEARCH_INFERENCE_WORKER_COUNT": "3",
     "EVOSSEARCH_LM_VIDEO_REPETITION_PENALTY": "1.08",
     "EVOSSEARCH_LUXRIOT_CAPTURE_SOURCE": "live_segment",
     "EVOSSEARCH_LUXRIOT_FFMPEG_HWACCEL": "auto",
@@ -153,6 +155,9 @@ PORT_ENV = {
     "EVOSSEARCH_VLM_FAST_ALERT_MIN_MOVING_FRACTION": "0.15",
     "EVOSSEARCH_VLM_FAST_ALERT_DEDUPE_WINDOW_SEC": "12",
     "EVOSSEARCH_LUXRIOT_ROLLUP_SCHEDULER_ENABLED": "true",
+    "EVOSSEARCH_LUXRIOT_ROLLUP_L1_SETTLE_DELAY_SEC": "30",
+    "EVOSSEARCH_LUXRIOT_ROLLUP_L2_SETTLE_DELAY_SEC": "120",
+    "EVOSSEARCH_LUXRIOT_ROLLUP_L3_SETTLE_DELAY_SEC": "300",
     "EVOSSEARCH_LUXRIOT_ROLLUP_LLM_LEVELS": "L1,L2,L3",
     "EVOSSEARCH_LUXRIOT_ROLLUP_LLM_MODEL": "agent",
     "EVOSSEARCH_LUXRIOT_ROLLUP_CONTEXT_LIMIT_TOKENS": "32768",
@@ -163,7 +168,9 @@ PORT_ENV = {
     "EVOSSEARCH_LUXRIOT_L0_CONTEXT_WINDOW_TOKENS": "16384",
     "EVOSSEARCH_LUXRIOT_L0_TEXT_BUDGET_TOKENS": "5000",
     "EVOSSEARCH_LUXRIOT_L0_VISION_BUDGET_TOKENS": "5500",
-    "EVOSSEARCH_LUXRIOT_L0_OUTPUT_BUDGET_TOKENS": "1536",
+    "EVOSSEARCH_LUXRIOT_L0_OUTPUT_BUDGET_TOKENS": "512",
+    "EVOSSEARCH_LUXRIOT_L0_HEARTBEAT_OUTPUT_TOKENS": "384",
+    "EVOSSEARCH_LUXRIOT_L0_EVENT_OUTPUT_TOKENS": "512",
     "EVOSSEARCH_LUXRIOT_L0_INCIDENT_BUDGET_TOKENS": "900",
     "EVOSSEARCH_LUXRIOT_L0_VISION_TOKENS_PER_IMAGE_ESTIMATE": "300",
     "EVOSSEARCH_LUXRIOT_ROLLUP_L3_DEEP_ENABLED": "true",
@@ -1475,13 +1482,13 @@ def render_runtime_env(
             "EVOSSEARCH_LM_PROFILE_AGENT_BASE_URL": answers.vlm_url,
             "EVOSSEARCH_LM_PROFILE_AGENT_MODEL": answers.vlm_model,
             "EVOSSEARCH_LM_PROFILE_AGENT_TIMEOUT": "600",
-            "EVOSSEARCH_LM_PROFILE_AGENT_MAX_INFLIGHT": "8",
+            "EVOSSEARCH_LM_PROFILE_AGENT_MAX_INFLIGHT": "4",
             "EVOSSEARCH_LM_PROFILE_VLM_KIND": "vlm",
             "EVOSSEARCH_LM_PROFILE_VLM_ENABLED": "true",
             "EVOSSEARCH_LM_PROFILE_VLM_BASE_URL": answers.vlm_url,
             "EVOSSEARCH_LM_PROFILE_VLM_MODEL": answers.vlm_model,
             "EVOSSEARCH_LM_PROFILE_VLM_TIMEOUT": "600",
-            "EVOSSEARCH_LM_PROFILE_VLM_MAX_INFLIGHT": "8",
+            "EVOSSEARCH_LM_PROFILE_VLM_MAX_INFLIGHT": "4",
             "EVOSSEARCH_LUXRIOT_ROLLUP_L3_DEEP_BASE_URL": answers.deep_url,
             "EVOSSEARCH_LUXRIOT_ROLLUP_L3_DEEP_MODEL": answers.deep_model,
             "EVOSSEARCH_LUXRIOT_ROLLUP_L3_DEEP_ENABLED": (
@@ -1596,10 +1603,10 @@ Environment=VLLM_USE_FLASHINFER_SAMPLER=0
 Environment=PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 EnvironmentFile={env_file}
 ExecStart={vllm} serve {model} --served-model-name {DEFAULT_VLM_MODEL} --host 127.0.0.1 --port 1234 --max-model-len 32768 --gpu-memory-utilization 0.72 --max-num-seqs 4 --max-num-batched-tokens 4096 --kv-cache-dtype fp8 --attention-backend TRITON_ATTN --mm-encoder-attn-backend FLASH_ATTN --mm-processor-cache-gb 0 --limit-mm-per-prompt.image 16 --limit-mm-per-prompt.video 0 --mm-processor-kwargs.max_pixels 100352 --enable-auto-tool-choice --tool-call-parser hermes
-ExecStartPost={app_dir}/.venv/bin/python {app_dir}/scripts/wait_openai_endpoint.py --timeout 240
+ExecStartPost={app_dir}/.venv/bin/python {app_dir}/scripts/wait_openai_endpoint.py --timeout 720
 Restart=on-failure
 RestartSec=10
-TimeoutStartSec=300
+TimeoutStartSec=780
 TimeoutStopSec=60
 KillMode=mixed
 

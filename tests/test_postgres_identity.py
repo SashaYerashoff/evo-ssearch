@@ -239,7 +239,14 @@ class RepositoryUnitTests(unittest.TestCase):
         )
         query = connection.executions[0]
         self.assertIn("s.expires_at > clock_timestamp()", query[0])
+        self.assertNotIn("FOR UPDATE", query[0])
         self.assertEqual(query[1][1], hashlib.sha256(b"token").digest())
+        last_seen_update = connection.executions[2]
+        self.assertIn("last_seen_at < clock_timestamp()", last_seen_update[0])
+        self.assertEqual(
+            last_seen_update[1][2],
+            repository._SESSION_LAST_SEEN_WRITE_INTERVAL_SECONDS,
+        )
         self.assertEqual(pool.contexts[0].actor_id, NIL_UUID)
         connection.assert_finished()
 

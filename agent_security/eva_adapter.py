@@ -384,7 +384,11 @@ class EvaAgentToolAdapter:
             "survey_deployment": 300.0,
             "apply_deployment_plan": 300.0,
             "describe_frame": 120.0,
-            "search_archive": 90.0,
+            # A cold full-source fanout over the bounded archive can exceed
+            # 90 seconds while the warmed repeat completes quickly. Keep the
+            # first request inside one audited call instead of timing it out
+            # and leaving its worker racing an identical retry.
+            "search_archive": 180.0,
             "get_visual_window_signals": 90.0,
             "calibrate_probe_from_archive": 90.0,
             "prepare_probe_calibration_batch": 90.0,

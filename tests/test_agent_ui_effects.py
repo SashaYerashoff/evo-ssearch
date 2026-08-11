@@ -71,3 +71,28 @@ def test_apply_receipt_projects_refresh():
 def test_failed_or_unmapped_tools_do_not_drive_console():
     assert derive_agent_ui_effects("search_archive", {}, {"error": "denied"}) == []
     assert derive_agent_ui_effects("lookup_help", {}, {"results": []}) == []
+
+
+def test_unscoped_video_read_does_not_override_live_depth():
+    [effect] = derive_agent_ui_effects(
+        "get_video_summaries",
+        {"channel_id": 112, "depth": "L1", "limit": 20},
+        {"channel_id": 112, "time_window": {"from_ts": 100.0, "to_ts": 200.0}},
+    )
+
+    assert effect["action"] == "show_period"
+    assert effect["payload"]["channel_id"] == 112
+    assert "depth" not in effect["payload"]
+    assert "since_ms" not in effect["payload"]
+
+
+def test_explicit_video_period_projects_depth_with_resolved_bounds():
+    [effect] = derive_agent_ui_effects(
+        "get_video_summaries",
+        {"channel_id": 112, "depth": "L1", "relative_range": "last hour"},
+        {"channel_id": 112, "time_window": {"from_ts": 100.0, "to_ts": 200.0}},
+    )
+
+    assert effect["payload"]["depth"] == "L1"
+    assert effect["payload"]["since_ms"] == 100_000
+    assert effect["payload"]["until_ms"] == 200_000
