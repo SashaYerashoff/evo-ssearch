@@ -89,14 +89,15 @@ Primary working repository:
 ```text
 path:   /home/sasha/Projects/evo-ssearch-office-demo
 branch: main
-latest code commit: 645f4f5 fix: bound rollup and operator-mode reads
+latest code commit: 2adc0cb fix: avoid monolithic rollup cache rewrites
 ```
 
-The stabilization work is split into two reviewed commits:
+The stabilization work is split into three reviewed code commits:
 
 ```text
 15ad09f fix: stabilize Georgia upgrade rehearsal runtime
 645f4f5 fix: bound rollup and operator-mode reads
+2adc0cb fix: avoid monolithic rollup cache rewrites
 ```
 
 The working tree is expected to be clean after committing this handoff update.
@@ -972,6 +973,49 @@ active with `NRestarts=0`; ports 1234 and 1235 return HTTP 200. About 11 GiB RAM
 available. EVA itself has approximately 5 MiB swapped, so the host's allocated
 2.2 GiB swap is not evidence of active EVA swap pressure. The rehearsal `.env`
 hash remains unchanged.
+
+### Rollup persistence/UI starvation follow-up
+
+The first real scheduled L1 pass after worker `2487723` started exposed a second
+latency component. Channel 112 needed 127.692 seconds for one L1 window and channel
+118 needed 134.036 seconds for two. llama.cpp logs showed only 12-24 seconds of
+model work; EVA then rewrote the former monolithic 259-entry rollup-cache JSON after
+every independently durable rollup while holding the manager cache lock. Status
+requests accumulated behind that lock and, together with bounded preview streams,
+could exhaust all four Gunicorn request threads. Even `/health` briefly timed out.
+
+Commit `2adc0cb` stops rewriting the legacy monolith when the runtime store supports
+per-rollup durability. The legacy payload is now an insert-only migration source,
+so it cannot overwrite a newer independently durable row during restart; durable
+rows are overlaid onto the migration snapshot before the hot cache becomes visible.
+If an individual durable save fails, EVA retains the monolithic fallback path.
+
+Verification before deployment:
+
+```text
+tests/test_luxriot_inference_runtime.py: 212 passed in 59.43 s
+```
+
+The target copies are:
+
+```text
+/home/sasha/Projects/eva-georgia-upgrade-repro/archive_store.py.pre-20260811-232900-rollup-cache-split
+/home/sasha/Projects/eva-georgia-upgrade-repro/luxriot_connector.py.pre-20260811-232900-rollup-cache-split
+```
+
+The HUP started worker `2522849`. Cold SigLIP initialization kept port 5081
+unavailable for about 159 seconds, confirming that graceful reload startup remains
+a separate pilot reliability defect. Both llama.cpp PIDs stayed unchanged and both
+units retained `NRestarts=0`; the `.env` hash stayed unchanged. On startup the new
+worker loaded 263 cache rows with `durable_rollups_promoted=0`, proving the old
+monolith did not overwrite current durable rows.
+
+A bounded authenticated operator synthesis then repaired two missing channel-112
+L1 windows. Both became `llm/ready`; the request completed in 64.575 seconds. The
+two llama.cpp generations themselves took about 14 seconds combined. During the
+entire operation, 103/103 concurrent `/health` samples succeeded with no timeout,
+maximum latency 1.539 seconds and p95 0.792 seconds. Persistence remains sequential
+and visible in total synthesis latency, but it no longer freezes liveness or the UI.
 
 ### Immediate next stabilization work
 
