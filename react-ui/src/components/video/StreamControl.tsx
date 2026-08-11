@@ -125,7 +125,7 @@ export function StreamControl(p: {
             <div className="vid-control-group-title">{t('video.source')}</div>
             <div className="wfield ch"><label>{t('video.channel')}</label>
               <div className="vid-row">
-                <Dropdown value={String(p.settingsChannelId ?? '')} onChange={(v) => p.onSettingsChannel(Number(v))}
+                <Dropdown variant="chip" value={String(p.settingsChannelId ?? '')} onChange={(v) => p.onSettingsChannel(Number(v))}
                   options={p.channels.map((c) => ({ value: String(c.id), label: c.title }))} />
               </div>
             </div>
@@ -134,7 +134,7 @@ export function StreamControl(p: {
             <div className="vid-control-group-title">{t('video.sampling')}</div>
             <div className="vid-control-fields">
               <div className="wfield batch"><label>{t('video.batch')}</label>
-                <Dropdown value={p.batch} onChange={p.onBatch} options={BATCHES.map((b) => ({ value: b, label: b }))} />
+                <Dropdown variant="chip" value={p.batch} onChange={p.onBatch} options={BATCHES.map((b) => ({ value: b, label: b }))} />
               </div>
               <div className="wfield xs"><label>{t('video.every')}</label>
                 <input type="number" min={0.2} max={300} step={0.1} value={p.every} onChange={(e) => p.onEvery(e.target.value)} />
@@ -213,12 +213,13 @@ export function StreamControl(p: {
             <div className="toolbar-scroll-rail vid-review-scroll">
             <div className="wfield ch"><label>{t('video.channel')}</label>
               <div className="vid-row">
-                <Dropdown value={String(p.reviewChannelId ?? '')} onChange={(v) => p.onReviewChannel(Number(v))}
+                <Dropdown variant="chip" value={String(p.reviewChannelId ?? '')} onChange={(v) => p.onReviewChannel(Number(v))}
                   options={p.channels.map((c) => ({ value: String(c.id), label: c.title }))} />
               </div>
             </div>
             <div className="wfield hist"><label>{t('video.period')}</label>
               <Dropdown
+                variant="chip"
                 value={p.period}
                 onChange={(value) => p.onPeriod(value as SummaryPeriod)}
                 options={periods.map((item) => ({ value: item.v, label: item.label }))}
@@ -226,6 +227,7 @@ export function StreamControl(p: {
             </div>
             <div className="wfield resolution"><label>{t('video.resolution')}</label>
               <Dropdown
+                variant="chip"
                 value={p.resolution}
                 onChange={(value) => p.onResolution(value as SummaryResolution)}
                 options={resolutions.map((item) => ({ value: item.v, label: item.label }))}
