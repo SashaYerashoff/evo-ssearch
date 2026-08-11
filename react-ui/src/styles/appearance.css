@@ -1,7 +1,7 @@
 /* Appearance editor and the first shared control primitives. Imported after app.css. */
 
 .topbar {
-  background: linear-gradient(180deg, var(--topbar-start), var(--topbar-end));
+  background: transparent;
 }
 
 .top-section,

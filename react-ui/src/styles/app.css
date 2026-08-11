@@ -58,9 +58,10 @@
   justify-content: space-between;
   gap: 14px;
   padding: 10px 16px;
-  background: linear-gradient(180deg, var(--topbar-start), var(--topbar-end));
-  border-bottom: 1px solid var(--line);
-  backdrop-filter: blur(8px);
+  background: transparent;
+  border-bottom: 0;
+  backdrop-filter: none;
+  -webkit-backdrop-filter: none;
 }
 .brand { display: flex; align-items: center; gap: 11px; }
 /* current section name — right of the logo */
