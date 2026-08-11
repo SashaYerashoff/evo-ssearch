@@ -309,10 +309,7 @@
   flex: 1; display: flex; min-height: 0; position: relative;
 }
 .shell.agent-full .status-console { display: none; }
-.shell.agent-full .body-row::before {
-  content: ""; position: absolute; inset: 0; z-index: 54;
-  pointer-events: none; background: var(--space-0);
-}
+.shell.agent-full .center { visibility: hidden; pointer-events: none; }
 
 /* ---- compact edge navigation ---- */
 .menu-shell {
