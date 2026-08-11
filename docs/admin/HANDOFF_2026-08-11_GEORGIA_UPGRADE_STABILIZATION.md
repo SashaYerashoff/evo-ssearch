@@ -32,7 +32,8 @@ endpoints returned HTTP 200, about 9.8 GiB RAM was available, swap usage was
 1.8/4.0 GiB, and there was no active swap-in/swap-out storm. The unrelated
 `slopai-*` Docker stack was left untouched.
 
-Two additional fixes are deployed in the rehearsal but remain uncommitted:
+Two additional fixes are deployed in the rehearsal and are now committed in
+`15ad09f`:
 
 - incident covers now resolve through bounded indexed time windows before JSON
   filtering; an authenticated live check returned grounded covers for all 38/38
@@ -55,9 +56,8 @@ Open the session with this repository as its workspace:
 
 Then ask Codex to read this file completely and continue from **Next work**.
 
-Do not reset, clean, stash, rebase, or discard the working tree. The uncommitted
-changes are the current stabilization work and include changes made across several
-passes. Inspect before editing and preserve unrelated/user changes.
+The stabilization source is committed. Do not reset, clean, stash, rebase, or
+discard later user changes; inspect the current tree before editing.
 
 ## Current objective
 
@@ -89,42 +89,18 @@ Primary working repository:
 ```text
 path:   /home/sasha/Projects/evo-ssearch-office-demo
 branch: main
-HEAD:   55b4771 fix(updater): verify React console after upgrade
+latest code commit: 645f4f5 fix: bound rollup and operator-mode reads
 ```
 
-The tree is intentionally dirty. At handoff time it contains modifications in:
+The stabilization work is split into two reviewed commits:
 
 ```text
-config.py
-docs/00_CANON/config_reference.md
-gunicorn_conf.py
-luxriot_connector.py
-oldapp.py
-probe_manager.py
-react-ui/src/components/video/StreamControl.tsx
-react-ui/src/components/video/VideoScreen.tsx
-react-ui/src/styles/app.css
-scripts/install_eva_083.py
-scripts/install_port_appliance.py
-scripts/update_bundle.sh
-scripts/vlm_vision_watchdog.py
-tests/test_api_dataflow_smoke.py
-tests/test_gunicorn_runtime_hooks.py
-tests/test_http_auth_routes.py
-tests/test_install_eva_083.py
-tests/test_lm_profiles.py
-tests/test_luxriot_inference_runtime.py
-tests/test_port_appliance_installer.py
-tests/test_probe_manager_attention.py
-tests/test_update_bundle.py
-tests/test_vlm_alert_contract.py
-tests/test_vlm_vision_gate.py
-tests/test_vlm_vision_health.py
-vlm_vision_health.py
+15ad09f fix: stabilize Georgia upgrade rehearsal runtime
+645f4f5 fix: bound rollup and operator-mode reads
 ```
 
-There are roughly 2.4k inserted lines across the full dirty tree. Do not interpret
-all of them as belonging only to the last installer task.
+The working tree is expected to be clean after committing this handoff update.
+No commit was pushed from this session.
 
 Other repositories:
 
@@ -391,9 +367,9 @@ missing_required_count=0
 
 The hash is safe to log; the underlying values and credentials are not.
 
-## Runtime stabilization already in the dirty tree
+## Runtime stabilization included in `15ad09f`
 
-The dirty tree also contains related product fixes from the current stabilization
+The commit also contains related product fixes from the current stabilization
 series:
 
 - L0 stopped synchronously re-embedding archive frames with SigLIP after every VLM
@@ -924,19 +900,91 @@ count advanced from 1 to 2, `live_segment_failed_count` stayed zero, and capture
 returned to snapshot. This is fresh evidence that the former fixed 67-second kill
 no longer aborts a progressing one-minute stream window.
 
+### Post-commit bounded-rollup and Operator Mode acceptance
+
+The remaining historical rollup cost came from rebuilding already durable target
+levels and from materializing all L0 temporal structures even when only a small
+number of missing higher-level buckets needed synthesis. Commit `645f4f5` makes
+durable read-only target buckets authoritative, reuses lower durable levels for
+L2/L3 reads, and materializes L0 structures only for missing L1 buckets. It retains
+the complete L0 source count for observability.
+
+Authenticated live 24-hour acceptance after deployment was:
+
+```text
+channel 112: L1 0.992 s, L2 1.019 s, L3 3.273 s
+channel 118: L1 2.967 s, L2 8.440 s, L3 7.692 s
+```
+
+Each channel returned exactly four L3 windows: three closed `llm/ready` windows
+and only the current open window as `pending_context/pending`. The false
+`refresh_pending` state is gone. A few historical closed L1/L2 gaps are still
+`deterministic/queued` and should be allowed to converge through the real scheduler
+rather than repaired by an ad-hoc database mutation.
+
+The same commit fixes the agent's attention-burst route and fail-closed behavior
+when a llama.cpp server ignores required tool choice. `live` is translated to the
+canonical closed depth `L0`; the Russian word `активность` no longer collides with
+the runtime-status intent; and completed attention reads terminate without falling
+through to unrelated L1 summaries. The output explains that attention bursts are a
+statistical visual-change marker rather than evidence of an event.
+
+Final authenticated Operator Mode acceptance used:
+
+```text
+На канале emu-1 (118) покажи самые сильные всплески визуальной активности за
+последний час. Это статистический сигнал, не делай выводов о событиях. Только чтение.
+```
+
+It completed in 11.355 seconds with exactly two successful calls:
+
+```text
+normalize_time_window(relative_range="последний час")
+list_attention_bursts(channel_id=118, target_level=L0) -> 0 bursts / 99 L0 windows
+```
+
+There were no summary calls, duplicate guards, tool errors or timeouts. The final
+Russian response truthfully said that the server marker found no sharp deviation
+and explicitly said this does not mean no events occurred. A separate cross-channel
+L3 acceptance completed in 46.361 seconds with one inventory and one bounded read
+per channel, no errors or repeats, and a compact Russian report covering both
+channels exactly once.
+
+Final relevant verification:
+
+```text
+tests/test_agent_video_summary_tools.py + tests/test_agent_tool_loop.py +
+tests/test_luxriot_inference_runtime.py: 360 passed, 16 subtests passed
+final agent rerun:                 150 passed, 16 subtests passed
+git show --check 645f4f5:         clean
+added-line credential scan:       no matches
+```
+
+These changes still fit the pinned tuktuk grammar: the attention lookup and
+per-channel rollups are bounded `DRILL` reads; the channel/time arguments come from
+operator text and server normalization; `L0` is a canonical closed enum; and no
+tool schema, intent group or result envelope changed. No grammar review question
+was required.
+
+After the final HUP, worker `2487723` is active under master `2014970` with strict
+readiness HTTP 200. Both user-scoped llama.cpp units and the watchdog timer are
+active with `NRestarts=0`; ports 1234 and 1235 return HTTP 200. About 11 GiB RAM is
+available. EVA itself has approximately 5 MiB swapped, so the host's allocated
+2.2 GiB swap is not evidence of active EVA swap pressure. The rehearsal `.env`
+hash remains unchanged.
+
 ### Immediate next stabilization work
 
-Before building the next updater bundle, inspect why the newest L3 windows remain
-semantic `partial`/pending on both live channels and verify they converge after the
-window closes. Then exercise the agent's intended L1-L3 consolidation scenarios,
-followed by end-to-end alert latency and probe availability as operator, agent and
-VLM secondary signal. Keep the slow Gunicorn HUP/SigLIP startup behavior as a
-separate reliability defect; do not mask it by weakening health checks or changing
-the preserved inference policy.
+First observe whether the remaining historical L1/L2 `queued` gaps converge through
+the scheduler and whether each open L3 window becomes ready after close. Then test
+end-to-end alert latency and probe availability as operator, agent and VLM secondary
+signal. Keep the slow Gunicorn HUP/SigLIP startup behavior as a separate reliability
+defect; do not mask it by weakening health checks or changing the preserved
+inference policy.
 
 ## Next work
 
-### 1. Preserve and review the dirty tree
+### 1. Confirm the committed baseline
 
 Start with:
 
@@ -946,8 +994,8 @@ git status --short
 git diff --check
 ```
 
-Review the installer/inference diff first. Do not clean unrelated stabilization
-changes.
+The expected result is a clean tree at the committed stabilization baseline. If
+new changes appear, inspect and preserve them.
 
 ### 2. Run the broader relevant tests
 
@@ -971,8 +1019,8 @@ The current Desktop wrapper may still point at an older checksummed archive. Do 
 edit a released tarball in place. Build a new bundle so its source commit, manifests,
 wheelhouse/runtime checksums and React dist agree.
 
-If the build requires a clean commit, first review the entire dirty diff with Sasha
-and commit intentionally; do not make a drive-by mega-commit without agreement.
+Build only from the reviewed committed source; do not fold unrelated later changes
+into the release archive.
 
 ### 4. Reset and perform the next manual Georgia rehearsal
 
@@ -1032,8 +1080,8 @@ Once the update path is proven, retest rather than assume the recent fixes:
 - Do not migrate Georgia to SigLIP2 by silently replacing an explicit existing
   embedding configuration. Bundled SigLIP assets may be installed for EVA use only
   under the reviewed append-only rules.
-- Do not merge or commit the entire dirty tree until the diff and rehearsal result
-  have been reviewed with Sasha.
+- Do not fold unrelated later work into the two reviewed stabilization commits or
+  into the rehearsal bundle.
 - Do not print `.env`, database DSNs, Evo passwords or LM API keys in logs/handoff.
 
 ## Permission/harness note
