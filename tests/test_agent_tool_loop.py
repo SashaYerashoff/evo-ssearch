@@ -239,6 +239,13 @@ class AgentToolLoopTests(unittest.TestCase):
         self.assertIn("calibrate_probe_from_archive", probe_tools)
         self.assertNotIn("get_video_summaries", probe_tools)
         self.assertEqual(
+            names(
+                "Проверь, какие пробы настроены на каналах 112 и 118, "
+                "включены ли они и были ли срабатывания за 24 часа"
+            ),
+            {"list_probes"},
+        )
+        self.assertEqual(
             names("Hi, Protocol: Deploy, target 8 channels"),
             {
                 "start_deployment",
@@ -1535,6 +1542,77 @@ class AgentToolLoopTests(unittest.TestCase):
         )
         self.assertIn("не означает, что событий не было", zero_text)
         self.assertNotIn("событий нет", zero_text.casefold())
+
+    def test_probe_inventory_read_uses_grounded_receipt_without_final_lm_pass(self):
+        result = {
+            "count": 2,
+            "since_hours": 24,
+            "probes": [
+                {
+                    "id": "probe-118",
+                    "name": "Vehicle drift",
+                    "channel_id": 118,
+                    "enabled": True,
+                    "bookmark": False,
+                    "pos_floor": 0.1,
+                    "margin": 0.0,
+                    "hit_count_24h": 1497,
+                },
+                {
+                    "id": "probe-112",
+                    "name": "Person in headphones",
+                    "channel_id": 112,
+                    "enabled": True,
+                    "bookmark": False,
+                    "pos_floor": 0.05,
+                    "margin": 0.01,
+                    "hit_count_24h": 59,
+                },
+                {
+                    "id": "probe-119",
+                    "name": "Outside requested scope",
+                    "channel_id": 119,
+                    "enabled": True,
+                    "bookmark": False,
+                    "pos_floor": 0.2,
+                    "margin": 0.02,
+                    "hit_count_24h": 8,
+                },
+            ],
+        }
+        runner = AgentRunner.__new__(AgentRunner)
+        runner.store = _FakeStore()
+        runner._lm_client = _FakeLMClient(
+            tool_rounds=1,
+            tool_name="list_probes",
+        )
+        runner._tools = _FakeTools(result=result)
+        runner._ps = object()
+        runner._ds = object()
+        runner._lxm = object()
+
+        events = [
+            json.loads(item.removeprefix("data: ").strip())
+            for item in runner.stream_chat(
+                "session-1",
+                "Проверь без изменений, какие семантические пробы настроены на каналах "
+                "112 и 118, включены ли они и были ли срабатывания за 24 часа. "
+                "Только чтение.",
+            )
+            if item.startswith("data: ")
+        ]
+
+        self.assertEqual(runner._tools.call_args, [("list_probes", {})])
+        self.assertIsNone(runner._lm_client.final_messages)
+        final_text = next(
+            event["content"] for event in events if event.get("type") == "text"
+        )
+        self.assertIn("CH 112", final_text)
+        self.assertIn("CH 118", final_text)
+        self.assertNotIn("CH 119", final_text)
+        self.assertIn("1497 сохранённых совпадений", final_text)
+        self.assertIn("не подтверждает событие", final_text)
+        self.assertNotIn("VLM-ошиб", final_text)
 
     def test_operator_mode_executes_only_relevant_tool_if_server_ignores_required(self):
         class IgnoringRequiredLM(_FakeLMClient):

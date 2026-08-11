@@ -17504,6 +17504,50 @@ def _probe_channel_group_scope_error(
     return None
 
 
+def _compact_probe_for_list_response(raw_probe: Mapping[str, Any]) -> Dict[str, Any]:
+    """Keep one card image while returning score-only probe history.
+
+    Probe hits are persisted with thumbnails so a later bookmark/archive write
+    still has its evidence.  Returning all 30 copies from ``/probes/list`` made
+    the monitoring board download and JSON-decode hundreds of kilobytes for
+    only a couple of probes.  The board needs the latest image plus the P/N/M
+    series; the remaining thumbnails stay in the store and are deliberately
+    omitted only from this collection response.
+    """
+
+    probe = copy.deepcopy(dict(raw_probe))
+    recent_raw = probe.get("recent_hits")
+    if not isinstance(recent_raw, Sequence) or isinstance(
+        recent_raw,
+        (str, bytes, bytearray),
+    ):
+        return probe
+
+    last_hit = probe.get("last_hit")
+    last_has_image = bool(
+        isinstance(last_hit, Mapping)
+        and any(
+            str(last_hit.get(key) or "").strip()
+            for key in ("thumbnail", "image_url", "image_path", "path")
+        )
+    )
+    compacted: List[Any] = []
+    for index, raw_hit in enumerate(recent_raw):
+        if not isinstance(raw_hit, Mapping):
+            compacted.append(copy.deepcopy(raw_hit))
+            continue
+        hit = copy.deepcopy(dict(raw_hit))
+        # Preserve a single fallback card image when legacy data has no
+        # explicit last_hit.  All score/history metadata remains available.
+        if last_has_image or index > 0:
+            hit.pop("thumbnail", None)
+        hit.pop("clip_vec", None)
+        hit.pop("embedding", None)
+        compacted.append(hit)
+    probe["recent_hits"] = compacted
+    return probe
+
+
 @app.route('/probes/list', methods=['GET'])
 def probes_list():
     try:
@@ -17536,7 +17580,7 @@ def probes_list():
         if expired_temporary:
             expired_temporary_count += 1
             continue
-        active_probes.append(probe)
+        active_probes.append(_compact_probe_for_list_response(probe))
     probes = active_probes
     try:
         channel_groups = _visible_probe_channel_groups(context)

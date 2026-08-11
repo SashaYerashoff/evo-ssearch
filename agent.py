@@ -10442,6 +10442,12 @@ def _select_relevant_tool_schemas(
         # multi-channel search; the final response must ask for the time.
         allowed_names.clear()
 
+    if context.get("probe_inventory_only"):
+        # A status/inventory question is a single MAP read.  Hiding mutation
+        # and calibration tools keeps a small local head from expanding a
+        # harmless audit into an unrelated tuning workflow.
+        allowed_names.intersection_update({"list_probes"})
+
     # A broad video request without a named channel must inventory scope first.
     # Once the inventory result is remembered, detail tools become available in
     # the same turn.
@@ -10622,6 +10628,34 @@ def _seed_turn_tool_context(user_text: Any) -> Dict[str, Any]:
         elif requested_depth in {"l1", "l2", "l3"}:
             context["requested_video_depth"] = requested_depth.upper()
     context["tool_intents"] = _classify_tool_intents(routing_text, context)
+    if context["tool_intents"] == ["probe_management"]:
+        inventory_language = bool(
+            re.search(
+                r"\b(?:list|show|check|configured|enabled|disabled|status|hits?)\b|"
+                r"(?:покаж|проверь|провер|какие|список|настроен|включен|выключен|"
+                r"статус|срабатыван)",
+                normalized_unicode,
+            )
+        )
+        tuning_language = bool(
+            re.search(
+                r"\b(?:create|add|delete|remove|update|change|edit|tune|calibrate|"
+                r"apply|threshold)\b|"
+                r"(?:созда|добав|удал|обнов|измен|редакт|настро[йи]|калибр|примен|порог)",
+                normalized_unicode,
+            )
+        )
+        explicit_read_only = bool(
+            re.search(
+                r"\b(?:read[ -]?only|only\s+read(?:ing)?|do\s+not\s+change|"
+                r"without\s+changes?)\b|"
+                r"(?:только\s+чтени|без\s+изменени|ничего\s+не\s+меня)",
+                normalized_unicode,
+            )
+        )
+        context["probe_inventory_only"] = bool(
+            inventory_language and (explicit_read_only or not tuning_language)
+        )
     if "archive_research" in context["tool_intents"]:
         archive_query = _extract_archive_search_query(routing_text)
         if archive_query:
@@ -12536,6 +12570,28 @@ def _remember_turn_tool_result(tool_name: str, result: Any, context: Dict[str, A
         }
         return
 
+    if tool_name == "list_probes":
+        context["probe_inventory_receipt"] = {
+            "count": _opt_int(result.get("count")) or 0,
+            "since_hours": result.get("since_hours"),
+            "probes": [
+                {
+                    "id": row.get("id"),
+                    "name": row.get("name"),
+                    "channel_id": row.get("channel_id"),
+                    "enabled": row.get("enabled"),
+                    "severity": row.get("severity"),
+                    "bookmark": row.get("bookmark"),
+                    "pos_floor": row.get("pos_floor"),
+                    "margin": row.get("margin"),
+                    "hit_count_24h": row.get("hit_count_24h"),
+                }
+                for row in (result.get("probes") or [])[:24]
+                if isinstance(row, Mapping)
+            ],
+        }
+        return
+
     if tool_name == "search_archive":
         context["archive_search_completed"] = True
         context["archive_search_query"] = str(result.get("query") or "").strip()
@@ -12910,6 +12966,37 @@ def _record_turn_signal_ledger(
                     if isinstance(row, Mapping)
                 ],
                 "note": "Statistical attention signal; not semantic proof.",
+            },
+        )
+        return
+
+    if tool_name == "list_probes":
+        probes = result.get("probes") if isinstance(result.get("probes"), list) else []
+        _signal_ledger_append(
+            ledger,
+            "semantic_signals",
+            {
+                "tool": tool_name,
+                "since_hours": result.get("since_hours"),
+                "count": result.get("count"),
+                "probes": [
+                    {
+                        "id": row.get("id"),
+                        "name": row.get("name"),
+                        "channel_id": row.get("channel_id"),
+                        "enabled": row.get("enabled"),
+                        "bookmark": row.get("bookmark"),
+                        "pos_floor": row.get("pos_floor"),
+                        "margin": row.get("margin"),
+                        "hit_count_24h": row.get("hit_count_24h"),
+                    }
+                    for row in probes[:12]
+                    if isinstance(row, Mapping)
+                ],
+                "note": (
+                    "Persisted semantic-hit inventory only; not live P/N/M, "
+                    "stream health, VLM health, or visual proof."
+                ),
             },
         )
         return
@@ -13755,6 +13842,119 @@ def _format_attention_burst_result(
     if receipt.get("truncated"):
         parts.append("Only the top of the ranked list is shown.")
     return "\n\n".join(part for part in parts if part)
+
+
+def _format_probe_inventory_result(
+    context: Mapping[str, Any],
+    user_text: Any,
+) -> str:
+    """Render the exact probe inventory without inventing runtime health."""
+
+    receipt = (
+        context.get("probe_inventory_receipt")
+        if isinstance(context.get("probe_inventory_receipt"), Mapping)
+        else {}
+    )
+    rows = [
+        dict(row)
+        for row in (receipt.get("probes") or [])
+        if isinstance(row, Mapping)
+    ]
+    query = str(user_text or "")
+    russian = bool(re.search(r"[а-яё]", query, re.IGNORECASE))
+    requested_channel_ids: set[int] = set()
+    for match in re.finditer(
+        r"(?:\bchannels?|\bch|\bканал\w*)\s*#?(\d{1,9})"
+        r"((?:\s*(?:,|and|и)\s*#?\d{1,9})*)",
+        query,
+        flags=re.IGNORECASE,
+    ):
+        requested_channel_ids.add(int(match.group(1)))
+        requested_channel_ids.update(
+            int(value) for value in re.findall(r"\d{1,9}", match.group(2) or "")
+        )
+    if requested_channel_ids:
+        rows = [
+            row
+            for row in rows
+            if _opt_int(row.get("channel_id")) in requested_channel_ids
+        ]
+
+    since_hours = _opt_float(receipt.get("since_hours")) or 24.0
+    since_label = f"{since_hours:g} ч" if russian else f"{since_hours:g}h"
+    if not rows:
+        if russian:
+            scope = (
+                "На каналах "
+                + ", ".join(str(item) for item in sorted(requested_channel_ids))
+                if requested_channel_ids
+                else "В запрошенном наборе"
+            )
+            return (
+                f"{scope} настроенных семантических проб не найдено. "
+                "Это означает только отсутствие записей конфигурации, а не отсутствие событий."
+            )
+        scope = (
+            "channels "
+            + ", ".join(str(item) for item in sorted(requested_channel_ids))
+            if requested_channel_ids
+            else "the requested scope"
+        )
+        return (
+            f"No configured semantic probes were found for {scope}. "
+            "That means only that no probe definitions were returned, not that no events occurred."
+        )
+
+    enabled_count = sum(row.get("enabled") is True for row in rows)
+    lead = (
+        f"Настроенных семантических проб: {len(rows)}; "
+        f"включено: {enabled_count}."
+        if russian
+        else (
+            f"I found {len(rows)} configured semantic probes; "
+            f"{enabled_count} of {len(rows)} are enabled."
+        )
+    )
+
+    lines: List[str] = []
+    for row in rows[:12]:
+        channel_id = _opt_int(row.get("channel_id"))
+        name = str(row.get("name") or row.get("id") or "unnamed probe").strip()
+        enabled = row.get("enabled") is True
+        hit_count = max(0, int(_opt_int(row.get("hit_count_24h")) or 0))
+        pos_floor = _opt_float(row.get("pos_floor"))
+        margin = _opt_float(row.get("margin"))
+        thresholds = []
+        if pos_floor is not None:
+            thresholds.append(f"P≥{pos_floor:g}")
+        if margin is not None:
+            thresholds.append(f"M≥{margin:g}")
+        threshold_text = ", ".join(thresholds) if thresholds else "—"
+        if russian:
+            lines.append(
+                f"- CH {channel_id} — «{name}»: "
+                f"{'включена' if enabled else 'выключена'}; за {since_label} — "
+                f"{hit_count} сохранённых совпадений; пороги {threshold_text}; "
+                f"закладки {'включены' if row.get('bookmark') is True else 'выключены'}."
+            )
+        else:
+            lines.append(
+                f"- CH {channel_id} — “{name}”: "
+                f"{'enabled' if enabled else 'disabled'}; {hit_count} persisted matches "
+                f"over {since_label}; thresholds {threshold_text}; bookmarks "
+                f"{'on' if row.get('bookmark') is True else 'off'}."
+            )
+
+    caveat = (
+        "Это статистика сохранённых semantic-hit записей. Она годится как дополнительный сигнал, "
+        "но сама по себе не подтверждает событие и ничего не говорит о текущем здоровье VLM или стрима."
+        if russian
+        else (
+            "These are persisted semantic-hit counts. They are useful as a secondary signal, "
+            "but do not prove an event or report current VLM/stream health."
+        )
+    )
+    return "\n\n".join((lead, "\n".join(lines), caveat))
 
 
 def _archive_research_response_needs_recovery(
@@ -15711,6 +15911,14 @@ class AgentRunner:
                                   "content": json.dumps(result_for_model, default=str)}
                     _remember_turn_tool_result(tc.name, result, turn_tool_context)
                     _record_turn_signal_ledger(turn_signal_ledger, tc.name, result_for_model)
+                    if (
+                        tc.name == "list_probes"
+                        and turn_tool_context.get("probe_inventory_only")
+                    ):
+                        # The requested MAP read is complete.  Do not spend two
+                        # more local-model passes asking whether to continue and
+                        # then paraphrasing the same bounded receipt.
+                        stop_tool_loop_after_batch = True
                     ui_result = _tool_result_for_ui(tc.name, result)
                     ui_effects = (
                         derive_agent_ui_effects(
@@ -15933,6 +16141,14 @@ class AgentRunner:
             and turn_tool_context.get("attention_bursts_completed")
         ):
             deterministic_final_text = _format_attention_burst_result(
+                turn_tool_context,
+                user_text,
+            )
+        elif (
+            turn_tool_context.get("probe_inventory_only")
+            and turn_tool_context.get("probe_inventory_receipt")
+        ):
+            deterministic_final_text = _format_probe_inventory_result(
                 turn_tool_context,
                 user_text,
             )

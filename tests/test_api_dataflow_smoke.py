@@ -326,6 +326,56 @@ class ApiDataflowSmokeTests(unittest.TestCase):
             "siglip2" if "siglip2" in config.CLIP_MODEL.lower() else "openai_clip",
         )
 
+    def test_probe_list_keeps_one_card_image_but_compacts_recent_hit_history(self) -> None:
+        store = type(
+            "ProbeStore",
+            (),
+            {
+                "list_probes": staticmethod(
+                    lambda: [
+                        {
+                            "id": "probe-with-history",
+                            "channel_id": 7,
+                            "last_hit": {
+                                "timestamp_ms": 3_000,
+                                "pos_score": 0.8,
+                                "thumbnail": "latest-card-image",
+                            },
+                            "recent_hits": [
+                                {
+                                    "timestamp_ms": 3_000,
+                                    "pos_score": 0.8,
+                                    "thumbnail": "duplicate-latest-image",
+                                    "clip_vec": [0.1, 0.2],
+                                },
+                                {
+                                    "timestamp_ms": 2_000,
+                                    "pos_score": 0.7,
+                                    "thumbnail": "older-image",
+                                    "embedding": [0.3, 0.4],
+                                },
+                            ],
+                        }
+                    ]
+                )
+            },
+        )()
+
+        with patch("oldapp.probes_store", store):
+            response = self.client.get("/probes/list")
+
+        self.assertEqual(response.status_code, 200)
+        probe = response.get_json()["probes"][0]
+        self.assertEqual(probe["last_hit"]["thumbnail"], "latest-card-image")
+        self.assertEqual(
+            [hit["pos_score"] for hit in probe["recent_hits"]],
+            [0.8, 0.7],
+        )
+        for hit in probe["recent_hits"]:
+            self.assertNotIn("thumbnail", hit)
+            self.assertNotIn("clip_vec", hit)
+            self.assertNotIn("embedding", hit)
+
     def test_expired_probe_lineage_omits_heavy_runtime_thumbnails(self) -> None:
         payload = _expired_stored_probe_lineage_payload(
             {
