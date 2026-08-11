@@ -184,7 +184,7 @@ export function ArchiveScreen({
       if (requestSeq.current !== seq) return
       const results = searchResult.items
       setSearchCoverage(searchResult.coverage)
-      setItems(results); setNote(`${results.length} matches · “${q}”`)
+      setItems(results); setNote('')
       setScoreSliderPercent(0)
       setNextOffset(0); setTotal(results.length); setHasMore(false); setResultMode('search')
       setAppliedFilters({ ...filters }); setSelected(null)
@@ -414,7 +414,6 @@ export function ArchiveScreen({
     return () => observer.disconnect()
   }, [filtersDirty, hasMore, resultMode, runLoad])
 
-  const q = textValue.trim()
   const scoreLabel = !scoreRange.hasScores
     ? 'No scores'
     : !scoreRange.hasSpread
@@ -536,7 +535,7 @@ export function ArchiveScreen({
           {(textSearchPending || showArchiveNote || filtersDirty) && (
             <div className="archive-results-context">
               {textSearchPending
-                ? `· Searching archive for “${q}”…`
+                ? '· Searching archive…'
                 : (showArchiveNote ? `· ${note}` : '')}
               {filtersDirty ? ' · Filters changed — load to apply' : ''}
             </div>
