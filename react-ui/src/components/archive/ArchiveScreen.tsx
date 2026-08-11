@@ -411,6 +411,7 @@ export function ArchiveScreen({
   const filtersDirty = !!appliedFilters && JSON.stringify(appliedFilters) !== JSON.stringify(filters)
   const archiveMatchCount = resultMode === 'list' ? total : items.length
   const normalizedTextValue = textValue.trim()
+  const textResultsFiltered = resultMode === 'search' && appliedTextQuery !== null
   const textFilterApplied = resultMode === 'search'
     && appliedTextQuery !== null
     && normalizedTextValue === appliedTextQuery
@@ -565,6 +566,7 @@ export function ArchiveScreen({
             <strong>{items.length.toLocaleString()}</strong>
             <span>loaded</span>
           </div>
+          {textResultsFiltered && <span className="archive-filtered-flag">Filtered</span>}
           {(textSearchPending || showArchiveNote || filtersDirty) && (
             <div className="archive-results-context">
               {textSearchPending
