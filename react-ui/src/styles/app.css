@@ -1651,8 +1651,7 @@
   background: linear-gradient(90deg, transparent, color-mix(in srgb, var(--surface) 74%, transparent) 13px);
 }
 .vid-review-scroll, .vid-settings-scroll { align-items: flex-end; }
-.vid-tb-row .wfield { gap: 5px; }
-.vid-tb-row .wfield > label { font-size: 10px; text-transform: uppercase; letter-spacing: .05em; }
+.vid-tb-row .wfield { gap: 0; }
 .vid-tb-row .wfield.ch { width: 240px; flex: 0 1 240px; min-width: 150px; }  /* same compact footprint as Archive's channel chip */
 .vid-tb-row .wfield.batch { width: 74px; flex: 0 0 auto; }
 .vid-tb-row .wfield.xs { width: 76px; flex: 0 0 auto; }
@@ -1694,8 +1693,7 @@
 .vid-control-group.inference { width: 200px; flex: 0 1 200px; min-width: 140px; }
 .vid-control-group.actions { flex: 0 0 auto; margin-left: 0; }
 .vid-control-fields { display: flex; align-items: flex-end; gap: 9px; }
-.vid-control-group .wfield { gap: 5px; min-width: 0; }
-.vid-control-group .wfield > label { color: var(--text-mut); font-size: 10px; letter-spacing: .05em; text-transform: uppercase; }
+.vid-control-group .wfield { gap: 0; min-width: 0; }
 .vid-control-group.source .wfield, .vid-control-group.inference .wfield { width: 100%; }
 .vid-control-group.sampling .wfield.batch { width: 74px; flex: 0 0 74px; }
 .vid-control-group.sampling .wfield.xs { width: 76px; min-width: 76px; flex: 0 0 76px; }
@@ -1710,10 +1708,7 @@
   display: flex; align-items: flex-end; gap: 10px; flex-wrap: wrap;
   padding-top: 9px; border-top: 1px solid var(--line);
 }
-.vid-lens-custom .wfield { width: 210px; gap: 5px; }
-.vid-lens-custom .wfield > label {
-  color: var(--text-mut); font-size: 10px; text-transform: uppercase; letter-spacing: .05em;
-}
+.vid-lens-custom .wfield { width: 210px; gap: 0; }
 .vid-lens-custom input { height: 30px; box-sizing: border-box; padding: 0 12px; border-radius: 999px; font-size: 12.5px; }
 
 .vid-row { display: flex; gap: 8px; align-items: stretch; }

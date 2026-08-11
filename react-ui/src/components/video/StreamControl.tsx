@@ -122,28 +122,25 @@ export function StreamControl(p: {
         <div className="vid-settings-toolbar">
           <div className="toolbar-scroll-rail vid-settings-scroll">
           <section className="vid-control-group source">
-            <div className="vid-control-group-title">{t('video.source')}</div>
-            <div className="wfield ch"><label>{t('video.channel')}</label>
+            <div className="wfield ch">
               <div className="vid-row">
-                <Dropdown variant="chip" value={String(p.settingsChannelId ?? '')} onChange={(v) => p.onSettingsChannel(Number(v))}
+                <Dropdown variant="chip" title={t('video.channel')} value={String(p.settingsChannelId ?? '')} onChange={(v) => p.onSettingsChannel(Number(v))}
                   options={p.channels.map((c) => ({ value: String(c.id), label: c.title }))} />
               </div>
             </div>
           </section>
           <section className="vid-control-group sampling">
-            <div className="vid-control-group-title">{t('video.sampling')}</div>
             <div className="vid-control-fields">
-              <div className="wfield batch"><label>{t('video.batch')}</label>
-                <Dropdown variant="chip" value={p.batch} onChange={p.onBatch} options={BATCHES.map((b) => ({ value: b, label: b }))} />
+              <div className="wfield batch">
+                <Dropdown variant="chip" title={t('video.batch')} value={p.batch} onChange={p.onBatch} options={BATCHES.map((b) => ({ value: b, label: b }))} />
               </div>
-              <div className="wfield xs"><label>{t('video.every')}</label>
-                <input type="number" min={0.2} max={300} step={0.1} value={p.every} onChange={(e) => p.onEvery(e.target.value)} />
+              <div className="wfield xs">
+                <input aria-label={t('video.every')} title={t('video.every')} type="number" min={0.2} max={300} step={0.1} value={p.every} onChange={(e) => p.onEvery(e.target.value)} />
               </div>
             </div>
           </section>
           </div>
           <section className="vid-control-group actions">
-            <div className="vid-control-group-title">{t('video.runtime')}</div>
             <div className="vid-tb-actions">
               <ToolbarActionMenu actions={[
                 {
@@ -211,23 +208,25 @@ export function StreamControl(p: {
         <div className="vid-lens-stack">
           <div className="vid-tb-row vid-lens-row">
             <div className="toolbar-scroll-rail vid-review-scroll">
-            <div className="wfield ch"><label>{t('video.channel')}</label>
+            <div className="wfield ch">
               <div className="vid-row">
-                <Dropdown variant="chip" value={String(p.reviewChannelId ?? '')} onChange={(v) => p.onReviewChannel(Number(v))}
+                <Dropdown variant="chip" title={t('video.channel')} value={String(p.reviewChannelId ?? '')} onChange={(v) => p.onReviewChannel(Number(v))}
                   options={p.channels.map((c) => ({ value: String(c.id), label: c.title }))} />
               </div>
             </div>
-            <div className="wfield hist"><label>{t('video.period')}</label>
+            <div className="wfield hist">
               <Dropdown
                 variant="chip"
+                title={t('video.period')}
                 value={p.period}
                 onChange={(value) => p.onPeriod(value as SummaryPeriod)}
                 options={periods.map((item) => ({ value: item.v, label: item.label }))}
               />
             </div>
-            <div className="wfield resolution"><label>{t('video.resolution')}</label>
+            <div className="wfield resolution">
               <Dropdown
                 variant="chip"
+                title={t('video.resolution')}
                 value={p.resolution}
                 onChange={(value) => p.onResolution(value as SummaryResolution)}
                 options={resolutions.map((item) => ({ value: item.v, label: item.label }))}
@@ -259,11 +258,11 @@ export function StreamControl(p: {
           </div>
           {p.period === 'custom' && (
             <div className="vid-lens-custom">
-              <div className="wfield"><label>{t('video.from')}</label>
-                <input type="datetime-local" value={p.customFrom} onChange={(event) => p.onCustomFrom(event.target.value)} />
+              <div className="wfield">
+                <input aria-label={t('video.from')} title={t('video.from')} type="datetime-local" value={p.customFrom} onChange={(event) => p.onCustomFrom(event.target.value)} />
               </div>
-              <div className="wfield"><label>{t('video.to')}</label>
-                <input type="datetime-local" value={p.customTo} onChange={(event) => p.onCustomTo(event.target.value)} />
+              <div className="wfield">
+                <input aria-label={t('video.to')} title={t('video.to')} type="datetime-local" value={p.customTo} onChange={(event) => p.onCustomTo(event.target.value)} />
               </div>
             </div>
           )}

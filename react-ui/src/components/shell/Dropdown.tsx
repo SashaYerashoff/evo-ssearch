@@ -26,7 +26,7 @@ export function Dropdown({ value, options, onChange, icon, variant = 'field', ti
   const sel = options.find((o) => o.value === value)
   return (
     <div className={`dd dd-${variant}`} ref={ref}>
-      <button type="button" className="dd-btn" disabled={disabled} title={title} onClick={() => !disabled && setOpen((v) => !v)}>
+      <button type="button" className="dd-btn" disabled={disabled} title={title} aria-label={title} onClick={() => !disabled && setOpen((v) => !v)}>
         {icon}<span className="dd-val">{sel?.label ?? value}</span><IconChevronDown size={13} className="dd-chev" />
       </button>
       {open && (
