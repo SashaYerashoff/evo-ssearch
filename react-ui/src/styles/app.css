@@ -1653,24 +1653,22 @@
 .vid-review-scroll, .vid-settings-scroll { align-items: flex-end; }
 .vid-tb-row .wfield { gap: 5px; }
 .vid-tb-row .wfield > label { font-size: 10px; text-transform: uppercase; letter-spacing: .05em; }
-.vid-tb-row .wfield.ch { width: 320px; flex: 0 1 320px; min-width: 180px; }  /* capped, but may shrink when the agent squeezes the console */
-.vid-tb-row .wfield.batch { width: 92px; flex: 0 0 auto; }
-.vid-tb-row .wfield.xs { width: 84px; flex: 0 0 auto; }
-.vid-tb-row .wfield.model { width: 220px; flex: 0 1 220px; min-width: 150px; }
-.vid-tb-row .wfield.hist { width: 168px; }
+.vid-tb-row .wfield.ch { width: 240px; flex: 0 1 240px; min-width: 150px; }  /* same compact footprint as Archive's channel chip */
+.vid-tb-row .wfield.batch { width: 74px; flex: 0 0 auto; }
+.vid-tb-row .wfield.xs { width: 76px; flex: 0 0 auto; }
+.vid-tb-row .wfield.model { width: 200px; flex: 0 1 200px; min-width: 140px; }
+.vid-tb-row .wfield.hist { width: 150px; }
 .vid-tb-row .wfield.sm { width: 112px; }
-.vid-tb-row .wfield.resolution { width: 184px; flex: 0 1 184px; min-width: 150px; }
+.vid-tb-row .wfield.resolution { width: 160px; flex: 0 1 160px; min-width: 130px; }
 .vid-lens-row .wfield.hist .dd-pop { min-width: 210px; }
 .vid-lens-row .wfield.resolution .dd-pop { min-width: 220px; }
 /* one uniform control height across the whole row */
 .vid-tb-row .wfield input,
 .vid-tb-row .dd-btn,
-.vid-tb-row .mon-btn,
 .vid-tb-row .vid-row > .mon-icobtn {
-  height: 38px; box-sizing: border-box; padding-top: 0; padding-bottom: 0;
+  height: 30px; box-sizing: border-box; padding: 0 12px; font-size: 12.5px;
 }
 .vid-tb-row .wfield input,
-.vid-tb-row .mon-btn,
 .vid-tb-row .vid-row > .mon-icobtn { border-radius: 999px; }
 
 .vid-lens-stack { width: 100%; min-width: 0; display: flex; flex-direction: column; gap: 9px; }
@@ -1691,22 +1689,20 @@
   min-width: 0; display: flex; flex-direction: column; justify-content: flex-end; gap: 7px;
   padding: 0; border: 0; border-radius: 0; background: transparent;
 }
-.vid-control-group.source { width: 320px; flex: 0 1 320px; min-width: 180px; }
-.vid-control-group.sampling { flex: 0 0 185px; }
-.vid-control-group.inference { width: 220px; flex: 0 1 220px; min-width: 150px; }
+.vid-control-group.source { width: 240px; flex: 0 1 240px; min-width: 150px; }
+.vid-control-group.sampling { flex: 0 0 159px; }
+.vid-control-group.inference { width: 200px; flex: 0 1 200px; min-width: 140px; }
 .vid-control-group.actions { flex: 0 0 auto; margin-left: 0; }
 .vid-control-fields { display: flex; align-items: flex-end; gap: 9px; }
 .vid-control-group .wfield { gap: 5px; min-width: 0; }
 .vid-control-group .wfield > label { color: var(--text-mut); font-size: 10px; letter-spacing: .05em; text-transform: uppercase; }
 .vid-control-group.source .wfield, .vid-control-group.inference .wfield { width: 100%; }
-.vid-control-group.sampling .wfield.batch { width: 92px; flex: 0 0 92px; }
-.vid-control-group.sampling .wfield.xs { width: 84px; min-width: 84px; flex: 0 0 84px; }
+.vid-control-group.sampling .wfield.batch { width: 74px; flex: 0 0 74px; }
+.vid-control-group.sampling .wfield.xs { width: 76px; min-width: 76px; flex: 0 0 76px; }
 .vid-control-group .wfield input,
 .vid-control-group .dd-btn,
-.vid-control-group .mon-btn,
-.vid-control-group .vid-row > .mon-icobtn { height: 38px; box-sizing: border-box; padding-top: 0; padding-bottom: 0; }
+.vid-control-group .vid-row > .mon-icobtn { height: 30px; box-sizing: border-box; padding: 0 12px; font-size: 12.5px; }
 .vid-control-group .wfield input,
-.vid-control-group .mon-btn,
 .vid-control-group .vid-row > .mon-icobtn { border-radius: 999px; }
 .vid-control-group.actions .vid-tb-actions { align-items: center; }
 .vid-control-group.actions .mon-btn { white-space: nowrap; }
@@ -1718,9 +1714,7 @@
 .vid-lens-custom .wfield > label {
   color: var(--text-mut); font-size: 10px; text-transform: uppercase; letter-spacing: .05em;
 }
-.vid-lens-custom input, .vid-lens-custom .mon-btn {
-  height: 38px; box-sizing: border-box; padding-top: 0; padding-bottom: 0; border-radius: 999px;
-}
+.vid-lens-custom input { height: 30px; box-sizing: border-box; padding: 0 12px; border-radius: 999px; font-size: 12.5px; }
 
 .vid-row { display: flex; gap: 8px; align-items: stretch; }
 .vid-row > select, .vid-row > .mon-btn, .vid-row > .dd { flex: 1; min-width: 0; }
