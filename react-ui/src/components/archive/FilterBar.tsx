@@ -170,6 +170,7 @@ export function FilterBar({
     <div className="filter-block">
       <span className="atp-glabel"><IconFilter size={13} /> Filters</span>
       <div className="filter-bar">
+      <div className="filter-bar-scroll">
       <ChannelPicker
         channels={channels}
         selected={selectedChannels}
@@ -232,6 +233,7 @@ export function FilterBar({
 
       <Dropdown variant="chip" icon={<IconArrowsSort size={15} />} value={filters.sortBy || 'similarity'} onChange={(v) => onChange({ sortBy: v })}
         options={[{ value: 'similarity', label: 'Similarity' }, { value: 'time', label: 'Newest' }]} />
+      </div>
 
       <div className="filter-bar-actions">
         <ToolbarActionMenu actions={[{

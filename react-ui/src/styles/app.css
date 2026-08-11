@@ -435,14 +435,16 @@
    Same plain header across Archive / Video / Monitoring. */
 .atp-tabrow {
   display: flex; align-items: center; gap: 6px; min-height: var(--atp-tabrow-height);
-  padding: 0 10px; min-width: 0; overflow: hidden;
+  padding: 0 10px; min-width: 0; overflow-x: auto; overflow-y: hidden;
   background: transparent;
+  scrollbar-width: none; -ms-overflow-style: none; overscroll-behavior-inline: contain;
 }
+.atp-tabrow::-webkit-scrollbar { display: none; }
 .tool-tabs.with-leading .atp-tabrow { margin-left: calc(var(--menu-rail-width) + 8px); }
 .atp-tab {
   position: relative; top: 0; z-index: 2;
   display: flex; align-items: center; gap: 7px; padding: 6px 11px;
-  min-width: 96px; max-width: 310px; flex: 0 1 auto;
+  min-width: 96px; max-width: 310px; flex: 0 0 auto;
   text-align: left; cursor: pointer; overflow: hidden;
   background: color-mix(in srgb, var(--surface-raised) 22%, transparent);
   border: 1px solid color-mix(in srgb, var(--line) 46%, transparent);
@@ -621,10 +623,22 @@
 .dr-error { margin-top: 12px; color: var(--danger); font-size: 11.5px; }
 @container (max-width: 620px) { .dr-cols { grid-template-columns: 1fr; } }
 
-/* filter bar */
-.filter-block { display: flex; flex-direction: column; gap: 8px; width: 100%; }
-.filter-bar { display: flex; align-items: center; gap: 9px; flex-wrap: wrap; width: 100%; }
-.filter-bar-actions { display: flex; align-items: center; gap: 8px; margin-left: auto; }
+/* Archive filters stay on one line. When the docked Agent narrows the workspace,
+   only the filter rail scrolls; actions remain visible and panel height is stable. */
+.filter-block { display: flex; flex-direction: column; gap: 8px; width: 100%; min-width: 0; }
+.filter-bar { display: flex; align-items: center; gap: 10px; flex-wrap: nowrap; width: 100%; min-width: 0; }
+.filter-bar-scroll {
+  display: flex; align-items: center; gap: 9px; flex: 1 1 auto; min-width: 0;
+  overflow-x: auto; overflow-y: hidden; padding: 1px 0;
+  scrollbar-width: none; -ms-overflow-style: none; overscroll-behavior-inline: contain;
+}
+.filter-bar-scroll::-webkit-scrollbar { display: none; }
+.filter-bar-scroll > * { flex: 0 0 auto; }
+.filter-bar-actions {
+  position: relative; z-index: 2; display: flex; align-items: center; gap: 8px;
+  flex: 0 0 auto; margin-left: 0; padding-left: 10px;
+  background: linear-gradient(90deg, transparent, color-mix(in srgb, var(--surface) 74%, transparent) 13px);
+}
 .archive-channel-picker { position: relative; display: inline-flex; }
 .archive-channel-picker-toggle {
   min-width: 150px; max-width: 240px; display: inline-flex; align-items: center; gap: 7px;
