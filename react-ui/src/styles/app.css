@@ -320,21 +320,34 @@
   padding: 0; border: 0; border-radius: 0; background: transparent; pointer-events: auto;
 }
 .menu-rail-trigger {
-  position: relative; z-index: 3;
+  position: relative; z-index: 3; isolation: isolate; overflow: hidden;
   width: var(--menu-rail-width); height: var(--atp-panel-content-height); padding: 6px 2px;
   display: grid; place-items: center;
-  border: 1px solid color-mix(in srgb, var(--accent-line) 72%, var(--line-2)); border-left: 0;
-  border-radius: 0 9px 9px 0;
-  background: color-mix(in srgb, var(--accent) 11%, var(--control));
+  border: 0; border-radius: 0 11px 11px 0;
+  background:
+    radial-gradient(ellipse 140% 68% at -18% 50%, color-mix(in srgb, var(--accent) 12%, transparent), transparent 72%),
+    linear-gradient(90deg,
+      color-mix(in srgb, var(--surface-raised) 58%, transparent),
+      color-mix(in srgb, var(--surface-raised) 24%, transparent) 74%,
+      transparent);
   backdrop-filter: blur(18px) saturate(1.15); -webkit-backdrop-filter: blur(18px) saturate(1.15);
-  box-shadow: none;
+  box-shadow: inset -1px 0 0 color-mix(in srgb, var(--accent) 34%, transparent), 8px 0 20px -18px var(--accent);
   pointer-events: auto;
+}
+.menu-rail-trigger::after {
+  content: ''; position: absolute; top: 15%; right: 0; bottom: 15%; width: 1px;
+  background: linear-gradient(180deg, transparent, color-mix(in srgb, var(--accent) 72%, transparent), transparent);
+  opacity: .7; pointer-events: none;
 }
 .menu-rail-trigger:hover,
 .menu-rail-trigger.open {
-  border-color: var(--accent-line);
-  background: color-mix(in srgb, var(--accent) 17%, var(--control-hover));
-  box-shadow: 0 0 14px -9px var(--accent);
+  background:
+    radial-gradient(ellipse 145% 72% at -18% 50%, color-mix(in srgb, var(--accent) 19%, transparent), transparent 74%),
+    linear-gradient(90deg,
+      color-mix(in srgb, var(--surface-raised) 68%, transparent),
+      color-mix(in srgb, var(--accent) 7%, transparent) 78%,
+      transparent);
+  box-shadow: inset -1px 0 0 color-mix(in srgb, var(--accent) 58%, transparent), 10px 0 24px -18px var(--accent);
 }
 .menu-shell.open > .menu-rail-trigger {
   z-index: 1;
@@ -343,51 +356,87 @@
 .menu-rail-lines,
 .menu-rail-lines::before,
 .menu-rail-lines::after {
-  width: 13px; height: 1.5px; border-radius: 999px; background: var(--accent);
+  height: 1.5px; border-radius: 999px; background: color-mix(in srgb, var(--accent) 78%, var(--text-2));
   transition: width .14s ease, background .14s ease, box-shadow .14s ease;
 }
-.menu-rail-lines { position: relative; display: block; }
+.menu-rail-lines { position: relative; z-index: 1; display: block; width: 15px; }
 .menu-rail-lines::before,
 .menu-rail-lines::after { content: ''; position: absolute; left: 0; }
-.menu-rail-lines::before { top: -5px; }
-.menu-rail-lines::after { top: 5px; }
+.menu-rail-lines::before { top: -5px; width: 10px; }
+.menu-rail-lines::after { top: 5px; width: 12px; }
 .menu-rail-trigger:hover .menu-rail-lines,
+.menu-rail-trigger.open .menu-rail-lines {
+  width: 17px; background: var(--accent); box-shadow: 0 0 8px -2px var(--accent);
+}
 .menu-rail-trigger:hover .menu-rail-lines::before,
+.menu-rail-trigger.open .menu-rail-lines::before { width: 12px; background: var(--accent); box-shadow: 0 0 8px -2px var(--accent); }
 .menu-rail-trigger:hover .menu-rail-lines::after,
-.menu-rail-trigger.open .menu-rail-lines,
-.menu-rail-trigger.open .menu-rail-lines::before,
-.menu-rail-trigger.open .menu-rail-lines::after {
-  width: 15px; background: var(--accent); box-shadow: 0 0 8px -2px var(--accent);
+.menu-rail-trigger.open .menu-rail-lines::after { width: 14px; background: var(--accent); box-shadow: 0 0 8px -2px var(--accent);
 }
 .menu-shell > .menu-rail-trigger {
   position: absolute; left: 0;
   top: calc(var(--workspace-tabs-top-padding) + var(--atp-tabrow-height));
 }
 .menu-drawer {
-  position: absolute; left: 0; top: 10px; bottom: 10px; z-index: 2;
-  width: min(248px, calc(100cqw - 32px)); padding: 16px 14px 16px 40px;
-  display: flex; flex-direction: column; gap: 5px;
-  border: 1px solid color-mix(in srgb, var(--line-2) 82%, transparent); border-left: 0;
-  border-radius: 0 var(--radius-lg) var(--radius-lg) 0;
-  background: color-mix(in srgb, var(--surface-raised) 82%, transparent);
-  backdrop-filter: blur(26px) saturate(1.22); -webkit-backdrop-filter: blur(26px) saturate(1.22);
-  box-shadow: 18px 0 48px -24px rgba(0,0,0,.75), var(--elev);
+  position: absolute; left: 0; top: 12px; bottom: 12px; z-index: 2;
+  width: min(232px, calc(100cqw - 28px)); padding: 18px 18px 16px 28px;
+  display: flex; flex-direction: column; gap: 4px; overflow: hidden;
+  border: 0; border-radius: 0 22px 22px 0;
+  background:
+    radial-gradient(ellipse 120% 42% at -12% 13%, color-mix(in srgb, var(--accent) 11%, transparent), transparent 68%),
+    linear-gradient(90deg,
+      color-mix(in srgb, var(--surface-raised) 96%, transparent) 0%,
+      color-mix(in srgb, var(--surface-raised) 88%, transparent) 72%,
+      color-mix(in srgb, var(--surface-raised) 64%, transparent) 100%);
+  backdrop-filter: blur(28px) saturate(1.18); -webkit-backdrop-filter: blur(28px) saturate(1.18);
+  box-shadow: 20px 0 46px -30px rgba(0,0,0,.9), 1px 0 0 color-mix(in srgb, var(--accent) 15%, transparent);
   transform: translateX(calc(-100% - 12px)); opacity: 0; visibility: hidden;
   transition: transform .2s ease, opacity .16s ease, visibility 0s linear .2s;
   pointer-events: auto;
 }
 .menu-shell.open .menu-drawer { transform: translateX(0); opacity: 1; visibility: visible; transition-delay: 0s; }
-.menu-title { padding: 2px 9px 10px; color: var(--text-mut); font-family: var(--mono); font-size: 10px; font-weight: 700; letter-spacing: .12em; text-transform: uppercase; }
-.menu-item {
-  display: flex; align-items: center; gap: 11px; width: 100%; min-height: 42px; padding: 7px 10px;
-  border: 1px solid transparent; border-radius: 10px; color: var(--text-2); background: transparent; text-align: left;
+.menu-title {
+  display: flex; align-items: center; gap: 10px; padding: 1px 10px 11px;
+  color: var(--text-mut); font-family: var(--mono); font-size: 9px;
+  font-weight: 700; letter-spacing: .14em; text-transform: uppercase;
 }
-.menu-item:hover { color: var(--text); background: var(--backdrop-mid); border-color: var(--line); }
-.menu-item.on { color: var(--accent); background: var(--accent-bg); border-color: var(--accent-line); }
+.menu-title::after {
+  content: ''; flex: 1 1 auto; height: 1px;
+  background: linear-gradient(90deg, color-mix(in srgb, var(--accent) 28%, transparent), transparent);
+}
+.menu-item {
+  position: relative; isolation: isolate;
+  display: flex; align-items: center; gap: 10px; width: 100%; min-height: 40px; padding: 6px 9px 6px 10px;
+  border: 0; border-radius: 9px; color: var(--text-2); background: transparent; text-align: left;
+  transition: color .14s ease;
+}
+.menu-item::before {
+  content: ''; position: absolute; inset: 0; z-index: -1; border-radius: inherit; opacity: 0;
+  background: linear-gradient(90deg, color-mix(in srgb, var(--accent) 13%, transparent), color-mix(in srgb, var(--accent) 4%, transparent) 72%, transparent);
+  box-shadow: inset 2px 0 0 color-mix(in srgb, var(--accent) 68%, transparent);
+  transition: opacity .14s ease;
+}
+.menu-item:hover { color: var(--text); background: transparent; }
+.menu-item:hover::before { opacity: .5; }
+.menu-item.on { color: var(--accent); background: transparent; }
+.menu-item.on::before { opacity: 1; }
 .menu-item.danger { margin-top: auto; color: var(--danger); }
-.ricon { width: 25px; height: 25px; flex: 0 0 25px; display: grid; place-items: center; }
+.menu-item.danger::before {
+  background: linear-gradient(90deg, color-mix(in srgb, var(--danger) 11%, transparent), transparent 76%);
+  box-shadow: inset 2px 0 0 color-mix(in srgb, var(--danger) 58%, transparent);
+}
+.menu-item.danger:hover::before { opacity: .7; }
+.ricon {
+  width: 27px; height: 27px; flex: 0 0 27px; display: grid; place-items: center;
+  border-radius: 8px; background: color-mix(in srgb, var(--text-2) 4%, transparent);
+  transition: background .14s ease, box-shadow .14s ease;
+}
+.menu-item.on .ricon {
+  background: color-mix(in srgb, var(--accent) 10%, transparent);
+  box-shadow: 0 0 15px -10px var(--accent);
+}
 .menu-label { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 12.5px; font-weight: 650; letter-spacing: .02em; }
-.menu-sep { height: 1px; background: var(--line); margin: 6px 8px; }
+.menu-sep { height: 1px; margin: 7px 10px; background: linear-gradient(90deg, var(--line), transparent); }
 
 /* ---- agent ear (flush-right) ---- */
 .agent-ear-wrap { flex: 0 0 auto; display: flex; align-items: center; }
