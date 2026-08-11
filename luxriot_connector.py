@@ -19470,7 +19470,20 @@ class LuxriotManager:
             if created is not None and created < cutoff:
                 self.rollup_summary_cache.pop(key, None)
 
-    def _persist_rollup_cache_locked(self) -> None:
+    def _persist_rollup_cache_locked(self, *, force_legacy: bool = False) -> None:
+        state_store = getattr(self, "runtime_state_store", None)
+        if (
+            not force_legacy
+            and state_store is not None
+            and callable(getattr(state_store, "save_rollup", None))
+        ):
+            # Each semantic rollup is already an independently durable row.
+            # Rewriting the former all-rollups JSON document here serialized
+            # hundreds of large summaries after every L1/L2 generation.  The
+            # write ran under cache_lock and could stall status/UI reads for
+            # more than a minute.  Keep the monolithic snapshot only as a
+            # fallback for stores that do not support per-rollup persistence.
+            return
         payload_entries = [
             dict(entry)
             for entry in self.rollup_summary_cache.values()
@@ -19478,7 +19491,6 @@ class LuxriotManager:
         ]
         cache_file = self.rollup_cache_file
         payload = {"version": 1, "updated_at": time.time(), "entries": payload_entries}
-        state_store = getattr(self, "runtime_state_store", None)
         if state_store is not None:
             try:
                 state_store.save_state("luxriot_rollup_cache", payload)
@@ -19534,36 +19546,90 @@ class LuxriotManager:
                 continue
             normalized_entries.append(normalized)
         normalized_entries.sort(key=lambda row: float(self._coerce_float(row.get("created_at")) or 0.0))
-        with self.cache_lock:
-            self.rollup_summary_cache.clear()
-            retained_entries = self._filter_rollup_cache_retention(normalized_entries)
-            legacy_entries = [
-                entry
-                for entry in retained_entries
-                if str(entry.get("summary_kind") or "").strip().lower()
-                == "legacy_cached"
-            ]
-            legacy_by_level: Dict[str, int] = {}
-            for entry in legacy_entries:
-                legacy_level = self._normalize_rollup_level(entry.get("level")) or "UNKNOWN"
-                legacy_by_level[legacy_level] = legacy_by_level.get(legacy_level, 0) + 1
-            self._rollup_scheduler_status["rollup_cache_entries_loaded"] = len(retained_entries)
-            self._rollup_scheduler_status["legacy_rollups_adopted"] = len(legacy_entries)
-            self._rollup_scheduler_status["legacy_rollups_adopted_by_level"] = legacy_by_level
-            for entry in retained_entries[-self.rollup_summary_cache_limit :]:
-                self.rollup_summary_cache[str(entry["rollup_id"])] = entry
+        retained_entries = self._filter_rollup_cache_retention(normalized_entries)
         bulk_saver = getattr(state_store, "save_rollups", None)
+        promoted = 0
+        durable_error: Optional[str] = None
         if callable(bulk_saver) and retained_entries:
             try:
                 promoted = int(bulk_saver(retained_entries) or 0)
-                with self.cache_lock:
-                    self._rollup_scheduler_status["durable_rollups_promoted"] = promoted
-                    self._rollup_scheduler_status["durable_store_last_error"] = None
             except Exception as exc:
-                with self.cache_lock:
-                    self._rollup_scheduler_status["durable_store_last_error"] = (
-                        _safe_error_text(exc, 240) or exc.__class__.__name__
+                durable_error = _safe_error_text(exc, 240) or exc.__class__.__name__
+
+        # The monolithic state row is now a migration source, not the source of
+        # truth.  After insert-only promotion, overlay independently durable
+        # rows so a stale legacy snapshot can never replace a newer summary on
+        # process restart.
+        durable_loader = getattr(state_store, "list_rollups", None)
+        if callable(durable_loader) and retained_entries:
+            merged_by_id = {
+                str(entry.get("rollup_id") or "").strip(): dict(entry)
+                for entry in retained_entries
+                if str(entry.get("rollup_id") or "").strip()
+            }
+            channel_ids = sorted(
+                {
+                    int(channel_id)
+                    for channel_id in (
+                        _parse_optional_int(entry.get("channel_id"))
+                        for entry in retained_entries
                     )
+                    if channel_id is not None and channel_id > 0
+                }
+            )
+            try:
+                for channel_id in channel_ids:
+                    durable_rows = durable_loader(
+                        channel_id=channel_id,
+                        start_ts=self._rollup_retention_cutoff(),
+                        end_ts=None,
+                        levels=("L1", "L2", "L3"),
+                        limit=50000,
+                    )
+                    if not isinstance(durable_rows, Sequence) or isinstance(
+                        durable_rows,
+                        (str, bytes, bytearray),
+                    ):
+                        continue
+                    for raw_row in durable_rows:
+                        if not isinstance(raw_row, Mapping):
+                            continue
+                        normalized = self._normalize_cached_rollup_entry(raw_row)
+                        if normalized is None:
+                            continue
+                        durable_id = str(normalized.get("rollup_id") or "").strip()
+                        if durable_id:
+                            merged_by_id[durable_id] = normalized
+                retained_entries = self._filter_rollup_cache_retention(
+                    sorted(
+                        merged_by_id.values(),
+                        key=lambda row: float(
+                            self._coerce_float(row.get("created_at")) or 0.0
+                        ),
+                    )
+                )
+            except Exception as exc:
+                durable_error = _safe_error_text(exc, 240) or exc.__class__.__name__
+
+        legacy_entries = [
+            entry
+            for entry in retained_entries
+            if str(entry.get("summary_kind") or "").strip().lower()
+            == "legacy_cached"
+        ]
+        legacy_by_level: Dict[str, int] = {}
+        for entry in legacy_entries:
+            legacy_level = self._normalize_rollup_level(entry.get("level")) or "UNKNOWN"
+            legacy_by_level[legacy_level] = legacy_by_level.get(legacy_level, 0) + 1
+        with self.cache_lock:
+            self.rollup_summary_cache.clear()
+            self._rollup_scheduler_status["rollup_cache_entries_loaded"] = len(retained_entries)
+            self._rollup_scheduler_status["legacy_rollups_adopted"] = len(legacy_entries)
+            self._rollup_scheduler_status["legacy_rollups_adopted_by_level"] = legacy_by_level
+            self._rollup_scheduler_status["durable_rollups_promoted"] = promoted
+            self._rollup_scheduler_status["durable_store_last_error"] = durable_error
+            for entry in retained_entries[-self.rollup_summary_cache_limit :]:
+                self.rollup_summary_cache[str(entry["rollup_id"])] = entry
 
     def persist_rollup_cache(self) -> None:
         with self.cache_lock:
@@ -19608,11 +19674,11 @@ class LuxriotManager:
             ) + 1
         return dict(normalized)
 
-    def _save_durable_rollup(self, payload: Mapping[str, Any]) -> None:
+    def _save_durable_rollup(self, payload: Mapping[str, Any]) -> bool:
         state_store = getattr(self, "runtime_state_store", None)
         saver = getattr(state_store, "save_rollup", None)
         if not callable(saver):
-            return
+            return False
         try:
             saver(payload)
             now = time.time()
@@ -19635,11 +19701,13 @@ class LuxriotManager:
                     self._rollup_scheduler_status["durable_rollups_pruned"] = int(
                         self._rollup_scheduler_status.get("durable_rollups_pruned") or 0
                     ) + pruned
+            return True
         except Exception as exc:
             with self.cache_lock:
                 self._rollup_scheduler_status["durable_store_last_error"] = (
                     _safe_error_text(exc, 240) or exc.__class__.__name__
                 )
+            return False
 
     def _put_cached_rollup_summary(self, rollup_id: str, summary: str, **meta: Any) -> None:
         key = str(rollup_id or "").strip()
@@ -19654,7 +19722,7 @@ class LuxriotManager:
         store_key = str(normalized_payload.get("rollup_id") or "").strip()
         if not store_key:
             return
-        self._save_durable_rollup(normalized_payload)
+        durable_saved = self._save_durable_rollup(normalized_payload)
         with self.cache_lock:
             self.rollup_summary_cache[store_key] = normalized_payload
             self._prune_rollup_cache_retention_locked()
@@ -19663,7 +19731,7 @@ class LuxriotManager:
                 if oldest_key == store_key and len(self.rollup_summary_cache) == 1:
                     break
                 self.rollup_summary_cache.pop(oldest_key, None)
-            self._persist_rollup_cache_locked()
+            self._persist_rollup_cache_locked(force_legacy=not durable_saved)
 
     def _list_cached_rollups(
         self,

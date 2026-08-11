@@ -121,9 +121,14 @@ class DurableRollupMemoryStateStore(MemoryRuntimeStateStore):
         self.rollups[str(payload["rollup_id"])] = dict(payload)
 
     def save_rollups(self, payloads):
+        written = 0
         for payload in payloads:
+            key = str(payload["rollup_id"])
+            if key in self.rollups:
+                continue
             self.save_rollup(payload)
-        return len(payloads)
+            written += 1
+        return written
 
     def load_rollup(self, rollup_id):
         payload = self.rollups.get(str(rollup_id))
@@ -2604,6 +2609,8 @@ class LuxriotCaptureDispatchTests(unittest.TestCase):
                 "luxriot_rollup:112:l2:1783879200",
             ],
         )
+        self.assertTrue(all("DO NOTHING" in query for query, _params in calls))
+        self.assertTrue(all("DO UPDATE" not in query for query, _params in calls))
 
     def test_postgres_runtime_state_rollup_range_read_does_not_wait_for_writer_lock(self):
         entered_transaction = threading.Event()
@@ -6935,6 +6942,86 @@ class LuxriotCaptureDispatchTests(unittest.TestCase):
 
             self.assertEqual(len(rows), 1)
             self.assertEqual(normalize.call_count, 1)
+
+    def test_per_rollup_store_skips_rewriting_legacy_monolithic_cache(self):
+        class TrackingStore(DurableRollupMemoryStateStore):
+            def __init__(self):
+                super().__init__()
+                self.saved_state_keys = []
+
+            def save_state(self, key, payload):
+                self.saved_state_keys.append(str(key))
+                super().save_state(key, payload)
+
+        with tempfile.TemporaryDirectory() as temp:
+            state_store = TrackingStore()
+            manager = build_manager(Path(temp), runtime_state_store=state_store)
+            window_start = 1_781_700_000.0
+
+            manager._put_cached_rollup_summary(
+                "l1-ch7-w900-1781700000",
+                operator_rollup_response("A person worked at the desk."),
+                channel_id=7,
+                level="L1",
+                source_level="L0",
+                window_start=window_start,
+                window_end=window_start + 900.0,
+                window_sec=900,
+                item_count=1,
+                frame_count=12,
+                source_tokens=120,
+                source_ids=["l0-a"],
+                source_signature="source-v2",
+                summary_kind="llm",
+                generation_status="ready",
+                format_version=2,
+            )
+
+            self.assertIn("l1-ch7-w900-1781700000", state_store.rollups)
+            self.assertNotIn("luxriot_rollup_cache", state_store.saved_state_keys)
+            manager.persist_rollup_cache()
+            self.assertNotIn("luxriot_rollup_cache", state_store.saved_state_keys)
+
+    def test_durable_rollup_overlays_stale_legacy_snapshot_on_startup(self):
+        with tempfile.TemporaryDirectory() as temp:
+            state_store = DurableRollupMemoryStateStore()
+            window_start = 1_781_700_000.0
+            rollup_id = "l1-ch7-w900-1781700000"
+            stale = {
+                "rollup_id": rollup_id,
+                "channel_id": 7,
+                "level": "L1",
+                "source_level": "L0",
+                "window_start": window_start,
+                "window_end": window_start + 900.0,
+                "window_sec": 900,
+                "summary": operator_rollup_response("Stale legacy summary."),
+                "summary_kind": "llm",
+                "generation_status": "ready",
+                "format_version": 2,
+                "created_at": window_start + 900.0,
+            }
+            durable = {
+                **stale,
+                "summary": operator_rollup_response("New durable summary."),
+                "source_signature": "new-source",
+            }
+            state_store.payloads["luxriot_rollup_cache"] = {
+                "version": 1,
+                "entries": [stale],
+            }
+            state_store.save_rollup(durable)
+
+            manager = build_manager(
+                Path(temp),
+                runtime_state_store=state_store,
+                config_overrides={"LUXRIOT_ROLLUP_RETENTION_DAYS": 90},
+            )
+
+            cached = manager._get_cached_rollup_record(rollup_id)
+            self.assertIsNotNone(cached)
+            self.assertIn("New durable summary", cached["summary"])
+            self.assertEqual(state_store.rollups[rollup_id]["source_signature"], "new-source")
 
     def test_081_semantic_cache_is_adopted_without_regeneration(self):
         with tempfile.TemporaryDirectory() as temp:

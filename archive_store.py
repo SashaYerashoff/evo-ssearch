@@ -2324,7 +2324,7 @@ class PostgresRuntimeStateStore(_TenantRepository):
         self._save_state_exact(key, payload_dict)
 
     def save_rollups(self, payloads: Sequence[Mapping[str, Any]]) -> int:
-        """Promote a legacy hot-cache payload in one transaction during upgrade."""
+        """Promote legacy hot-cache rows without replacing newer durable rows."""
 
         entries: List[Tuple[str, Dict[str, Any], str]] = []
         for payload in payloads:
@@ -2340,9 +2340,21 @@ class PostgresRuntimeStateStore(_TenantRepository):
                     cache_key = f"exact:{key}"
                     if self._last_state_hashes.get(cache_key) == digest:
                         continue
-                    self._upsert_state_locked(connection, key, payload_dict)
-                    self._last_state_hashes[cache_key] = digest
-                    written += 1
+                    cursor = connection.execute(
+                        """
+                        INSERT INTO archive.runtime_state (
+                            tenant_id,
+                            state_key,
+                            payload_json
+                        )
+                        VALUES (%s, %s, %s)
+                        ON CONFLICT (tenant_id, state_key) DO NOTHING
+                        """,
+                        (self.tenant_id, key, _jsonb(payload_dict)),
+                    )
+                    if int(cursor.rowcount or 0) > 0:
+                        self._last_state_hashes[cache_key] = digest
+                        written += 1
         return written
 
     def load_rollup(self, rollup_id: str) -> Optional[Dict[str, Any]]:
