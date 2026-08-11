@@ -835,12 +835,9 @@
 .archive-results-count strong { color: var(--accent); font-size: 20px; font-weight: 700; font-variant-numeric: tabular-nums; }
 .archive-results-separator { color: var(--text-mut); font-size: 12px; }
 .archive-filtered-flag {
-  align-self: center; margin-left: 4px; padding: 3px 7px;
-  border: 1px solid color-mix(in srgb, var(--accent) 38%, transparent);
-  border-radius: 999px; color: var(--accent);
-  background: color-mix(in srgb, var(--accent) 7%, transparent);
+  align-self: baseline; margin-left: 3px; color: var(--accent);
   font-family: var(--mono); font-size: 9px; font-weight: 700;
-  letter-spacing: .09em; line-height: 1; text-transform: uppercase;
+  letter-spacing: .09em; line-height: inherit; text-transform: uppercase;
 }
 .archive-results-context { color: var(--text-mut); font-size: 11px; }
 .archive-coverage-notice {
