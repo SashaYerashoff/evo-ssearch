@@ -996,9 +996,12 @@
   position: relative;
   flex: 0 0 auto; width: 0; overflow: hidden;
   display: flex; flex-direction: column;
-  background: var(--panel-solid);
-  border: 1px solid var(--agent-edge);
-  border-radius: 14px 0 0 14px;
+  background:
+    radial-gradient(ellipse 80% 34% at 82% 0%, color-mix(in srgb, var(--accent) 5%, transparent), transparent 72%),
+    color-mix(in srgb, var(--panel-solid) 88%, transparent);
+  border: 0; border-left: 1px solid var(--agent-edge);
+  border-radius: 18px 0 0 18px;
+  backdrop-filter: blur(20px); -webkit-backdrop-filter: blur(20px);
   transition:
     width .24s cubic-bezier(.4,0,.2,1),
     margin-left .24s cubic-bezier(.4,0,.2,1);
@@ -1037,13 +1040,13 @@
      whole workspace so content that keeps its fixed geometry disappears under
      the dock instead of painting across the agent surface. */
   z-index: 55;
-  box-shadow: -24px 0 60px -26px rgba(0,0,0,0.6);
+  box-shadow: -28px 0 70px -34px rgba(0,0,0,0.62);
 }
 /* full: absolute overlay — out of flow, so the console behind stays full-width & untouched.
    left starts after the rail so the left bar stays visible/usable. */
 .agent-dock.open.full {
   position: absolute; top: 0; right: 0; bottom: 0; left: calc(var(--rail-w) + 14px); width: auto; z-index: 55;
-  border-radius: 14px 0 0 14px; border: 1px solid var(--agent-edge);
+  border-radius: 18px 0 0 18px; border: 0; border-left: 1px solid var(--agent-edge);
 }
 .agent-dock > * { min-width: 380px; }
 .agent-head-btns { display: flex; align-items: center; gap: 2px; flex: 0 0 auto; }
@@ -1053,14 +1056,14 @@
 .ag-cols.full { display: grid; grid-template-columns: 232px minmax(0,1fr); }
 .ag-rail, .ag-inspector {
   min-width: 0; display: flex; flex-direction: column; min-height: 0;
-  background: rgba(10,14,28,0.35); overflow-y: auto;
+  background: color-mix(in srgb, var(--surface-raised) 22%, transparent); overflow-y: auto;
 }
-.ag-rail { border-right: 1px solid var(--line); }
-.ag-inspector { border-left: 1px solid var(--line); gap: 4px; padding: 4px 0; }
+.ag-rail { border-right: 0; }
+.ag-inspector { border-left: 0; gap: 4px; padding: 4px 0; }
 .ag-chat { min-width: 0; flex: 1; display: flex; flex-direction: column; min-height: 0; }
 
 /* top strip inside chat: skills / model / streams dropdowns */
-.ag-strip { flex: 0 0 auto; display: flex; align-items: center; gap: 8px; padding: 8px 12px; border-bottom: 1px solid var(--line); position: relative; z-index: 5; flex-wrap: wrap; }
+.ag-strip { flex: 0 0 auto; display: flex; align-items: center; gap: 8px; padding: 7px 18px 11px; border: 0; position: relative; z-index: 5; flex-wrap: wrap; }
 .ag-drop { position: relative; }
 .ag-drop-btn {
   display: inline-flex; align-items: center; gap: 6px; max-width: 260px;
@@ -1079,7 +1082,7 @@
 .ag-drop-list { display: flex; flex-direction: column; gap: 2px; }
 .ag-drop-note { font-size: 11px; color: var(--text-mut); padding: 4px 8px 6px; }
 .ag-drop .ag-model { padding: 4px 6px 6px; }
-.ag-messages { flex: 1; overflow-y: auto; padding: 16px 16px 8px; display: flex; flex-direction: column; gap: 16px; }
+.ag-messages { flex: 1; overflow-y: auto; padding: 10px 22px 18px; display: flex; flex-direction: column; gap: 22px; }
 .ag-empty { font-size: 12px; color: var(--text-mut); padding: 10px 12px; }
 
 /* sessions */
@@ -1265,7 +1268,13 @@
 .ag-skill-run:hover { background: var(--void-tile); color: var(--text); }
 
 /* composer */
-.agent-composer { flex: 0 0 auto; border-top: 1px solid var(--line); }
+.agent-composer {
+  flex: 0 0 auto; border: 0;
+  background: linear-gradient(0deg,
+    color-mix(in srgb, var(--panel-solid) 92%, transparent) 0%,
+    color-mix(in srgb, var(--panel-solid) 72%, transparent) 72%,
+    transparent 100%);
+}
 .agent-composer .agent-input { border-top: none; }
 .ag-img-preview { position: relative; width: fit-content; margin: 10px 12px 0; }
 .ag-img-preview img { max-height: 92px; border-radius: 8px; border: 1px solid var(--line-2); display: block; }
@@ -1274,7 +1283,7 @@
 .agent-chip-file { display: inline-flex; align-items: center; gap: 6px; cursor: pointer; }
 
 /* guided prompt builder — rebuildable autocomplete assist above the Image chip */
-.agent-assist { display: flex; flex-direction: column; gap: 10px; padding: 2px 14px 10px; }
+.agent-assist { display: flex; flex-direction: column; gap: 10px; padding: 4px 20px 10px; }
 .aa-head { display: flex; align-items: center; gap: 10px; }
 .aa-label { font-size: 11px; font-weight: 700; text-transform: uppercase; letter-spacing: .08em; color: var(--text-mut); }
 .aa-reset { display: inline-flex; align-items: center; gap: 4px; font-size: 11px; color: var(--danger); background: none; border: none; cursor: pointer; padding: 0; }
@@ -2063,6 +2072,18 @@
   background: var(--void-tile); color: var(--text);
 }
 .chat-msg.user .chat-bubble { background: linear-gradient(135deg, rgba(56,224,212,0.18), rgba(56,224,212,0.08)); border-color: var(--accent-line); }
+.chat-msg.assistant .chat-bubble.md {
+  padding: 14px 18px;
+  border: 0; border-radius: 16px;
+  background:
+    radial-gradient(ellipse 38% 90% at 0% 0%, color-mix(in srgb, var(--accent) 6%, transparent), transparent 76%),
+    linear-gradient(105deg,
+      color-mix(in srgb, var(--surface-raised) 34%, transparent),
+      color-mix(in srgb, var(--surface-raised) 13%, transparent) 72%,
+      transparent 100%);
+  box-shadow: 0 18px 42px -38px rgba(0,0,0,.78);
+}
+.chat-msg.assistant .chat-role { padding-left: 16px; }
 .chat-bubble.typing { display: inline-flex; gap: 4px; padding: 12px 14px; }
 .chat-bubble.typing i, .action-dots i {
   width: 5px; height: 5px; border-radius: 50%; background: var(--text-mut);
@@ -2099,7 +2120,7 @@
 .agent-caret { caret-color: transparent; border-color: var(--accent-line) !important; }
 .agent-caret::after { content: ''; }
 
-.agent-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 10px; padding: 13px 14px; border-bottom: 1px solid var(--line); }
+.agent-head { display: flex; align-items: center; justify-content: space-between; gap: 10px; padding: 14px 18px 8px; border: 0; }
 .agent-head-title { display: flex; gap: 10px; }
 .agent-badge { width: 30px; height: 30px; border-radius: 9px; display: grid; place-items: center; color: var(--primary-text); background: linear-gradient(135deg, var(--accent), var(--accent-2)); box-shadow: var(--glow); flex: 0 0 auto; }
 .agent-badge.lg { width: 46px; height: 46px; border-radius: 14px; margin: 0 auto; }
@@ -2109,12 +2130,12 @@
 .agent-hello { display: flex; flex-direction: column; align-items: center; gap: 8px; text-align: center; padding: 28px 6px 6px; }
 .agent-suggest { display: flex; flex-direction: column; gap: 8px; }
 /* prompt assist relocated to the centre on a fresh session */
-.agent-assist-center { margin-top: 14px; padding-top: 12px; border-top: 1px solid var(--line); }
+.agent-assist-center { margin-top: 14px; padding-top: 12px; border: 0; }
 .agent-assist-center .agent-assist { padding: 0; }
 .agent-chip { text-align: left; font-size: 13px; color: var(--text-2); background: var(--void-tile); border: 1px solid var(--line); border-radius: 10px; padding: 10px 12px; transition: border-color .15s, color .15s; }
 .agent-chip:hover { border-color: var(--accent-line); color: var(--text); }
 
-.agent-input { display: flex; align-items: flex-end; gap: 8px; padding: 12px 12px 14px; border-top: 1px solid var(--line); }
+.agent-input { display: flex; align-items: flex-end; gap: 8px; padding: 12px 18px 10px; border: 0; }
 /* paperclip attach — plain icon at the far left of the input, aligned with the send button */
 .agent-clip { width: 38px; height: 44px; flex: 0 0 auto; align-self: center; border: none; background: none; display: grid; place-items: center; cursor: pointer; color: var(--text-mut); transition: color .15s; }
 .agent-clip:hover { color: var(--accent); }
