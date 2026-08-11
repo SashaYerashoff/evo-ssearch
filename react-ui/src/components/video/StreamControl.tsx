@@ -101,28 +101,17 @@ export function StreamControl(p: {
   const { t } = useI18n()
   const periods = PERIODS.map((item) => ({ ...item, label: t(PERIOD_LABEL_KEYS[item.v]) }))
   const resolutions = RESOLUTIONS.map((item) => ({ ...item, label: t(RESOLUTION_LABEL_KEYS[item.v]) }))
-  const settingsTitle = p.channels.find((c) => c.id === p.settingsChannelId)?.title || '—'
-  const reviewTitle = p.channels.find((c) => c.id === p.reviewChannelId)?.title || '—'
-  const settingsSummary = `${settingsTitle} · ${t('video.batch').toLocaleLowerCase()} ${p.batch} · ${p.every}s · ${p.capturing ? t('status.capturing') : t('status.idle')}`
-  const reviewSummary = [
-    reviewTitle,
-    periods.find((item) => item.v === p.period)?.label || t('period.live'),
-    resolutions.find((item) => item.v === p.resolution)?.label || t('resolution.auto'),
-    p.live ? t('video.liveOn') : t('video.liveOff'),
-  ].join(' · ')
-
   return (
     <ToolTabs
       tabs={[
-        { id: 'review', icon: <IconFileDescription size={13} />, label: t('video.review'), summary: reviewSummary },
+        { id: 'review', icon: <IconFileDescription size={13} />, label: t('video.review') },
         ...(visibleVideoWorkspaceTabs(p.showIncidents).includes('incidents') ? [{
           id: 'incidents',
           icon: <IconAlertTriangle size={13} />,
           label: t('incident.review'),
           badge: 'FiP',
-          summary: `Feature in progress · ${t('incident.tabSummary')}`,
         }] : []),
-        { id: 'settings', icon: <IconVideo size={13} />, label: t('video.settings'), summary: settingsSummary },
+        { id: 'settings', icon: <IconVideo size={13} />, label: t('video.settings') },
       ]}
       active={p.activeTab}
       onSelect={(id) => p.onTab(id as VideoWorkspaceTab)}

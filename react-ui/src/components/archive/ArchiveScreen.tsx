@@ -23,7 +23,7 @@ import {
   type ArchiveProbeOption,
   type ArchiveSearchCoverage,
 } from '../../api/detections'
-import { FilterBar, TIMES } from './FilterBar'
+import { FilterBar } from './FilterBar'
 import { ToolTabs } from '../shell/ToolTabs'
 import { DetectionCard } from './DetectionCard'
 import { InspectorModal } from './InspectorModal'
@@ -414,20 +414,6 @@ export function ArchiveScreen({
     return () => observer.disconnect()
   }, [filtersDirty, hasMore, resultMode, runLoad])
 
-  // live summaries shown on collapsed chips
-  const filtersSummary = [
-    filters.channelIds?.length
-      ? (filters.channelIds.length === 1
-          ? (channels.find((c) => String(c.id) === filters.channelIds?.[0])?.title || `ch ${filters.channelIds[0]}`)
-          : `${filters.channelIds.length} streams`)
-      : filters.channelId
-        ? (channels.find((c) => String(c.id) === filters.channelId)?.title || `ch ${filters.channelId}`)
-        : 'All streams',
-    filters.source === 'probe' && filters.probeId
-      ? (probeOptions.find((p) => p.id === filters.probeId)?.name || filters.probeId)
-      : null,
-    (filters.sinceMs || filters.untilMs) ? 'custom range' : (TIMES.find((t) => t.v === (filters.hours || '24'))?.label || 'Last 24h'),
-  ].filter(Boolean).join(' · ')
   const q = textValue.trim()
   const scoreLabel = !scoreRange.hasScores
     ? 'No scores'
@@ -436,10 +422,10 @@ export function ArchiveScreen({
       : scoreThreshold > 0
         ? `≥ ${formatArchiveScore(scoreThreshold)}`
         : 'All'
-  const TOOL_META: Record<typeof openTool, { Icon: any; label: string; summary: string }> = {
-    filters: { Icon: IconFilter, label: 'Filters', summary: filtersSummary },
-    text: { Icon: IconLetterT, label: 'Text query', summary: '—' },
-    image: { Icon: IconPhoto, label: 'Image', summary: '—' },
+  const TOOL_META: Record<typeof openTool, { Icon: any; label: string }> = {
+    filters: { Icon: IconFilter, label: 'Filters' },
+    text: { Icon: IconLetterT, label: 'Text query' },
+    image: { Icon: IconPhoto, label: 'Image' },
   }
 
   // active tool's controls, shown to the right of the fixed tab strip
@@ -518,8 +504,8 @@ export function ArchiveScreen({
       )}
       <ToolTabs
         tabs={(['filters', 'text', 'image'] as const).map((t) => {
-          const { Icon, label, summary } = TOOL_META[t]
-          return { id: t, icon: <Icon size={13} />, label, summary }
+          const { Icon, label } = TOOL_META[t]
+          return { id: t, icon: <Icon size={13} />, label }
         })}
         active={openTool}
         onSelect={(id) => setOpenTool(id as typeof openTool)}

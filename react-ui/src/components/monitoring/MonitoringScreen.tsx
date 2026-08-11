@@ -277,8 +277,6 @@ export function MonitoringScreen({
   const inspectedBookmarkBlocked = canManage
     && probeMutationRequiresBookmarkPermission(inspected, canCreateBookmarks)
   const filtersActive = origins.size > 0 || states.size > 0 || !!query.trim()
-  const runningCount = probes.filter((probe) => statusOf(probe, runtime, semanticRuntime) === 'running').length
-
   const persistView = (next: 'grid' | 'list') => {
     setView(next)
     window.localStorage.setItem(VIEW_STORAGE_KEY, next)
@@ -422,7 +420,6 @@ export function MonitoringScreen({
           id: 'probes',
           icon: <IconRadar2 size={13} />,
           label: 'Probes',
-          summary: `${filtersActive ? `${filtered.length}/${probes.length}` : probes.length} probes · ${runningCount} running`,
         }]}
         active="probes"
         onSelect={() => {}}
