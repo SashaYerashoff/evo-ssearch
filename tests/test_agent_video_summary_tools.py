@@ -3738,7 +3738,10 @@ class AgentVideoSummaryToolTests(unittest.TestCase):
 
     def test_list_attention_bursts_ranks_windows_and_reports_gaps(self):
         class _BurstSummaryManager(_SummaryManager):
+            requested_target_levels = []
+
             def summary_rollups(self, channel_id, run_selector=None, start_ts=None, end_ts=None, level_limit=None, target_level=None, synthesize=True):
+                self.requested_target_levels.append(target_level)
                 nodes = [
                     {
                         "level": "L0",
@@ -3817,6 +3820,7 @@ class AgentVideoSummaryToolTests(unittest.TestCase):
         )
         self.assertEqual(strict["burst_count"], 1)
         self.assertEqual(strict["bursts"][0]["activity_x"], 11.1)
+        self.assertEqual(tools._lxm.requested_target_levels, ["L0", "L0"])
 
     def test_system_prompt_routes_spike_questions_to_the_burst_tool(self):
         prompt = build_system_prompt(

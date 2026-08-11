@@ -201,6 +201,23 @@ class AgentToolLoopTests(unittest.TestCase):
             names("Show current active streams, models, queues and dropped frames"),
             {"list_video_summary_channels"},
         )
+        attention_context = _seed_turn_tool_context(
+            "На канале 118 покажи сильнейшие всплески визуальной активности "
+            "за последний час."
+        )
+        self.assertTrue(attention_context["attention_burst_request"])
+        self.assertFalse(attention_context["runtime_status_only"])
+        self.assertEqual(attention_context["tool_intents"], ["video_research"])
+        self.assertIn(
+            "list_attention_bursts",
+            {
+                row["function"]["name"]
+                for row in _select_relevant_tool_schemas(
+                    agent._TOOL_SCHEMAS,
+                    attention_context,
+                )
+            },
+        )
         self.assertEqual(
             names("Show recent VLM alerts and notable video-summary events for the last hour"),
             {"normalize_time_window", "list_video_summary_channels"},
@@ -1435,6 +1452,140 @@ class AgentToolLoopTests(unittest.TestCase):
             any(event.get("type") == "research_plan_complete" for event in events)
         )
         self.assertEqual(runner._lm_client.tool_call_messages, [])
+
+    def test_attention_burst_request_is_a_bounded_l0_drill(self):
+        class AttentionTools(_FakeTools):
+            def execute(self, name, args, progress_cb=None):
+                self.calls += 1
+                self.call_args.append((name, dict(args)))
+                if name == "normalize_time_window":
+                    return {
+                        "from_ts": 100.0,
+                        "to_ts": 3_700.0,
+                        "since_ms": 100_000,
+                        "until_ms": 3_700_000,
+                        "duration_sec": 3_600,
+                        "relative_range": "последний час",
+                    }
+                if name == "list_attention_bursts":
+                    return {
+                        "channel_id": args["channel_id"],
+                        "burst_count": 1,
+                        "scanned_l0_windows": 8,
+                        "bursts": [
+                            {
+                                "timestamp_ms": 3_500_000,
+                                "activity_x": 7.5,
+                                "mode": "burst",
+                                "summary_excerpt": "Fast motion in the frame.",
+                            }
+                        ],
+                        "truncated": False,
+                        "semantics": (
+                            "statistical attention, not semantic proof"
+                        ),
+                    }
+                raise AssertionError(name)
+
+        runner = AgentRunner.__new__(AgentRunner)
+        runner.store = _FakeStore()
+        runner._lm_client = _FakeLMClient(tool_rounds=0)
+        runner._tools = AttentionTools()
+        runner._ps = object()
+        runner._ds = object()
+        runner._lxm = object()
+
+        events = [
+            json.loads(item.removeprefix("data: ").strip())
+            for item in runner.stream_chat(
+                "session-1",
+                "На канале 118 покажи сильнейшие всплески визуальной "
+                "активности за последний час. Это статистический сигнал, "
+                "не делай выводов о событиях.",
+                force_tools=True,
+            )
+            if item.startswith("data: ")
+        ]
+
+        self.assertEqual(
+            [name for name, _args in runner._tools.call_args],
+            ["normalize_time_window", "list_attention_bursts"],
+        )
+        burst_args = runner._tools.call_args[1][1]
+        self.assertEqual(burst_args["channel_id"], 118)
+        self.assertEqual(burst_args["from_ts"], 100.0)
+        self.assertEqual(burst_args["to_ts"], 3_700.0)
+        self.assertEqual(runner._lm_client.tool_call_messages, [])
+        self.assertIsNone(runner._lm_client.final_messages)
+        final_text = next(
+            event["content"] for event in events if event.get("type") == "text"
+        )
+        self.assertIn("статистические точки внимания", final_text)
+        self.assertIn("не доказанные события", final_text)
+        zero_text = agent._format_attention_burst_result(
+            {
+                "attention_bursts_receipt": {
+                    "channel_id": 118,
+                    "burst_count": 0,
+                    "scanned_l0_windows": 98,
+                    "bursts": [],
+                }
+            },
+            "Покажи всплески",
+        )
+        self.assertIn("не означает, что событий не было", zero_text)
+        self.assertNotIn("событий нет", zero_text.casefold())
+
+    def test_operator_mode_executes_only_relevant_tool_if_server_ignores_required(self):
+        class IgnoringRequiredLM(_FakeLMClient):
+            def __init__(self):
+                super().__init__(tool_rounds=0)
+                self.tool_choices = []
+
+            def call_with_tools(
+                self,
+                messages,
+                tools=None,
+                cancel_event=None,
+                tool_choice="auto",
+            ):
+                self.tools = tools
+                self.tool_choices.append(tool_choice)
+                self.tool_call_messages.append(list(messages))
+                return _LMResponse(
+                    content="ungrounded model prose",
+                    finish_reason="stop",
+                    tool_calls=[],
+                )
+
+        runner = AgentRunner.__new__(AgentRunner)
+        runner.store = _FakeStore()
+        runner._lm_client = IgnoringRequiredLM()
+        runner._tools = _FakeTools(
+            result={
+                "candidate_channels": [],
+                "active_count": 0,
+                "inactive_count": 0,
+                "error_count": 0,
+            }
+        )
+        runner._ps = object()
+        runner._ds = object()
+        runner._lxm = object()
+
+        list(
+            runner.stream_chat(
+                "session-1",
+                "Show current active streams, models, queues and dropped frames",
+                force_tools=True,
+            )
+        )
+
+        self.assertEqual(
+            runner._tools.call_args,
+            [("list_video_summary_channels", {"runtime_only": True})],
+        )
+        self.assertEqual(runner._lm_client.tool_choices, ["required", "auto"])
 
     def test_duplicate_video_read_is_suppressed_and_stops_tool_loop(self):
         runner = AgentRunner.__new__(AgentRunner)

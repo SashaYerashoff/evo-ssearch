@@ -7126,6 +7126,270 @@ class LuxriotCaptureDispatchTests(unittest.TestCase):
             self.assertEqual(merged["generation_status"], "refresh_pending")
             self.assertTrue(merged["semantic_refresh_pending"])
 
+    def test_readonly_rollup_skips_sources_for_durable_target_buckets(self):
+        with tempfile.TemporaryDirectory() as temp:
+            manager = build_manager(Path(temp))
+            window_sec = int(manager.rollup_windows["L1"])
+            bucket_start = float(
+                manager._bucket_start(1_781_700_000.0, window_sec)
+            )
+            stored = {
+                "rollup_id": manager._canonical_rollup_id(
+                    "L1", 7, bucket_start, window_sec
+                ),
+                "channel_id": 7,
+                "level": "L1",
+                "window_start": bucket_start,
+                "window_end": bucket_start + window_sec,
+                "window_sec": window_sec,
+                "summary": operator_rollup_response("Durable narrative."),
+                "summary_kind": "llm",
+                "generation_status": "ready",
+            }
+            sources = [
+                {
+                    "rollup_id": "l0-inside-durable",
+                    "window_start": bucket_start + 10.0,
+                    "window_end": bucket_start + 20.0,
+                    "summary": "Already represented.",
+                },
+                {
+                    "rollup_id": "l0-missing-next-window",
+                    "window_start": bucket_start + window_sec + 10.0,
+                    "window_end": bucket_start + window_sec + 20.0,
+                    "summary": "Needs a read-only bucket.",
+                },
+            ]
+
+            selected = manager._rollup_sources_for_unstored_windows(
+                channel_id=7,
+                level="L1",
+                window_sec=window_sec,
+                source_nodes=sources,
+                stored_rows=[stored],
+            )
+
+            self.assertEqual(
+                [row["rollup_id"] for row in selected],
+                ["l0-missing-next-window"],
+            )
+
+    def test_readonly_summary_uses_durable_bucket_without_refresh_rebuild(self):
+        with tempfile.TemporaryDirectory() as temp:
+            manager = build_manager(Path(temp))
+            window_sec = int(manager.rollup_windows["L1"])
+            bucket_start = float(
+                manager._bucket_start(1_781_700_000.0, window_sec)
+            )
+            manager.record_summary_log(
+                7,
+                {
+                    "channel_id": 7,
+                    "run_id": "run-7",
+                    "summary": "A late L0 observation expanded the source set.",
+                    "frame_count": 3,
+                    "created_at": bucket_start + 10.0,
+                },
+            )
+            rollup_id = manager._canonical_rollup_id(
+                "L1", 7, bucket_start, window_sec
+            )
+            manager.rollup_summary_cache[rollup_id] = {
+                "rollup_id": rollup_id,
+                "channel_id": 7,
+                "level": "L1",
+                "source_level": "L0",
+                "window_start": bucket_start,
+                "window_end": bucket_start + window_sec,
+                "window_sec": window_sec,
+                "summary": operator_rollup_response("Durable narrative."),
+                "operator_summary": operator_rollup_response(
+                    "Durable narrative."
+                ),
+                "summary_kind": "llm",
+                "generation_status": "ready",
+                "source_signature": "stored-source-signature",
+                "format_version": 2,
+                "created_at": bucket_start + window_sec,
+            }
+
+            result = manager.summary_rollups(
+                7,
+                run_selector="all",
+                start_ts=bucket_start,
+                end_ts=bucket_start + window_sec,
+                level_limit=10,
+                target_level="L1",
+                synthesize=False,
+            )
+
+            row = next(
+                item
+                for item in result["levels"]["L1"]
+                if item["rollup_id"] == rollup_id
+            )
+            self.assertEqual(row["summary_kind"], "llm")
+            self.assertEqual(row["generation_status"], "ready")
+            self.assertNotIn("semantic_refresh_pending", row)
+
+    def test_targeted_read_materializes_l0_only_for_missing_l1_buckets(self):
+        with tempfile.TemporaryDirectory() as temp:
+            manager = build_manager(Path(temp))
+            window_sec = int(manager.rollup_windows["L1"])
+            bucket_start = float(
+                manager._bucket_start(1_781_700_000.0, window_sec)
+            )
+            for offset, summary in (
+                (10.0, "Observation represented by durable L1."),
+                (window_sec + 10.0, "Observation in a missing L1 bucket."),
+            ):
+                manager.record_summary_log(
+                    7,
+                    {
+                        "channel_id": 7,
+                        "run_id": "run-7",
+                        "summary": summary,
+                        "frame_count": 3,
+                        "created_at": bucket_start + offset,
+                    },
+                )
+            l1_id = manager._canonical_rollup_id(
+                "L1", 7, bucket_start, window_sec
+            )
+            manager.rollup_summary_cache[l1_id] = {
+                "rollup_id": l1_id,
+                "channel_id": 7,
+                "level": "L1",
+                "source_level": "L0",
+                "window_start": bucket_start,
+                "window_end": bucket_start + window_sec,
+                "window_sec": window_sec,
+                "summary": operator_rollup_response("Durable L1 narrative."),
+                "summary_kind": "llm",
+                "generation_status": "ready",
+                "format_version": 2,
+            }
+            original_l0_builder = manager._l0_nodes_from_logs
+            materialized_logs = []
+
+            def recording_l0_builder(channel_id, logs):
+                materialized_logs.extend(logs)
+                return original_l0_builder(channel_id, logs)
+
+            with patch.object(
+                manager,
+                "_l0_nodes_from_logs",
+                side_effect=recording_l0_builder,
+            ):
+                result = manager.summary_rollups(
+                    7,
+                    run_selector="all",
+                    start_ts=bucket_start,
+                    end_ts=bucket_start + 2 * window_sec,
+                    target_level="L2",
+                    synthesize=False,
+                )
+
+            self.assertEqual(len(materialized_logs), 1)
+            self.assertIn("missing L1 bucket", materialized_logs[0]["summary"])
+            self.assertEqual(result["source_counts"]["L0"], 2)
+            self.assertEqual(len(result["levels"]["L0"]), 1)
+            self.assertEqual(
+                [row["rollup_id"] for row in result["levels"]["L1"]],
+                [
+                    l1_id,
+                    manager._canonical_rollup_id(
+                        "L1", 7, bucket_start + window_sec, window_sec
+                    ),
+                ],
+            )
+
+    def test_targeted_l2_synthesis_reuses_durable_l1_without_rebuilding_it(self):
+        with tempfile.TemporaryDirectory() as temp:
+            calls = []
+
+            def lm_callback(messages, _model):
+                calls.append(messages)
+                return operator_rollup_response(
+                    "The hour continued the durable desk-work pattern."
+                )
+
+            manager = build_manager(Path(temp), lm_callback=lm_callback)
+            manager.rollup_llm_levels = {"L1", "L2"}
+            bucket_start = float(
+                manager._bucket_start(
+                    1_781_700_000.0,
+                    int(manager.rollup_windows["L1"]),
+                )
+            )
+            manager.record_summary_log(
+                7,
+                {
+                    "channel_id": 7,
+                    "run_id": "run-7",
+                    "summary": "A late L0 observation in the stored L1 window.",
+                    "frame_count": 3,
+                    "created_at": bucket_start + 10.0,
+                },
+            )
+            l1_id = manager._canonical_rollup_id(
+                "L1", 7, bucket_start, int(manager.rollup_windows["L1"])
+            )
+            manager.rollup_summary_cache[l1_id] = {
+                "rollup_id": l1_id,
+                "channel_id": 7,
+                "level": "L1",
+                "source_level": "L0",
+                "window_start": bucket_start,
+                "window_end": bucket_start + manager.rollup_windows["L1"],
+                "window_sec": manager.rollup_windows["L1"],
+                "summary": operator_rollup_response(
+                    "Durable L1 desk-work narrative."
+                ),
+                "operator_summary": operator_rollup_response(
+                    "Durable L1 desk-work narrative."
+                ),
+                "summary_kind": "llm",
+                "generation_status": "ready",
+                "source_signature": "durable-l1-source",
+                "format_version": 2,
+            }
+            build_calls = []
+            original_build = manager._build_rollup_level
+
+            def recording_build(*args, **kwargs):
+                build_calls.append(
+                    (
+                        kwargs.get("level"),
+                        len(kwargs.get("source_nodes") or []),
+                        kwargs.get("synthesize"),
+                    )
+                )
+                return original_build(*args, **kwargs)
+
+            with patch.object(
+                manager,
+                "_build_rollup_level",
+                side_effect=recording_build,
+            ):
+                result = manager.summary_rollups(
+                    7,
+                    run_selector="all",
+                    start_ts=bucket_start,
+                    end_ts=bucket_start + manager.rollup_windows["L1"],
+                    target_level="L2",
+                    synthesize=True,
+                    synthesize_levels={"L2"},
+                )
+
+            self.assertEqual(build_calls[0], ("L1", 0, False))
+            self.assertEqual(build_calls[1][0], "L2")
+            self.assertGreater(build_calls[1][1], 0)
+            self.assertTrue(build_calls[1][2])
+            self.assertEqual(len(calls), 1)
+            self.assertEqual(result["levels"]["L1"][0]["summary_kind"], "llm")
+            self.assertEqual(result["levels"]["L2"][0]["summary_kind"], "llm")
+
     def test_durable_rollup_prevents_regeneration_after_hot_cache_eviction(self):
         with tempfile.TemporaryDirectory() as temp:
             calls = []

@@ -19857,6 +19857,107 @@ class LuxriotManager:
         )
         return merged
 
+    def _rollup_sources_for_unstored_windows(
+        self,
+        *,
+        channel_id: int,
+        level: str,
+        window_sec: int,
+        source_nodes: Sequence[Mapping[str, Any]],
+        stored_rows: Sequence[Mapping[str, Any]],
+    ) -> List[Mapping[str, Any]]:
+        """Keep only source nodes whose target bucket has no durable row.
+
+        Read-only L3 requests used to rebuild every L1 and L2 bucket in the
+        requested period before merging PostgreSQL rows.  On a busy 24-hour
+        channel that repeated the complete temporal-ledger aggregation over
+        roughly a thousand L0 observations and could take over a minute.
+
+        A persisted bucket is the authoritative read result.  Source-signature
+        refresh belongs to the synthesis scheduler; a read may still construct
+        missing or currently open buckets, but must not recompute closed durable
+        buckets merely to display them.
+        """
+
+        normalized_level = self._normalize_rollup_level(level)
+        normalized_window = max(1, int(window_sec))
+        represented = {
+            identity
+            for identity in (
+                self._rollup_identity_key(row)
+                for row in stored_rows
+                if isinstance(row, Mapping)
+            )
+            if identity
+        }
+        if not represented:
+            return list(source_nodes)
+        missing: List[Mapping[str, Any]] = []
+        for node in source_nodes:
+            if not isinstance(node, Mapping):
+                continue
+            source_start = self._coerce_float(node.get("window_start"))
+            if source_start is None:
+                continue
+            bucket_start = self._bucket_start(source_start, normalized_window)
+            target_id = self._canonical_rollup_id(
+                normalized_level,
+                int(channel_id),
+                float(bucket_start),
+                normalized_window,
+            )
+            if target_id not in represented:
+                missing.append(node)
+        return missing
+
+    def _rollup_logs_for_unstored_l1_windows(
+        self,
+        *,
+        channel_id: int,
+        logs: Sequence[Mapping[str, Any]],
+        stored_rows: Sequence[Mapping[str, Any]],
+    ) -> List[Mapping[str, Any]]:
+        """Materialize expensive L0 structures only for missing L1 buckets.
+
+        Targeted L1-L3 reads return durable summaries as their public result.
+        Re-parsing every historical L0 batch (including temporal ledgers and
+        signal extraction) merely to rediscover an already persisted L1 row
+        made concurrent agent/UI reads contend for the Python worker for tens
+        of seconds.  Preserve the full source count, but only construct L0
+        nodes that can contribute to an unstored L1 bucket.
+        """
+
+        window_sec = max(1, int(self.rollup_windows["L1"]))
+        represented = {
+            identity
+            for identity in (
+                self._rollup_identity_key(row)
+                for row in stored_rows
+                if isinstance(row, Mapping)
+            )
+            if identity
+        }
+        if not represented:
+            return list(logs)
+        missing: List[Mapping[str, Any]] = []
+        for log in logs:
+            if not isinstance(log, Mapping):
+                continue
+            log_start, _log_end = self._summary_log_bounds_seconds(log)
+            if log_start is None:
+                missing.append(log)
+                continue
+            bucket_start = self._bucket_start(log_start, window_sec)
+            target_id = self._canonical_rollup_id(
+                "L1",
+                int(channel_id),
+                float(bucket_start),
+                window_sec,
+            )
+            if target_id not in represented:
+                missing.append(log)
+        return missing
+
     def _refresh_channel_routine_from_l2(self, channel_id: int, l2_rows: Sequence[Mapping[str, Any]]) -> None:
         if not l2_rows:
             return
@@ -24131,6 +24232,11 @@ class LuxriotManager:
         def synthesis_forced(level: str) -> bool:
             return synthesize and level in forced_synthesis_levels
 
+        synthesis_enabled = {
+            level: should_synthesize(level) or synthesis_forced(level)
+            for level in ("L1", "L2", "L3")
+        }
+
         target_rank = {"L0": 0, "L1": 1, "L2": 2, "L3": 3}.get(
             requested_target or "L3",
             3,
@@ -24145,7 +24251,6 @@ class LuxriotManager:
         logs_raw = status.get("logs")
         logs = logs_raw if isinstance(logs_raw, list) else []
 
-        l0_nodes = self._l0_nodes_from_logs(channel_id, logs)
         selected_run_id = str(status.get("run_filter_id") or "").strip() or None
         stored_rollups = self._list_cached_rollups(
             channel_id=channel_id,
@@ -24168,29 +24273,59 @@ class LuxriotManager:
             if stored_level in stored_by_level:
                 stored_by_level[stored_level].append(dict(row))
 
+        l0_source_logs: Sequence[Mapping[str, Any]] = logs
+        if (
+            requested_target in {"L1", "L2", "L3"}
+            and not synthesis_enabled["L1"]
+        ):
+            l0_source_logs = self._rollup_logs_for_unstored_l1_windows(
+                channel_id=channel_id,
+                logs=logs,
+                stored_rows=stored_by_level["L1"],
+            )
+        l0_nodes = self._l0_nodes_from_logs(channel_id, l0_source_logs)
+
         l1_nodes: List[Dict[str, Any]] = []
         l2_nodes: List[Dict[str, Any]] = []
         l3_nodes: List[Dict[str, Any]] = []
         if target_rank >= 1:
+            l1_sources: Sequence[Mapping[str, Any]] = l0_nodes
+            if not synthesis_enabled["L1"]:
+                l1_sources = self._rollup_sources_for_unstored_windows(
+                    channel_id=channel_id,
+                    level="L1",
+                    window_sec=self.rollup_windows["L1"],
+                    source_nodes=l0_nodes,
+                    stored_rows=stored_by_level["L1"],
+                )
             l1_nodes = self._build_rollup_level(
                 channel_id=channel_id,
                 level="L1",
                 source_level="L0",
                 window_sec=self.rollup_windows["L1"],
-                source_nodes=l0_nodes,
-                synthesize=should_synthesize("L1") or synthesis_forced("L1"),
+                source_nodes=l1_sources,
+                synthesize=synthesis_enabled["L1"],
                 max_new=max_new_per_level,
                 force_synthesis=synthesis_forced("L1"),
             )
             l1_nodes = self._merge_rollup_rows(l1_nodes, stored_by_level["L1"])
         if target_rank >= 2:
+            l2_sources: Sequence[Mapping[str, Any]] = l1_nodes
+            if not synthesis_enabled["L2"]:
+                l2_sources = self._rollup_sources_for_unstored_windows(
+                    channel_id=channel_id,
+                    level="L2",
+                    window_sec=self.rollup_windows["L2"],
+                    source_nodes=l1_nodes,
+                    stored_rows=stored_by_level["L2"],
+                )
             l2_nodes = self._build_rollup_level(
                 channel_id=channel_id,
                 level="L2",
                 source_level="L1",
                 window_sec=self.rollup_windows["L2"],
-                source_nodes=l1_nodes,
-                synthesize=should_synthesize("L2") or synthesis_forced("L2"),
+                source_nodes=l2_sources,
+                synthesize=synthesis_enabled["L2"],
                 max_new=max_new_per_level,
                 force_synthesis=synthesis_forced("L2"),
             )
@@ -24201,13 +24336,22 @@ class LuxriotManager:
                 l0_nodes,
             )
         if target_rank >= 3:
+            l3_sources: Sequence[Mapping[str, Any]] = l2_nodes
+            if not synthesis_enabled["L3"]:
+                l3_sources = self._rollup_sources_for_unstored_windows(
+                    channel_id=channel_id,
+                    level="L3",
+                    window_sec=self.rollup_windows["L3"],
+                    source_nodes=l2_nodes,
+                    stored_rows=stored_by_level["L3"],
+                )
             l3_nodes = self._build_rollup_level(
                 channel_id=channel_id,
                 level="L3",
                 source_level="L2",
                 window_sec=self.rollup_windows["L3"],
-                source_nodes=l2_nodes,
-                synthesize=should_synthesize("L3") or synthesis_forced("L3"),
+                source_nodes=l3_sources,
+                synthesize=synthesis_enabled["L3"],
                 max_new=max_new_per_level,
                 force_synthesis=synthesis_forced("L3"),
             )
@@ -24268,7 +24412,10 @@ class LuxriotManager:
             "stored_counts": stored_counts,
             "routine_context": routine_context,
             "source_counts": {
-                "L0": len(l0_nodes),
+                # Targeted durable reads may intentionally avoid materializing
+                # represented L0 rows, but coverage/truncation still needs the
+                # complete number of filtered source observations.
+                "L0": len(logs),
                 "L1": len(l1_nodes),
                 "L2": len(l2_nodes),
                 "L3": len(l3_nodes),

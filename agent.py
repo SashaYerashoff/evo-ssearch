@@ -7321,7 +7321,11 @@ class AgentTools:
                 start_ts=from_ts,
                 end_ts=to_ts,
                 level_limit=AGENT_VIDEO_SUMMARY_MAX_LEVEL_LIMIT,
-                target_level="live",
+                # The manager accepts only the canonical L0-L3 depth enum.
+                # "live" is an operator-facing alias resolved by the harness,
+                # not a backend level; leaking it here raised ValueError and
+                # could make a live attention drill appear to fall back to L1.
+                target_level="L0",
             )
         except Exception as exc:
             raise ToolError(f"Could not scan attention bursts: {exc}") from exc
@@ -10300,6 +10304,9 @@ def _classify_tool_intents(user_text: Any, context: Mapping[str, Any]) -> List[s
     if context.get("vlm_alert_policy_request"):
         add("prompt_policy")
         return intents
+    if context.get("attention_burst_request"):
+        add("video_research")
+        return intents
     if context.get("runtime_status_only"):
         add("runtime")
         return intents
@@ -10537,8 +10544,21 @@ def _seed_turn_tool_context(user_text: Any) -> Dict[str, Any]:
     normalized_unicode = unicodedata.normalize("NFKC", routing_text).casefold()
     runtime_terms = ("active", "running", "runtime", "current", "live")
     status_terms = ("stream", "model", "queue", "dropped", "last error", "status")
+    attention_burst_request = bool(
+        re.search(
+            r"\b(?:attention|visual activity|activity)\s+(?:burst|spike|peak)s?\b|"
+            r"\b(?:burst|spike|peak)s?\b.{0,40}\b(?:attention|motion|visual activity)\b|"
+            r"(?:всплеск|пик)\w*.{0,40}(?:визуальн\w*\s+)?активност|"
+            r"(?:визуальн\w*\s+)?активност\w*.{0,40}(?:всплеск|пик)\w*|"
+            r"резк\w*.{0,24}(?:движен|активност)",
+            normalized_unicode,
+        )
+    )
     russian_runtime_status = bool(
-        re.search(r"актив|работа(?:ет|ют|ющ)|текущ|жив(?:ой|ые|ых)", normalized_unicode)
+        re.search(
+            r"\b(?:актив(?!ност)\w*|работа(?:ет|ют|ющ)\w*|текущ\w*|жив(?:ой|ые|ых))\b",
+            normalized_unicode,
+        )
         and re.search(r"стрим|канал|модел|очеред|потер|дроп|ошиб|статус", normalized_unicode)
     )
     context = {
@@ -10569,6 +10589,7 @@ def _seed_turn_tool_context(user_text: Any) -> Dict[str, Any]:
                 normalized_unicode,
             )
         ),
+        "attention_burst_request": attention_burst_request,
         "runtime_status_only": (
             (
                 any(term in normalized for term in runtime_terms)
@@ -11811,6 +11832,19 @@ def _required_video_research_tool_call(
                 args={"relative_range": relative_range},
             )
 
+    if context.get("attention_burst_request"):
+        if context.get("attention_bursts_completed"):
+            return None
+        if (
+            context.get("channel_id") is not None
+            and "list_attention_bursts" in available
+        ):
+            return _ToolCall(
+                id=f"required-attention-{uuid.uuid4().hex[:12]}",
+                name="list_attention_bursts",
+                args={"channel_id": int(context["channel_id"])},
+            )
+
     if (
         context.get("channel_id") is None
         and not context.get("video_inventory_completed")
@@ -11886,6 +11920,8 @@ def _required_video_research_tool_call(
 def _video_overview_research_plan_completed(context: Mapping[str, Any]) -> bool:
     """Return true once the bounded server-owned overview plan has enough data."""
 
+    if context.get("attention_burst_request"):
+        return bool(context.get("attention_bursts_completed"))
     if not context.get("video_overview_request"):
         return False
     active_skills = {
@@ -12470,6 +12506,36 @@ def _remember_turn_tool_result(tool_name: str, result: Any, context: Dict[str, A
             }
         return
 
+    if tool_name == "list_attention_bursts":
+        context["attention_bursts_completed"] = True
+        channel_id = _opt_int(result.get("channel_id"))
+        if channel_id is not None and channel_id > 0:
+            context["channel_id"] = int(channel_id)
+        context["attention_bursts_receipt"] = {
+            "channel_id": channel_id,
+            "burst_count": _opt_int(result.get("burst_count")) or 0,
+            "scanned_l0_windows": (
+                _opt_int(result.get("scanned_l0_windows")) or 0
+            ),
+            "truncated": bool(result.get("truncated")),
+            "backpressure_gap_count": (
+                _opt_int(result.get("backpressure_gap_count")) or 0
+            ),
+            "bursts": [
+                {
+                    "timestamp_ms": row.get("timestamp_ms"),
+                    "activity_x": row.get("activity_x"),
+                    "summary_excerpt": _compact_signal_value(
+                        row.get("summary_excerpt"), 180
+                    ),
+                }
+                for row in (result.get("bursts") or [])[:8]
+                if isinstance(row, Mapping)
+            ],
+            "time_window": copy.deepcopy(context.get("time_window") or {}),
+        }
+        return
+
     if tool_name == "search_archive":
         context["archive_search_completed"] = True
         context["archive_search_query"] = str(result.get("query") or "").strip()
@@ -12807,6 +12873,44 @@ def _record_turn_signal_ledger(
                 "timezone": result.get("timezone"),
             },
             limit=4,
+        )
+        return
+
+    if tool_name == "list_attention_bursts":
+        bursts = (
+            result.get("bursts")
+            if isinstance(result.get("bursts"), list)
+            else []
+        )
+        _signal_ledger_append(
+            ledger,
+            "semantic_signals",
+            {
+                "tool": tool_name,
+                "channel_id": result.get("channel_id"),
+                "burst_count": result.get("burst_count"),
+                "scanned_l0_windows": result.get("scanned_l0_windows"),
+                "truncated": result.get("truncated"),
+                "backpressure_gap_count": result.get(
+                    "backpressure_gap_count"
+                ),
+                "semantics": _compact_signal_value(
+                    result.get("semantics"), 220
+                ),
+                "bursts": [
+                    {
+                        "timestamp_ms": row.get("timestamp_ms"),
+                        "activity_x": row.get("activity_x"),
+                        "mode": row.get("mode"),
+                        "summary_excerpt": _compact_signal_value(
+                            row.get("summary_excerpt"), 180
+                        ),
+                    }
+                    for row in bursts[:8]
+                    if isinstance(row, Mapping)
+                ],
+                "note": "Statistical attention signal; not semantic proof.",
+            },
         )
         return
 
@@ -13544,6 +13648,113 @@ def _format_video_event_followup_clarification(
         f"drillable timestamp for it: {event_query}. Give me the approximate event time and I will "
         "inspect only that channel and its adjacent window, without broadening to other cameras."
     )
+
+
+def _format_attention_burst_result(
+    context: Mapping[str, Any],
+    user_text: Any,
+) -> str:
+    """Render a grounded attention result without turning motion into events."""
+
+    receipt = (
+        context.get("attention_bursts_receipt")
+        if isinstance(context.get("attention_bursts_receipt"), Mapping)
+        else {}
+    )
+    russian = bool(re.search(r"[а-яё]", str(user_text or ""), re.IGNORECASE))
+    channel_id = _opt_int(receipt.get("channel_id"))
+    scanned = max(0, int(_opt_int(receipt.get("scanned_l0_windows")) or 0))
+    bursts = [
+        dict(row)
+        for row in (receipt.get("bursts") or [])
+        if isinstance(row, Mapping)
+    ]
+    burst_count = max(0, int(_opt_int(receipt.get("burst_count")) or 0))
+    gap_count = max(
+        0,
+        int(_opt_int(receipt.get("backpressure_gap_count")) or 0),
+    )
+    scope = f"CH {channel_id}" if channel_id is not None else "the channel"
+
+    if russian:
+        if burst_count <= 0:
+            parts = [
+                f"На {scope} серверный attention-маркер не отметил резких "
+                f"отклонений от обычного движения в {scanned} L0-окнах.",
+                "Это не означает, что событий не было: маркер измеряет только "
+                "силу визуального изменения относительно нормы канала, а не "
+                "смысл происходящего.",
+            ]
+        else:
+            lines = []
+            for row in bursts[:5]:
+                timestamp_ms = _opt_int(row.get("timestamp_ms"))
+                when = (
+                    _format_epoch_minute(float(timestamp_ms) / 1000.0)
+                    if timestamp_ms is not None
+                    else "время не указано"
+                )
+                activity_x = _opt_float(row.get("activity_x"))
+                strength = (
+                    f"{float(activity_x):.1f}× нормы"
+                    if activity_x is not None
+                    else "сила не указана"
+                )
+                lines.append(f"- {when}: {strength}")
+            parts = [
+                f"На {scope} attention-маркер отметил {burst_count} "
+                f"всплеск(а) в {scanned} L0-окнах.",
+                "\n".join(lines),
+                "Это статистические точки внимания, не доказанные события; "
+                "для смыслового вывода нужны соответствующие кадры.",
+            ]
+        if gap_count:
+            parts.append(
+                f"Есть {gap_count} пропущенных из-за backpressure окон; они "
+                "неизвестны и не считаются спокойными."
+            )
+        if receipt.get("truncated"):
+            parts.append("Показана только верхняя часть ранжированного списка.")
+        return "\n\n".join(part for part in parts if part)
+
+    if burst_count <= 0:
+        parts = [
+            f"On {scope}, the server-side attention marker found no sharp "
+            f"departure from normal motion across {scanned} L0 windows.",
+            "That does not mean no events occurred: this marker measures visual "
+            "change relative to the channel baseline, not semantic meaning.",
+        ]
+    else:
+        lines = []
+        for row in bursts[:5]:
+            timestamp_ms = _opt_int(row.get("timestamp_ms"))
+            when = (
+                _format_epoch_minute(float(timestamp_ms) / 1000.0)
+                if timestamp_ms is not None
+                else "time unavailable"
+            )
+            activity_x = _opt_float(row.get("activity_x"))
+            strength = (
+                f"{float(activity_x):.1f}× baseline"
+                if activity_x is not None
+                else "strength unavailable"
+            )
+            lines.append(f"- {when}: {strength}")
+        parts = [
+            f"On {scope}, the attention marker found {burst_count} spike(s) "
+            f"across {scanned} L0 windows.",
+            "\n".join(lines),
+            "These are statistical attention points, not verified events; "
+            "inspect the corresponding frames before assigning meaning.",
+        ]
+    if gap_count:
+        parts.append(
+            f"There are {gap_count} backpressure gaps; those intervals are "
+            "unknown, not quiet."
+        )
+    if receipt.get("truncated"):
+        parts.append("Only the top of the ranked list is shown.")
+    return "\n\n".join(part for part in parts if part)
 
 
 def _archive_research_response_needs_recovery(
@@ -15262,8 +15473,40 @@ class AgentRunner:
                     return
 
             if lm_response.finish_reason != "tool_calls" or not lm_response.tool_calls:
-                # Model wants to respond with text — break out to streaming phase
-                break
+                if force_tools and tool_calls_used == 0 and available_tool_schemas:
+                    # Some OpenAI-compatible local servers accept
+                    # tool_choice=required but still return finish_reason=stop.
+                    # With one harness-approved schema there is no model-owned
+                    # routing ambiguity, so execute that safe read directly.
+                    # With multiple choices, fail closed instead of letting an
+                    # ungrounded Operator Mode answer sound authoritative.
+                    available_names = sorted(
+                        _tool_schema_names(available_tool_schemas)
+                    )
+                    if len(available_names) == 1:
+                        lm_response = _LMResponse(
+                            content="",
+                            finish_reason="tool_calls",
+                            tool_calls=[
+                                _ToolCall(
+                                    id=(
+                                        "required-operator-"
+                                        + uuid.uuid4().hex[:12]
+                                    ),
+                                    name=available_names[0],
+                                    args={},
+                                )
+                            ],
+                        )
+                    else:
+                        turn_tool_context[
+                            "operator_mode_grounding_failed"
+                        ] = True
+                        break
+                else:
+                    # Model wants to respond with text — break out to streaming
+                    # phase after any completed trusted tool work.
+                    break
 
             for tool_call in lm_response.tool_calls:
                 if (
@@ -15671,7 +15914,29 @@ class AgentRunner:
             })
 
         deterministic_final_text: Optional[str]
-        if turn_tool_context.get("video_event_followup_missing_time"):
+        if turn_tool_context.get("operator_mode_grounding_failed"):
+            deterministic_final_text = (
+                "Operator Mode не получил ни одного доверенного результата: "
+                "локальная модель не выбрала обязательный инструмент. Я не буду "
+                "выдавать состояние системы по памяти. Повтори запрос с более "
+                "узким объектом проверки."
+                if re.search(r"[а-яё]", user_text, flags=re.IGNORECASE)
+                else (
+                    "Operator Mode received no trusted result because the local "
+                    "model did not select a required tool. I will not report "
+                    "system state from memory; retry with a narrower inspection "
+                    "target."
+                )
+            )
+        elif (
+            turn_tool_context.get("attention_burst_request")
+            and turn_tool_context.get("attention_bursts_completed")
+        ):
+            deterministic_final_text = _format_attention_burst_result(
+                turn_tool_context,
+                user_text,
+            )
+        elif turn_tool_context.get("video_event_followup_missing_time"):
             deterministic_final_text = _format_video_event_followup_clarification(
                 turn_tool_context,
                 turn_signal_ledger,
