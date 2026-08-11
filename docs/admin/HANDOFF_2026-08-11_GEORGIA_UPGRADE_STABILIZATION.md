@@ -1,6 +1,6 @@
 # EVA AI handoff — Georgia upgrade and inference-preservation work
 
-Date: 2026-08-11 (Europe/Riga)
+Date: 2026-08-12 (Europe/Riga)
 
 ## Live rehearsal state after single-instance cleanup
 
@@ -89,15 +89,16 @@ Primary working repository:
 ```text
 path:   /home/sasha/Projects/evo-ssearch-office-demo
 branch: main
-latest code commit: 2adc0cb fix: avoid monolithic rollup cache rewrites
+latest code commit: 8969893 fix: ground probe inventory and compact list payloads
 ```
 
-The stabilization work is split into three reviewed code commits:
+The stabilization work is split into four reviewed code commits:
 
 ```text
 15ad09f fix: stabilize Georgia upgrade rehearsal runtime
 645f4f5 fix: bound rollup and operator-mode reads
 2adc0cb fix: avoid monolithic rollup cache rewrites
+8969893 fix: ground probe inventory and compact list payloads
 ```
 
 The working tree is expected to be clean after committing this handoff update.
@@ -1017,14 +1018,109 @@ entire operation, 103/103 concurrent `/health` samples succeeded with no timeout
 maximum latency 1.539 seconds and p95 0.792 seconds. Persistence remains sequential
 and visible in total synthesis latency, but it no longer freezes liveness or the UI.
 
+### Probe-list payload, alert/probe path and grounded agent acceptance
+
+The persistent probe store was healthy, but `/probes/list` returned all 30 stored
+base64 thumbnails for every probe. With only two probes the authenticated response
+was 560,189 bytes, of which about 502 KiB was duplicate recent-hit imagery. The
+monitoring board needs one current card image and the P/N/M series, not 30 images.
+Commit `8969893` keeps the latest card thumbnail and all numeric history while
+omitting thumbnails and embedding arrays from `recent_hits` in the collection
+response. Stored evidence is unchanged.
+
+Live acceptance after deployment:
+
+```text
+/probes/list: 55,300 bytes (-90.1%), 84 ms, HTTP 200
+CH 118 probe: runtime=running, semantic=ready, no capture/semantic error, 164 ms
+CH 112 probe: runtime=running, semantic=ready, no capture/semantic error, 609 ms
+recent_hits: 30 score rows per probe, zero repeated thumbnails
+```
+
+The fast VLM alert lane was also observed before the final reload. It accepted and
+completed 18 motion/semantic-change episodes with no queue rejection or runtime
+error; all produced `alerts: []`, so zero bookmarks was a grounded no-alert result,
+not a dead lane. Measured Luxriot bookmark calls were about 63-165 ms. The dominant
+event-to-ack latency remained capture/batch closure, queue wait and VLM inference:
+roughly 55 seconds median and 106 seconds p95 over the sampled 24-hour alert rows.
+
+Both current operator probes have `bookmark=false`. The separate realtime bookmark
+lane therefore has no eligible probe to deliver. Under shared-GPU contention it
+also observed embedding ages above its five-second freshness gate; a bookmark-enabled
+probe still needs a deliberate live acceptance before this lane is considered pilot-
+ready. Do not solve that by silently changing `.env` or weakening the freshness gate.
+
+The first live Operator Mode probe audit used one successful `list_probes` call but
+the local model added an unsupported claim about active VLM errors and took 62.304
+seconds. The agent now treats an explicit probe inventory/status request as one
+bounded `MAP -> TERM` read, exposes only `list_probes`, and renders a compact trusted
+receipt. Explicit negation such as `без изменений`, `ничего не меняй`, or `только
+чтение` keeps the route read-only even though the phrase contains an edit-related
+word stem.
+
+The exact post-fix request was:
+
+```text
+Проверь без изменений, какие семантические пробы настроены на каналах 112 и 118,
+включены ли они, и были ли у них срабатывания за последние 24 часа. Используй пробы
+только как дополнительный статистический сигнал; не делай по ним выводов о событиях.
+Только чтение.
+```
+
+It completed in 5.898 seconds with exactly one `list_probes(since_hours=24)` call,
+no errors, retries or recovery, and a compact Russian answer covering both probes.
+It explicitly says persisted semantic hits are secondary statistics, not event proof
+or evidence of current VLM/stream health. The progressive-disclosure change remains
+inside the pinned tuktuk `MAP -> TERM` path: no tool schema, result envelope or legal
+argument source changed, and source honesty is strengthened.
+
+Verification for this commit:
+
+```text
+agent tool-loop + video-summary suites: 151 passed, 16 subtests passed
+probe list/lineage focus:                3 passed, 52 deselected
+full API dataflow suite:                 55 passed, 127 subtests passed
+git diff --check:                        passed
+```
+
+Two HUPs were required because the first live acceptance exposed the read-only
+negation edge case. They made port 5081 unavailable for about 139 and 132 seconds,
+respectively. Both llama.cpp PIDs stayed unchanged (`1499650` VLM and `1142087`
+agent), and the rehearsal `.env` hash remained unchanged. The current worker after
+the second HUP is `2567031` under master `2014970`. Recoverable copies are:
+
+```text
+/home/sasha/Projects/eva-georgia-upgrade-repro/oldapp.py.pre-20260812-probe-list-compaction
+/home/sasha/Projects/eva-georgia-upgrade-repro/agent.py.pre-20260812-probe-agent-grounding
+/home/sasha/Projects/eva-georgia-upgrade-repro/agent.py.pre-20260812-probe-agent-readonly-negation
+```
+
 ### Immediate next stabilization work
 
-First observe whether the remaining historical L1/L2 `queued` gaps converge through
-the scheduler and whether each open L3 window becomes ready after close. Then test
-end-to-end alert latency and probe availability as operator, agent and VLM secondary
-signal. Keep the slow Gunicorn HUP/SigLIP startup behavior as a separate reliability
-defect; do not mask it by weakening health checks or changing the preserved
-inference policy.
+A final read-only 24-hour `run=all` durable check showed that ordinary current
+boundaries are represented correctly, while old gaps are not automatically swept:
+
+```text
+CH 112 L1: 68 ready, 4 queued, 1 current pending
+CH 112 L2: 15 ready, 4 queued, 1 current pending
+CH 112 L3:  3 ready, 0 queued, 1 current pending
+CH 118 L1: 65 ready, 3 queued, 1 current pending
+CH 118 L2: 15 ready, 3 queued, 1 current pending
+CH 118 L3:  3 ready, 0 queued, 1 current pending
+```
+
+The pending rows are exactly the open windows: L1 `21:00-21:15 UTC`, L2
+`21:00-22:00 UTC`, and L3 `16:00-00:00 UTC`. The remaining queued rows are older
+closed windows, including several around the disruptive HUPs. The normal boundary
+scheduler does not perform an arbitrary historical sweep, so these now require the
+existing explicit restore/backfill preview and trusted UI Apply if the operator wants
+them repaired. Do not silently synthesize them from this handoff.
+
+Next run a deliberate bookmark-enabled probe acceptance with an operator-reviewed
+criterion so the realtime path has an eligible target. The ordinary probe board,
+agent inventory, VLM secondary-signal path and fast-alert execution are accepted.
+Keep the slow Gunicorn HUP/SigLIP startup behavior as a separate reliability defect;
+do not mask it by weakening health checks or changing the preserved inference policy.
 
 ## Next work
 
@@ -1124,7 +1220,7 @@ Once the update path is proven, retest rather than assume the recent fixes:
 - Do not migrate Georgia to SigLIP2 by silently replacing an explicit existing
   embedding configuration. Bundled SigLIP assets may be installed for EVA use only
   under the reviewed append-only rules.
-- Do not fold unrelated later work into the two reviewed stabilization commits or
+- Do not fold unrelated later work into the reviewed stabilization commits or
   into the rehearsal bundle.
 - Do not print `.env`, database DSNs, Evo passwords or LM API keys in logs/handoff.
 
