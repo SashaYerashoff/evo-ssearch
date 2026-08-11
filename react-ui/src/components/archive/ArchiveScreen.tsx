@@ -8,6 +8,7 @@ import {
   IconPhoto,
   IconSearch,
   IconSparkles,
+  IconX,
 } from '@tabler/icons-react'
 import type { Channel, Detection, ArchiveFilters } from '../../api/types'
 import type { AgentDrive } from '../../App'
@@ -100,6 +101,7 @@ export function ArchiveScreen({
   const [selected, setSelected] = useState<Detection | null>(null)
   const [scoreSliderPercent, setScoreSliderPercent] = useState(0)
   const [textValue, setTextValue] = useState('')
+  const [appliedTextQuery, setAppliedTextQuery] = useState<string | null>(null)
   const [agentStep, setAgentStep] = useState<string | null>(null)
   const [agentTyping, setAgentTyping] = useState(false)
   const [nextOffset, setNextOffset] = useState(0)
@@ -138,7 +140,10 @@ export function ArchiveScreen({
     loadingRef.current = true
     const seq = ++requestSeq.current
     setTextSearchPending(false)
-    if (!append) setSearchCoverage(null)
+    if (!append) {
+      setSearchCoverage(null)
+      setAppliedTextQuery(null)
+    }
     setLoading(true); setError(null)
     try {
       const result = await listArchive(filters, channels, requestedOffset)
@@ -187,6 +192,7 @@ export function ArchiveScreen({
       setItems(results); setNote('')
       setScoreSliderPercent(0)
       setNextOffset(0); setTotal(results.length); setHasMore(false); setResultMode('search')
+      setAppliedTextQuery(q)
       setAppliedFilters({ ...filters }); setSelected(null)
     } catch (e: any) {
       if (requestSeq.current === seq) {
@@ -201,6 +207,15 @@ export function ArchiveScreen({
       }
     }
   }, [filters, channels])
+
+  const clearAppliedTextSearch = useCallback(() => {
+    setTextValue('')
+    setAppliedTextQuery(null)
+    setSearchCoverage(null)
+    setScoreSliderPercent(0)
+    setResultMode('list')
+    void runLoad(0)
+  }, [runLoad])
 
   const runImageSearch = useCallback(async (blob: Blob, label: string) => {
     loadingRef.current = true
@@ -221,6 +236,7 @@ export function ArchiveScreen({
       setItems(results); setNote(`${results.length} similar · ${label}`)
       setScoreSliderPercent(0)
       setNextOffset(0); setTotal(results.length); setHasMore(false); setResultMode('search')
+      setAppliedTextQuery(null)
       setAppliedFilters({ ...filters }); setSelected(null)
     } catch (e: any) {
       if (requestSeq.current === seq) {
@@ -267,6 +283,7 @@ export function ArchiveScreen({
   const animateTyping = useCallback(async (q: string) => {
     if (noAnim) return
     const token = ++typeToken.current
+    setAppliedTextQuery(null)
     setAgentTyping(true); setTextValue('')
     await sleep(240)
     for (let i = 1; i <= q.length; i++) {
@@ -368,6 +385,7 @@ export function ArchiveScreen({
         setItems(found)
         setScoreSliderPercent(0)
         setNextOffset(0); setTotal(found.length); setHasMore(false); setResultMode('search')
+        setAppliedTextQuery(null)
         setAppliedFilters({ ...filters })
         setNote(`Agent · ${found.length} frame${found.length === 1 ? '' : 's'} · ${prettyTool(name)}`)
         setError(found.length ? null : 'Agent returned no frames for this query.')
@@ -392,6 +410,10 @@ export function ArchiveScreen({
   const displayed = items.filter((d) => passesArchiveScoreThreshold(d, scoreThreshold))
   const filtersDirty = !!appliedFilters && JSON.stringify(appliedFilters) !== JSON.stringify(filters)
   const archiveMatchCount = resultMode === 'list' ? total : items.length
+  const normalizedTextValue = textValue.trim()
+  const textFilterApplied = resultMode === 'search'
+    && appliedTextQuery !== null
+    && normalizedTextValue === appliedTextQuery
   const showArchiveNote = !!note && !/^\d+\s+loaded$/i.test(note.trim())
   const coverageMessages = useMemo(
     () => archiveCoverageMessages(searchCoverage, channels),
@@ -448,22 +470,33 @@ export function ArchiveScreen({
         <span className="atp-glabel"><IconLetterT size={13} /> Text query</span>
         <form className="atp-text" onSubmit={(e) => {
           e.preventDefault()
-          const v = textValue.trim()
-          if (v && !textSearchPending) void runText(v)
+          if (normalizedTextValue && !textSearchPending && !textFilterApplied) {
+            void runText(normalizedTextValue)
+          }
         }}>
           <input placeholder="describe an archived scene…" aria-label="Text query — press Enter to search" autoFocus={!agentTyping}
-            value={textValue} readOnly={agentTyping} className={agentTyping ? 'agent-caret' : ''}
-            onChange={(e) => setTextValue(e.target.value)} />
+            value={textValue} readOnly={agentTyping || textSearchPending} className={agentTyping ? 'agent-caret' : ''}
+            onChange={(e) => {
+              const nextValue = e.target.value
+              if (!nextValue.trim() && appliedTextQuery !== null && resultMode === 'search') {
+                clearAppliedTextSearch()
+                return
+              }
+              setTextValue(nextValue)
+            }} />
           <button
-            type="submit"
-            className="atp-query-submit"
-            disabled={agentTyping || textSearchPending || !textValue.trim()}
-            aria-label={textSearchPending ? 'Searching archive' : 'Search archive'}
-            title={textSearchPending ? 'Searching archive…' : 'Search archive (Enter)'}
+            type={textFilterApplied ? 'button' : 'submit'}
+            className={`atp-query-submit${textFilterApplied ? ' clear' : ''}`}
+            disabled={agentTyping || textSearchPending || (!textFilterApplied && !normalizedTextValue)}
+            aria-label={textSearchPending ? 'Searching archive' : textFilterApplied ? 'Clear text search' : 'Search archive'}
+            title={textSearchPending ? 'Searching archive…' : textFilterApplied ? 'Clear text search' : 'Search archive (Enter)'}
+            onClick={textFilterApplied ? clearAppliedTextSearch : undefined}
           >
             {textSearchPending
               ? <IconLoader2 className="spin" size={16} />
-              : <IconSearch size={16} />}
+              : textFilterApplied
+                ? <IconX size={17} />
+                : <IconSearch size={16} />}
           </button>
         </form>
         <span className="sr-only" role="status" aria-live="polite">

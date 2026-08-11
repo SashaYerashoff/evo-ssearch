@@ -561,6 +561,14 @@
   border-color: var(--accent-line); background: color-mix(in srgb, var(--accent) 14%, transparent);
   outline: none;
 }
+.atp-query-submit.clear {
+  color: var(--danger);
+  background: color-mix(in srgb, var(--danger) 9%, transparent);
+}
+.atp-query-submit.clear:hover:not(:disabled), .atp-query-submit.clear:focus-visible {
+  border-color: color-mix(in srgb, var(--danger) 48%, transparent);
+  background: color-mix(in srgb, var(--danger) 16%, transparent);
+}
 .atp-query-submit:disabled { color: var(--text-mut); cursor: default; opacity: .62; }
 .atp-query-submit:disabled:has(.spin) { color: var(--accent); opacity: 1; }
 .atp-image { flex: 0 0 auto; align-self: flex-start; margin-left: 0; }
