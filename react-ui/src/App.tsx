@@ -392,7 +392,7 @@ export default function App() {
   const agentPresetGrid = agentOpen && !agentFull
   const noAnim = isMotionReduced
   return (
-    <div className={`shell ${noAnim ? 'no-anim' : ''}`}>
+    <div className={`shell ${noAnim ? 'no-anim' : ''} ${agentOpen && agentFull ? 'agent-full' : ''}`}>
       <NeuralBackground noAnim={noAnim} />
       <TopBar
         appVersion={appVersion}
