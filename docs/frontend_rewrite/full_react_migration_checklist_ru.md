@@ -424,8 +424,9 @@ Legacy endpoints, вызываемые старым UI, но не вызывае
   полей и кнопок `38px`, стандартные ширины Channel/Batch/Every/Model
   `320/92/84/220px`; поля больше не растягиваются по всей ширине экрана.
 - [x] Toolbar actions получили единую визуальную иерархию: главное действие
-  текущего таба остаётся яркой кнопкой справа, вторичные команды собраны в один
-  dropdown `Actions`, а `Collapse all / Expand all` объединены в stateful action.
+  текущего таба остаётся акцентной кнопкой справа без постоянной яркой заливки
+  и glow, вторичные команды собраны в один dropdown `Actions`, а
+  `Collapse all / Expand all` объединены в stateful action.
 - [x] Есть L0 feed и L1/L2/L3 rollups.
 - [x] Есть manual refresh, live polling и history range для L1/L2/L3.
 - [x] L0 History передаёт `from_ts` в `/luxriot/session`.
