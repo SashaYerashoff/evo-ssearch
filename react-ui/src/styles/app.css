@@ -554,7 +554,7 @@
 .atp-text input { flex: 1 1 auto; min-width: 0; background: var(--void-tile); border: 1px solid var(--line-2); border-radius: 9px; color: var(--text); padding: 9px 11px; font-size: 13.5px; outline: none; }
 .atp-text input:focus { border-color: var(--accent-line); }
 .atp-search-submit { justify-content: center; }
-.atp-image { flex: 0 0 auto; align-self: flex-end; margin-left: 0; }
+.atp-image { flex: 0 0 auto; align-self: flex-start; margin-left: 0; }
 /* search controls on one line: sort · results · min match */
 .atp-sc { display: flex; align-items: flex-end; gap: 12px; }
 .atp-sc .wfield { gap: 4px; }
