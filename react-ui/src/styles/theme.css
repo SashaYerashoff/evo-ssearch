@@ -119,12 +119,12 @@ html, body, #root { height: 100%; margin: 0; }
   container-type: size;
 }
 
-/* Big interface reproduces a 150% browser zoom while preserving a full-screen
+/* Big interface reproduces a 125% browser zoom while preserving a full-screen
    application viewport for fixed panels, drawers, and modal overlays. */
 html[data-interface-scale="large"] #root {
-  width: 66.666667%;
-  height: 66.666667%;
-  transform: scale(1.5);
+  width: 80%;
+  height: 80%;
+  transform: scale(1.25);
   transform-origin: top left;
 }
 

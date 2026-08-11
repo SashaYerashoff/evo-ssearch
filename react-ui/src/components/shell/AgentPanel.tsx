@@ -136,7 +136,7 @@ export function AgentPanel({
   canManageSkills: boolean
 }) {
   const { activePreferences } = useAppearance()
-  const interfaceScale = activePreferences.scale === 'large' ? 1.5 : 1
+  const interfaceScale = activePreferences.scale === 'large' ? 1.25 : 1
   const layoutViewportWidth = agentLayoutViewportWidth(window.innerWidth, interfaceScale)
   const [msgs, setMsgs] = useState<Msg[]>([])
   const [input, setInput] = useState('')

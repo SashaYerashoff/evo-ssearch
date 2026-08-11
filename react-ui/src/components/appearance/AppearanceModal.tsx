@@ -165,7 +165,7 @@ export function AppearanceModal({ onClose, embedded = false }: { onClose: () => 
             <div className="appearance-section-head">
               <div>
                 <h3>Interface</h3>
-                <p>Use the standard workspace or enlarge the entire operator interface to 150%.</p>
+                <p>Use the standard workspace or enlarge the entire operator interface to 125%.</p>
               </div>
             </div>
             <OptionGroup
@@ -173,7 +173,7 @@ export function AppearanceModal({ onClose, embedded = false }: { onClose: () => 
               value={draft.scale}
               options={[
                 { value: 'normal', label: 'Normal' },
-                { value: 'large', label: 'Big 150%' },
+                { value: 'large', label: 'Big 125%' },
               ]}
               onChange={(scale) => update({ ...draft, scale: scale as AppearancePreferences['scale'] })}
             />

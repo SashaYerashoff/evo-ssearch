@@ -27,12 +27,12 @@ describe('agent width presets', () => {
     expect(presets.map((preset) => preset.archiveColumns)).toEqual([4, 3])
   })
 
-  it('uses the scaled layout viewport for Big 150% interface presets', () => {
-    const viewportWidth = agentLayoutViewportWidth(1920, 1.5)
-    expect(viewportWidth).toBe(1280)
+  it('uses the scaled layout viewport for Big 125% interface presets', () => {
+    const viewportWidth = agentLayoutViewportWidth(1920, 1.25)
+    expect(viewportWidth).toBe(1536)
     const presets = agentWidthPresets(viewportWidth)
     expect(presets.map((preset) => preset.archiveColumns)).toEqual([4, 3])
-    expect(presets.map((preset) => preset.width)).toEqual([402, 604])
+    expect(presets.map((preset) => preset.width)).toEqual([488, 732])
   })
 
   it('snaps a dragged width to the nearest preset', () => {
