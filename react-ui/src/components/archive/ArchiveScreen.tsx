@@ -4,7 +4,9 @@ import {
   IconAlertTriangle,
   IconFilter,
   IconLetterT,
+  IconLoader2,
   IconPhoto,
+  IconSearch,
   IconSparkles,
 } from '@tabler/icons-react'
 import type { Channel, Detection, ArchiveFilters } from '../../api/types'
@@ -453,6 +455,17 @@ export function ArchiveScreen({
           <input placeholder="describe an archived scene…" aria-label="Text query — press Enter to search" autoFocus={!agentTyping}
             value={textValue} readOnly={agentTyping} className={agentTyping ? 'agent-caret' : ''}
             onChange={(e) => setTextValue(e.target.value)} />
+          <button
+            type="submit"
+            className="atp-query-submit"
+            disabled={agentTyping || textSearchPending || !textValue.trim()}
+            aria-label={textSearchPending ? 'Searching archive' : 'Search archive'}
+            title={textSearchPending ? 'Searching archive…' : 'Search archive (Enter)'}
+          >
+            {textSearchPending
+              ? <IconLoader2 className="spin" size={16} />
+              : <IconSearch size={16} />}
+          </button>
         </form>
         <span className="sr-only" role="status" aria-live="polite">
           {textSearchPending ? 'Semantic archive search in progress.' : ''}
@@ -523,7 +536,7 @@ export function ArchiveScreen({
           {(textSearchPending || showArchiveNote || filtersDirty) && (
             <div className="archive-results-context">
               {textSearchPending
-                ? `· Searching archive for “${q}” · current results remain visible`
+                ? `· Searching archive for “${q}”…`
                 : (showArchiveNote ? `· ${note}` : '')}
               {filtersDirty ? ' · Filters changed — load to apply' : ''}
             </div>
@@ -531,7 +544,11 @@ export function ArchiveScreen({
         </div>
       </div>
 
-      <div ref={resultsScrollRef} className="archive-results-scroll">
+      <div
+        ref={resultsScrollRef}
+        className={`archive-results-scroll ${textSearchPending ? 'is-searching' : ''}`}
+        aria-busy={textSearchPending}
+      >
         {coverageMessages.length > 0 && (
           <div className="archive-coverage-notice" role="status" aria-live="polite">
             <IconAlertTriangle size={16} />
