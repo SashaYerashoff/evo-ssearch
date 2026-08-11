@@ -486,23 +486,27 @@
 .atp-tabpanel-content::before {
   content: "";
   position: absolute; z-index: 0; pointer-events: none;
-  top: -45%; bottom: -45%; left: 0; width: 56%;
+  inset: -45% -16%;
   background:
-    radial-gradient(ellipse at 48% 44%, color-mix(in srgb, var(--accent) 9%, transparent) 0%, transparent 66%),
-    radial-gradient(ellipse at 58% 62%, color-mix(in srgb, var(--accent-2) 6%, transparent) 0%, transparent 72%);
+    radial-gradient(ellipse at 24% 44%, color-mix(in srgb, var(--accent) 9%, transparent) 0%, transparent 68%),
+    radial-gradient(ellipse at 76% 62%, color-mix(in srgb, var(--accent-2) 6%, transparent) 0%, transparent 72%),
+    linear-gradient(90deg,
+      color-mix(in srgb, var(--accent) 2%, transparent),
+      color-mix(in srgb, var(--accent-2) 3%, transparent),
+      color-mix(in srgb, var(--accent) 2%, transparent));
+  background-size: 720px 100%, 720px 100%, 100% 100%;
+  background-repeat: repeat-x, repeat-x, no-repeat;
+  background-position: 0 50%, 360px 50%, 0 0;
   filter: blur(16px);
   opacity: .58;
-  transform: translate3d(-112%, 0, 0) skewX(-12deg);
-  will-change: transform, opacity;
-  animation: atp-light-river 14s ease-in-out infinite;
+  transform: translateZ(0) skewX(-8deg);
+  will-change: background-position;
+  animation: atp-light-river 15s linear infinite;
 }
 .atp-tabpanel-content > * { position: relative; z-index: 1; }
 @keyframes atp-light-river {
-  0% { opacity: 0; transform: translate3d(-112%, 0, 0) skewX(-12deg); }
-  10% { opacity: .36; }
-  45%, 58% { opacity: .58; }
-  90% { opacity: .28; }
-  100% { opacity: 0; transform: translate3d(285%, 0, 0) skewX(-12deg); }
+  from { background-position: 0 50%, 360px 50%, 0 0; }
+  to { background-position: 720px 50%, 1080px 50%, 0 0; }
 }
 .atp-content-row { flex: 1 1 auto; min-width: 0; display: flex; align-items: stretch; gap: 8px; }
 .atp-open { flex: 1 1 auto; width: 100%; min-width: 0; }
