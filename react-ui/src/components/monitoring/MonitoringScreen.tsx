@@ -430,6 +430,7 @@ export function MonitoringScreen({
         reserveLeading
       >
         <div className="probe-board-toolbar">
+          <div className="toolbar-scroll-rail probe-toolbar-scroll">
           <div className="mon-search" title="Search names, prompts, channels and parent alerts">
             <IconSearch size={15} />
             <input
@@ -462,6 +463,7 @@ export function MonitoringScreen({
                 {state}
               </button>
             ))}
+          </div>
           </div>
           <div className="mon-toolbar-primary-actions">
             <ToolbarActionMenu actions={[

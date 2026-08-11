@@ -170,7 +170,7 @@ export function FilterBar({
     <div className="filter-block">
       <span className="atp-glabel"><IconFilter size={13} /> Filters</span>
       <div className="filter-bar">
-      <div className="filter-bar-scroll">
+      <div className="toolbar-scroll-rail filter-bar-scroll">
       <ChannelPicker
         channels={channels}
         selected={selectedChannels}

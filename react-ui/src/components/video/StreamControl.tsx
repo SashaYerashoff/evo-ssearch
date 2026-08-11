@@ -131,6 +131,7 @@ export function StreamControl(p: {
     >
       {p.activeTab === 'settings' ? (
         <div className="vid-settings-toolbar">
+          <div className="toolbar-scroll-rail vid-settings-scroll">
           <section className="vid-control-group source">
             <div className="vid-control-group-title">{t('video.source')}</div>
             <div className="wfield ch"><label>{t('video.channel')}</label>
@@ -151,6 +152,7 @@ export function StreamControl(p: {
               </div>
             </div>
           </section>
+          </div>
           <section className="vid-control-group actions">
             <div className="vid-control-group-title">{t('video.runtime')}</div>
             <div className="vid-tb-actions">
@@ -219,6 +221,7 @@ export function StreamControl(p: {
       ) : (
         <div className="vid-lens-stack">
           <div className="vid-tb-row vid-lens-row">
+            <div className="toolbar-scroll-rail vid-review-scroll">
             <div className="wfield ch"><label>{t('video.channel')}</label>
               <div className="vid-row">
                 <Dropdown value={String(p.reviewChannelId ?? '')} onChange={(v) => p.onReviewChannel(Number(v))}
@@ -238,6 +241,7 @@ export function StreamControl(p: {
                 onChange={(value) => p.onResolution(value as SummaryResolution)}
                 options={resolutions.map((item) => ({ value: item.v, label: item.label }))}
               />
+            </div>
             </div>
             <div className="vid-tb-actions">
               <ToolbarActionMenu actions={[

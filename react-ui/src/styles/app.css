@@ -510,11 +510,25 @@
   animation: atp-light-river 15s linear infinite;
 }
 .atp-tabpanel-content > * { position: relative; z-index: 1; }
+.atp-tabpanel-content:has(.dd-pop, .qf-pop, .daterange-pop, .archive-channel-picker-pop, .toolbar-actions-pop) {
+  overflow: visible;
+}
+.atp-tabpanel-content:has(.dd-pop, .qf-pop, .daterange-pop, .archive-channel-picker-pop, .toolbar-actions-pop)::before {
+  inset: 0;
+}
 @keyframes atp-light-river {
   from { background-position: 0 50%, 360px 50%, 0 0; }
   to { background-position: 720px 50%, 1080px 50%, 0 0; }
 }
 .atp-content-row { flex: 1 1 auto; min-width: 0; display: flex; align-items: stretch; gap: 8px; }
+.toolbar-scroll-rail {
+  display: flex; align-items: center; gap: 9px; flex: 1 1 auto; min-width: 0;
+  overflow-x: auto; overflow-y: hidden; padding: 1px 0;
+  scrollbar-width: none; -ms-overflow-style: none; overscroll-behavior-inline: contain;
+}
+.toolbar-scroll-rail::-webkit-scrollbar { display: none; }
+.toolbar-scroll-rail > * { flex-shrink: 0; }
+.toolbar-scroll-rail:has(.dd-pop, .qf-pop, .daterange-pop, .archive-channel-picker-pop) { overflow: visible; }
 .atp-open { flex: 1 1 auto; width: 100%; min-width: 0; }
 /* the tab already names the section — don't repeat the label inside the panel */
 .atp-tabpanel .atp-glabel { display: none; }
@@ -522,9 +536,17 @@
    Text query lays its search box and the Min-match slider on ONE row so the panel
    never grows taller (which was shoving the whole page down). */
 .atp-tabpanel .atp-textgroup { flex: 1 1 auto; min-width: 0; flex-direction: row; align-items: center; gap: 18px; }
+.atp-tabpanel .atp-textgroup {
+  overflow-x: auto; overflow-y: hidden;
+  scrollbar-width: none; -ms-overflow-style: none; overscroll-behavior-inline: contain;
+}
+.atp-tabpanel .atp-textgroup::-webkit-scrollbar { display: none; }
 .atp-tabpanel .atp-textgroup .atp-text { display: contents; }
-.atp-tabpanel .atp-textgroup .atp-text input { width: 340px; flex: 0 1 auto; order: 1; }
-.atp-tabpanel .atp-textgroup .atp-search-submit { order: 3; margin-left: auto; }
+.atp-tabpanel .atp-textgroup .atp-text input { width: 340px; flex: 0 0 340px; order: 1; }
+.atp-tabpanel .atp-textgroup .atp-search-submit {
+  position: sticky; right: 0; z-index: 2; order: 3; flex: 0 0 auto; margin-left: auto;
+  box-shadow: -14px 0 18px -16px var(--surface);
+}
 .atp-tabpanel .atp-min { width: 210px; min-width: 160px; flex: 0 0 auto; }
 .atp-tabpanel .atp-textgroup .atp-min { order: 2; }
 .atp-group { display: flex; flex-direction: column; gap: 8px; justify-content: flex-start; }
@@ -627,12 +649,6 @@
    only the filter rail scrolls; actions remain visible and panel height is stable. */
 .filter-block { display: flex; flex-direction: column; gap: 8px; width: 100%; min-width: 0; }
 .filter-bar { display: flex; align-items: center; gap: 10px; flex-wrap: nowrap; width: 100%; min-width: 0; }
-.filter-bar-scroll {
-  display: flex; align-items: center; gap: 9px; flex: 1 1 auto; min-width: 0;
-  overflow-x: auto; overflow-y: hidden; padding: 1px 0;
-  scrollbar-width: none; -ms-overflow-style: none; overscroll-behavior-inline: contain;
-}
-.filter-bar-scroll::-webkit-scrollbar { display: none; }
 .filter-bar-scroll > * { flex: 0 0 auto; }
 .filter-bar-actions {
   position: relative; z-index: 2; display: flex; align-items: center; gap: 8px;
@@ -1356,7 +1372,11 @@
   gap: 14px; padding: 14px 16px; overflow-y: auto;
 }
 .mon-toolbar-actions { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
-.mon-toolbar-primary-actions { display: flex; align-items: center; gap: 8px; margin-left: auto; }
+.mon-toolbar-primary-actions {
+  position: relative; z-index: 2; display: flex; align-items: center; gap: 8px;
+  flex: 0 0 auto; margin-left: 0; padding-left: 10px;
+  background: linear-gradient(90deg, transparent, color-mix(in srgb, var(--surface) 74%, transparent) 13px);
+}
 /* probe channel filter — fixed width, same height as the buttons beside it */
 .mon-ch-filter { width: 250px; flex: 0 0 auto; }
 .mon-ch-filter .dd-btn { height: 38px; box-sizing: border-box; padding-top: 0; padding-bottom: 0; }
@@ -1629,8 +1649,13 @@
 }
 
 /* video tool-tab content rows (Stream review / Stream settings) */
-.vid-tb-row { display: flex; align-items: flex-end; gap: 12px; flex-wrap: wrap; flex: 1 1 auto; min-width: 0; }
-.vid-tb-actions { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-left: auto; }
+.vid-tb-row { display: flex; align-items: flex-end; gap: 12px; flex-wrap: nowrap; flex: 1 1 auto; min-width: 0; }
+.vid-tb-actions {
+  position: relative; z-index: 2; display: flex; align-items: center; gap: 8px;
+  flex: 0 0 auto; flex-wrap: nowrap; margin-left: 0; padding-left: 10px;
+  background: linear-gradient(90deg, transparent, color-mix(in srgb, var(--surface) 74%, transparent) 13px);
+}
+.vid-review-scroll, .vid-settings-scroll { align-items: flex-end; }
 .vid-tb-row .wfield { gap: 5px; }
 .vid-tb-row .wfield > label { font-size: 10px; text-transform: uppercase; letter-spacing: .05em; }
 .vid-tb-row .wfield.ch { width: 320px; flex: 0 1 320px; min-width: 180px; }  /* capped, but may shrink when the agent squeezes the console */
@@ -1662,7 +1687,7 @@
 .vid-cols .atp-tab { max-width: 340px; }
 .vid-settings-toolbar {
   width: 100%; min-width: 0; display: flex;
-  align-items: flex-end; gap: 12px; flex-wrap: wrap;
+  align-items: flex-end; gap: 12px; flex-wrap: nowrap;
 }
 .vid-control-group {
   min-width: 0; display: flex; flex-direction: column; justify-content: flex-end; gap: 7px;
@@ -1671,7 +1696,7 @@
 .vid-control-group.source { width: 320px; flex: 0 1 320px; min-width: 180px; }
 .vid-control-group.sampling { flex: 0 0 185px; }
 .vid-control-group.inference { width: 220px; flex: 0 1 220px; min-width: 150px; }
-.vid-control-group.actions { flex: 0 0 auto; margin-left: auto; }
+.vid-control-group.actions { flex: 0 0 auto; margin-left: 0; }
 .vid-control-fields { display: flex; align-items: flex-end; gap: 9px; }
 .vid-control-group .wfield { gap: 5px; min-width: 0; }
 .vid-control-group .wfield > label { color: var(--text-mut); font-size: 10px; letter-spacing: .05em; text-transform: uppercase; }
@@ -2217,9 +2242,10 @@
 
 /* ===== Probes board — group → channel → probe, with explicit lineage ===== */
 .probe-board-toolbar {
-  display: flex; align-items: center; flex-wrap: wrap; gap: 8px;
+  display: flex; align-items: center; flex-wrap: nowrap; gap: 8px;
   width: 100%; min-width: 0;
 }
+.probe-toolbar-scroll { align-items: center; }
 .probe-filter-set {
   display: inline-flex; align-items: center; gap: 4px; padding: 3px;
   border: 1px solid var(--line); border-radius: 10px; background: var(--space-0);
