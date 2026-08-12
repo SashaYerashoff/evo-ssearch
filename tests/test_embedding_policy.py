@@ -396,6 +396,22 @@ class ProbeCaptureWarmupTests(unittest.TestCase):
     def tearDown(self) -> None:
         config.PROBE_CAPTURE_WARMUP_SEC = self.original_warmup
 
+    def test_synthetic_benchmark_cannot_block_active_live_capture(self) -> None:
+        live_session = SimpleNamespace()
+        with (
+            patch.object(oldapp.luxriot_manager, "sessions", {112: live_session}),
+            patch.object(oldapp.luxriot_manager, "probe_sessions", {118: live_session}),
+            patch("oldapp.init_clip") as init_clip,
+            app.test_request_context("/probes/bench"),
+        ):
+            response, status = oldapp.probes_bench()
+
+        payload = response.get_json()
+        self.assertEqual(status, 409)
+        self.assertEqual(payload["error"], "benchmark_blocked_by_live_capture")
+        self.assertEqual(payload["active_channel_ids"], [112, 118])
+        init_clip.assert_not_called()
+
     def test_empty_query_starts_capture_and_retries_after_first_frame(self) -> None:
         config.PROBE_CAPTURE_WARMUP_SEC = 0.1
         query = Mock(

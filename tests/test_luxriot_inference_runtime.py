@@ -4237,6 +4237,8 @@ class LuxriotCaptureDispatchTests(unittest.TestCase):
                 run_id="run-7",
             )
             session.slow_snapshot_count = 1
+            session.snapshot_count = 2
+            session.snapshot_slow_streak = 2
             decoded_frames = [
                 SimpleNamespace(
                     timestamp_ms=1_000,
@@ -4262,8 +4264,10 @@ class LuxriotCaptureDispatchTests(unittest.TestCase):
             self.assertEqual(session.live_segment_frame_count, 2)
             self.assertEqual(session.last_live_segment_frames, 2)
             self.assertIsNone(session.last_live_segment_error)
+            self.assertEqual(session.snapshot_slow_streak, 2)
+            self.assertTrue(session._should_use_live_segment())
 
-    def test_auto_capture_requires_a_slow_streak_and_retries_snapshot_after_live(self):
+    def test_auto_capture_requires_a_slow_streak_and_stays_on_dense_live_source(self):
         with tempfile.TemporaryDirectory() as temp:
             manager = build_manager(
                 Path(temp),
@@ -4291,9 +4295,11 @@ class LuxriotCaptureDispatchTests(unittest.TestCase):
             self.assertEqual(session.snapshot_slow_streak, 2)
             self.assertTrue(session._should_use_live_segment())
 
-            session._retry_snapshot_after_live_segment()
-            self.assertEqual(session.snapshot_slow_streak, 1)
-            self.assertFalse(session._should_use_live_segment())
+            # A successful dense segment must not re-arm a blocking snapshot
+            # request.  Source selection is sticky for this session; live
+            # failure and session restart remain the recovery paths.
+            self.assertEqual(session.snapshot_slow_streak, 2)
+            self.assertTrue(session._should_use_live_segment())
 
     def test_auto_capture_falls_back_to_live_segment_after_snapshot_failure(self):
         with tempfile.TemporaryDirectory() as temp:

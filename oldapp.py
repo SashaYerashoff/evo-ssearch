@@ -5948,6 +5948,59 @@ probes_store, detections_store = _build_archive_stores()
 luxriot_manager.probes_store = probes_store
 
 
+def _warm_live_embedding_runtime() -> Dict[str, Any]:
+    """Warm the exact live image path, then cache persisted probe phrases.
+
+    Capture restore is deliberately downstream of this function.  SigLIP text
+    and image inference share the model lifecycle lock, so letting probe text
+    prewarm race the first camera frames can make those frames stale before
+    they ever reach realtime scoring.
+    """
+
+    started = time.monotonic()
+    image_started = time.monotonic()
+    # A synthetic image exercises processor, device transfer and the image
+    # tower without entering a probe buffer or durable archive.
+    _clip_image_batch_with_space(
+        [Image.new("RGB", (224, 224), color=(0, 0, 0))]
+    )
+    image_ms = (time.monotonic() - image_started) * 1000.0
+
+    phrases: List[str] = []
+    probe_status = "ready"
+    probe_error = ""
+    try:
+        for raw_probe in probes_store.list_probes():
+            if not isinstance(raw_probe, Mapping) or raw_probe.get("enabled") is False:
+                continue
+            phrases.extend(
+                str(item).strip()
+                for field in ("positives", "negatives")
+                for item in (raw_probe.get(field) or [])
+                if str(item).strip()
+            )
+        phrases = list(dict.fromkeys(phrases))
+        if phrases:
+            probe_manager.prewarm_texts(phrases)
+    except Exception as exc:
+        # Archive capture remains useful when the durable probe registry is
+        # temporarily unavailable.  The normal single-flight async path will
+        # retry cold phrases after startup.
+        probe_status = "deferred"
+        probe_error = f"{type(exc).__name__}: {exc}"[:300]
+
+    result: Dict[str, Any] = {
+        "status": "ready",
+        "image_ms": round(image_ms, 3),
+        "probe_text_status": probe_status,
+        "probe_text_count": len(phrases),
+        "total_ms": round((time.monotonic() - started) * 1000.0, 3),
+    }
+    if probe_error:
+        result["probe_text_error"] = probe_error
+    return result
+
+
 def _build_incident_store() -> Any:
     if not _postgres_archive_enabled():
         return _UnavailablePostgresStore("incidents")
@@ -7401,10 +7454,12 @@ def initialize_runtime_services() -> None:
         if bool(getattr(config, "EMBEDDER_EAGER_LOAD", False)):
             try:
                 ensure_embedder_loaded(active_embedder)
+                live_warmup = _warm_live_embedding_runtime()
                 _runtime_embedder_result = {
                     "ok": True,
                     "status": "loaded",
                     "embedder": active_embedder,
+                    "live_warmup": live_warmup,
                 }
             except Exception as exc:
                 # Liveness must survive a missing/corrupt model or unavailable
@@ -18211,7 +18266,32 @@ def probes_run():
 
 @app.route('/probes/bench', methods=['GET'])
 def probes_bench():
-    """Measure encoder throughput separately from shared-runtime lock wait."""
+    """Measure idle encoder throughput without starving live capture."""
+    with luxriot_manager.cache_lock:
+        active_channel_ids = sorted(
+            {
+                int(channel_id)
+                for channel_id in (
+                    list(luxriot_manager.sessions)
+                    + list(luxriot_manager.probe_sessions)
+                )
+            }
+        )
+    if active_channel_ids:
+        with _live_clip_batcher_lock:
+            live_batcher = _live_clip_batcher
+        return jsonify({
+            "error": "benchmark_blocked_by_live_capture",
+            "message": (
+                "Stop live capture before running the synthetic encoder "
+                "benchmark; it shares the production SigLIP runtime."
+            ),
+            "active_channel_ids": active_channel_ids,
+            "live_encoder_timing": _clip_runtime_timing_status(),
+            "live_microbatcher": (
+                live_batcher.status() if live_batcher is not None else None
+            ),
+        }), 409
     try:
         import torch  # type: ignore
         init_clip()
@@ -18225,9 +18305,8 @@ def probes_bench():
         1,
         min(6, _to_int(request.args.get('iterations'), 3)),
     )
-    # This endpoint shares the production encoder by design. Bound its work so
-    # a diagnostic click cannot turn into tens of seconds without live probe
-    # embeddings when the GPU is already contended.
+    # No live capture exists at this point. Keep a separate hard budget anyway
+    # so an idle diagnostic cannot monopolize a worker indefinitely.
     benchmark_budget_ms = max(
         1_000,
         min(10_000, _to_int(request.args.get('budget_ms'), 5_000)),

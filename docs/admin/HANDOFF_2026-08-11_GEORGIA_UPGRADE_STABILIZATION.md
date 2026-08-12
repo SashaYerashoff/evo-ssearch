@@ -1317,6 +1317,69 @@ additional Luxriot/archive tests, 22/22 incident maintenance/command tests, and
 4/4 focused bookmark dataflow tests. Final service state was `/ready=200`, one
 Gunicorn worker, and systemd `NRestarts=0`.
 
+## 2026-08-12 dense capture and encoder isolation follow-up
+
+The deployment `.env` was again left byte-for-byte unchanged; SHA-256 remained
+`2c254527143f62bbdbcf7a14914872e2a6f1e0f4f776ef02024c0f27aac76325`.
+Neither llama.cpp server was restarted or reconfigured.
+
+The remaining periodic channel-118 gap was a capture-source state-machine bug.
+After every successful 60-second dense live segment, auto mode deliberately
+lowered `snapshot_slow_streak` and synchronously retried the snapshot endpoint.
+That endpoint takes approximately five seconds on emu1, so the retry inserted a
+five-second hole between otherwise healthy live segments. Auto mode is now
+sticky after two slow snapshots. It still falls back to snapshot if live capture
+actually fails, and a restarted or reconfigured session evaluates both sources
+from a clean state. Live verification crossed a segment boundary with
+`snapshot_count=6`, `slow_snapshot_count=2` and `snapshot_slow_streak=2` all
+unchanged while the next segment started immediately.
+
+Cold SigLIP startup now runs one synthetic image through the exact image tower
+and prewarms all persisted positive/negative probe phrases before desired camera
+sessions are restored. The synthetic frame is not added to a probe buffer or
+archive. Probe-registry failure defers only text prewarm; image-runtime failure
+still leaves startup explicitly unready. This removes the known image-versus-
+probe-text startup race, but a subsequent cold rehearsal still recorded one
+unattributed 16-second `_clip_init_lock` wait on the first live work. Steady state
+recovered immediately. Add caller-level lock telemetry before claiming cold
+startup fully solved.
+
+The synthetic `/probes/bench` endpoint was also able to hold the same production
+encoder lock for up to its ten-second diagnostic budget. It is now rejected with
+HTTP 409 whenever any video or analytics capture session is active and returns
+the current live encoder/batcher telemetry instead. The UI displays the explicit
+reason. An idle appliance can still run the synthetic benchmark.
+
+In a clean 20-second steady sample, the two channels completed 39 embeddings,
+the microbatch queue remained empty, and lock wait added approximately 1.4 ms in
+total across the window. Derived mean image work was about 103 ms per frame and
+the CUDA portion about 59 ms; the last observed complete encode/evaluation was
+20-21 ms. Channel 112 staleness ranged from roughly 0.18 to 0.79 seconds and
+channel 118 from 0.30 to 0.62 seconds away from a segment boundary. There were no
+archive drops or failures. CV apex selection remains CPU-only and dispatches one
+selected frame into the shared SigLIP batcher; it does not create a second
+embedding path.
+
+GPU sampling showed SigLIP on the RTX 5060 Ti in short bursts with 0-2% at the
+one-second sampling instants. The RTX 4060 was continuously 76-100% busy in the
+same window under the separate Qwen/VLM server; it did not increase the SigLIP
+queue because the runtimes are on different GPUs. Host memory was 16 GiB used
+with 14 GiB available. Swap still contained about 3.9 GiB of old pages, but a
+five-second `vmstat` sample showed zero active swap-in/swap-out after startup.
+
+Operationally, Gunicorn HUP is still not truly graceful for this heavy worker:
+the superseded worker is forced out after about eight seconds while the new
+worker needs about two minutes to import and load transformers. This creates an
+HTTP/capture outage during reload even though systemd remains active and reports
+`NRestarts=0`. Treat this as an upgrade-runbook risk; do not advertise zero-
+downtime reload until worker readiness handover is redesigned.
+
+Verification for this pass: 319/319 combined runtime-bootstrap, embedding-
+batcher, embedding-policy, ProbeManager-attention, Luxriot inference and UI
+contract tests. This includes the active-capture benchmark guard. The deployed
+service returned `/ready=200`, restored channels 112 and 118 as VLM/batch-8
+sessions, retained one worker and reported systemd `NRestarts=0`.
+
 ## Next work
 
 ### 1. Confirm the committed baseline

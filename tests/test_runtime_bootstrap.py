@@ -1,3 +1,4 @@
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import oldapp
@@ -62,6 +63,10 @@ def test_runtime_services_start_only_from_explicit_idempotent_bootstrap():
         oldapp.config.EMBEDDER_EAGER_LOAD = True
         with (
             patch("oldapp.ensure_embedder_loaded") as load_embedder,
+            patch(
+                "oldapp._warm_live_embedding_runtime",
+                return_value={"status": "ready"},
+            ) as warm_live,
             patch("oldapp._configure_inference_queue") as configure_queue,
             patch.object(
                 oldapp.luxriot_manager,
@@ -73,6 +78,7 @@ def test_runtime_services_start_only_from_explicit_idempotent_bootstrap():
             oldapp.initialize_runtime_services()
 
         load_embedder.assert_called_once_with(oldapp.active_embedder)
+        warm_live.assert_called_once_with()
         configure_queue.assert_called_once_with()
         restore.assert_called_once_with()
         assert oldapp._luxriot_restore_result["status"] == "restored"
@@ -81,6 +87,50 @@ def test_runtime_services_start_only_from_explicit_idempotent_bootstrap():
         oldapp._runtime_embedder_result = original_embedder
         oldapp._luxriot_restore_result = original_restore
         oldapp.config.EMBEDDER_EAGER_LOAD = original_eager
+
+
+def test_live_embedding_warmup_runs_image_before_persisted_probe_texts():
+    events = []
+    fake_store = SimpleNamespace(
+        list_probes=lambda: [
+            {
+                "enabled": True,
+                "positives": ["thumbs up", "person"],
+                "negatives": ["victory gesture"],
+            },
+            {
+                "enabled": True,
+                "positives": ["thumbs up"],
+                "negatives": [],
+            },
+            {
+                "enabled": False,
+                "positives": ["disabled phrase"],
+            },
+        ]
+    )
+    fake_manager = SimpleNamespace(
+        prewarm_texts=lambda texts: events.append(("texts", list(texts)))
+    )
+
+    with (
+        patch.object(
+            oldapp,
+            "_clip_image_batch_with_space",
+            side_effect=lambda images: events.append(("image", len(images))),
+        ),
+        patch.object(oldapp, "probes_store", fake_store),
+        patch.object(oldapp, "probe_manager", fake_manager),
+    ):
+        result = oldapp._warm_live_embedding_runtime()
+
+    assert events == [
+        ("image", 1),
+        ("texts", ["thumbs up", "person", "victory gesture"]),
+    ]
+    assert result["status"] == "ready"
+    assert result["probe_text_status"] == "ready"
+    assert result["probe_text_count"] == 3
 
 
 def test_embedder_bootstrap_failure_stays_live_unready_and_starts_no_runtime():

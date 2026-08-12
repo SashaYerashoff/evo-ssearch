@@ -1895,19 +1895,6 @@ class LuxriotCaptureSession:
             and snapshot_failed_count > 0
         ) or slow_streak >= 2
 
-    def _retry_snapshot_after_live_segment(self) -> None:
-        """Let auto mode re-test a previously working snapshot endpoint."""
-
-        with self.lock:
-            if self.capture_source_mode != "auto" or self.snapshot_count <= 0:
-                return
-            # Retain one strike: a second slow retry returns immediately to the
-            # dense stream, while one healthy snapshot clears the streak.
-            self.snapshot_slow_streak = min(
-                1,
-                max(0, int(self.snapshot_slow_streak)),
-            )
-
     def _snapshot_unavailable_in_auto(self) -> bool:
         if self.capture_source_mode != "auto":
             return False
@@ -2213,7 +2200,12 @@ class LuxriotCaptureSession:
             self._flush_capture_apex_bucket()
             self._summarize_if_ready()
             if accepted > 0:
-                self._retry_snapshot_after_live_segment()
+                # Auto mode remains on the dense source once the snapshot
+                # endpoint has proved too slow.  Re-testing snapshot here used
+                # to insert a synchronous request-timeout gap after every
+                # successful segment.  A live-segment failure still falls back
+                # to snapshot in ``_run``, and a restarted/reconfigured session
+                # evaluates the source again from a clean state.
                 self._clear_capture_error()
             return accepted > 0
         except Exception as exc:
@@ -2863,11 +2855,9 @@ class LuxriotCaptureSession:
                     self._flush_capture_apex_bucket()
                     self._summarize_if_ready()
                 if accepted > 0 and process_error is None:
-                    self._retry_snapshot_after_live_segment()
                     self._clear_capture_error()
                     return True
                 if accepted > 0:
-                    self._retry_snapshot_after_live_segment()
                     if process_error is not None:
                         self._set_capture_error(process_error)
                     return True

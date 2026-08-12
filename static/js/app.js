@@ -13392,7 +13392,7 @@
             try {
                 const resp = await fetch('/probes/bench');
                 const data = await resp.json();
-                if (!resp.ok || data.error) throw new Error(data.error || 'Benchmark failed');
+                if (!resp.ok || data.error) throw new Error(data.message || data.error || 'Benchmark failed');
                 probeBenchOutput.textContent = `~${data.approx_fps} fps @ batch ${data.batch} on ${data.device} (elapsed ${data.elapsed_sec}s)`;
             } catch (err) {
                 probeBenchOutput.textContent = `Benchmark failed: ${err.message}`;
