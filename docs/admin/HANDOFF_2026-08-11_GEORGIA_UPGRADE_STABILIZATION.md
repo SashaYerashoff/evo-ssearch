@@ -2039,3 +2039,42 @@ explicitly switched EVA off during local development. When EVA is available
 again, first confirm the service/process ownership and `.env` hash, then perform
 the ordinary readiness-gated rollout, live API/UI acceptance, immutable bundle
 verification, launcher update, and final handoff amendment.
+
+## 2026-08-13 nested-incident live rollout
+
+The operator brought EVA/Luxriot back and the pre-rollout control checks passed:
+the service was ready on beta 0.8.7, PostgreSQL remained at `20260805_0013`,
+Luxriot restored channels 112 and 118, `.env` retained its control hash, and the
+VLM/agent llama.cpp processes retained PIDs `1499650` and `2916440` with their
+recorded command lines.
+
+Commit `f25028e` was staged with bounded rollback copies:
+
+- backend suffix `pre-20260813-nested-incidents-f25028e`;
+- React rollback directory
+  `react-ui/dist.pre-20260813-nested-incidents-f25028e`.
+
+One graceful HUP was sent only to Gunicorn master `2014970`. Old worker `5849`
+continued serving while replacement `170651` loaded CUDA/runtime state. After
+the old worker retired, readiness briefly returned 503 while the sole new worker
+acquired background ownership, then returned 200 with both desired channels
+restored. `NRestarts=0`; neither inference process was restarted.
+
+Live acceptance after handover:
+
+- `/health=200`, `/ready=200`, beta 0.8.7;
+- CUDA SigLIP2 loaded, PostgreSQL reachable, Luxriot reachable/restored 2/2;
+- CLIP, semantic archive and realtime-probe pending queues were zero;
+- served React assets are `index-BJEko90E.js` and `index-ToIv3F5P.css`;
+- staged backend and React SHA-256 values match reviewed source/build output;
+- authenticated operator login, review list, full list, temporal context and
+  logout returned 200;
+- review and full totals were both 149; PostgreSQL contained zero nested-only
+  children immediately after rollout, proving the change did not retroactively
+  multiply historical records;
+- temporal output includes the new `nested_incidents` list contract.
+
+No synthetic incident was inserted into the live operator queue. Separate child
+materialization and replay behavior remain covered by the 51 focused tests and
+322 related incident/Luxriot runtime tests recorded above; a natural eligible L2
+composition will exercise the same server path without test-data pollution.
