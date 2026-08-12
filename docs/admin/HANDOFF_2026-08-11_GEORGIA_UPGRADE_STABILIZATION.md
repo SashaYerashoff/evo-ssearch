@@ -2078,3 +2078,24 @@ No synthetic incident was inserted into the live operator queue. Separate child
 materialization and replay behavior remain covered by the 51 focused tests and
 322 related incident/Luxriot runtime tests recorded above; a natural eligible L2
 composition will exercise the same server path without test-data pollution.
+
+The final immutable rehearsal archive for this pass is:
+
+```text
+/home/sasha/Downloads/eva-ai-georgia-upgrade-0.8.1-to-0.8.7-2fae764.tar.gz
+git commit: 2fae764ac842501f73934571e47706c5066aed43
+size:       169657772 bytes
+SHA-256:    dd3ae8939b5e5c4d407bcf88a1ad7a4f8e30e9aa795b2ddd5449c754b4a39a23
+```
+
+The outer checksum, clean manifest, every reused media-runtime checksum, staged
+backend source hash, and React assets `index-BJEko90E.js` /
+`index-ToIv3F5P.css` passed. The bundle contains the checked Linux x86-64 media
+runtime but deliberately contains neither a wheelhouse nor the SigLIP model; it
+preserves and reuses the accepted target venv/model configuration.
+
+`/home/sasha/Desktop/EVA_GEORGIA_UPGRADE_TEST.sh` now pins this archive and the
+exact manifest commit; `bash -n` and a final outer checksum check pass. The prior
+`b18876b` archive remains immutable as the previous recovery artifact. No
+destructive RECOVER or interactive upgrade rehearsal was run while producing
+this archive.
