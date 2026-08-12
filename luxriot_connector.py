@@ -12650,15 +12650,6 @@ class LuxriotManager:
         }
         out: List[Dict[str, Any]] = []
         for component in components:
-            semantic_keys = list(
-                dict.fromkeys(
-                    str(row.get("semantic_key") or "").strip().lower()
-                    for row in component
-                    if str(row.get("semantic_key") or "").strip()
-                )
-            )
-            if len(semantic_keys) < 2:
-                continue
             roots = [
                 row
                 for row in component
@@ -12680,6 +12671,29 @@ class LuxriotManager:
                     bounds(row)[0],
                 ),
             )
+            parent_start, parent_end = bounds(parent)
+            parent_priority = str(parent.get("priority") or "")
+            parent_entity = str(parent.get("semantic_key") or "").split(" ", 1)[0]
+            component = [
+                row
+                for row in component
+                if bounds(row)[0] <= parent_end + max_gap_ms
+                and bounds(row)[1] >= parent_start - max_gap_ms
+                and (
+                    parent_priority == "safety"
+                    or str(row.get("semantic_key") or "").split(" ", 1)[0]
+                    == parent_entity
+                )
+            ]
+            semantic_keys = list(
+                dict.fromkeys(
+                    str(row.get("semantic_key") or "").strip().lower()
+                    for row in component
+                    if str(row.get("semantic_key") or "").strip()
+                )
+            )
+            if len(semantic_keys) < 2:
+                continue
             episode_ids = [str(row.get("episode_id") or "") for row in component]
             parent_id = str(parent.get("episode_id") or "")
             start_ms = min(bounds(row)[0] for row in component)
@@ -12718,7 +12732,7 @@ class LuxriotManager:
                     "level": normalized_level,
                     "channel_id": int(parent.get("channel_id") or 0),
                     "parent_episode_id": parent_id,
-                    "parent_priority": str(parent.get("priority") or ""),
+                    "parent_priority": parent_priority,
                     "parent_severity": str(parent.get("severity") or ""),
                     "episode_ids": episode_ids[:128],
                     "nested_episode_ids": [

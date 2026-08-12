@@ -9233,6 +9233,66 @@ class LuxriotCaptureDispatchTests(unittest.TestCase):
 
         self.assertNotIn("incident_compositions", memory)
 
+    def test_high_operator_composition_keeps_same_entity_and_rejects_chain_noise(self):
+        parent = {
+            "episode_id": "episode-cat-enter",
+            "channel_id": 112,
+            "semantic_key": "cat enter",
+            "priority": "operator_criterion",
+            "severity": "high",
+            "status": "open",
+            "start_ms": 10_000,
+            "last_observed_ms": 12_000,
+            "observation_ids": ["obs-cat-enter"],
+            "evidence_refs": [],
+        }
+        cat_motion = {
+            "episode_id": "episode-cat-motion",
+            "channel_id": 112,
+            "semantic_key": "cat motion",
+            "priority": "context",
+            "status": "open",
+            "start_ms": 20_000,
+            "last_observed_ms": 21_000,
+            "observation_ids": ["obs-cat-motion"],
+            "evidence_refs": [],
+        }
+        person_exit = {
+            "episode_id": "episode-person-exit",
+            "channel_id": 112,
+            "semantic_key": "person exit",
+            "priority": "context",
+            "status": "open",
+            "start_ms": 22_000,
+            "last_observed_ms": 23_000,
+            "observation_ids": ["obs-person-exit"],
+            "evidence_refs": [],
+        }
+        late_cat = {
+            "episode_id": "episode-late-cat",
+            "channel_id": 112,
+            "semantic_key": "cat jump_climb",
+            "priority": "context",
+            "status": "open",
+            "start_ms": 10_000 + 6 * 60 * 1000,
+            "last_observed_ms": 10_000 + 6 * 60 * 1000 + 1_000,
+            "observation_ids": ["obs-late-cat"],
+            "evidence_refs": [],
+        }
+
+        compositions = LuxriotManager._compose_temporal_incident_candidates(
+            [parent, cat_motion, person_exit, late_cat],
+            level="L2",
+        )
+
+        self.assertEqual(len(compositions), 1)
+        self.assertEqual(
+            compositions[0]["semantic_keys"],
+            ["cat enter", "cat motion"],
+        )
+        self.assertNotIn("episode-person-exit", compositions[0]["episode_ids"])
+        self.assertNotIn("episode-late-cat", compositions[0]["episode_ids"])
+
     def test_rollup_incident_dispatch_retries_failure_then_coalesces_replay(self):
         with tempfile.TemporaryDirectory() as temp:
             manager = build_manager(Path(temp))

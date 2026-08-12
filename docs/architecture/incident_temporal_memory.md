@@ -51,9 +51,13 @@ first production slice of the third gate is also implemented at L2:
 - successful and degraded rollups preserve routine, temporal, episode and
   disposition ledgers in the durable rollup row; existing semantic rollups are
   backfilled from the same deterministic children without another LLM call;
-- a bounded five-minute temporal component may propose a composition only when
-  it contains at least two semantic tracks and is rooted in independent safety
-  evidence or a high/critical saved operator criterion;
+- a parent-centered five-minute neighborhood may propose a composition only
+  when it contains at least two semantic tracks and is rooted in independent
+  safety evidence or a high/critical saved operator criterion; child-to-child
+  proximity cannot form an unbounded transitive chain;
+- a safety root may retain cross-entity scene context, while an operator-rule
+  root is limited to the same primary entity so a specific `cat enter` rule
+  cannot absorb nearby person gestures or exits;
 - the composition can append replay-safe nested episodes only to the already
   existing grounded parent incident; it cannot create a parent from ordinary
   context, merge incident IDs, close a case, or change risk state;
