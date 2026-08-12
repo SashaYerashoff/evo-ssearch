@@ -261,12 +261,12 @@ export const videoApi = {
     api.postJson('/luxriot/bookmark', b),
 }
 
-// Model-view preview from EVA's bounded attention-frame ring. Dense Luxriot
-// capture fills windows incrementally, so a five-second freshness limit can
-// reject a healthy channel between apex admissions. Match the legacy
-// operator preview contract: frames remain live evidence for at most 60 s.
+// Model-view preview from EVA's bounded attention-frame ring. It deliberately
+// fails quickly when that ring is not fresh: a high-frequency UI refresh must
+// never open another Luxriot recorder/snapshot request or compete with model
+// capture. The UI keeps its last good decoded frame briefly while retrying.
 export function recentFrameUrl(channelId: number, bust: number): string {
-  return `/luxriot/recent_frame/${channelId}?stream=mainStream&fallback=snapshot&mode=latest&max_age_sec=60&_=${bust}`
+  return `/luxriot/recent_frame/${channelId}?stream=mainStream&fallback=0&mode=latest&max_age_sec=60&_=${bust}`
 }
 
 // Exact bounded MJPEG sequence of per-second EVA apex frames. Unlike full

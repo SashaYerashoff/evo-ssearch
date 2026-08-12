@@ -106,36 +106,96 @@ export function ProbeSettingsModal({ probe, channels, busy, canControlCapture, c
   const [advOpen, setAdvOpen] = useState(() => openTuning || openImage)
 
   // live preview + capture status of the selected channel
-  const [bust, setBust] = useState(1)
+  const [previewSrc, setPreviewSrc] = useState('')
   const [pvErr, setPvErr] = useState(true)
   const [st, setSt] = useState<ChannelStatus>({ channel_id: d.channel_id ?? 0 })
   const [applyMessage, setApplyMessage] = useState<string | null>(null)
-  const previewTimerRef = useRef<number | null>(null)
-  const schedulePreview = (delayMs: number) => {
-    if (previewTimerRef.current != null) window.clearTimeout(previewTimerRef.current)
-    previewTimerRef.current = window.setTimeout(() => {
-      setPvErr(true)
-      setBust((value) => value + 1)
-    }, delayMs)
-  }
+  const previewBlobUrlRef = useRef<string | null>(null)
   useEffect(() => {
-    setBust((b) => b + 1); setPvErr(true); setSt({ channel_id: d.channel_id ?? 0 })
+    let disposed = false
+    let requestNumber = 0
+    let lastGoodAtMs = 0
+    let previewTimer: number | null = null
+    let activeController: AbortController | null = null
+    const revokeTimers = new Map<number, string>()
+    const previousBlobUrl = previewBlobUrlRef.current
+    previewBlobUrlRef.current = null
+    if (previousBlobUrl) URL.revokeObjectURL(previousBlobUrl)
+    setPreviewSrc('')
+    setPvErr(true)
+    setSt({ channel_id: d.channel_id ?? 0 })
+
+    const schedulePreview = (delayMs: number) => {
+      if (previewTimer != null) window.clearTimeout(previewTimer)
+      previewTimer = window.setTimeout(loadPreview, delayMs)
+    }
+    const previewHasExpired = () => (
+      lastGoodAtMs === 0 || Date.now() - lastGoodAtMs >= 15_000
+    )
+    const retireBlobUrl = (url: string) => {
+      const timer = window.setTimeout(() => {
+        revokeTimers.delete(timer)
+        URL.revokeObjectURL(url)
+      }, 5_000)
+      revokeTimers.set(timer, url)
+    }
+    async function loadPreview() {
+      if (disposed || d.channel_id == null) return
+      const controller = new AbortController()
+      activeController = controller
+      const watchdog = window.setTimeout(() => controller.abort(), 12_000)
+      try {
+        const response = await fetch(
+          recentFrameUrl(d.channel_id, ++requestNumber),
+          { credentials: 'include', cache: 'no-store', signal: controller.signal },
+        )
+        const contentType = String(response.headers.get('content-type') || '').toLowerCase()
+        if (!response.ok || !contentType.startsWith('image/')) {
+          throw new Error(`Preview frame unavailable (${response.status})`)
+        }
+        const blob = await response.blob()
+        if (disposed) return
+        const nextBlobUrl = URL.createObjectURL(blob)
+        const oldBlobUrl = previewBlobUrlRef.current
+        previewBlobUrlRef.current = nextBlobUrl
+        lastGoodAtMs = Date.now()
+        setPreviewSrc(nextBlobUrl)
+        setPvErr(false)
+        if (oldBlobUrl) retireBlobUrl(oldBlobUrl)
+        schedulePreview(1_000)
+      } catch {
+        if (disposed) return
+        // A transient slow/error response must not blank a frame that was
+        // already loaded successfully. Escalate only after a bounded period
+        // without any good replacement, while retrying without overlap.
+        if (previewHasExpired()) setPvErr(true)
+        schedulePreview(2_000)
+      } finally {
+        window.clearTimeout(watchdog)
+        if (activeController === controller) activeController = null
+      }
+    }
     const poll = () => {
       if (d.channel_id != null) probesApi.status(d.channel_id, d.id).then(setSt).catch(() => {})
     }
     poll()
-    // Do not replace an in-flight <img> URL on a fixed interval.  A slow
-    // backend response would be cancelled by the next tick and the preview
-    // could remain blank forever.  onLoad/onError below schedules the normal
-    // cadence; this timer is only a bounded hung-request watchdog.
-    schedulePreview(12_000)
+    void loadPreview()
     const signals = window.setInterval(poll, 1200)
     return () => {
-      if (previewTimerRef.current != null) window.clearTimeout(previewTimerRef.current)
+      disposed = true
+      if (previewTimer != null) window.clearTimeout(previewTimer)
+      activeController?.abort()
       window.clearInterval(signals)
+      for (const [timer, url] of revokeTimers) {
+        window.clearTimeout(timer)
+        URL.revokeObjectURL(url)
+      }
+      revokeTimers.clear()
+      const blobUrl = previewBlobUrlRef.current
+      previewBlobUrlRef.current = null
+      if (blobUrl) URL.revokeObjectURL(blobUrl)
     }
   }, [d.channel_id, d.id])
-  const previewSrc = d.channel_id != null ? recentFrameUrl(d.channel_id, bust) : ''
 
   // ROI drawing on the preview
   const pvRef = useRef<HTMLDivElement>(null)
@@ -269,9 +329,7 @@ export function ProbeSettingsModal({ probe, channels, busy, canControlCapture, c
           <div className="probe-col-scroll">
           <div className={`probe-preview ${pvErr ? 'err' : ''} ${d.roiOn ? 'roi-mode' : ''}`} ref={pvRef}
             onMouseDown={roiDown} onMouseMove={roiMove} onMouseUp={roiUp} onMouseLeave={roiUp}>
-            {previewSrc && <img className={pvErr ? 'preview-pending' : undefined} src={previewSrc} alt="stream preview" draggable={false}
-              onLoad={() => { setPvErr(false); schedulePreview(1_000) }}
-              onError={() => { setPvErr(true); schedulePreview(2_000) }} />}
+            {previewSrc && <img src={previewSrc} alt="stream preview" draggable={false} onError={() => setPvErr(true)} />}
             {pvErr && <div className="vid-overlay"><IconVideoOff size={18} /> PREVIEW UNAVAILABLE</div>}
             {d.roiOn && d.roi && (
               <div className="probe-roi-rect" style={{ left: pct(d.roi.x), top: pct(d.roi.y), width: pct(d.roi.w), height: pct(d.roi.h) }} />

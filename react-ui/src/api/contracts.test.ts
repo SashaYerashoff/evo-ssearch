@@ -223,7 +223,7 @@ describe('React/backend contract normalizers', () => {
 
   it('keeps model-view preview fresh across dense capture windows', () => {
     expect(recentFrameUrl(112, 7)).toBe(
-      '/luxriot/recent_frame/112?stream=mainStream&fallback=snapshot&mode=latest&max_age_sec=60&_=7',
+      '/luxriot/recent_frame/112?stream=mainStream&fallback=0&mode=latest&max_age_sec=60&_=7',
     )
   })
 
