@@ -738,6 +738,12 @@ def test_l2_composition_replay_attaches_context_only_to_grounded_safety_case():
             self.observations.setdefault(record["idempotency_key"], dict(record))
             return dict(self.observations[record["idempotency_key"]])
 
+        def list_episodes(self, *_args, **_kwargs):
+            return [dict(item) for item in self.episodes.values()], len(self.episodes)
+
+        def list_relations(self, *_args, **_kwargs):
+            return [], 0
+
     rollup = {
         "rollup_id": "l2-ch112-w3600-0",
         "channel_id": 112,
@@ -785,16 +791,32 @@ def test_l2_composition_replay_attaches_context_only_to_grounded_safety_case():
 
     first = service.ingest_rollup_incident_compositions(112, rollup)
     replay = service.ingest_rollup_incident_compositions(112, rollup)
+    temporal = service.temporal_context(safety)
 
     assert first["attached"] == 1
     assert replay["attached"] == 1
-    assert len(store.episodes) == 1
-    episode = next(iter(store.episodes.values()))
-    assert episode["incident_id"] == INCIDENT_ID
-    assert episode["semantic_key"] == "person phone_call"
-    assert episode["perception_state"] == "ended"
-    assert episode["coverage"]["nested_context"] is True
-    assert episode["coverage"]["automatic_merge"] is False
+    assert len(store.episodes) == 2
+    parent = next(
+        item
+        for item in store.episodes.values()
+        if item["semantic_key"] == "vehicle collision"
+    )
+    nested = next(
+        item
+        for item in store.episodes.values()
+        if item["semantic_key"] == "person phone_call"
+    )
+    assert parent["incident_id"] == INCIDENT_ID
+    assert parent["coverage"]["composition_parent"] is True
+    assert parent["coverage"]["nested_context"] is False
+    assert nested["incident_id"] == INCIDENT_ID
+    assert nested["perception_state"] == "ended"
+    assert nested["coverage"]["nested_context"] is True
+    assert nested["coverage"]["automatic_merge"] is False
+    assert temporal["episodes"][0]["composition_parent"] is True
+    assert temporal["episodes"][0]["nested_context"] is False
+    assert temporal["episodes"][1]["nested_context"] is True
+    assert temporal["episodes"][1]["automatic_merge"] is False
     assert len(store.observations) == 1
     assert store.list_calls[0]["case_states"] == ["candidate", "open"]
 

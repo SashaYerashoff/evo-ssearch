@@ -355,7 +355,13 @@ export function IncidentModal({
     ['Attention', incident?.attention_state],
   ]
   const visibleObservations = observations.slice(-8).reverse()
-  const primaryEpisode = temporal?.episodes?.[0]
+  const temporalEpisodes = temporal?.episodes || []
+  const primaryEpisode = temporalEpisodes.find((episode) => episode.composition_parent)
+    || temporalEpisodes.find((episode) => !episode.nested_context)
+    || temporalEpisodes[0]
+  const nestedEpisodes = temporalEpisodes
+    .filter((episode) => episode !== primaryEpisode && episode.nested_context)
+    .slice(0, 8)
   const disposition = temporalDisposition(primaryEpisode?.scale_disposition)
   const seriesLinks = temporal?.series_links || []
   const lifecycleHistory = temporal?.lifecycle_history || []
@@ -470,6 +476,27 @@ export function IncidentModal({
                         <span>{disposition.description}</span>
                         {primaryEpisode.semantic_key && <i>{primaryEpisode.semantic_key.replace(/_/g, ' ')}</i>}
                       </div>
+                      {nestedEpisodes.length > 0 && (
+                        <div className="incident-nested-episodes">
+                          <span>Nested episode sequence</span>
+                          <ol>
+                            {nestedEpisodes.map((episode) => {
+                              const nestedDisposition = temporalDisposition(episode.scale_disposition)
+                              return (
+                                <li key={episode.id || episode.episode_key}>
+                                  <strong>{String(episode.semantic_key || 'Observed context').replace(/_/g, ' ')}</strong>
+                                  <small>
+                                    {fmtTime(episode.observed_start_ms || episode.possible_start_ms)}
+                                    {' · '}{nestedDisposition.label}
+                                    {episode.source_level ? ` · ${episode.source_level}` : ''}
+                                  </small>
+                                </li>
+                              )
+                            })}
+                          </ol>
+                          <small>Context is attached to the grounded parent; no incidents were merged automatically.</small>
+                        </div>
+                      )}
                       {seriesLinks.length > 0 && (
                         <div className="incident-series-links">
                           <span>Possible recurrence series</span>

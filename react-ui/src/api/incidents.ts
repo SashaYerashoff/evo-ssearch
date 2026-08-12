@@ -151,6 +151,11 @@ export interface IncidentTemporalEpisode {
   possible_end_ms?: number | null
   scale_disposition: string
   operator_review_required: boolean
+  nested_context: boolean
+  composition_parent: boolean
+  source_level?: string | null
+  composition_id?: string | null
+  automatic_merge: boolean
   evidence_count: number
 }
 

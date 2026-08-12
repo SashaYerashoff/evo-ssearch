@@ -567,6 +567,11 @@ class IncidentCommandService:
                         coverage.get("scale_disposition") or "unclassified_keep"
                     ),
                     "operator_review_required": coverage.get("operator_review_required") is not False,
+                    "nested_context": coverage.get("nested_context") is True,
+                    "composition_parent": coverage.get("composition_parent") is True,
+                    "source_level": str(coverage.get("source_level") or "") or None,
+                    "composition_id": str(coverage.get("composition_id") or "") or None,
+                    "automatic_merge": coverage.get("automatic_merge") is True,
                     "evidence_count": len(
                         [
                             item
@@ -1074,11 +1079,23 @@ class IncidentCommandService:
                 for value in composition.get("nested_episode_ids") or []
                 if str(value or "").strip()
             ][:127]
+            parent_episode_id = str(
+                composition.get("parent_episode_id") or ""
+            ).strip()
+            composition_episode_ids = list(
+                dict.fromkeys(
+                    [
+                        *([parent_episode_id] if parent_episode_id else []),
+                        *nested_ids,
+                    ]
+                )
+            )
             try:
-                for episode_id in nested_ids:
+                for episode_id in composition_episode_ids:
                     episode = episodes_by_id.get(episode_id)
                     if not episode:
                         continue
+                    nested_context = episode_id != parent_episode_id
                     start_ms = self._optional_int(episode.get("start_ms"))
                     end_ms = self._optional_int(
                         episode.get("boundary_at_ms")
@@ -1093,7 +1110,11 @@ class IncidentCommandService:
                         f"{composition_id}:{episode_id}".encode("utf-8")
                     ).hexdigest()
                     evidence_refs = [
-                        {"kind": "vlm_snapshot", "ref": str(value), "role": "context"}
+                        {
+                            "kind": "vlm_snapshot",
+                            "ref": str(value),
+                            "role": "context" if nested_context else "event",
+                        }
                         for value in episode.get("evidence_refs") or []
                         if str(value or "").strip()
                     ][:128]
@@ -1119,7 +1140,8 @@ class IncidentCommandService:
                                     episode.get("scale_disposition")
                                     or "unclassified_keep"
                                 ),
-                                "nested_context": True,
+                                "nested_context": nested_context,
+                                "composition_parent": not nested_context,
                                 "automatic_merge": False,
                                 "operator_review_required": True,
                             },
