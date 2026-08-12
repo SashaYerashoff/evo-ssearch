@@ -1757,6 +1757,110 @@ and React asset names passed. The intermediate `cdeb6bb` archive remains
 immutable but is no longer selected by the launcher. No RECOVER or upgrade
 rehearsal was run.
 
+## 2026-08-12 grounded L2 incident memory and nested episode projection
+
+Runtime commits `ffe9815`, `4d5c3d9`, and `b18876b` complete the first
+production-safe L2 composition slice. Investigation found that successful L1
+and L2 generation built temporal observations, episode dispositions and routine
+ledgers in memory but omitted them from the durable rollup write. Consequently,
+almost every successful stored L1/L2 row retained only its narrative, while one
+degraded L3 row happened to preserve the temporal fields. Successful, degraded
+and review-pending writes now retain the same bounded ledgers. A semantic cached
+rollup can be enriched from deterministic children without another LM call.
+
+The automatic boundary remains conservative:
+
+- ordinary L0 episode evidence still cannot create a durable case;
+- L2 may attach nested episodes only to an already existing incident grounded
+  by independent safety evidence or a high/critical saved operator criterion;
+- each child must be within five minutes of the grounded parent itself;
+  child-to-child proximity cannot form a transitive scene-wide chain;
+- a safety parent may retain cross-entity scene context, while an operator-rule
+  parent is restricted to the same primary entity;
+- replay uses deterministic composition, episode and observation keys;
+- no incident ID is merged, no case or risk state is changed, and every nested
+  episode remains operator-review required with `automatic_merge=false`.
+
+This last same-entity restriction was prompted by live data before the hourly
+L2 write. An earlier draft would have allowed a high `cat enter` operator alert
+to absorb nearby person exits, gestures and arm movement through a transitive
+five-minute chain. The parent-bounded implementation rejected that semantic
+soup. At the natural hourly live pass, channel 112 stored a new ready L2 with 27
+temporal observations and 9 episodes, while channel 118 stored 94 observations
+and 2 episodes. Both produced zero compositions: the cat episodes were too far
+apart, and emu1 contained a recurrence series of one `vehicle maneuver`
+semantic track rather than distinct nested events. No new incident card and no
+L2 composition episode was created. This is a positive conservative acceptance,
+not a missing callback.
+
+The preceding natural L1 pass also verified the repaired durable path on both
+channels. New ready rows for channel 112 retained 8 observations and 3-4
+episodes per sampled window; channel 118 retained 20-25 observations and 1-2
+episodes. Before this rollout, successful L1 and L2 rows on these channels had
+zero temporal/incident ledgers.
+
+Policy matching now treats irregular `left` as `leave` only in explicit egress
+phrases such as `left the scene` or `left the camera view`. The historical
+`Person turning head` candidate remains untouched for audit, but directional
+`turned head left` text can no longer satisfy the configured entering/leaving
+criterion. The same historical row subsequently received genuinely grounded
+exit observations, so it must not be bulk-deleted automatically.
+
+Incident detail now selects an explicitly marked composition parent instead of
+blindly displaying `episodes[0]`, and shows up to eight nested episodes as a
+short operator sequence. The copy states that these are attached context and
+that no incidents were automatically merged. Full evidence remains under
+technical details.
+
+Three readiness-gated HUPs rolled these backend steps onto the rehearsal service.
+The final worker is `5849` under unchanged master `2014970`; `NRestarts=0`,
+readiness is green, the CUDA SigLIP2 embedder is loaded, and Luxriot restored
+2/2 desired sessions. The inference PIDs remained `1499650` and `2916440`, and
+their command-line flags were not changed. The rehearsal `.env` still hashes to:
+
+```text
+2c254527143f62bbdbcf7a14914872e2a6f1e0f4f776ef02024c0f27aac76325
+```
+
+Backend rollbacks are beside the live files with suffixes
+`pre-20260812-incident-composition-ffe9815`,
+`pre-20260812-nested-episodes-4d5c3d9`, and
+`pre-20260812-parent-bounded-composition-b18876b`. The prior React dist is
+`react-ui/dist.pre-20260812-nested-episodes-4d5c3d9`. Served assets are
+`index-BjX4TzO_.js` and `index-BzONcufY.css`.
+
+Verification:
+
+```text
+focused composition/policy checks:  6 passed
+incident command suite:             20 passed
+combined backend incident/runtime:  327 passed
+React suite:                         97 passed
+TypeScript/Vite production build:   passed
+Python compilation / diff check:    passed
+```
+
+The final immutable rehearsal archive selected by the Desktop launcher is:
+
+```text
+/home/sasha/Downloads/eva-ai-georgia-upgrade-0.8.1-to-0.8.7-b18876b.tar.gz
+git commit: b18876b168903a8b6033d732781c037357940448
+size:       169647872 bytes
+SHA-256:    41afc3689e15a951b396089779f35efac11f03acedd282c5ec6a2593ce676401
+```
+
+Its outer checksum, clean manifest, reused checked media-runtime checksum
+manifest, backend source hashes, and React asset names passed. The prior
+`4529b67` and `4d5c3d9` archives remain immutable but are no longer selected.
+No RECOVER or interactive upgrade rehearsal was run.
+
+Complete multi-incident scene understanding is not claimed. Separate durable
+subincident IDs (for example a bystander's phone call inside a collision),
+candidate causal/concurrent relations, L3 cross-window composition, and learned
+weekday/time-of-day baselines remain the next incident-logic layers. The
+architecture contract and research basis are recorded in
+`docs/architecture/incident_temporal_memory.md`.
+
 ## Next work
 
 ### 1. Confirm the committed baseline
