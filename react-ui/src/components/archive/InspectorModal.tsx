@@ -19,6 +19,7 @@ import {
   archivePlaybackUrl,
   batchFrameNumber,
   describeFrame,
+  detectionBatchFrameKey,
   detImageSrc,
   falsePositiveExportUrl,
   fullDetectionImageSrc,
@@ -121,6 +122,7 @@ export function InspectorModal({
     detail?: string
   }>({ state: 'idle' })
   const [playbackElapsed, setPlaybackElapsed] = useState(0)
+  const frameReviewKey = `${d.key}|${detectionBatchFrameKey(d) || 'single'}`
 
   const active = frames[activeIndex] || d
   const previewSrc = detImageSrc(active)
@@ -209,7 +211,10 @@ export function InspectorModal({
         if (alive) setFramesLoading(false)
       })
     return () => { alive = false }
-  }, [d, channels])
+  // Channel inventory health is refreshed every 30 seconds, but a completed
+  // archive batch is immutable. Depend only on the selected evidence/batch so
+  // an unrelated channel-array replacement cannot clear and reload the strip.
+  }, [frameReviewKey]) // eslint-disable-line react-hooks/exhaustive-deps
 
   useEffect(() => {
     let alive = true

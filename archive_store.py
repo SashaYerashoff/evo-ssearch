@@ -2046,6 +2046,12 @@ class PostgresDetectionsStore(_TenantRepository):
             params.append(int(until_ms))
         normalized_batch_id = str(batch_id or "").strip()
         if normalized_batch_id:
+            # Keep this explicit existence predicate aligned with the partial
+            # ix_archive_detections_vlm_batch index. PostgreSQL does not infer
+            # `payload_json ? 'batch_id'` from an equality on `->>`, so without
+            # it even a six-frame immutable batch falls back to two full-table
+            # scans (COUNT + page read) across thumbnail-heavy archive rows.
+            where.append("payload_json ? 'batch_id'")
             where.append("payload_json->>'batch_id' = %s")
             params.append(normalized_batch_id)
         normalized_parent_alert_id = str(parent_alert_id or "").strip()

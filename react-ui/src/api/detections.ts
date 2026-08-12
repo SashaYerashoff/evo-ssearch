@@ -329,30 +329,103 @@ export async function findParentAlert(
     : null
 }
 
-export async function loadDetectionBatchFrames(
-  detection: Detection,
-  channels: Channel[],
-): Promise<Detection[]> {
-  if (!['vlm_summary', 'vlm_alert'].includes(detection.source)) return [detection]
+type DetectionBatchFrameScope = {
+  key: string
+  batchId: string
+  batchStart: number | null
+  batchEnd: number | null
+}
+
+const DETECTION_BATCH_FRAME_CACHE_LIMIT = 8
+const detectionBatchFrameCache = new Map<string, Detection[]>()
+const detectionBatchFrameRequests = new Map<string, Promise<Detection[]>>()
+
+function detectionBatchFrameScope(detection: Detection): DetectionBatchFrameScope | null {
+  if (!['vlm_summary', 'vlm_alert'].includes(detection.source)) return null
   const payload = detection.raw?.payload || {}
   const batchId = String(payload.batch_id || detection.raw?.batch_id || '').trim()
   const batchStart = num(payload.batch_start_ms ?? detection.raw?.batch_start_ms)
   const batchEnd = num(payload.batch_end_ms ?? detection.raw?.batch_end_ms)
   if (detection.channelId == null || (!batchId && (batchStart == null || batchEnd == null))) {
-    return [detection]
+    return null
   }
-  const response = await api.get('/detections/list', {
-    channel_id: detection.channelId,
-    source: 'vlm_summary',
-    batch_id: batchId || undefined,
-    since_ms: batchId ? undefined : Math.min(batchStart!, batchEnd!),
-    until_ms: batchId ? undefined : Math.max(batchStart!, batchEnd!),
-    limit: 120,
-    offset: 0,
-  })
-  const normalized = (response.detections || [])
-    .map((row: any) => normalizeDetection(row, channelMap(channels)))
-    .filter((row: Detection) => !!detImageSrc(row))
+  return {
+    key: batchId
+      ? `batch:${detection.channelId}:${batchId}`
+      : `window:${detection.channelId}:${Math.min(batchStart!, batchEnd!)}:${Math.max(batchStart!, batchEnd!)}`,
+    batchId,
+    batchStart,
+    batchEnd,
+  }
+}
+
+export function detectionBatchFrameKey(detection: Detection): string | null {
+  return detectionBatchFrameScope(detection)?.key || null
+}
+
+function cachedDetectionBatchFrames(key: string): Detection[] | undefined {
+  const cached = detectionBatchFrameCache.get(key)
+  if (!cached) return undefined
+  // Touch the entry so the small cache remains least-recently-used. The
+  // retained base64 thumbnails are bounded to avoid turning review history
+  // into unbounded browser memory.
+  detectionBatchFrameCache.delete(key)
+  detectionBatchFrameCache.set(key, cached)
+  return cached
+}
+
+function rememberDetectionBatchFrames(key: string, frames: Detection[]): Detection[] {
+  detectionBatchFrameCache.delete(key)
+  detectionBatchFrameCache.set(key, frames)
+  while (detectionBatchFrameCache.size > DETECTION_BATCH_FRAME_CACHE_LIMIT) {
+    const oldest = detectionBatchFrameCache.keys().next().value
+    if (oldest == null) break
+    detectionBatchFrameCache.delete(oldest)
+  }
+  return frames
+}
+
+async function loadImmutableDetectionBatch(
+  detection: Detection,
+  channels: Channel[],
+  scope: DetectionBatchFrameScope,
+): Promise<Detection[]> {
+  const cached = cachedDetectionBatchFrames(scope.key)
+  if (cached) return cached
+
+  let request = detectionBatchFrameRequests.get(scope.key)
+  if (!request) {
+    request = api.get('/detections/list', {
+      channel_id: detection.channelId!,
+      source: 'vlm_summary',
+      batch_id: scope.batchId || undefined,
+      since_ms: scope.batchId ? undefined : Math.min(scope.batchStart!, scope.batchEnd!),
+      until_ms: scope.batchId ? undefined : Math.max(scope.batchStart!, scope.batchEnd!),
+      limit: 120,
+      offset: 0,
+    }).then((response) => rememberDetectionBatchFrames(
+      scope.key,
+      (response.detections || [])
+        .map((row: any) => normalizeDetection(row, channelMap(channels)))
+        .filter((row: Detection) => !!detImageSrc(row)),
+    ))
+    detectionBatchFrameRequests.set(scope.key, request)
+    void request.finally(() => {
+      if (detectionBatchFrameRequests.get(scope.key) === request) {
+        detectionBatchFrameRequests.delete(scope.key)
+      }
+    }).catch(() => {})
+  }
+  return request
+}
+
+export async function loadDetectionBatchFrames(
+  detection: Detection,
+  channels: Channel[],
+): Promise<Detection[]> {
+  const scope = detectionBatchFrameScope(detection)
+  if (!scope) return [detection]
+  const normalized = await loadImmutableDetectionBatch(detection, channels, scope)
   const unique = new Map<string, Detection>()
   for (const row of [detection, ...normalized]) unique.set(batchFrameIdentity(row), row)
   return [...unique.values()].sort((left, right) => (

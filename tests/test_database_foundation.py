@@ -321,6 +321,7 @@ class ArchiveChannelFilterTests(unittest.TestCase):
             batch_id="vlm-7c6512",
         )
 
+        self.assertIn("payload_json ? 'batch_id'", where_sql)
         self.assertIn("payload_json->>'batch_id' = %s", where_sql)
         self.assertEqual(
             params,

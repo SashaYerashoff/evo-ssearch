@@ -26,6 +26,7 @@ import {
   buildArchiveListQuery,
   buildArchiveSearchPayload,
   batchFrameNumber,
+  detectionBatchFrameKey,
   falsePositiveExportUrl,
   fullDetectionImageSrc,
   normalizeDetection,
@@ -417,6 +418,23 @@ describe('React/backend contract normalizers', () => {
     expect(falsePositiveExportUrl('xml', 112)).toBe(
       '/reports/false-positives/export?format=xml&hours=24&channel_id=112',
     )
+  })
+
+  it('keys immutable VLM batch frames independently of channel inventory refreshes', () => {
+    const first = normalizeDetection({
+      id: 41,
+      source: 'vlm_summary',
+      channel_id: 112,
+      payload: { batch_id: 'vlm-stable-batch', snapshot_index: 1 },
+    })
+    const second = normalizeDetection({
+      id: 42,
+      source: 'vlm_summary',
+      channel_id: 112,
+      payload: { batch_id: 'vlm-stable-batch', snapshot_index: 2 },
+    })
+    expect(detectionBatchFrameKey(first)).toBe('batch:112:vlm-stable-batch')
+    expect(detectionBatchFrameKey(second)).toBe(detectionBatchFrameKey(first))
   })
 
   it('normalizes auth aliases and channel ids before authorization checks', () => {
