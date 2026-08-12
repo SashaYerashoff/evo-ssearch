@@ -26,6 +26,10 @@ class IncidentMaintenanceWorker:
         self.service_factory = service_factory
         self.interval_sec = max(1.0, min(300.0, float(interval_sec)))
         self.batch_size = max(1, min(500, int(batch_size)))
+        # Temporal projection is restart/backfill work, not a realtime lane.
+        # Each incident can require several PostgreSQL round trips, so keep its
+        # page deliberately smaller than Follow-TTL reconciliation.
+        self.projection_batch_size = min(8, self.batch_size)
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
         self._lock = threading.RLock()
@@ -93,7 +97,7 @@ class IncidentMaintenanceWorker:
                 with self._lock:
                     projection_offset = int(self._projection_offset)
                 projection_records, projection_total = self.incident_store.list_incidents(
-                    limit=self.batch_size,
+                    limit=self.projection_batch_size,
                     offset=projection_offset,
                 )
                 for raw in projection_records:
@@ -199,6 +203,7 @@ class IncidentMaintenanceWorker:
             state["alive"] = bool(self._thread is not None and self._thread.is_alive())
             state["interval_sec"] = self.interval_sec
             state["batch_size"] = self.batch_size
+            state["projection_batch_size"] = self.projection_batch_size
             return state
 
     def _loop(self) -> None:

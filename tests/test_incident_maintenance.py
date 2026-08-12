@@ -174,3 +174,28 @@ def test_maintenance_reuses_projection_until_incident_revision_changes():
         ("incident-1", 1),
         ("incident-1", 2),
     ]
+
+
+def test_temporal_projection_page_is_capped_below_realtime_follow_page():
+    store = _Store([])
+    requested_limits = []
+
+    def list_incidents(**kwargs):
+        if kwargs.get("states") == ["following"]:
+            return [], 0
+        requested_limits.append(int(kwargs["limit"]))
+        return [], 0
+
+    store.list_incidents = list_incidents
+
+    class _Projecting(_Service):
+        def ensure_temporal_projection(self, record):
+            return {"episode_created": False, "relation_created": False}
+
+    worker = IncidentMaintenanceWorker(store, lambda: _Projecting(store), batch_size=64)
+
+    worker.run_once()
+
+    assert worker.status()["batch_size"] == 64
+    assert worker.status()["projection_batch_size"] == 8
+    assert requested_limits == [8]
