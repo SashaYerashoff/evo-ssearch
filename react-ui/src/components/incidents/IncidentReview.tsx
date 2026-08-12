@@ -154,6 +154,24 @@ function cleanState(value: unknown): string {
   return String(value || 'unknown').replace(/_/g, ' ')
 }
 
+function comparableNarrative(value: unknown): string {
+  return String(value || '')
+    .toLocaleLowerCase()
+    .replace(/[^\p{L}\p{N}]+/gu, ' ')
+    .trim()
+}
+
+export function distinctIncidentSummary(title: unknown, summary: unknown): string {
+  const cleanSummary = String(summary || '').trim()
+  if (!cleanSummary) return ''
+  return comparableNarrative(title) === comparableNarrative(cleanSummary) ? '' : cleanSummary
+}
+
+export function shortIncidentId(value: unknown): string {
+  const normalized = String(value || '').trim()
+  return normalized.length > 8 ? normalized.slice(-8) : normalized
+}
+
 function IncidentCard({
   incident,
   channels,
@@ -165,12 +183,13 @@ function IncidentCard({
   locale: string
   onOpen: () => void
 }) {
+  const { t } = useI18n()
   const channelNames = (incident.channels || []).map((channelId) => (
     channels.find((channel) => channel.id === Number(channelId))?.title || `#${channelId}`
   ))
   const detectionId = Number(incident.cover?.detection_id)
-  const title = String(incident.title || 'Incident awaiting review')
-  const summary = String(incident.summary || '').trim()
+  const title = String(incident.title || t('incident.awaitingReview'))
+  const summary = distinctIncidentSummary(title, incident.summary)
   const coverage = incident.coverage && typeof incident.coverage === 'object'
     ? incident.coverage as Record<string, unknown>
     : {}
@@ -179,46 +198,70 @@ function IncidentCard({
     ? incident.follow as Record<string, unknown>
     : {}
   const priorityLabel = incident.priority === 'operator_criterion'
-    ? 'operator criterion'
+    ? t('incident.operatorCriterion')
     : incident.priority === 'safety'
-      ? 'safety signal'
-      : ''
+      ? t('incident.safetySignal')
+      : t('incident.contextCandidate')
+  const lifecycleLabels = [
+    incident.perception_state === 'ended'
+      ? t('incident.episodeEnded')
+      : incident.perception_state === 'observed'
+        ? t('incident.ongoingEvidence')
+        : '',
+    incident.risk_state === 'critical'
+      ? t('incident.criticalRisk')
+      : incident.risk_state === 'active'
+        ? t('incident.activeRisk')
+        : '',
+    incident.case_state === 'open' ? t('incident.caseOpen') : '',
+    follow.active === true ? t('incident.following') : '',
+  ].filter(Boolean)
+  const shortId = shortIncidentId(incident.incident_id)
 
   return (
-    <button className={`incident-review-card state-${incident.review_state}`} onClick={onOpen}>
+    <button
+      className={`incident-review-card state-${incident.review_state} priority-${incident.priority || 'context'}`}
+      onClick={onOpen}
+      aria-label={`${title}. ${priorityLabel}.`}
+    >
       <div className="incident-review-cover">
         {Number.isInteger(detectionId) && detectionId > 0
           ? <img src={`/detections/thumbnail/${detectionId}`} alt="" loading="lazy" />
-          : <div className="incident-review-no-cover"><IconPhotoOff size={21} /> No grounded cover</div>}
-        <span className={`incident-review-severity severity-${String(incident.severity || 'info').toLowerCase()}`}>
-          {cleanState(incident.severity)}
-        </span>
-        {follow.active === true && <span className="incident-review-follow"><IconEye size={12} /> follow</span>}
+          : <div className="incident-review-no-cover"><IconPhotoOff size={21} /> {t('incident.noCover')}</div>}
       </div>
       <div className="incident-review-card-body">
+        <div className="incident-review-card-kicker">
+          <span className={`priority priority-${incident.priority || 'context'}`}>{priorityLabel}</span>
+          <span className={`severity severity-${String(incident.severity || 'info').toLowerCase()}`}>
+            {cleanState(incident.severity)}
+          </span>
+          {follow.active === true && <span className="follow"><IconEye size={12} /> {t('incident.following')}</span>}
+        </div>
         <div className="incident-review-card-title">
           <strong>{title}</strong>
-          <span>#{incident.incident_id}</span>
+          <span title={incident.incident_id}>#{shortId}</span>
         </div>
-        <p>{summary || 'No consolidated narrative yet. Open the report to inspect grounded evidence.'}</p>
-        <div className="incident-review-axis" aria-label="Incident lifecycle">
-          <span>{cleanState(incident.perception_state)}</span>
-          <span>{cleanState(incident.risk_state)}</span>
-          <span>{cleanState(incident.case_state)}</span>
-          <span>{cleanState(incident.attention_state)}</span>
+        <div className="incident-review-card-context">
+          <strong>{channelNames.length ? channelNames.join(', ') : t('video.noChannel')}</strong>
+          <span>{t('incident.lastEvidence')} {formatTime(incident.last_evidence_ms, locale)}</span>
         </div>
+        {summary && <p>{summary}</p>}
+        {lifecycleLabels.length > 0 && (
+          <div className="incident-review-axis" aria-label="Incident lifecycle">
+            {lifecycleLabels.map((label) => <span key={label}>{label}</span>)}
+          </div>
+        )}
         <dl className="incident-review-metrics">
-          <div><dt>Observed</dt><dd>{formatReviewDuration(incident.observed_duration_ms)}</dd></div>
-          <div><dt>Case age</dt><dd>{formatReviewDuration(incident.case_duration_ms)}</dd></div>
-          <div><dt>Last evidence</dt><dd>{formatTime(incident.last_evidence_ms, locale)}</dd></div>
+          <div><dt>{t('incident.observedFor')}</dt><dd>{formatReviewDuration(incident.observed_duration_ms)}</dd></div>
+          <div><dt>{t('incident.caseAge')}</dt><dd>{formatReviewDuration(incident.case_duration_ms)}</dd></div>
+          <div><dt>{t('incident.evidence')}</dt><dd>{incident.evidence_count || 0}</dd></div>
         </dl>
-        <div className="incident-review-card-foot">
-          {priorityLabel && <span className={`priority priority-${incident.priority}`}>{priorityLabel}</span>}
-          <span>{channelNames.length ? channelNames.join(', ') : 'No channel'}</span>
-          <span>{incident.evidence_count || 0} evidence</span>
-          {incident.uncertainty_count > 0 && <span className="warning">{incident.uncertainty_count} uncertain</span>}
-          {Number.isFinite(coverageFraction) && <span>{Math.round(coverageFraction * 100)}% coverage</span>}
-        </div>
+        {(incident.uncertainty_count > 0 || Number.isFinite(coverageFraction)) && (
+          <div className="incident-review-card-foot">
+            {incident.uncertainty_count > 0 && <span className="warning">{incident.uncertainty_count} {t('incident.uncertain')}</span>}
+            {Number.isFinite(coverageFraction) && <span>{Math.round(coverageFraction * 100)}% {t('incident.coverage')}</span>}
+          </div>
+        )}
       </div>
     </button>
   )

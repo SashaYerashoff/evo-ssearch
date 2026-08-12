@@ -1,5 +1,11 @@
 import { describe, expect, it } from 'vitest'
-import { compareIncidentReviewPriority, formatReviewDuration, incidentReviewBounds } from './IncidentReview'
+import {
+  compareIncidentReviewPriority,
+  distinctIncidentSummary,
+  formatReviewDuration,
+  incidentReviewBounds,
+  shortIncidentId,
+} from './IncidentReview'
 
 describe('incident review helpers', () => {
   it('bounds review history in seconds for the HTTP API', () => {
@@ -38,5 +44,12 @@ describe('incident review helpers', () => {
 
     expect([context, configured].sort(compareIncidentReviewPriority).map((item) => item.incident_id))
       .toEqual(['configured', 'context'])
+  })
+
+  it('does not repeat a title as mechanical summary copy', () => {
+    expect(distinctIncidentSummary('Thumbs-up gesture', 'Thumbs-up gesture.')).toBe('')
+    expect(distinctIncidentSummary('Thumbs-up gesture', 'A person raises a thumb near the camera.'))
+      .toBe('A person raises a thumb near the camera.')
+    expect(shortIncidentId('4b638866-0df0-4855-a1e9-a21a7854bb0a')).toBe('7854bb0a')
   })
 })
