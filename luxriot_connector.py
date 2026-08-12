@@ -11168,6 +11168,58 @@ class LuxriotManager:
         )
 
     @classmethod
+    def _temporal_immediate_incident_candidate(cls, value: Mapping[str, Any]) -> bool:
+        """Return whether one grounded L0 observation warrants an immediate case.
+
+        Meaningful entries, exits, gestures, object handling and animal motion
+        remain in temporal memory for L1-L3 composition.  Only independently
+        actionable safety/security evidence bypasses that consolidation gate.
+        """
+
+        text = " ".join(
+            cls._truncate_text(value.get(key), limit)
+            for key, limit in (
+                ("label", 220),
+                ("summary", 320),
+                ("description", 320),
+                ("event_id", 120),
+            )
+        ).casefold()
+        if not text.strip():
+            return False
+        if re.search(
+            r"\b(?:"
+            r"fall(?:s|en|ing)?|fell|collaps(?:e|es|ed|ing)|faint(?:s|ed|ing)?|"
+            r"fight(?:s|ing)?|assault(?:s|ed|ing)?|attack(?:s|ed|ing)?|"
+            r"hit(?:s|ting)?|strik(?:e|es|ing)|violent|violence|"
+            r"snatch(?:es|ed|ing)?|steal(?:s|ing)?|stole|theft|robbery|"
+            r"break\s*[- ]?\s*in|forced?\s+entry|intrusion|trespass|"
+            r"collid(?:e|es|ed|ing)|collision|crash(?:es|ed|ing)?|near\s+miss|"
+            r"(?:run|runs|ran|running|cross|crosses|crossed|crossing)\s+(?:a\s+)?red\s+light|"
+            r"red\s+light\s+violation|traffic\s+signal\s+violation|"
+            r"fire|flame|smoke|explosion|flood|gas\s+leak|"
+            r"weapon|gun|knife|obstruction|blocked\s+(?:route|lane|entrance|channel)|"
+            r"distress|unconscious|unresponsive"
+            r")\b",
+            text,
+            flags=re.IGNORECASE,
+        ):
+            return True
+        return bool(
+            re.search(
+                r"\b(?:vehicle|car|truck|vessel|ship|boat|yacht|jetski|jet\s+ski)\b",
+                text,
+            )
+            and re.search(
+                r"\b(?:drift(?:s|ed|ing)?|dangerous\s+(?:driving|maneuver|vehicle\s+behavior)|"
+                r"high\s*[- ]?\s*speed|moving\s+fast|accelerat(?:e|es|ed|ing)|"
+                r"sharp\s+turn|wrong\s+direction|overturn(?:s|ed|ing)?|"
+                r"capsiz(?:e|es|ed|ing))\b",
+                text,
+            )
+        )
+
+    @classmethod
     def _temporal_event_semantic_key(cls, value: Mapping[str, Any]) -> str:
         """Canonical episode key resilient to small-model IDs and timestamps."""
 
@@ -11184,6 +11236,9 @@ class LuxriotManager:
             ("object", r"\b(?:bag|package|parcel|object|item|weapon|gun|knife)\b"),
         )
         action_patterns = (
+            ("thumbs_up", r"\bthumbs?\s*[- ]?\s*up\b"),
+            ("victory_gesture", r"\b(?:victory|peace|v\s*[- ]?\s*sign|two\s+finger)\b"),
+            ("phone_call", r"\b(?:phone\s+call|call(?:s|ed|ing)?\s+(?:on|by|with)\s+(?:a\s+)?phone|talk(?:s|ed|ing)?\s+on\s+(?:a\s+)?phone)\b"),
             ("enter", r"\b(?:enter|entry|arriv|appear)"),
             ("exit", r"\b(?:exit|leave|left|depart|disappear)"),
             ("fall", r"\b(?:fall|fell|collapse|faint)"),
@@ -11209,6 +11264,9 @@ class LuxriotManager:
                 "violence",
                 "take_object",
                 "maneuver",
+                "thumbs_up",
+                "victory_gesture",
+                "phone_call",
                 "enter",
                 "exit",
                 "chase_run",
@@ -11219,6 +11277,9 @@ class LuxriotManager:
             action = next(item for item in action_priority if item in actions)
             entity_priority = {
                 "maneuver": ("vessel", "vehicle"),
+                "thumbs_up": ("person",),
+                "victory_gesture": ("person",),
+                "phone_call": ("person",),
                 "collision": ("vessel", "vehicle", "person", "object"),
                 "take_object": ("object", "person"),
                 "jump_climb": ("cat", "dog", "person", "object", "vessel", "vehicle"),
@@ -11230,9 +11291,16 @@ class LuxriotManager:
                 "fire_smoke": ("vessel", "vehicle", "object", "person"),
                 "hazard": ("vessel", "vehicle", "object", "person"),
             }.get(action, ())
+            default_entity = (
+                "person"
+                if action in {"thumbs_up", "victory_gesture", "phone_call"}
+                else entities[0]
+                if len(entities) == 1
+                else "scene"
+            )
             entity = next(
                 (item for item in entity_priority if item in entities),
-                entities[0] if len(entities) == 1 else "scene",
+                default_entity,
             )
             return f"{entity} {action}"[:160]
         raw = cls._event_semantic_key(value)
@@ -12095,26 +12163,39 @@ class LuxriotManager:
                 state = "uncertain"
             if kind != "event":
                 state = None
-            out.append(
-                {
-                    "observation_id": observation_id,
-                    "channel_id": int(channel_id),
-                    "source_batch_id": source_batch_id,
-                    "ordinal": max(0, int(ordinal)),
-                    "kind": kind,
-                    "state": state,
-                    "semantic_key": cls._truncate_text(raw.get("semantic_key"), 160),
-                    "label": cls._truncate_text(raw.get("label"), 240),
-                    "start_ms": int(start_ms),
-                    "end_ms": max(int(start_ms), int(end_ms)),
-                    "applies_to": cls._coerce_memory_items(
-                        raw.get("applies_to"), max_items=32, max_len=160
-                    ),
-                    "evidence_refs": cls._coerce_memory_items(
-                        raw.get("evidence_refs"), max_items=32, max_len=160
-                    ),
-                }
-            )
+            compact = {
+                "observation_id": observation_id,
+                "channel_id": int(channel_id),
+                "source_batch_id": source_batch_id,
+                "ordinal": max(0, int(ordinal)),
+                "kind": kind,
+                "state": state,
+                "semantic_key": cls._truncate_text(raw.get("semantic_key"), 160),
+                "label": cls._truncate_text(raw.get("label"), 240),
+                "start_ms": int(start_ms),
+                "end_ms": max(int(start_ms), int(end_ms)),
+                "applies_to": cls._coerce_memory_items(
+                    raw.get("applies_to"), max_items=32, max_len=160
+                ),
+                "evidence_refs": cls._coerce_memory_items(
+                    raw.get("evidence_refs"), max_items=32, max_len=160
+                ),
+            }
+            trigger_kind = str(raw.get("trigger_kind") or "").strip().lower()
+            if trigger_kind in {
+                "episode_event",
+                "safety_event",
+                "safety_alert",
+                "operator_alert",
+            }:
+                compact["trigger_kind"] = trigger_kind
+            severity = str(raw.get("severity") or "").strip().lower()
+            if severity:
+                compact["severity"] = severity[:32]
+            operator_criterion = cls._truncate_text(raw.get("operator_criterion"), 220)
+            if operator_criterion:
+                compact["operator_criterion"] = operator_criterion
+            out.append(compact)
         return out
 
     @classmethod
@@ -12127,6 +12208,7 @@ class LuxriotManager:
         batch_start_ms: int,
         batch_end_ms: int,
         coverage_gap: bool = False,
+        operator_alert_policy: object = "",
     ) -> List[Dict[str, Any]]:
         rows: List[Dict[str, Any]] = []
         ordinal = 0
@@ -12171,16 +12253,25 @@ class LuxriotManager:
                 end_ms=batch_end_ms,
                 evidence_refs=evidence_refs,
             )
-            rows.append(observation.to_dict())
+            row = observation.to_dict()
+            row["trigger_kind"] = (
+                "safety_event"
+                if cls._temporal_immediate_incident_candidate(raw)
+                else "episode_event"
+            )
+            rows.append(row)
             ordinal += 1
-        event_semantic_keys = {
-            str(row.get("semantic_key") or "")
+        event_rows_by_key = {
+            str(row.get("semantic_key") or ""): row
             for row in rows
             if str(row.get("kind") or "") == "event"
         }
-        # Structured alerts are already bounded by the operator's alert
-        # criteria. Preserve them as temporal observations even when a small
-        # VLM forgets to duplicate the alert in ``events``.
+        operator_criteria = cls._operator_alert_policy_criteria(operator_alert_policy)
+        # A structured VLM alert is not, by itself, proof that the operator
+        # requested an incident.  Admit it only when it matches a configured
+        # criterion or when its grounded content independently passes the
+        # safety/security event gate.  This keeps free-form model suggestions
+        # such as ordinary hand-to-face motion out of the review queue.
         for raw in batch_state.get("alerts") or []:
             if not isinstance(raw, Mapping):
                 continue
@@ -12190,9 +12281,43 @@ class LuxriotManager:
                 "label": raw.get("label") or raw.get("title"),
                 "summary": raw.get("summary") or raw.get("description"),
             }
+            matched_criterion = ""
+            matched_score = -1.0
+            for criterion in operator_criteria:
+                score = cls._operator_policy_event_match(criterion, alert_event)
+                if score is not None and score > matched_score:
+                    matched_criterion = criterion
+                    matched_score = score
+            trigger_kind = (
+                "operator_alert"
+                if matched_criterion
+                else "safety_alert"
+                if cls._temporal_immediate_incident_candidate(alert_event)
+                else ""
+            )
+            if not trigger_kind:
+                continue
             label = cls._truncate_text(alert_event.get("label"), 240)
             semantic_key = cls._temporal_event_semantic_key(alert_event)
-            if not label or not semantic_key or semantic_key in event_semantic_keys:
+            if not label or not semantic_key:
+                continue
+            existing = event_rows_by_key.get(semantic_key)
+            if existing is not None:
+                existing["trigger_kind"] = trigger_kind
+                existing["severity"] = str(raw.get("severity") or "info").strip().lower()[:32]
+                if matched_criterion:
+                    existing["operator_criterion"] = matched_criterion
+                existing_refs = list(existing.get("evidence_refs") or [])
+                for index in raw.get("snapshot_indices") or []:
+                    parsed_index = _parse_optional_int(index)
+                    ref = (
+                        f"{source_batch_id}:snapshot:{int(parsed_index)}"
+                        if parsed_index is not None
+                        else ""
+                    )
+                    if ref and ref not in existing_refs:
+                        existing_refs.append(ref)
+                existing["evidence_refs"] = existing_refs[:16]
                 continue
             state = str(raw.get("state") or "new").strip().lower()
             try:
@@ -12215,8 +12340,13 @@ class LuxriotManager:
                     if _parse_optional_int(index) is not None
                 ][:16],
             )
-            rows.append(observation.to_dict())
-            event_semantic_keys.add(semantic_key)
+            row = observation.to_dict()
+            row["trigger_kind"] = trigger_kind
+            row["severity"] = str(raw.get("severity") or "info").strip().lower()[:32]
+            if matched_criterion:
+                row["operator_criterion"] = matched_criterion
+            rows.append(row)
+            event_rows_by_key[semantic_key] = row
             ordinal += 1
         for routine in cls._compact_routine_observations(
             batch_state.get("routines"), max_items=16
@@ -16925,6 +17055,20 @@ class LuxriotManager:
 
         value = str(token or "").strip().lower()
         posture_aliases = {
+            "arrive": "enter",
+            "arrived": "enter",
+            "arrives": "enter",
+            "arriving": "enter",
+            "entered": "enter",
+            "entering": "enter",
+            "depart": "leave",
+            "departed": "leave",
+            "departing": "leave",
+            "departs": "leave",
+            "exit": "leave",
+            "exited": "leave",
+            "exiting": "leave",
+            "exits": "leave",
             "left": "leave",
             "leaves": "leave",
             "leaving": "leave",
@@ -18694,6 +18838,12 @@ class LuxriotManager:
     def get_stream_system_prompt(self, channel_id: Optional[int] = None) -> str:
         with self.cache_lock:
             return self._get_stream_system_prompt_locked(channel_id)
+
+    def get_alert_policy_prompt(self, channel_id: Optional[int] = None) -> str:
+        """Return the raw effective alert policy without copying all prompt state."""
+
+        with self.cache_lock:
+            return self._get_alert_policy_prompt_locked(channel_id)
 
     def get_effective_stream_system_prompt(self, channel_id: int) -> str:
         with self.cache_lock:
@@ -21332,6 +21482,7 @@ class LuxriotManager:
 
     def _l0_nodes_from_logs(self, channel_id: int, logs: Sequence[Mapping[str, Any]]) -> List[Dict[str, Any]]:
         nodes: List[Dict[str, Any]] = []
+        operator_alert_policy = self.get_alert_policy_prompt(channel_id)
         for log in logs:
             if not isinstance(log, Mapping):
                 continue
@@ -21422,6 +21573,7 @@ class LuxriotManager:
                 batch_start_ms=int(batch_start_ms),
                 batch_end_ms=int(batch_end_ms),
                 coverage_gap=bool(log.get("coverage_gap")),
+                operator_alert_policy=operator_alert_policy,
             )
             node = {
                 "rollup_id": rollup_id,

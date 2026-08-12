@@ -808,6 +808,13 @@ class IncidentCommandService:
                 skipped += 1
                 continue
             incident = active_by_key.get(semantic_key)
+            trigger_kind = str(observation.get("trigger_kind") or "").strip().lower()
+            if incident is None and trigger_kind == "episode_event":
+                # Preserve the observation in L0-L3 temporal memory, but wait
+                # for a wider-scale composition before asking an operator to
+                # review an ordinary transition as a durable case.
+                skipped += 1
+                continue
             if incident is None and event_state in {"resolved", "finished"}:
                 skipped += 1
                 continue
@@ -928,6 +935,21 @@ class IncidentCommandService:
         start_ms = self._optional_int(observation.get("start_ms")) or int(heartbeat["batch_start_ms"])
         end_ms = max(start_ms, self._optional_int(observation.get("end_ms")) or int(heartbeat["batch_end_ms"]))
         label = str(observation.get("label") or semantic_key or "Incident candidate").strip()[:200]
+        trigger_kind = str(observation.get("trigger_kind") or "legacy_event").strip().lower()
+        if trigger_kind not in {
+            "legacy_event",
+            "episode_event",
+            "safety_event",
+            "safety_alert",
+            "operator_alert",
+        }:
+            trigger_kind = "legacy_event"
+        severity = str(observation.get("severity") or "info").strip().lower()[:32] or "info"
+        report_source = {
+            "operator_alert": "operator_alert_l0",
+            "safety_alert": "safety_alert_l0",
+            "safety_event": "safety_event_l0",
+        }.get(trigger_kind, "vlm_l0_temporal")
         evidence_refs = [
             {"kind": "vlm_snapshot", "ref": str(item), "role": "event"}
             for item in observation.get("evidence_refs") or []
@@ -959,19 +981,33 @@ class IncidentCommandService:
                 "source_batch_id": str(heartbeat.get("batch_id") or ""),
             },
             "uncertainties": [
-                "Automated L0 incident candidate; operator confirmation is required."
+                (
+                    "Grounded L0 match to an operator-configured alert criterion; "
+                    "operator confirmation is required."
+                    if trigger_kind == "operator_alert"
+                    else "Grounded L0 safety/security candidate; operator confirmation is required."
+                    if trigger_kind in {"safety_alert", "safety_event"}
+                    else "Automated L0 incident candidate; operator confirmation is required."
+                )
             ],
             "report": {
-                "severity": "info",
+                "severity": severity,
                 "summary": label,
-                "source": "vlm_l0_temporal",
+                "source": report_source,
+                "priority": (
+                    "operator_criterion"
+                    if trigger_kind == "operator_alert"
+                    else "safety"
+                    if trigger_kind in {"safety_alert", "safety_event"}
+                    else "context"
+                ),
             },
             "follow_policy": {},
         }
 
     @staticmethod
     def _l0_timeline_ref(observation: Mapping[str, Any]) -> dict[str, Any]:
-        return {
+        item = {
             "observation_id": str(observation.get("observation_id") or ""),
             "timestamp_ms": observation.get("start_ms"),
             "start_ms": observation.get("start_ms"),
@@ -981,6 +1017,16 @@ class IncidentCommandService:
             "state": str(observation.get("state") or "uncertain")[:32],
             "source": "vlm_l0_temporal",
         }
+        trigger_kind = str(observation.get("trigger_kind") or "").strip().lower()
+        if trigger_kind:
+            item["trigger_kind"] = trigger_kind[:32]
+        severity = str(observation.get("severity") or "").strip().lower()
+        if severity:
+            item["severity"] = severity[:32]
+        operator_criterion = str(observation.get("operator_criterion") or "").strip()
+        if operator_criterion:
+            item["operator_criterion"] = operator_criterion[:220]
+        return item
 
     def _extend_l0_incident(
         self,
@@ -1102,7 +1148,7 @@ class IncidentCommandService:
                 "source_kind": (
                     "routine_boundary"
                     if str(observation.get("kind") or "") == "routine_gap"
-                    else "vlm_l0_event"
+                    else str(observation.get("trigger_kind") or "vlm_l0_event")
                 ),
                 "observed_at_ms": self._optional_int(observation.get("end_ms")) or self._wall_clock_ms(),
                 "channel_id": _positive_ints(incident.get("channel_ids"))[0],
@@ -1112,6 +1158,9 @@ class IncidentCommandService:
                     "semantic_key": observation.get("semantic_key"),
                     "label": str(observation.get("label") or "")[:240],
                     "state": observation.get("state"),
+                    "trigger_kind": observation.get("trigger_kind"),
+                    "severity": observation.get("severity"),
+                    "operator_criterion": observation.get("operator_criterion"),
                     "homeostasis": dict(homeostasis),
                 },
             },
@@ -1970,6 +2019,8 @@ class IncidentCommandService:
             "homeostasis": dict(synopsis.get("homeostasis") or {}),
             "follow_result": dict(synopsis.get("follow_result") or {}),
             "severity": str(report.get("severity") or "info"),
+            "source": str(report.get("source") or ""),
+            "priority": str(report.get("priority") or ""),
             "review_state": review_state,
             "state": "draft" if state == "following" and follow.get("active") is False else state,
             "perception_state": perception_state,

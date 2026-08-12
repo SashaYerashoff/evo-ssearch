@@ -16,11 +16,56 @@ channel ownership, or close cases by omission.
 L0 display prose and state/routine ledgers may retain ordinary posture, gaze,
 and scene-motion observations. The incident chronology is intentionally
 narrower: generic movement, head turns, seated/resting state, motion blur, and
-similar micro-motion do not create episodes by themselves. Alert records keep
-their independent path. Accepted VLM episode labels are normalized to a stable
-primary entity/action key (for example `vehicle maneuver` or
-`cat jump_climb`), and routine `applies_to_event_keys` are normalized through
-the same function before they can close an episode.
+similar micro-motion do not create episodes by themselves. A structured VLM
+alert is not automatically an operator incident: immediate admission requires
+either a deterministic match to the channel's saved operator alert criteria or
+independently actionable safety/security evidence. Accepted VLM episode labels
+are normalized to a stable primary entity/action key (for example
+`vehicle maneuver` or `cat jump_climb`), and routine
+`applies_to_event_keys` are normalized through the same function before they
+can close an episode.
+
+## Admission and multi-scale composition
+
+Continuous video must not be segmented into one operator case per model noun
+phrase. Research on event perception describes simultaneous, nested event
+boundaries at multiple timescales, while long-term video anomaly work shows
+that normality depends on scene and temporal context. EVA therefore separates
+three decisions:
+
+1. **Observe at L0.** Keep a grounded transition in temporal memory. Ordinary
+   entry/exit, gestures, object handling and animal motion are `episode_event`
+   evidence, not immediate durable cases.
+2. **Interrupt immediately when justified.** A saved operator criterion match
+   is `operator_alert`; an independently actionable hazard is `safety_event` or
+   `safety_alert`. These may create a bounded review candidate immediately.
+3. **Compose at wider scales.** L1-L3 must decide whether smaller observations
+   are children of a continuing incident, a distinct nested incident, a
+   recurrence series, or routine at that scale. The wider baseline is
+   channel-, zone-, weekday- and time-of-day-relative; a lower-scale return to
+   routine does not end its enclosing incident.
+
+The first two gates and provenance-preserving priority are implemented. The
+third is the remaining production composition step: deterministic child
+dispositions exist in rollup metadata, but automatic durable promotion of a
+multi-action L1/L2 episode is not yet allowed. Until that binding is grounded,
+EVA prefers retaining evidence without opening a case over flooding the
+operator queue with speculative micro-incidents.
+
+Design basis:
+
+- Zacks et al., *Segmentation in the perception and memory of events*:
+  simultaneous hierarchical event segmentation across timescales
+  (<https://pmc.ncbi.nlm.nih.gov/articles/PMC2263140/>).
+- Baldassano et al., *Discovering event structure in continuous narrative
+  perception and memory*: nested short and long event representations
+  (<https://pmc.ncbi.nlm.nih.gov/articles/PMC5558154/>).
+- Yang and Radke, *Context-aware Video Anomaly Detection in Long-Term
+  Datasets*: normality depends on time of day, weekday and event schedule
+  (<https://openaccess.thecvf.com/content/CVPR2024W/VAND/html/Yang_Context-aware_Video_Anomaly_Detection_in_Long-Term_Datasets_CVPRW_2024_paper.html>).
+- NIST SP 800-61r3 is used only as a lifecycle discipline reference: detection,
+  response and recovery are distinct decisions; perceptual disappearance is
+  not case closure (<https://csrc.nist.gov/pubs/sp/800/61/r3/final>).
 
 ## Identity hierarchy
 
@@ -129,9 +174,11 @@ incidents are unaffected. Transport/generic keys such as `vlm_alert`,
 such a candidate, maintenance appends a `rejected` correction referencing the
 bad relation instead of rewriting the append-only ledger.
 
-Covered high-signal L0 observations may also open a durable
-`case_state=candidate` record automatically. The server, not the VLM, assigns
-the incident ID; an exact normalized semantic track continues that candidate,
+Covered operator-criterion matches and independently actionable safety/security
+L0 observations may also open a durable `case_state=candidate` record
+automatically. Other meaningful L0 transitions remain rollup evidence. The
+server, not the VLM, assigns the incident ID; an exact normalized semantic track
+continues that candidate,
 while a different track remains a parallel incident. A grounded resolved event
 or an explicit covered routine boundary ends the perceptual episode but leaves
 the operator case in the review queue. Automatic creation is bounded to four
@@ -256,3 +303,7 @@ and inference latency.
 6. Critical focus does not erase a parallel Follow context.
 7. Repeated processing is idempotent and process restart preserves identities.
 8. Missing rollup output becomes `unclassified_keep`.
+9. One batch containing a thumbs-up event plus a differently worded thumbs-up
+   alert creates one operator-priority temporal observation, not two cases.
+10. A model-authored hand-to-face alert that matches neither saved criteria nor
+    the safety gate remains evidence/prose and does not enter Incident Review.

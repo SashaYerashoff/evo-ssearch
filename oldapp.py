@@ -6209,6 +6209,9 @@ def _append_l0_incident_observations(
             batch_start_ms=int(heartbeat.get("batch_start_ms") or 0),
             batch_end_ms=int(heartbeat.get("batch_end_ms") or 0),
             coverage_gap=bool(heartbeat.get("coverage_gap")),
+            operator_alert_policy=luxriot_manager.get_alert_policy_prompt(
+                int(channel_id)
+            ),
         )
         automatic = service.ingest_l0_temporal_observations(
             int(channel_id),

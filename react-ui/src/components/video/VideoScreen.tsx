@@ -31,7 +31,7 @@ import { renderMarkdown } from '../agent/markdown'
 import { StreamControl, type VideoWorkspaceTab } from './StreamControl'
 import { PromptSettingsModal } from './PromptSettingsModal'
 import { IncidentModal } from '../incidents/IncidentModal'
-import { IncidentReview } from '../incidents/IncidentReview'
+import { IncidentReview, type IncidentPeriod } from '../incidents/IncidentReview'
 import {
   SUMMARY_SEVERITIES,
   resolveSummaryResolution,
@@ -109,6 +109,8 @@ function defaultCustomRange(): { inputs: { from: string; to: string }; bounds: S
 
 const REVIEW_CHANNEL_STORAGE_KEY = 'eva.video.reviewChannelId'
 const SETTINGS_CHANNEL_STORAGE_KEY = 'eva.video.settingsChannelId'
+const INCIDENT_CHANNEL_STORAGE_KEY = 'eva.video.incidentChannelId'
+const INCIDENT_PERIOD_STORAGE_KEY = 'eva.video.incidentPeriod'
 
 function initialChannelId(channels: Channel[], storageKey: string): number | null {
   try {
@@ -118,6 +120,27 @@ function initialChannelId(channels: Channel[], storageKey: string): number | nul
     // Browser storage is an optional convenience; channel selection still works without it.
   }
   return channels[0]?.id ?? null
+}
+
+function initialIncidentChannelId(channels: Channel[]): string {
+  try {
+    const stored = String(window.localStorage.getItem(INCIDENT_CHANNEL_STORAGE_KEY) || '').trim()
+    if (stored === 'all') return stored
+    if (channels.some((channel) => String(channel.id) === stored)) return stored
+  } catch {
+    // Browser storage is optional; default to one bounded stream below.
+  }
+  return channels[0] ? String(channels[0].id) : ''
+}
+
+function initialIncidentPeriod(): IncidentPeriod {
+  try {
+    const stored = String(window.localStorage.getItem(INCIDENT_PERIOD_STORAGE_KEY) || '')
+    if (['24h', '7d', '30d', 'all'].includes(stored)) return stored as IncidentPeriod
+  } catch {
+    // Browser storage is optional; the safe bounded default remains 24 hours.
+  }
+  return '24h'
 }
 
 function summaryRange(entry: SummaryEntry, locale: string): string {
@@ -381,6 +404,11 @@ export function VideoScreen({
   const [activeTab, setActiveTab] = useState<VideoWorkspaceTab>('review')
   const [reviewChannelId, setReviewChannelId] = useState<number | null>(() => initialChannelId(channels, REVIEW_CHANNEL_STORAGE_KEY))
   const [settingsChannelId, setSettingsChannelId] = useState<number | null>(() => initialChannelId(channels, SETTINGS_CHANNEL_STORAGE_KEY))
+  const [incidentChannelId, setIncidentChannelId] = useState(() => initialIncidentChannelId(channels))
+  const [incidentPeriod, setIncidentPeriod] = useState<IncidentPeriod>(initialIncidentPeriod)
+  const [incidentVisited, setIncidentVisited] = useState(false)
+  const [incidentRefreshKey, setIncidentRefreshKey] = useState(0)
+  const [incidentLoading, setIncidentLoading] = useState(false)
   const [streams, setStreams] = useState<StreamsStatus>({})
   const [feed, setFeed] = useState<SummaryEntry[]>([])
   const [batch, setBatch] = useState('12')
@@ -553,6 +581,11 @@ export function VideoScreen({
         ? current
         : (channels[0]?.id ?? null)
     ))
+    setIncidentChannelId((current) => (
+      current === 'all' || channels.some((channel) => String(channel.id) === current)
+        ? current
+        : (channels[0] ? String(channels[0].id) : '')
+    ))
   }, [channels])
   useEffect(() => {
     if (reviewChannelId == null) return
@@ -568,6 +601,13 @@ export function VideoScreen({
     if (settingsChannelId == null) return
     try { window.localStorage.setItem(SETTINGS_CHANNEL_STORAGE_KEY, String(settingsChannelId)) } catch { /* optional */ }
   }, [settingsChannelId])
+  useEffect(() => {
+    if (!incidentChannelId) return
+    try { window.localStorage.setItem(INCIDENT_CHANNEL_STORAGE_KEY, incidentChannelId) } catch { /* optional */ }
+  }, [incidentChannelId])
+  useEffect(() => {
+    try { window.localStorage.setItem(INCIDENT_PERIOD_STORAGE_KEY, incidentPeriod) } catch { /* optional */ }
+  }, [incidentPeriod])
   useEffect(() => {
     hydratedSettingsChannelRef.current = null
     setBatch('12')
@@ -804,6 +844,7 @@ export function VideoScreen({
 
   const selectWorkspaceTab = useCallback((nextTab: VideoWorkspaceTab) => {
     if (nextTab !== 'review') setReviewPreviewOpen(false)
+    if (nextTab === 'incidents') setIncidentVisited(true)
     setActiveTab(nextTab)
   }, [])
   const requestSettingsChannel = useCallback((channelId: number, openSettings = false) => {
@@ -938,6 +979,12 @@ export function VideoScreen({
         onEditReviewStream={editReviewStream}
         settingsDirty={settingsDirty}
         onDiscardSettings={discardSettingsDraft}
+        incidentChannelId={incidentChannelId}
+        onIncidentChannel={setIncidentChannelId}
+        incidentPeriod={incidentPeriod}
+        onIncidentPeriod={setIncidentPeriod}
+        incidentLoading={incidentLoading}
+        onRefreshIncidents={() => setIncidentRefreshKey((value) => value + 1)}
       />
 
       {activeTab === 'review' ? (
@@ -988,9 +1035,7 @@ export function VideoScreen({
           </div>
           {reviewPreviewOpen && <aside className="vid-review-preview-drawer">{previewCard}</aside>}
         </div>
-      ) : activeTab === 'incidents' ? (
-        <IncidentReview channels={channels} canExport={canExport} canManage={canReportIncidents} />
-      ) : (
+      ) : activeTab === 'settings' ? (
         <div className="vid-settings-main">
           <section className="vid-settings-preview">
             {previewCard}
@@ -1048,6 +1093,21 @@ export function VideoScreen({
               </div>
             </div>
           </section>
+        </div>
+      ) : null}
+
+      {incidentVisited && (
+        <div className="vid-incident-main" hidden={activeTab !== 'incidents'}>
+          <IncidentReview
+            channels={channels}
+            canExport={canExport}
+            canManage={canReportIncidents}
+            active={activeTab === 'incidents'}
+            channelId={incidentChannelId}
+            period={incidentPeriod}
+            refreshKey={incidentRefreshKey}
+            onLoadingChange={setIncidentLoading}
+          />
         </div>
       )}
 

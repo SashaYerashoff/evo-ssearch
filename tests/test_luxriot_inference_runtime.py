@@ -8787,6 +8787,7 @@ class LuxriotCaptureDispatchTests(unittest.TestCase):
         self.assertEqual(len(events), 1)
         self.assertEqual(events[0]["label"], "Person enters from the right doorway")
         self.assertEqual(events[0]["semantic_key"], "person enter")
+        self.assertEqual(events[0]["trigger_kind"], "episode_event")
 
     def test_temporal_memory_rejects_generic_person_movement(self):
         observations = LuxriotManager._l0_temporal_observations(
@@ -8832,10 +8833,110 @@ class LuxriotCaptureDispatchTests(unittest.TestCase):
 
         self.assertEqual(len(observations), 1)
         self.assertEqual(observations[0]["semantic_key"], "person fall")
+        self.assertEqual(observations[0]["trigger_kind"], "safety_alert")
         self.assertEqual(
             observations[0]["evidence_refs"],
             ["vlm-room-alert-1:snapshot:3", "vlm-room-alert-1:snapshot:4"],
         )
+
+    def test_temporal_memory_admits_configured_gesture_once_and_marks_priority(self):
+        observations = LuxriotManager._l0_temporal_observations(
+            channel_id=112,
+            source_batch_id="vlm-room-alert-gesture",
+            operator_alert_policy=(
+                "Alert if you spot a thumbs-up gesture, severity - info\n"
+                "Alert if you spot a victory gesture, severity - normal"
+            ),
+            batch_state={
+                "events": [
+                    {
+                        "event_id": "thumb_up_gesture",
+                        "label": "Thumb-up gesture",
+                        "summary": "Novel gesture observed in snapshot 3.",
+                        "state": "new",
+                        "novelty": "novel",
+                        "pass_up": True,
+                        "snapshot_indices": [3],
+                    }
+                ],
+                "alerts": [
+                    {
+                        "title": "Thumb-up gesture detected",
+                        "description": "Person raised thumb in snapshot 3.",
+                        "severity": "info",
+                        "state": "new",
+                        "snapshot_indices": [3],
+                    }
+                ],
+            },
+            batch_start_ms=1_000,
+            batch_end_ms=2_000,
+        )
+
+        self.assertEqual(len(observations), 1)
+        self.assertEqual(observations[0]["semantic_key"], "person thumbs_up")
+        self.assertEqual(observations[0]["trigger_kind"], "operator_alert")
+        self.assertEqual(observations[0]["severity"], "info")
+        self.assertIn("thumbs-up gesture", observations[0]["operator_criterion"])
+
+    def test_temporal_memory_rejects_unconfigured_model_alert_micro_motion(self):
+        observations = LuxriotManager._l0_temporal_observations(
+            channel_id=112,
+            source_batch_id="vlm-room-alert-noise",
+            operator_alert_policy="Alert if you spot a thumbs-up gesture, severity - info",
+            batch_state={
+                "events": [
+                    {
+                        "event_id": "person_gesture",
+                        "label": "Person raises hand to face",
+                        "summary": "Ordinary brief hand movement.",
+                        "state": "new",
+                        "novelty": "novel",
+                        "pass_up": True,
+                        "snapshot_indices": [6],
+                    }
+                ],
+                "alerts": [
+                    {
+                        "title": "Person raising hand to face",
+                        "description": "Unusual gesture observed in snapshot 6.",
+                        "severity": "info",
+                        "state": "new",
+                        "snapshot_indices": [6],
+                    }
+                ],
+            },
+            batch_start_ms=1_000,
+            batch_end_ms=2_000,
+        )
+
+        self.assertEqual(observations, [])
+
+    def test_temporal_memory_matches_exit_wording_to_configured_leave_criterion(self):
+        observations = LuxriotManager._l0_temporal_observations(
+            channel_id=112,
+            source_batch_id="vlm-room-alert-exit",
+            operator_alert_policy=(
+                "Alert if person entering or leaving scene, severity - info"
+            ),
+            batch_state={
+                "alerts": [
+                    {
+                        "title": "Person exiting frame",
+                        "description": "Person exits through the right doorway.",
+                        "severity": "info",
+                        "state": "new",
+                        "snapshot_indices": [5],
+                    }
+                ],
+            },
+            batch_start_ms=1_000,
+            batch_end_ms=2_000,
+        )
+
+        self.assertEqual(len(observations), 1)
+        self.assertEqual(observations[0]["semantic_key"], "person exit")
+        self.assertEqual(observations[0]["trigger_kind"], "operator_alert")
 
     def test_temporal_keys_ignore_generated_ids_and_preserve_parallel_events(self):
         first = LuxriotManager._l0_temporal_observations(

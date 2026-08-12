@@ -535,6 +535,61 @@ def test_l0_temporal_ingestion_creates_continues_and_ends_candidate_at_routine()
     assert len(store.observations) == 3
     assert store.records[0]["qualia_refs"][0]["activity_x_max"] == 4.5
 
+    held_for_rollup = service.ingest_l0_temporal_observations(
+        112,
+        {
+            **base_heartbeat,
+            "batch_id": "batch-4",
+            "batch_start_ms": 7_000,
+            "batch_end_ms": 8_000,
+        },
+        [
+            {
+                **first,
+                "observation_id": "obs-episode-only",
+                "semantic_key": "person exit",
+                "label": "Person leaves the room",
+                "trigger_kind": "episode_event",
+                "start_ms": 7_000,
+                "end_ms": 8_000,
+            }
+        ],
+    )
+    assert held_for_rollup["created"] == 0
+    assert held_for_rollup["skipped"] == 1
+    assert len(store.records) == 1
+
+
+def test_l0_operator_alert_candidate_preserves_admission_priority():
+    service = _service(_Store(), _Runtime())
+    record = service._l0_incident_record(
+        112,
+        {
+            "batch_id": "batch-alert-1",
+            "batch_start_ms": 1_000,
+            "batch_end_ms": 2_000,
+        },
+        {
+            "observation_id": "obs-alert-1",
+            "kind": "event",
+            "state": "new",
+            "semantic_key": "person thumbs_up",
+            "label": "Thumb-up gesture detected",
+            "start_ms": 1_000,
+            "end_ms": 2_000,
+            "trigger_kind": "operator_alert",
+            "severity": "info",
+            "operator_criterion": "you spot a thumbs-up gesture",
+            "evidence_refs": ["batch-alert-1:snapshot:3"],
+        },
+        {"sample_count": 1, "activity_x_max": 2.0},
+    )
+
+    assert record["report"]["source"] == "operator_alert_l0"
+    assert record["report"]["priority"] == "operator_criterion"
+    assert record["timeline_refs"][0]["trigger_kind"] == "operator_alert"
+    assert record["timeline_refs"][0]["operator_criterion"] == "you spot a thumbs-up gesture"
+
 
 def test_open_automatic_incident_waits_for_boundary_before_episode_materialization():
     class _ProjectionStore:

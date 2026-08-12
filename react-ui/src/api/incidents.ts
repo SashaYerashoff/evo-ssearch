@@ -106,6 +106,8 @@ export interface IncidentReviewRecord extends Incident {
   incident_id: string
   review_state: IncidentReviewState
   severity: string
+  source?: string
+  priority?: 'operator_criterion' | 'safety' | 'context' | string
   channels: number[]
   possible_start_ms?: number | null
   observed_start_ms?: number | null

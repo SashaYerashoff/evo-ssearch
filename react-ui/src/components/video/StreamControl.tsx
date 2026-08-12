@@ -16,6 +16,7 @@ import type { ReactNode } from 'react'
 import { Dropdown } from '../shell/Dropdown'
 import { ToolTabs } from '../shell/ToolTabs'
 import type { SummaryPeriod, SummaryResolution } from './summaryView'
+import type { IncidentPeriod } from '../incidents/IncidentReview'
 import { useI18n, type TranslationKey } from '../../i18n/I18nProvider'
 
 const BATCHES = ['4', '8', '12', '16']
@@ -78,6 +79,12 @@ export function StreamControl(p: {
   onEditReviewStream: () => void
   settingsDirty: boolean
   onDiscardSettings: () => void
+  incidentChannelId: string
+  onIncidentChannel: (id: string) => void
+  incidentPeriod: IncidentPeriod
+  onIncidentPeriod: (period: IncidentPeriod) => void
+  incidentLoading: boolean
+  onRefreshIncidents: () => void
 }) {
   const { t } = useI18n()
   const periods = PERIODS.map((item) => ({ ...item, label: t(PERIOD_LABEL_KEYS[item.v]) }))
@@ -142,9 +149,34 @@ export function StreamControl(p: {
           </section>
         </div>
       ) : p.activeTab === 'incidents' ? (
-        <div className="vid-incident-tab-note">
-          <IconAlertTriangle size={16} />
-          <span>{t('incident.tabHelp')}</span>
+        <div className="vid-incident-toolbar incident-review-filters">
+          <label>
+            {t('video.channel')}
+            <Dropdown
+              value={p.incidentChannelId}
+              onChange={p.onIncidentChannel}
+              options={[
+                { value: 'all', label: t('incident.allChannels') },
+                ...p.channels.map((channel) => ({ value: String(channel.id), label: channel.title })),
+              ]}
+            />
+          </label>
+          <label>
+            {t('video.period')}
+            <Dropdown
+              value={p.incidentPeriod}
+              onChange={(value) => p.onIncidentPeriod(value as IncidentPeriod)}
+              options={[
+                { value: '24h', label: t('incident.last24h') },
+                { value: '7d', label: t('period.last7d') },
+                { value: '30d', label: t('period.last30d') },
+                { value: 'all', label: t('incident.allTime') },
+              ]}
+            />
+          </label>
+          <button className="mon-btn" onClick={p.onRefreshIncidents} disabled={p.incidentLoading || !p.incidentChannelId}>
+            <IconReload size={14} /> {p.incidentLoading ? t('status.checking') : t('video.refresh')}
+          </button>
         </div>
       ) : (
         <div className="vid-lens-stack">

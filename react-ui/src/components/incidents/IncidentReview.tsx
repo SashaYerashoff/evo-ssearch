@@ -1,11 +1,10 @@
-import { useCallback, useEffect, useMemo, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import {
   IconAlertTriangle,
   IconClock,
   IconEye,
   IconFileDescription,
   IconPhotoOff,
-  IconRefresh,
 } from '@tabler/icons-react'
 import type { Channel } from '../../api/types'
 import {
@@ -13,11 +12,20 @@ import {
   type IncidentReviewRecord,
   type IncidentReviewState,
 } from '../../api/incidents'
-import { Dropdown } from '../shell/Dropdown'
 import { useI18n } from '../../i18n/I18nProvider'
 import { IncidentModal } from './IncidentModal'
 
-type IncidentPeriod = '24h' | '7d' | '30d' | 'all'
+export type IncidentPeriod = '24h' | '7d' | '30d' | 'all'
+
+type IncidentReviewCacheEntry = {
+  records: IncidentReviewRecord[]
+  total: number
+  loadedAt: number
+}
+
+const INCIDENT_REVIEW_CACHE_LIMIT = 4
+const incidentReviewCache = new Map<string, IncidentReviewCacheEntry>()
+const incidentReviewRequests = new Map<string, Promise<IncidentReviewCacheEntry>>()
 
 const PERIOD_SECONDS: Record<Exclude<IncidentPeriod, 'all'>, number> = {
   '24h': 24 * 60 * 60,
@@ -26,6 +34,58 @@ const PERIOD_SECONDS: Record<Exclude<IncidentPeriod, 'all'>, number> = {
 }
 
 const REVIEW_ORDER: IncidentReviewState[] = ['active', 'needs_review', 'history']
+
+function incidentReviewQueryKey(channelId: string, period: IncidentPeriod): string {
+  return `${channelId}:${period}`
+}
+
+function cachedIncidentReview(key: string): IncidentReviewCacheEntry | undefined {
+  const cached = incidentReviewCache.get(key)
+  if (!cached) return undefined
+  incidentReviewCache.delete(key)
+  incidentReviewCache.set(key, cached)
+  return cached
+}
+
+function rememberIncidentReview(key: string, entry: IncidentReviewCacheEntry): IncidentReviewCacheEntry {
+  incidentReviewCache.delete(key)
+  incidentReviewCache.set(key, entry)
+  while (incidentReviewCache.size > INCIDENT_REVIEW_CACHE_LIMIT) {
+    const oldest = incidentReviewCache.keys().next().value
+    if (oldest == null) break
+    incidentReviewCache.delete(oldest)
+  }
+  return entry
+}
+
+function requestIncidentReview(
+  channelId: string,
+  period: IncidentPeriod,
+  force: boolean,
+): Promise<IncidentReviewCacheEntry> {
+  const key = incidentReviewQueryKey(channelId, period)
+  if (!force) {
+    const cached = cachedIncidentReview(key)
+    if (cached) return Promise.resolve(cached)
+    const pending = incidentReviewRequests.get(key)
+    if (pending) return pending
+  }
+  const query: Record<string, unknown> = {
+    ...incidentReviewBounds(period),
+    limit: 500,
+  }
+  if (channelId !== 'all') query.channel_id = channelId
+  const request = incidentsApi.review(query).then((response) => rememberIncidentReview(key, {
+    records: Array.isArray(response.incidents) ? response.incidents : [],
+    total: Number(response.total || 0),
+    loadedAt: Date.now(),
+  }))
+  incidentReviewRequests.set(key, request)
+  void request.finally(() => {
+    if (incidentReviewRequests.get(key) === request) incidentReviewRequests.delete(key)
+  }).catch(() => {})
+  return request
+}
 
 function finiteNumber(value: unknown): number | null {
   const number = Number(value)
@@ -52,6 +112,31 @@ export function formatReviewDuration(value: unknown): string {
   const days = Math.floor(hours / 24)
   const remainingHours = hours % 24
   return remainingHours ? `${days}d ${remainingHours}h` : `${days}d`
+}
+
+const INCIDENT_PRIORITY_RANK: Record<string, number> = {
+  operator_criterion: 0,
+  safety: 1,
+  context: 2,
+}
+
+const INCIDENT_SEVERITY_RANK: Record<string, number> = {
+  critical: 0,
+  high: 1,
+  normal: 2,
+  low: 3,
+  info: 4,
+}
+
+export function compareIncidentReviewPriority(a: IncidentReviewRecord, b: IncidentReviewRecord): number {
+  const priority = (INCIDENT_PRIORITY_RANK[String(a.priority || '')] ?? 3)
+    - (INCIDENT_PRIORITY_RANK[String(b.priority || '')] ?? 3)
+  if (priority) return priority
+  const severity = (INCIDENT_SEVERITY_RANK[String(a.severity || '').toLowerCase()] ?? 5)
+    - (INCIDENT_SEVERITY_RANK[String(b.severity || '').toLowerCase()] ?? 5)
+  if (severity) return severity
+  return (finiteNumber(b.last_evidence_ms) || finiteNumber(b.possible_start_ms) || 0)
+    - (finiteNumber(a.last_evidence_ms) || finiteNumber(a.possible_start_ms) || 0)
 }
 
 function formatTime(value: unknown, locale: string): string {
@@ -93,6 +178,11 @@ function IncidentCard({
   const follow = incident.follow && typeof incident.follow === 'object'
     ? incident.follow as Record<string, unknown>
     : {}
+  const priorityLabel = incident.priority === 'operator_criterion'
+    ? 'operator criterion'
+    : incident.priority === 'safety'
+      ? 'safety signal'
+      : ''
 
   return (
     <button className={`incident-review-card state-${incident.review_state}`} onClick={onOpen}>
@@ -123,6 +213,7 @@ function IncidentCard({
           <div><dt>Last evidence</dt><dd>{formatTime(incident.last_evidence_ms, locale)}</dd></div>
         </dl>
         <div className="incident-review-card-foot">
+          {priorityLabel && <span className={`priority priority-${incident.priority}`}>{priorityLabel}</span>}
           <span>{channelNames.length ? channelNames.join(', ') : 'No channel'}</span>
           <span>{incident.evidence_count || 0} evidence</span>
           {incident.uncertainty_count > 0 && <span className="warning">{incident.uncertainty_count} uncertain</span>}
@@ -133,35 +224,72 @@ function IncidentCard({
   )
 }
 
-export function IncidentReview({ channels, canExport, canManage }: { channels: Channel[]; canExport: boolean; canManage: boolean }) {
+export function IncidentReview({
+  channels,
+  canExport,
+  canManage,
+  active,
+  channelId,
+  period,
+  refreshKey,
+  onLoadingChange,
+}: {
+  channels: Channel[]
+  canExport: boolean
+  canManage: boolean
+  active: boolean
+  channelId: string
+  period: IncidentPeriod
+  refreshKey: number
+  onLoadingChange?: (loading: boolean) => void
+}) {
   const { locale, t } = useI18n()
   const [records, setRecords] = useState<IncidentReviewRecord[]>([])
+  const [total, setTotal] = useState(0)
+  const [loadedAt, setLoadedAt] = useState(0)
   const [reviewState, setReviewState] = useState<IncidentReviewState>('active')
-  const [channelId, setChannelId] = useState('all')
-  const [period, setPeriod] = useState<IncidentPeriod>('30d')
   const [selectedId, setSelectedId] = useState<string | null>(null)
-  const [loading, setLoading] = useState(true)
+  const [loading, setLoading] = useState(false)
   const [error, setError] = useState('')
+  const requestSequence = useRef(0)
+  const observedRefreshKey = useRef(refreshKey)
+  const queryKey = incidentReviewQueryKey(channelId, period)
 
-  const load = useCallback(async () => {
+  const load = useCallback(async (force = false) => {
+    if (!channelId) return
+    const sequence = ++requestSequence.current
     setLoading(true)
+    onLoadingChange?.(true)
     setError('')
     try {
-      const query: Record<string, unknown> = {
-        ...incidentReviewBounds(period),
-        limit: 500,
-      }
-      if (channelId !== 'all') query.channel_id = channelId
-      const response = await incidentsApi.review(query)
-      setRecords(Array.isArray(response.incidents) ? response.incidents : [])
+      const response = await requestIncidentReview(channelId, period, force)
+      if (requestSequence.current !== sequence) return
+      setRecords(response.records)
+      setTotal(response.total)
+      setLoadedAt(response.loadedAt)
     } catch (exception: any) {
-      setError(exception?.message || 'Incident review is unavailable.')
+      if (requestSequence.current === sequence) {
+        setError(exception?.message || 'Incident review is unavailable.')
+      }
     } finally {
-      setLoading(false)
+      if (requestSequence.current === sequence) {
+        setLoading(false)
+        onLoadingChange?.(false)
+      }
     }
-  }, [channelId, period])
+  }, [channelId, period, onLoadingChange])
 
-  useEffect(() => { void load() }, [load])
+  useEffect(() => {
+    if (!active || !channelId) return
+    const force = observedRefreshKey.current !== refreshKey
+    observedRefreshKey.current = refreshKey
+    void load(force)
+  }, [active, queryKey, refreshKey, load])
+
+  useEffect(() => () => {
+    requestSequence.current += 1
+    onLoadingChange?.(false)
+  }, [onLoadingChange])
 
   const counts = useMemo(() => {
     const initial: Record<IncidentReviewState, number> = { active: 0, needs_review: 0, history: 0 }
@@ -171,7 +299,9 @@ export function IncidentReview({ channels, canExport, canManage }: { channels: C
     return initial
   }, [records])
   const visible = useMemo(
-    () => records.filter((record) => record.review_state === reviewState),
+    () => records
+      .filter((record) => record.review_state === reviewState)
+      .sort(compareIncidentReviewPriority),
     [records, reviewState],
   )
   const stateLabels: Record<IncidentReviewState, string> = {
@@ -183,38 +313,10 @@ export function IncidentReview({ channels, canExport, canManage }: { channels: C
   return (
     <section className="incident-review-board">
       <header className="incident-review-toolbar">
-        <div>
-          <div className="mon-panel-title"><IconFileDescription size={14} /> {t('incident.review')}</div>
-          <p>{t('incident.reviewHelp')}</p>
-        </div>
-        <div className="incident-review-filters">
-          <label>
-            {t('video.channel')}
-            <Dropdown
-              value={channelId}
-              onChange={setChannelId}
-              options={[
-                { value: 'all', label: t('incident.allChannels') },
-                ...channels.map((channel) => ({ value: String(channel.id), label: channel.title })),
-              ]}
-            />
-          </label>
-          <label>
-            {t('video.period')}
-            <Dropdown
-              value={period}
-              onChange={(value) => setPeriod(value as IncidentPeriod)}
-              options={[
-                { value: '24h', label: t('incident.last24h') },
-                { value: '7d', label: t('period.last7d') },
-                { value: '30d', label: t('period.last30d') },
-                { value: 'all', label: t('incident.allTime') },
-              ]}
-            />
-          </label>
-          <button className="mon-btn" onClick={() => void load()} disabled={loading}>
-            <IconRefresh size={14} /> {loading ? t('status.checking') : t('video.refresh')}
-          </button>
+        <div className="mon-panel-title"><IconFileDescription size={14} /> {t('incident.review')}</div>
+        <div className="incident-review-load-meta">
+          <span>{records.length}{total > records.length ? ` / ${total}` : ''} loaded</span>
+          {loadedAt > 0 && <time dateTime={new Date(loadedAt).toISOString()}>updated {formatTime(loadedAt, locale)}</time>}
         </div>
       </header>
 
@@ -252,7 +354,7 @@ export function IncidentReview({ channels, canExport, canManage }: { channels: C
           incidentIdValue={selectedId}
           canExport={canExport}
           canManage={canManage}
-          onChanged={() => void load()}
+          onChanged={() => void load(true)}
           onClose={() => setSelectedId(null)}
         />
       )}
