@@ -14,6 +14,7 @@ from unittest.mock import patch
 import oldapp
 import numpy as np
 from PIL import Image
+from luxriot_connector import AlertDeliveryResult
 
 from oldapp import (
     _MUTATION_ENDPOINT_PERMISSIONS,
@@ -1102,6 +1103,118 @@ class ApiDataflowSmokeTests(unittest.TestCase):
             release.set()
             runtime.shutdown()
 
+    def test_fast_vlm_alert_reports_admission_http_and_e2e_timing(self) -> None:
+        runtime = oldapp._FastVlmAlertRuntime()
+        now_ms = int(time.time() * 1000.0)
+        trigger_ms = now_ms - 5_000
+        post_ms = trigger_ms + 2_500
+        frames = [
+            {
+                "timestamp_ms": timestamp_ms,
+                "thumbnail": "ZmFrZS1qcGVn",
+                "capture_selection": {"activity_x": activity},
+            }
+            for timestamp_ms, activity in (
+                (trigger_ms - 1_000, 0.1),
+                (trigger_ms, 0.9),
+                (post_ms, 0.2),
+            )
+        ]
+
+        class Session:
+            @staticmethod
+            def recent_frame_items(_limit: int = 90) -> List[Dict[str, Any]]:
+                return frames
+
+        summary = oldapp._LMChatText(
+            'BATCH_STATE_JSON: {"version":1,"alerts":[]}'
+        )
+        summary.eva_response_meta = {
+            "profile_id": "vlm",
+            "workload": "alert",
+            "configured_capacity": 3,
+            "served_capacity": 1,
+            "effective_capacity": 1,
+            "admission_wait_ms": 750.0,
+            "http_ms": 1_200.0,
+            "admitted_at_ms": trigger_ms + 4_000,
+            "http_started_at_ms": trigger_ms + 4_000,
+            "http_completed_at_ms": trigger_ms + 5_200,
+            "prompt_tokens": 321,
+            "completion_tokens": 12,
+        }
+        batch_state = {"contract_status": "parsed", "alerts": []}
+        emitted: List[Tuple[str, Dict[str, Any]]] = []
+        episode = {
+            "trigger_timestamp_ms": trigger_ms,
+            "observed_post_timestamp_ms": post_ms,
+            "created_at_ms": trigger_ms + 100,
+            "submitted_at_ms": trigger_ms + 2_600,
+            "reason": "cv_burst",
+        }
+
+        try:
+            with (
+                patch.dict(oldapp.luxriot_manager.sessions, {112: Session()}),
+                patch.object(
+                    oldapp.luxriot_manager,
+                    "_get_alert_policy_prompt_locked",
+                    return_value="",
+                ),
+                patch.object(
+                    oldapp.luxriot_manager,
+                    "_render_alert_policy_prompt",
+                    return_value="",
+                ),
+                patch("oldapp._call_video_understanding", return_value=summary),
+                patch.object(
+                    oldapp.luxriot_manager,
+                    "_extract_batch_state",
+                    return_value=batch_state,
+                ),
+                patch.object(
+                    oldapp.luxriot_manager,
+                    "_reconcile_operator_alert_contract",
+                    return_value=(summary, batch_state),
+                ),
+                patch.object(
+                    oldapp.luxriot_manager,
+                    "_reconcile_general_hazard_alert_contract",
+                    return_value=(summary, batch_state),
+                ),
+                patch.object(
+                    oldapp.luxriot_manager,
+                    "process_summary_alerts",
+                    return_value=AlertDeliveryResult(),
+                ),
+                patch.object(
+                    oldapp.luxriot_manager,
+                    "emit_attention_event",
+                    side_effect=lambda kind, payload: emitted.append((kind, payload)),
+                ),
+            ):
+                runtime._run_episode(112, episode)
+
+            status = runtime.status()
+            trace = status["last_decision_by_channel"]["112"]["latency_trace"]
+            self.assertEqual(trace["lm_admission_wait_ms"], 750.0)
+            self.assertEqual(trace["lm_http_ms"], 1_200.0)
+            self.assertEqual(trace["lm_configured_capacity"], 3)
+            self.assertEqual(trace["lm_served_capacity"], 1)
+            self.assertEqual(trace["lm_effective_capacity"], 1)
+            self.assertEqual(trace["event_to_lm_admission_ms"], 4_000)
+            self.assertEqual(trace["post_roll_source_ms"], 2_500)
+            self.assertEqual(trace["batch_first_frame_at_ms"], trigger_ms - 1_000)
+            self.assertEqual(status["last_inference_ms"], 1_200)
+            self.assertEqual(status["last_admission_wait_ms"], 750.0)
+            self.assertEqual(emitted[0][0], "scheduler_decision")
+            self.assertEqual(
+                emitted[0][1]["record"]["latency_trace"]["lm_effective_capacity"],
+                1,
+            )
+        finally:
+            runtime.shutdown()
+
     def test_realtime_probe_lane_coalesces_stale_channel_work(self) -> None:
         runtime = oldapp._RealtimeProbeBookmarkRuntime()
         started = threading.Event()
@@ -1127,6 +1240,22 @@ class ApiDataflowSmokeTests(unittest.TestCase):
                 self.assertTrue(completed.wait(2.0))
             self.assertEqual(seen, [1, 3])
             self.assertEqual(runtime.status()["coalesced_total"], 2)
+        finally:
+            runtime.shutdown()
+
+    def test_realtime_probe_lane_clears_recovered_stale_diagnostic(self) -> None:
+        runtime = oldapp._RealtimeProbeBookmarkRuntime()
+        runtime.max_event_age_ms = 1_000
+        try:
+            with (
+                patch.object(oldapp.time, "time", return_value=10.0),
+                patch.object(oldapp.probes_store, "list_probes", return_value=[]),
+            ):
+                runtime._evaluate(112, {"timestamp_ms": 1_000})
+                self.assertIn("semantic apex was stale", runtime.status()["last_error"])
+
+                runtime._evaluate(112, {"timestamp_ms": 10_000})
+                self.assertIsNone(runtime.status()["last_error"])
         finally:
             runtime.shutdown()
 

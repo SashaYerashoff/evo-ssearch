@@ -1840,6 +1840,8 @@ class HttpAuthRouteTests(unittest.TestCase):
                 return self.payload
 
         def get_models(url, **_kwargs):
+            if "lm-mismatch.example" in url and url.endswith("/slots"):
+                return Response([{"id": 0}])
             if "lm-match.example" in url:
                 return Response({"data": [{"id": "model-a", "max_model_len": 32768}]})
             if "lm-mismatch.example" in url:
@@ -1859,7 +1861,7 @@ class HttpAuthRouteTests(unittest.TestCase):
 
         self.assertEqual(response.status_code, 200, response.get_json())
         self.assertEqual(cached_response.status_code, 200, cached_response.get_json())
-        self.assertEqual(get.call_count, 3)
+        self.assertEqual(get.call_count, 4)
         rows = {row["id"]: row for row in response.get_json()["profiles"]}
         self.assertIs(rows["match"]["model_match"], True)
         self.assertEqual(rows["match"]["served_models"], ["model-a"])
@@ -1867,6 +1869,9 @@ class HttpAuthRouteTests(unittest.TestCase):
         self.assertIs(rows["mismatch"]["model_match"], False)
         self.assertEqual(rows["mismatch"]["served_models"], ["actually-served"])
         self.assertEqual(rows["mismatch"]["served_context_length"], 16384)
+        self.assertEqual(rows["mismatch"]["served_capacity"], 1)
+        self.assertEqual(rows["mismatch"]["effective_capacity"], 1)
+        self.assertEqual(rows["mismatch"]["capacity_source"], "llama_cpp_slots")
         self.assertEqual(rows["unreachable"]["model_match"], "unknown")
         self.assertEqual(rows["unreachable"]["served_models"], [])
         serialized = str(response.get_json())

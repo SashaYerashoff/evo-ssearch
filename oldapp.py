@@ -57,7 +57,7 @@ from io import BytesIO
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable, Dict, Iterable, List, Mapping, Optional, Sequence, Set, Tuple, Union, cast
 from urllib.parse import unquote, urlencode
-from urllib.parse import urlparse
+from urllib.parse import urlparse, urlsplit, urlunsplit
 from threading import Lock, RLock
 
 _EVA_RUNTIME_PYTHON = Path(__file__).resolve().parent / ".eva-runtime" / "python"
@@ -4490,6 +4490,7 @@ def _probe_served_lm_models(
             "served_models": [],
             "contexts": {},
         }
+        probe_llama_slots = False
         headers = {"Accept": "application/json"}
         if str(api_key or "").strip():
             headers["Authorization"] = f"Bearer {str(api_key).strip()}"
@@ -4513,15 +4514,34 @@ def _probe_served_lm_models(
                         continue
                     if model_id not in served_models:
                         served_models.append(model_id)
-                    for key in ("max_model_len", "max_context_length", "context_length"):
-                        context_length = _reported_lm_context_length(item.get(key))
-                        if context_length is not None:
-                            contexts[model_id] = context_length
-                            break
+                    item_meta = item.get("meta")
+                    if (
+                        isinstance(item_meta, Mapping)
+                        and _reported_lm_context_length(item_meta.get("n_ctx"))
+                        is not None
+                    ):
+                        probe_llama_slots = True
+                    context_length = next(
+                        (
+                            parsed
+                            for parsed in (
+                                _reported_lm_context_length(item.get(key))
+                                for key in (
+                                    "max_model_len",
+                                    "max_context_length",
+                                    "context_length",
+                                )
+                            )
+                            if parsed is not None
+                        ),
+                        None,
+                    )
+                    if context_length is not None:
+                        contexts[model_id] = context_length
                     else:
                         # llama.cpp reports its loaded context under
                         # data[].meta.n_ctx rather than the common vLLM keys.
-                        meta = item.get("meta")
+                        meta = item_meta
                         context_length = (
                             _reported_lm_context_length(meta.get("n_ctx"))
                             if isinstance(meta, Mapping)
@@ -4529,6 +4549,7 @@ def _probe_served_lm_models(
                         )
                         if context_length is not None:
                             contexts[model_id] = context_length
+                            probe_llama_slots = True
                 if served_models:
                     result = {
                         "known": True,
@@ -4540,6 +4561,43 @@ def _probe_served_lm_models(
                         if context_length is not None:
                             result["endpoint_context_length"] = context_length
                             break
+            if probe_llama_slots:
+                parsed_base = urlsplit(str(base_url or "").rstrip("/"))
+                slots_path = parsed_base.path.rstrip("/")
+                if slots_path.endswith("/v1"):
+                    slots_path = slots_path[:-3]
+                slots_url = urlunsplit(
+                    (
+                        parsed_base.scheme,
+                        parsed_base.netloc,
+                        f"{slots_path}/slots" or "/slots",
+                        "",
+                        "",
+                    )
+                )
+                try:
+                    slots_response = requests.get(
+                        slots_url,
+                        headers=headers,
+                        timeout=3.0,
+                    )
+                    slots_response.raise_for_status()
+                    slots_payload = slots_response.json()
+                    if (
+                        isinstance(slots_payload, Sequence)
+                        and not isinstance(slots_payload, (str, bytes, bytearray))
+                    ):
+                        served_capacity = len(
+                            [slot for slot in slots_payload if isinstance(slot, Mapping)]
+                        )
+                        if served_capacity > 0:
+                            result["served_capacity"] = served_capacity
+                            result["capacity_source"] = "llama_cpp_slots"
+                except Exception:
+                    # OpenAI-compatible servers are not required to expose the
+                    # llama.cpp diagnostic endpoint. Unknown capacity retains
+                    # the explicit configured value.
+                    pass
         except Exception:
             # Unreachable and malformed endpoints are explicitly unknown. Never
             # echo transport errors because their URLs may contain credentials.
@@ -4586,6 +4644,22 @@ def _lm_admission_profiles() -> List[Dict[str, Any]]:
             "served_models": served_models[:8],
             "model_match": model_match,
         }
+        configured_capacity = configured_lm_capacity(
+            str(profile.get("id") or ""),
+            default=1,
+        )
+        served_capacity = _to_optional_int(served.get("served_capacity"))
+        effective_capacity = (
+            min(configured_capacity, served_capacity)
+            if served_capacity is not None and served_capacity > 0
+            else configured_capacity
+        )
+        row["configured_capacity"] = configured_capacity
+        row["served_capacity"] = served_capacity
+        row["effective_capacity"] = effective_capacity
+        row["capacity_source"] = str(
+            served.get("capacity_source") or "configured"
+        )
         contexts = served.get("contexts")
         context_length = (
             _reported_lm_context_length(contexts.get(configured_model))
@@ -4609,6 +4683,33 @@ def _lm_admission_profiles() -> List[Dict[str, Any]]:
             row["served_context_length"] = context_length
         rows.append(row)
     return rows
+
+
+def _cached_served_lm_capacity(resource: str) -> Optional[int]:
+    """Return the last confirmed endpoint capacity without network I/O.
+
+    Probe expiry controls when diagnostics refresh the remote state; it must
+    not erase the last confirmed safety limit on the request hot path. A
+    transiently quiet runtime could otherwise revert to configured
+    oversubscription merely because no diagnostics request refreshed the
+    cache within its TTL.
+    """
+
+    with _lm_served_models_cache_lock:
+        cached = _lm_served_models_cache.get(str(resource or ""))
+        if cached is None:
+            return None
+        served_capacity = _to_optional_int(cached[1].get("served_capacity"))
+    return served_capacity if served_capacity is not None and served_capacity > 0 else None
+
+
+def _prime_lm_runtime_capacities() -> None:
+    """Discover endpoint slots before restored streams begin LM work."""
+
+    try:
+        _lm_admission_profiles()
+    except Exception as exc:
+        app.logger.warning("LM endpoint capacity discovery deferred: %s", exc)
 
 
 _lm_admission_controller = get_lm_admission_controller()
@@ -4784,7 +4885,16 @@ def _call_lm_chat(
     }
     response: Optional[requests.Response] = None
     resource = normalize_lm_resource(base_url, str(profile.get("model") or ""))
-    capacity = configured_lm_capacity(str(profile.get("id") or ""), default=1)
+    configured_capacity = configured_lm_capacity(
+        str(profile.get("id") or ""),
+        default=1,
+    )
+    served_capacity = _cached_served_lm_capacity(resource)
+    capacity = (
+        min(configured_capacity, served_capacity)
+        if served_capacity is not None
+        else configured_capacity
+    )
     default_workload = "agent" if str(profile_kind or "").strip().lower() == "agent" else "vlm"
     requested_workload = str(workload_class or "").strip().lower()
     workload = requested_workload if requested_workload in {"agent", "interactive", "alert", "describe", "video", "vlm", "heartbeat", "rollup", "background"} else default_workload
@@ -4829,8 +4939,11 @@ def _call_lm_chat(
     def _perform(request_payload: Mapping[str, Any]) -> Mapping[str, Any]:
         response: Optional[requests.Response] = None
         admission_started = time.perf_counter()
+        admission_queued_at_ms = int(time.time() * 1000.0)
         admission_wait_ms = 0.0
         request_started = admission_started
+        admitted_at_ms: Optional[int] = None
+        response_received_at_ms: Optional[int] = None
         try:
             with _lm_admission_controller.admission(
                 resource,
@@ -4842,6 +4955,7 @@ def _call_lm_chat(
                     0.0,
                     (time.perf_counter() - admission_started) * 1000.0,
                 )
+                admitted_at_ms = int(time.time() * 1000.0)
                 if preflight is not None:
                     preflight()
                 request_started = time.perf_counter()
@@ -4852,6 +4966,7 @@ def _call_lm_chat(
                     timeout=int(profile.get("timeout") or config.LM_TIMEOUT),
                 )
                 response.raise_for_status()
+                response_received_at_ms = int(time.time() * 1000.0)
         except requests.HTTPError as exc:
             resp = getattr(exc, "response", None) or response
             detail = _response_error_detail(resp) if resp is not None else str(exc)
@@ -4887,7 +5002,13 @@ def _call_lm_chat(
                 2,
             ),
             "finish_reason": finish_reason[:40],
+            "admission_queued_at_ms": admission_queued_at_ms,
         }
+        if admitted_at_ms is not None:
+            attempt["admitted_at_ms"] = admitted_at_ms
+            attempt["http_started_at_ms"] = admitted_at_ms
+        if response_received_at_ms is not None:
+            attempt["http_completed_at_ms"] = response_received_at_ms
         if isinstance(usage, Mapping):
             for key in ("prompt_tokens", "completion_tokens", "total_tokens"):
                 parsed = _to_optional_int(usage.get(key))
@@ -4924,6 +5045,11 @@ def _call_lm_chat(
         "retried": len(attempt_stats) > 1,
         "attempts": attempt_stats[:2],
         "finish_reason": str(finish_reason or "")[:40],
+        "profile_id": str(profile.get("id") or "")[:80],
+        "workload": workload,
+        "configured_capacity": configured_capacity,
+        "served_capacity": served_capacity,
+        "effective_capacity": capacity,
     }
     if issue:
         response_meta["retry_reason"] = str(issue)[:160]
@@ -4936,6 +5062,21 @@ def _call_lm_chat(
             sum(float(item.get("http_ms") or 0.0) for item in attempt_stats),
             2,
         )
+        for target_key, source_key, use_last in (
+            ("admission_queued_at_ms", "admission_queued_at_ms", False),
+            ("admitted_at_ms", "admitted_at_ms", False),
+            ("http_started_at_ms", "http_started_at_ms", False),
+            ("http_completed_at_ms", "http_completed_at_ms", True),
+        ):
+            timeline_values = [
+                int(item[source_key])
+                for item in attempt_stats
+                if isinstance(item.get(source_key), int)
+            ]
+            if timeline_values:
+                response_meta[target_key] = (
+                    timeline_values[-1] if use_last else timeline_values[0]
+                )
         for key in ("prompt_tokens", "completion_tokens", "total_tokens"):
             values = [
                 int(item[key])
@@ -7213,10 +7354,17 @@ def _check_attention_ready() -> Dict[str, Any]:
                     "slow_snapshot_count",
                     "snapshot_slow_streak",
                     "live_segment_inflight",
+                    "live_segment_capture_started_at",
+                    "live_segment_inflight_target_seconds",
                     "live_segment_inflight_frames",
                     "live_segment_inflight_represented_seconds",
+                    "last_live_segment_latency_sec",
                     "last_live_segment_completed_at",
                     "last_live_segment_represented_seconds",
+                    "last_live_segment_source_start_timestamp_ms",
+                    "last_live_segment_last_source_timestamp_ms",
+                    "last_live_segment_timestamp_source",
+                    "live_segment_decoder",
                     "last_live_segment_error",
                     "snapshot_count",
                     "snapshot_failed_count",
@@ -7491,6 +7639,11 @@ def initialize_runtime_services() -> None:
                 "status": "not_eager",
                 "embedder": active_embedder,
             }
+        # Capacity configured in EVA is an upper bound. llama.cpp may expose
+        # fewer actual slots (for example ``-np 1`` with MAX_INFLIGHT=3); learn
+        # that ground truth before restored streams can fill the server's own
+        # opaque FIFO and bypass EVA's alert priority.
+        _prime_lm_runtime_capacities()
         try:
             if _attention_writer is not None:
                 _attention_writer.start()
@@ -9994,6 +10147,12 @@ class _FastVlmAlertRuntime:
             "last_latency_ms": None,
             "last_trigger_to_inference_ms": None,
             "last_inference_ms": None,
+            "last_post_roll_ms": None,
+            "last_executor_wait_ms": None,
+            "last_evidence_prepare_ms": None,
+            "last_admission_wait_ms": None,
+            "last_http_ms": None,
+            "last_postprocess_delivery_ms": None,
             "last_event_to_bookmark_ack_ms": None,
             "last_error": None,
         }
@@ -10095,6 +10254,7 @@ class _FastVlmAlertRuntime:
                 if int(timestamp_ms) >= trigger_ms + self.post_roll_ms:
                     dispatch = dict(pending)
                     dispatch["observed_post_timestamp_ms"] = int(timestamp_ms)
+                    dispatch["submitted_at_ms"] = int(time.time() * 1000.0)
                     self._pending.pop(channel, None)
                     self._last_dispatched_ms[channel] = int(timestamp_ms)
             self._status["pending_channels"] = len(self._pending)
@@ -10167,6 +10327,7 @@ class _FastVlmAlertRuntime:
         action: str,
         alert_count: int,
         bookmarks_sent: int,
+        latency_trace: Optional[Mapping[str, Any]] = None,
     ) -> None:
         """Persist the fast episode and its decision in one writer batch."""
 
@@ -10188,6 +10349,8 @@ class _FastVlmAlertRuntime:
                 - _to_int(episode.get("trigger_timestamp_ms"), batch_start_ms),
             ),
         }
+        if isinstance(latency_trace, Mapping):
+            record["latency_trace"] = dict(latency_trace)
         luxriot_manager.emit_attention_event(
             "scheduler_decision",
             {
@@ -10270,6 +10433,7 @@ class _FastVlmAlertRuntime:
         return ordered
 
     def _run_episode(self, channel_id: int, episode: Mapping[str, Any]) -> None:
+        executor_started_at_ms = int(time.time() * 1000.0)
         trigger_ms = _to_int(episode.get("trigger_timestamp_ms"), 0)
         post_ms = _to_int(episode.get("observed_post_timestamp_ms"), trigger_ms)
         frames = self._episode_frames(channel_id, trigger_ms, post_ms)
@@ -10315,6 +10479,7 @@ class _FastVlmAlertRuntime:
             task_prompt,
             system_prompt,
         )
+        evidence_ready_at_ms = int(time.time() * 1000.0)
         inference_started_at_ms = int(time.time() * 1000.0)
         summary = _call_video_understanding(
             messages,
@@ -10323,6 +10488,11 @@ class _FastVlmAlertRuntime:
             max_tokens_override=self.max_tokens,
         )
         inference_completed_at_ms = int(time.time() * 1000.0)
+        response_meta = dict(
+            getattr(summary, "eva_response_meta", {})
+            if isinstance(getattr(summary, "eva_response_meta", {}), Mapping)
+            else {}
+        )
         batch_state = luxriot_manager._extract_batch_state(summary, frames)
         if str(batch_state.get("contract_status") or "") == "parsed_terminal_fence":
             summary = luxriot_manager._render_reconciled_batch_state_summary(summary, batch_state)
@@ -10348,6 +10518,118 @@ class _FastVlmAlertRuntime:
                 delivery_lane="fast_alert",
             )
         completed_at_ms = int(time.time() * 1000.0)
+        delivery_payload = delivery.as_dict()
+        first_attempt_ms = _to_optional_int(
+            delivery_payload.get("bookmark_first_attempt_at_ms")
+        )
+        first_ack_ms = _to_optional_int(
+            delivery_payload.get("bookmark_first_ack_at_ms")
+        )
+        episode_created_at_ms = _to_int(
+            episode.get("created_at_ms"),
+            trigger_ms,
+        )
+        submitted_at_ms = _to_int(
+            episode.get("submitted_at_ms"),
+            executor_started_at_ms,
+        )
+        admitted_at_ms = _to_optional_int(response_meta.get("admitted_at_ms"))
+        http_started_at_ms = _to_optional_int(
+            response_meta.get("http_started_at_ms")
+        )
+        http_completed_at_ms = _to_optional_int(
+            response_meta.get("http_completed_at_ms")
+        )
+        latency_trace: Dict[str, Any] = {
+            "trigger_timestamp_ms": trigger_ms,
+            "trigger_observed_at_ms": episode_created_at_ms,
+            "post_roll_observed_timestamp_ms": post_ms,
+            "submitted_at_ms": submitted_at_ms,
+            "executor_started_at_ms": executor_started_at_ms,
+            "evidence_ready_at_ms": evidence_ready_at_ms,
+            "lm_call_started_at_ms": inference_started_at_ms,
+            "lm_call_completed_at_ms": inference_completed_at_ms,
+            "completed_at_ms": completed_at_ms,
+            "source_to_trigger_observed_ms": max(
+                0, episode_created_at_ms - trigger_ms
+            ),
+            "post_roll_source_ms": max(0, post_ms - trigger_ms),
+            "trigger_to_submit_ms": max(0, submitted_at_ms - trigger_ms),
+            "executor_wait_ms": max(
+                0, executor_started_at_ms - submitted_at_ms
+            ),
+            "evidence_prepare_ms": max(
+                0, evidence_ready_at_ms - executor_started_at_ms
+            ),
+            "lm_call_ms": max(
+                0, inference_completed_at_ms - inference_started_at_ms
+            ),
+            "postprocess_delivery_ms": max(
+                0, completed_at_ms - inference_completed_at_ms
+            ),
+            "event_to_completion_ms": max(0, completed_at_ms - trigger_ms),
+        }
+        for key in (
+            "admission_wait_ms",
+            "http_ms",
+            "configured_capacity",
+            "served_capacity",
+            "effective_capacity",
+            "prompt_tokens",
+            "completion_tokens",
+            "total_tokens",
+            "profile_id",
+            "workload",
+        ):
+            value = response_meta.get(key)
+            if value is not None:
+                latency_trace[f"lm_{key}"] = value
+        if admitted_at_ms is not None:
+            latency_trace["lm_admitted_at_ms"] = admitted_at_ms
+            latency_trace["event_to_lm_admission_ms"] = max(
+                0, admitted_at_ms - trigger_ms
+            )
+        if http_started_at_ms is not None:
+            latency_trace["lm_http_started_at_ms"] = http_started_at_ms
+        if http_completed_at_ms is not None:
+            latency_trace["lm_http_completed_at_ms"] = http_completed_at_ms
+        if first_attempt_ms is not None:
+            latency_trace["bookmark_first_attempt_at_ms"] = first_attempt_ms
+        if first_ack_ms is not None:
+            latency_trace["bookmark_first_ack_at_ms"] = first_ack_ms
+            latency_trace["event_to_bookmark_ack_ms"] = max(
+                0, first_ack_ms - trigger_ms
+            )
+            if first_attempt_ms is not None:
+                latency_trace["bookmark_delivery_ms"] = max(
+                    0, first_ack_ms - first_attempt_ms
+                )
+        latency_trace.update(
+            {
+                "batch_first_frame_at_ms": batch_start_ms,
+                "batch_last_frame_at_ms": batch_end_ms,
+                "batch_sealed_at_ms": post_ms,
+                "summary_enqueued_at_ms": submitted_at_ms,
+                "summary_dispatch_started_at_ms": executor_started_at_ms,
+                "inference_started_at_ms": admitted_at_ms or inference_started_at_ms,
+                "inference_completed_at_ms": http_completed_at_ms or inference_completed_at_ms,
+                "inference_ms": int(
+                    round(
+                        _to_float(
+                            response_meta.get("http_ms"),
+                            max(
+                                0,
+                                inference_completed_at_ms - inference_started_at_ms,
+                            ),
+                        )
+                    )
+                ),
+            }
+        )
+        if first_ack_ms is not None:
+            latency_trace["batch_end_to_bookmark_ack_ms"] = max(
+                0, first_ack_ms - batch_end_ms
+            )
         reconciled_alerts = batch_state.get("alerts")
         alert_count = (
             len(reconciled_alerts)
@@ -10361,13 +10643,28 @@ class _FastVlmAlertRuntime:
             self._status["last_latency_ms"] = max(0, completed_at_ms - trigger_ms)
             self._status["last_trigger_to_inference_ms"] = max(
                 0,
-                inference_started_at_ms - trigger_ms,
+                (admitted_at_ms or inference_started_at_ms) - trigger_ms,
             )
-            self._status["last_inference_ms"] = max(
-                0,
-                inference_completed_at_ms - inference_started_at_ms,
+            self._status["last_inference_ms"] = int(
+                round(
+                    _to_float(
+                        response_meta.get("http_ms"),
+                        max(0, inference_completed_at_ms - inference_started_at_ms),
+                    )
+                )
             )
-            delivery_payload = delivery.as_dict()
+            self._status["last_post_roll_ms"] = latency_trace["post_roll_source_ms"]
+            self._status["last_executor_wait_ms"] = latency_trace["executor_wait_ms"]
+            self._status["last_evidence_prepare_ms"] = latency_trace["evidence_prepare_ms"]
+            self._status["last_admission_wait_ms"] = _to_optional_float(
+                response_meta.get("admission_wait_ms")
+            )
+            self._status["last_http_ms"] = _to_optional_float(
+                response_meta.get("http_ms")
+            )
+            self._status["last_postprocess_delivery_ms"] = latency_trace[
+                "postprocess_delivery_ms"
+            ]
             self._status["last_event_to_bookmark_ack_ms"] = _to_optional_int(
                 delivery_payload.get("bookmark_first_ack_at_ms")
             )
@@ -10393,6 +10690,7 @@ class _FastVlmAlertRuntime:
                 "summary_chars": len(str(summary or "")),
                 "completed_at_ms": completed_at_ms,
                 "latency_ms": max(0, completed_at_ms - trigger_ms),
+                "latency_trace": dict(latency_trace),
             }
             self._status["last_error"] = None
         if not delivery.alert_events:
@@ -10407,6 +10705,7 @@ class _FastVlmAlertRuntime:
                 action="fast_vlm_no_alert",
                 alert_count=0,
                 bookmarks_sent=0,
+                latency_trace=latency_trace,
             )
             return
         with self._lock:
@@ -10422,31 +10721,6 @@ class _FastVlmAlertRuntime:
         for event in delivery.alert_events:
             severity = str(event.get("severity") or "normal").strip().lower()
             counts[severity] = counts.get(severity, 0) + 1
-        delivery_payload = delivery.as_dict()
-        first_attempt_ms = _to_optional_int(
-            delivery_payload.get("bookmark_first_attempt_at_ms")
-        )
-        first_ack_ms = _to_optional_int(
-            delivery_payload.get("bookmark_first_ack_at_ms")
-        )
-        latency_trace = {
-            "batch_first_frame_at_ms": batch_start_ms,
-            "batch_last_frame_at_ms": batch_end_ms,
-            "batch_sealed_at_ms": post_ms,
-            "summary_enqueued_at_ms": post_ms,
-            "summary_dispatch_started_at_ms": inference_started_at_ms,
-            "inference_started_at_ms": inference_started_at_ms,
-            "inference_completed_at_ms": inference_completed_at_ms,
-            "inference_ms": max(0, inference_completed_at_ms - inference_started_at_ms),
-        }
-        if first_attempt_ms is not None:
-            latency_trace["bookmark_first_attempt_at_ms"] = first_attempt_ms
-        if first_ack_ms is not None:
-            latency_trace["bookmark_first_ack_at_ms"] = first_ack_ms
-            latency_trace["batch_end_to_bookmark_ack_ms"] = max(
-                0,
-                first_ack_ms - batch_end_ms,
-            )
         entry: Dict[str, Any] = {
             "channel_id": channel_id,
             "run_id": f"fast-alert:{episode_id}",
@@ -10483,6 +10757,7 @@ class _FastVlmAlertRuntime:
             action="fast_vlm_alert_delivered",
             alert_count=alert_count,
             bookmarks_sent=int(delivery),
+            latency_trace=latency_trace,
         )
 
     def status(self) -> Dict[str, Any]:
@@ -10702,6 +10977,14 @@ class _RealtimeProbeBookmarkRuntime:
                     f"semantic apex was stale ({event_age_ms} ms)"
                 )
             return
+        # A stale frame is an observation-level rejection, not a sticky health
+        # failure.  Clear that diagnostic as soon as fresh evidence traverses
+        # the lane; otherwise /ready and the operator UI keep reporting a
+        # recovered transient indefinitely.
+        with self._lock:
+            previous_error = str(self._status.get("last_error") or "")
+            if previous_error.startswith("semantic apex was stale"):
+                self._status["last_error"] = None
         thumbnail = str(observation.get("thumbnail") or "").strip()
         raw_embedding = observation.get("embedding")
         try:

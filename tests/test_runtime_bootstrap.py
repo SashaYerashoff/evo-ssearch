@@ -67,6 +67,7 @@ def test_runtime_services_start_only_from_explicit_idempotent_bootstrap():
                 "oldapp._warm_live_embedding_runtime",
                 return_value={"status": "ready"},
             ) as warm_live,
+            patch("oldapp._prime_lm_runtime_capacities") as prime_lm,
             patch("oldapp._configure_inference_queue") as configure_queue,
             patch.object(
                 oldapp.luxriot_manager,
@@ -79,6 +80,7 @@ def test_runtime_services_start_only_from_explicit_idempotent_bootstrap():
 
         load_embedder.assert_called_once_with(oldapp.active_embedder)
         warm_live.assert_called_once_with()
+        prime_lm.assert_called_once_with()
         configure_queue.assert_called_once_with()
         restore.assert_called_once_with()
         assert oldapp._luxriot_restore_result["status"] == "restored"

@@ -2108,6 +2108,27 @@ class LuxriotCaptureSession:
             self._last_live_source_timestamp_ms = int(candidate)
         return int(candidate)
 
+    def _next_live_observed_timestamp_ms(self, observed_at_ms: int) -> int:
+        """Timestamp decoded live frames when Evo exposes no source clock.
+
+        Opening and probing an authenticated media response can take several
+        seconds.  Anchoring the synthetic media cadence before that setup made
+        every otherwise-current frame look stale by the decoder startup time.
+        When Evo does not provide ``X-Stream-Start-Time`` there is no honest
+        camera timestamp to reconstruct, so use the instant EVA observed the
+        decoded frame.  A one-millisecond tie break keeps buffer identifiers
+        monotonic when ffmpeg releases several startup frames together without
+        inventing future half-second timestamps for that backlog.
+        """
+
+        candidate = int(observed_at_ms)
+        with self.lock:
+            previous = self._last_live_source_timestamp_ms
+            if previous is not None and candidate <= int(previous):
+                candidate = int(previous) + 1
+            self._last_live_source_timestamp_ms = int(candidate)
+        return int(candidate)
+
     def _cancel_live_segment_inflight(self) -> None:
         with self.lock:
             self.live_segment_inflight = False
@@ -2722,15 +2743,30 @@ class LuxriotCaptureSession:
                                     image = opened.convert("RGB")
                             except Exception:
                                 continue
-                            source_anchor_ms = int(
-                                _parse_optional_int(feed_state.get("source_anchor_ms"))
-                                or int(time.time() * 1000)
-                            )
-                            timestamp_ms = self._next_live_source_timestamp_ms(
-                                source_anchor_ms=source_anchor_ms,
-                                frame_index=frame_index,
-                                fps=fps,
-                            )
+                            timestamp_source = str(
+                                feed_state.get("timestamp_source") or ""
+                            ).strip()
+                            if timestamp_source == "evo_x_stream_start_time":
+                                source_anchor_ms = int(
+                                    _parse_optional_int(
+                                        feed_state.get("source_anchor_ms")
+                                    )
+                                    or int(time.time() * 1000)
+                                )
+                                timestamp_ms = self._next_live_source_timestamp_ms(
+                                    source_anchor_ms=source_anchor_ms,
+                                    frame_index=frame_index,
+                                    fps=fps,
+                                )
+                            else:
+                                timestamp_ms = self._next_live_observed_timestamp_ms(
+                                    int(time.time() * 1000)
+                                )
+                                if first_source_timestamp_ms is None:
+                                    feed_state["source_anchor_ms"] = int(timestamp_ms)
+                                feed_state["timestamp_source"] = (
+                                    "decoded_frame_observed_at"
+                                )
                             if first_source_timestamp_ms is None:
                                 first_source_timestamp_ms = timestamp_ms
                             last_source_timestamp_ms = timestamp_ms
@@ -3826,6 +3862,7 @@ class LuxriotCaptureSession:
                 self.channel_id,
                 embedding_work,
                 embedding_complete,
+                source_timestamp_ms=selected_timestamp,
             )
             if embedding_async:
                 if not frame.get("embedding_ref") and not frame.get(
@@ -5678,6 +5715,21 @@ class LuxriotManager:
             "callback_failed_total": 0,
             "pending": 0,
             "in_flight": 0,
+            "last_queue_wait_ms": None,
+            "max_queue_wait_ms": 0.0,
+            "queue_wait_total_ms": 0.0,
+            "last_work_ms": None,
+            "max_work_ms": 0.0,
+            "work_total_ms": 0.0,
+            "last_callback_ms": None,
+            "max_callback_ms": 0.0,
+            "callback_total_ms": 0.0,
+            "last_source_age_at_submit_ms": None,
+            "max_source_age_at_submit_ms": 0,
+            "last_source_age_at_work_start_ms": None,
+            "max_source_age_at_work_start_ms": 0,
+            "last_source_age_at_work_complete_ms": None,
+            "max_source_age_at_work_complete_ms": 0,
             "stopped": False,
             "last_error": None,
         }
@@ -5694,6 +5746,8 @@ class LuxriotManager:
                     [Optional[Dict[str, Any]], Optional[BaseException]],
                     None,
                 ],
+                Optional[int],
+                float,
             ],
         ] = {}
         # Manager helpers are layered (status/prompt/rollup paths call compact
@@ -8380,6 +8434,8 @@ class LuxriotManager:
             [Optional[Dict[str, Any]], Optional[BaseException]],
             None,
         ],
+        *,
+        source_timestamp_ms: Optional[int] = None,
     ) -> bool:
         """Run CLIP off-thread with one active and one latest job per channel."""
 
@@ -8392,10 +8448,34 @@ class LuxriotManager:
                 None,
             ]
         ] = None
+        submitted_at = time.perf_counter()
+        normalized_source_timestamp_ms = _parse_optional_int(source_timestamp_ms)
         with self._probe_embedding_runtime_lock:
             if bool(self._probe_embedding_runtime.get("stopped")):
                 return False
             self._probe_embedding_runtime["submitted_total"] += 1
+            if (
+                normalized_source_timestamp_ms is not None
+                and normalized_source_timestamp_ms > 0
+            ):
+                source_age_ms = max(
+                    0,
+                    int(time.time() * 1000.0) - normalized_source_timestamp_ms,
+                )
+                self._probe_embedding_runtime[
+                    "last_source_age_at_submit_ms"
+                ] = source_age_ms
+                self._probe_embedding_runtime[
+                    "max_source_age_at_submit_ms"
+                ] = max(
+                    int(
+                        self._probe_embedding_runtime.get(
+                            "max_source_age_at_submit_ms"
+                        )
+                        or 0
+                    ),
+                    source_age_ms,
+                )
             already_active = (
                 normalized_channel in self._probe_embedding_active_channels
             )
@@ -8406,6 +8486,8 @@ class LuxriotManager:
                 self._probe_embedding_pending_latest[normalized_channel] = (
                     work,
                     callback,
+                    normalized_source_timestamp_ms,
+                    submitted_at,
                 )
                 if previous is None:
                     self._probe_embedding_runtime["pending"] += 1
@@ -8458,14 +8540,61 @@ class LuxriotManager:
         def run_channel() -> None:
             current_work = work
             current_callback = callback
+            current_source_timestamp_ms = normalized_source_timestamp_ms
+            current_submitted_at = submitted_at
             try:
                 while True:
+                    work_started_at = time.perf_counter()
+                    queue_wait_ms = max(
+                        0.0,
+                        (work_started_at - current_submitted_at) * 1000.0,
+                    )
                     with self._probe_embedding_runtime_lock:
                         self._probe_embedding_runtime["pending"] = max(
                             0,
                             int(self._probe_embedding_runtime["pending"]) - 1,
                         )
                         self._probe_embedding_runtime["in_flight"] += 1
+                        self._probe_embedding_runtime[
+                            "last_queue_wait_ms"
+                        ] = round(queue_wait_ms, 3)
+                        self._probe_embedding_runtime[
+                            "queue_wait_total_ms"
+                        ] += queue_wait_ms
+                        self._probe_embedding_runtime[
+                            "max_queue_wait_ms"
+                        ] = max(
+                            float(
+                                self._probe_embedding_runtime.get(
+                                    "max_queue_wait_ms"
+                                )
+                                or 0.0
+                            ),
+                            queue_wait_ms,
+                        )
+                        if (
+                            current_source_timestamp_ms is not None
+                            and current_source_timestamp_ms > 0
+                        ):
+                            source_age_ms = max(
+                                0,
+                                int(time.time() * 1000.0)
+                                - current_source_timestamp_ms,
+                            )
+                            self._probe_embedding_runtime[
+                                "last_source_age_at_work_start_ms"
+                            ] = source_age_ms
+                            self._probe_embedding_runtime[
+                                "max_source_age_at_work_start_ms"
+                            ] = max(
+                                int(
+                                    self._probe_embedding_runtime.get(
+                                        "max_source_age_at_work_start_ms"
+                                    )
+                                    or 0
+                                ),
+                                source_age_ms,
+                            )
 
                     result: Optional[Dict[str, Any]] = None
                     error: Optional[BaseException] = None
@@ -8473,12 +8602,52 @@ class LuxriotManager:
                         result = current_work()
                     except BaseException as exc:
                         error = exc
+                    work_completed_at = time.perf_counter()
+                    work_ms = max(
+                        0.0,
+                        (work_completed_at - work_started_at) * 1000.0,
+                    )
                     with self._probe_embedding_runtime_lock:
                         self._probe_embedding_runtime["in_flight"] = max(
                             0,
                             int(self._probe_embedding_runtime["in_flight"]) - 1,
                         )
                         self._probe_embedding_runtime["completed_total"] += 1
+                        self._probe_embedding_runtime["last_work_ms"] = round(
+                            work_ms,
+                            3,
+                        )
+                        self._probe_embedding_runtime["work_total_ms"] += work_ms
+                        self._probe_embedding_runtime["max_work_ms"] = max(
+                            float(
+                                self._probe_embedding_runtime.get("max_work_ms")
+                                or 0.0
+                            ),
+                            work_ms,
+                        )
+                        if (
+                            current_source_timestamp_ms is not None
+                            and current_source_timestamp_ms > 0
+                        ):
+                            source_age_ms = max(
+                                0,
+                                int(time.time() * 1000.0)
+                                - current_source_timestamp_ms,
+                            )
+                            self._probe_embedding_runtime[
+                                "last_source_age_at_work_complete_ms"
+                            ] = source_age_ms
+                            self._probe_embedding_runtime[
+                                "max_source_age_at_work_complete_ms"
+                            ] = max(
+                                int(
+                                    self._probe_embedding_runtime.get(
+                                        "max_source_age_at_work_complete_ms"
+                                    )
+                                    or 0
+                                ),
+                                source_age_ms,
+                            )
                         if error is not None:
                             self._probe_embedding_runtime["failed_total"] += 1
                             self._probe_embedding_runtime["last_error"] = (
@@ -8486,6 +8655,7 @@ class LuxriotManager:
                             )[:500]
                         else:
                             self._probe_embedding_runtime["last_error"] = None
+                    callback_started_at = time.perf_counter()
                     try:
                         current_callback(result, error)
                     except BaseException as exc:
@@ -8496,6 +8666,28 @@ class LuxriotManager:
                             self._probe_embedding_runtime["last_error"] = (
                                 f"{type(exc).__name__}: {exc}"
                             )[:500]
+                    callback_ms = max(
+                        0.0,
+                        (time.perf_counter() - callback_started_at) * 1000.0,
+                    )
+                    with self._probe_embedding_runtime_lock:
+                        self._probe_embedding_runtime[
+                            "last_callback_ms"
+                        ] = round(callback_ms, 3)
+                        self._probe_embedding_runtime[
+                            "callback_total_ms"
+                        ] += callback_ms
+                        self._probe_embedding_runtime[
+                            "max_callback_ms"
+                        ] = max(
+                            float(
+                                self._probe_embedding_runtime.get(
+                                    "max_callback_ms"
+                                )
+                                or 0.0
+                            ),
+                            callback_ms,
+                        )
 
                     with self._probe_embedding_runtime_lock:
                         pending = self._probe_embedding_pending_latest.pop(
@@ -8507,7 +8699,12 @@ class LuxriotManager:
                                 normalized_channel
                             )
                             break
-                        current_work, current_callback = pending
+                        (
+                            current_work,
+                            current_callback,
+                            current_source_timestamp_ms,
+                            current_submitted_at,
+                        ) = pending
             finally:
                 self._probe_embedding_capacity.release()
 
@@ -8537,12 +8734,28 @@ class LuxriotManager:
             pending_latest_channels = len(
                 self._probe_embedding_pending_latest
             )
+        completed_total = int(runtime.get("completed_total") or 0)
         return {
             "enabled": bool(self._probe_embedding_async_enabled),
             "workers": int(self._probe_embedding_worker_count),
             "queue_capacity": int(self._probe_embedding_queue_capacity),
             "active_channels": int(active_channels),
             "pending_latest_channels": int(pending_latest_channels),
+            "average_queue_wait_ms": round(
+                float(runtime.get("queue_wait_total_ms") or 0.0)
+                / max(1, completed_total),
+                3,
+            ),
+            "average_work_ms": round(
+                float(runtime.get("work_total_ms") or 0.0)
+                / max(1, completed_total),
+                3,
+            ),
+            "average_callback_ms": round(
+                float(runtime.get("callback_total_ms") or 0.0)
+                / max(1, completed_total),
+                3,
+            ),
             **runtime,
         }
 

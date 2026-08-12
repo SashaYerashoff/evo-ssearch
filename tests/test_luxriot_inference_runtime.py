@@ -1931,6 +1931,10 @@ class LuxriotCaptureDispatchTests(unittest.TestCase):
             self.assertEqual(status["in_flight"], 0)
             self.assertEqual(status["active_channels"], 0)
             self.assertEqual(status["pending_latest_channels"], 0)
+            self.assertGreaterEqual(status["last_queue_wait_ms"], 0.0)
+            self.assertGreaterEqual(status["last_work_ms"], 0.0)
+            self.assertGreaterEqual(status["last_callback_ms"], 0.0)
+            self.assertGreaterEqual(status["average_work_ms"], 0.0)
 
     def test_async_clip_dispatch_does_not_block_capture_bucket_rollover(self):
         started = threading.Event()
@@ -3519,6 +3523,33 @@ class LuxriotCaptureDispatchTests(unittest.TestCase):
                 fps=3.0,
             )
             self.assertGreater(continued_timestamp, source_anchor_ms + 14_667)
+
+    def test_live_segment_without_source_clock_uses_decode_observation_time(self):
+        with tempfile.TemporaryDirectory() as temp:
+            manager = build_manager(Path(temp))
+            session = LuxriotCaptureSession(
+                manager,
+                channel_id=7,
+                batch_size=2,
+                prompt="Describe.",
+                run_id="run-7",
+            )
+
+            # Several decoder-startup frames can arrive in one wall-clock
+            # tick. Keep them ordered without spreading that backlog into the
+            # future or inheriting the media-open delay.
+            self.assertEqual(
+                session._next_live_observed_timestamp_ms(20_000),
+                20_000,
+            )
+            self.assertEqual(
+                session._next_live_observed_timestamp_ms(20_000),
+                20_001,
+            )
+            self.assertEqual(
+                session._next_live_observed_timestamp_ms(20_500),
+                20_500,
+            )
 
     def test_ffmpeg_incremental_window_stop_actively_breaks_feeder_and_stdout(self):
         response_started = threading.Event()

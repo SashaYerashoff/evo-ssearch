@@ -110,6 +110,7 @@ class LmProfileRuntimeTests(unittest.TestCase):
         class AdmissionCapture:
             def admission(self, _resource, *, workload, **_kwargs):
                 captured["workload"] = workload
+                captured["capacity"] = _kwargs.get("capacity")
                 return nullcontext()
 
         with (
@@ -117,6 +118,8 @@ class LmProfileRuntimeTests(unittest.TestCase):
             patch.object(oldapp.config, "LM_VLM_PROFILE_ID", "vlm-a"),
             patch.object(oldapp.requests, "post", fake_post),
             patch.object(oldapp, "_lm_admission_controller", AdmissionCapture()),
+            patch.object(oldapp, "configured_lm_capacity", return_value=3),
+            patch.object(oldapp, "_cached_served_lm_capacity", return_value=1),
         ):
             result = oldapp._call_lm_chat(
                 [{"role": "user", "content": "describe"}],
@@ -132,15 +135,37 @@ class LmProfileRuntimeTests(unittest.TestCase):
         self.assertEqual(captured["headers"]["Authorization"], "Bearer vlm-secret")
         self.assertEqual(captured["timeout"], 321)
         self.assertEqual(captured["workload"], "rollup")
+        self.assertEqual(captured["capacity"], 1)
         self.assertEqual(captured["json"]["max_tokens"], 2048)
         self.assertEqual(result.eva_response_meta["attempt_count"], 1)
         self.assertEqual(result.eva_response_meta["finish_reason"], "stop")
         self.assertEqual(result.eva_response_meta["prompt_tokens"], 123)
         self.assertEqual(result.eva_response_meta["completion_tokens"], 17)
+        self.assertEqual(result.eva_response_meta["configured_capacity"], 3)
+        self.assertEqual(result.eva_response_meta["served_capacity"], 1)
+        self.assertEqual(result.eva_response_meta["effective_capacity"], 1)
+        self.assertEqual(result.eva_response_meta["profile_id"], "vlm-a")
+        self.assertEqual(result.eva_response_meta["workload"], "rollup")
+        self.assertIn("admission_queued_at_ms", result.eva_response_meta)
+        self.assertIn("admitted_at_ms", result.eva_response_meta)
+        self.assertIn("http_completed_at_ms", result.eva_response_meta)
         self.assertEqual(
             captured["json"]["chat_template_kwargs"],
             {"enable_thinking": False},
         )
+
+    def test_confirmed_served_capacity_survives_probe_cache_expiry(self):
+        resource = "http://127.0.0.1:1234"
+        with oldapp._lm_served_models_cache_lock:
+            oldapp._lm_served_models_cache[resource] = (
+                0.0,
+                {"served_capacity": 1, "capacity_source": "llama_cpp_slots"},
+            )
+        try:
+            self.assertEqual(oldapp._cached_served_lm_capacity(resource), 1)
+        finally:
+            with oldapp._lm_served_models_cache_lock:
+                oldapp._lm_served_models_cache.pop(resource, None)
 
     def test_interactive_agent_keeps_model_thinking_mode(self):
         profile = {

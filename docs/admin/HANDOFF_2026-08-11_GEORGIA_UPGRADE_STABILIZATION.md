@@ -1380,6 +1380,89 @@ contract tests. This includes the active-capture benchmark guard. The deployed
 service returned `/ready=200`, restored channels 112 and 118 as VLM/batch-8
 sessions, retained one worker and reported systemd `NRestarts=0`.
 
+## 2026-08-12 served-capacity, alert latency and live timestamp follow-up
+
+The deployment inference configuration was again preserved byte-for-byte. The
+`.env` SHA-256 remained
+`2c254527143f62bbdbcf7a14914872e2a6f1e0f4f776ef02024c0f27aac76325`.
+Neither inference server was restarted or reconfigured. The VLM remains
+Qwen3-VL-4B Q4_K_XL on llama.cpp with 16K context and one parallel slot; the
+agent remains Qwen3.5-9B with 65K context on the other GPU/server.
+
+The EVA VLM profile was configured with `max_inflight=3`, while llama.cpp
+reported exactly one `/slots` entry and runs with `-np 1`. EVA therefore
+admitted up to three requests into llama.cpp's opaque FIFO, where urgent fast
+alerts could sit behind normal L0 work. Served llama capacity is now discovered
+from the llama-style model metadata plus `/slots`, cached across the probe TTL,
+and used as a conservative admission clamp:
+`effective_capacity=min(configured_capacity, served_capacity)`. Startup primes
+this before restoring streams. Live traces reported configured 3, served 1 and
+effective 1; llama metrics subsequently showed `requests_processing=1` and
+`requests_deferred=0` under active work.
+
+Fast VLM alert records now carry stage timestamps and durations for source
+observation, post-roll, executor wait, evidence preparation, EVA admission,
+HTTP inference, postprocessing/bookmark delivery and full event-to-ACK latency,
+including token counts and the configured/served/effective capacity. Measured
+bookmark HTTP delivery itself was normally only about 50-228 ms. Representative
+end-to-end decisions were 8.6-15.5 seconds; post-roll was 2.5-3 seconds,
+admission waits reached 2.2-6.7 seconds, and llama inference was about 3.0-6.1
+seconds depending on the 2.5K-4.2K-token visual prompt. Evo bookmark delivery
+was not the dominant latency.
+
+The async semantic path now reports queue, work and callback timing plus frame
+age at submission/work start/work completion. This separated a cold CUDA/lock
+outlier from the steady path. The persistent emu1 age was a timestamp contract
+bug: when Evo omitted `X-Stream-Start-Time`, EVA anchored synthetic timestamps
+before authenticated stream/decoder startup, making freshly decoded frames
+appear several seconds stale. Frames without an upstream clock now use their
+actual decode-observation time with a monotonic 1 ms tie break; a genuine Evo
+source timestamp remains authoritative. A recovered stale-frame rejection also
+clears its transient health message instead of leaving the UI degraded forever.
+
+The final post-reload 30-second sample was clean:
+
+```text
+channel 112  snapshot      29 semantic frames  0 skipped
+channel 118  live_segment  30 semantic frames  0 skipped
+async lane                  59 submitted/completed, 0 coalesced, 0 failed
+selected frame age          642 ms on both channels at sample end
+queue/work/callback         1.5 ms / 85 ms / 1 ms on the last work item
+SigLIP microbatch           33 ms compute, 8 ms queue wait, queue depth 0
+realtime probe evaluation   33 ms, event age 160 ms, no current error
+emu1 timestamp source       decoded_frame_observed_at
+```
+
+A separate GPU sample before the timestamp fix showed the shared SigLIP GPU at
+about 33% average utilization while both channels still completed 59/59 frames
+in 30 seconds. React was not the cause of the semantic delay. The first live
+encode after a cold worker start can still take 16-28 seconds, but steady CUDA
+work returned to roughly 25-75 ms and no queue accumulated.
+
+Durable PostgreSQL rollups remained healthy after the final reload. At the
+check time both channels had L1 `13:00-13:15 UTC`, L2 `12:00-13:00 UTC` with
+`source_level=L1`, and L3 `00:00-08:00 UTC` with `source_level=L2`,
+`generation_route=agent_profile`, `proposals_only=true`, and
+`mutations_applied=false`. A direct app-compatible agent smoke with thinking
+disabled returned exactly `EVA_AGENT_OK`; `/health` was OK and the model endpoint
+reported 65,536 context.
+
+The final HUP again produced a 137-second HTTP outage. The old worker was forced
+out before the new worker completed transformers/SigLIP initialization. On this
+reload `/ready` briefly returned 200 while its embedder component still said
+`not_loaded` because that component is marked optional, although restored probe
+sessions already depend on it. Zero-downtime worker handover and the readiness
+contract are still P1 deployment defects; do not use HUP during a live pilot
+without an explicit maintenance window.
+
+Verification for this follow-up: Python compilation, `git diff --check`, five
+focused timestamp/latest-only/realtime tests, and a final 28/28 explicit
+regression set covering LM profiles and capacity caching, runtime bootstrap,
+settings provenance, fast-alert timing, realtime probe recovery, dense capture
+and async CLIP dispatch. Live service acceptance additionally covered both
+channels, the SigLIP path, llama queue metrics, agent inference and durable
+L1-L3 lineage.
+
 ## Next work
 
 ### 1. Confirm the committed baseline
