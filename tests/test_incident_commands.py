@@ -702,6 +702,170 @@ def test_open_automatic_incident_waits_for_boundary_before_episode_materializati
     assert store.episodes == []
 
 
+def test_l2_composition_replay_attaches_context_only_to_grounded_safety_case():
+    safety = {
+        **_record(state="candidate"),
+        "case_state": "candidate",
+        "possible_start_ms": 10_000,
+        "observed_start_ms": 10_000,
+        "observed_end_ms": 12_000,
+        "anchor_ref": {"observation_id": "obs-collision"},
+        "timeline_refs": [
+            {
+                "observation_id": "obs-collision",
+                "semantic_key": "vehicle collision",
+            }
+        ],
+        "report": {"priority": "safety", "severity": "critical"},
+    }
+
+    class _CompositionStore:
+        def __init__(self, records):
+            self.records = list(records)
+            self.episodes = {}
+            self.observations = {}
+            self.list_calls = []
+
+        def list_incidents(self, **kwargs):
+            self.list_calls.append(dict(kwargs))
+            return [dict(item) for item in self.records], len(self.records)
+
+        def append_episode(self, record, **_kwargs):
+            self.episodes.setdefault(record["idempotency_key"], dict(record))
+            return dict(self.episodes[record["idempotency_key"]])
+
+        def append_observation(self, record, **_kwargs):
+            self.observations.setdefault(record["idempotency_key"], dict(record))
+            return dict(self.observations[record["idempotency_key"]])
+
+    rollup = {
+        "rollup_id": "l2-ch112-w3600-0",
+        "channel_id": 112,
+        "level": "L2",
+        "incident_ledger": [
+            {
+                "episode_id": "episode-collision",
+                "semantic_key": "vehicle collision",
+                "status": "open",
+                "start_ms": 10_000,
+                "last_observed_ms": 12_000,
+                "observation_ids": ["obs-collision"],
+                "priority": "safety",
+                "severity": "critical",
+            },
+            {
+                "episode_id": "episode-phone",
+                "semantic_key": "person phone_call",
+                "status": "ended_by_routine",
+                "start_ms": 20_000,
+                "last_observed_ms": 30_000,
+                "boundary_at_ms": 31_000,
+                "observation_ids": ["obs-phone"],
+                "evidence_refs": ["batch-phone:snapshot:4"],
+                "priority": "context",
+                "scale_disposition": "routine_at_this_scale",
+            },
+        ],
+        "incident_compositions": [
+            {
+                "composition_id": "composition-crash-phone",
+                "parent_episode_id": "episode-collision",
+                "parent_observation_ids": ["obs-collision"],
+                "nested_episode_ids": ["episode-phone"],
+                "semantic_keys": ["vehicle collision", "person phone_call"],
+                "start_ms": 10_000,
+                "end_ms": 31_000,
+                "promotion_policy": "extend_grounded_anchor",
+                "automatic_merge": False,
+            }
+        ],
+    }
+    store = _CompositionStore([safety])
+    service = _service(store, _Runtime())
+
+    first = service.ingest_rollup_incident_compositions(112, rollup)
+    replay = service.ingest_rollup_incident_compositions(112, rollup)
+
+    assert first["attached"] == 1
+    assert replay["attached"] == 1
+    assert len(store.episodes) == 1
+    episode = next(iter(store.episodes.values()))
+    assert episode["incident_id"] == INCIDENT_ID
+    assert episode["semantic_key"] == "person phone_call"
+    assert episode["perception_state"] == "ended"
+    assert episode["coverage"]["nested_context"] is True
+    assert episode["coverage"]["automatic_merge"] is False
+    assert len(store.observations) == 1
+    assert store.list_calls[0]["case_states"] == ["candidate", "open"]
+
+
+def test_l2_composition_cannot_promote_context_or_info_operator_case():
+    info_operator = {
+        **_record(state="candidate"),
+        "case_state": "candidate",
+        "possible_start_ms": 10_000,
+        "observed_start_ms": 10_000,
+        "anchor_ref": {"observation_id": "obs-thumb"},
+        "timeline_refs": [{"observation_id": "obs-thumb"}],
+        "report": {"priority": "operator_criterion", "severity": "info"},
+    }
+
+    class _NoPromotionStore:
+        def __init__(self):
+            self.episodes = []
+            self.observations = []
+
+        def list_incidents(self, **_kwargs):
+            return [dict(info_operator)], 1
+
+        def append_episode(self, record, **_kwargs):
+            self.episodes.append(dict(record))
+
+        def append_observation(self, record, **_kwargs):
+            self.observations.append(dict(record))
+
+    rollup = {
+        "rollup_id": "l2-ch112-w3600-0",
+        "level": "L2",
+        "incident_ledger": [
+            {
+                "episode_id": "episode-thumb",
+                "semantic_key": "person thumbs_up",
+                "start_ms": 10_000,
+                "last_observed_ms": 11_000,
+            },
+            {
+                "episode_id": "episode-head",
+                "semantic_key": "person head_turn",
+                "start_ms": 12_000,
+                "last_observed_ms": 13_000,
+            },
+        ],
+        "incident_compositions": [
+            {
+                "composition_id": "composition-info",
+                "parent_observation_ids": ["obs-thumb"],
+                "nested_episode_ids": ["episode-head"],
+                "start_ms": 10_000,
+                "end_ms": 13_000,
+                "promotion_policy": "extend_grounded_anchor",
+                "automatic_merge": False,
+            }
+        ],
+    }
+    store = _NoPromotionStore()
+
+    result = _service(store, _Runtime()).ingest_rollup_incident_compositions(
+        112,
+        rollup,
+    )
+
+    assert result["attached"] == 0
+    assert result["skipped"] == 1
+    assert store.episodes == []
+    assert store.observations == []
+
+
 def test_review_projection_is_compact_and_keeps_independent_lifecycle_axes():
     service = IncidentCommandService(
         _Store(),

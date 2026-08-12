@@ -6331,8 +6331,24 @@ def _append_l0_incident_observations(
     }
 
 
+def _append_l2_incident_compositions(
+    channel_id: int,
+    rollup: Mapping[str, Any],
+) -> Dict[str, Any]:
+    """Materialize only context rooted in an existing alert/safety case."""
+
+    return _incident_command_service().ingest_rollup_incident_compositions(
+        int(channel_id),
+        rollup,
+        tracked_limit=int(getattr(config, "LUXRIOT_INCIDENT_TRACKED_LIMIT", 64)),
+    )
+
+
 luxriot_manager.set_incident_observation_callback(
     _append_l0_incident_observations
+)
+luxriot_manager.set_rollup_incident_callback(
+    _append_l2_incident_compositions
 )
 semantic_snapshot_writer: Optional[SemanticSnapshotArchiveWriter] = None
 if bool(getattr(config, "SEMANTIC_SNAPSHOT_ARCHIVE_ENABLED", True)):

@@ -904,6 +904,267 @@ class IncidentCommandService:
             "failures": failures[:8],
         }
 
+    def ingest_rollup_incident_compositions(
+        self,
+        channel_id: int,
+        rollup: Mapping[str, Any],
+        *,
+        actor_id: str | None = None,
+        tracked_limit: int = 128,
+    ) -> dict[str, Any]:
+        """Attach L2 context to an existing grounded incident, replay-safely.
+
+        Deterministic consolidation may enrich a case which already exists due
+        to an operator criterion or an independent safety signal.  It must not
+        create attention from ordinary scene narration, and it never merges or
+        closes incidents automatically.
+        """
+
+        normalized_channel = int(channel_id)
+        if normalized_channel <= 0:
+            raise ValueError("channel_id must be positive")
+        if str(rollup.get("level") or "").strip().upper() != "L2":
+            return {
+                "supported": True,
+                "compositions": 0,
+                "attached": 0,
+                "episodes": 0,
+                "skipped": "not_l2",
+            }
+        compositions = [
+            dict(item)
+            for item in rollup.get("incident_compositions") or []
+            if isinstance(item, Mapping)
+        ][:32]
+        episodes_by_id = {
+            str(item.get("episode_id") or ""): dict(item)
+            for item in rollup.get("incident_ledger") or []
+            if isinstance(item, Mapping)
+            and str(item.get("episode_id") or "").strip()
+        }
+        if not compositions or not episodes_by_id:
+            return {
+                "supported": True,
+                "compositions": len(compositions),
+                "attached": 0,
+                "episodes": 0,
+                "skipped": "no_compositions" if not compositions else "no_episode_ledger",
+            }
+        lister = getattr(self.incident_store, "list_incidents", None)
+        episode_appender = getattr(self.incident_store, "append_episode", None)
+        observation_appender = getattr(self.incident_store, "append_observation", None)
+        if not all(callable(item) for item in (lister, episode_appender, observation_appender)):
+            return {
+                "supported": False,
+                "compositions": len(compositions),
+                "attached": 0,
+                "episodes": 0,
+            }
+
+        starts = [self._optional_int(item.get("start_ms")) for item in compositions]
+        ends = [self._optional_int(item.get("end_ms")) for item in compositions]
+        bounded_starts = [value for value in starts if value is not None]
+        bounded_ends = [value for value in ends if value is not None]
+        if not bounded_starts or not bounded_ends:
+            return {
+                "supported": True,
+                "compositions": len(compositions),
+                "attached": 0,
+                "episodes": 0,
+                "skipped": "missing_bounds",
+            }
+        context_pad_ms = 5 * 60 * 1000
+        incidents, _total = lister(
+            channel_ids=[normalized_channel],
+            case_states=["candidate", "open"],
+            since_ms=max(0, min(bounded_starts) - context_pad_ms),
+            until_ms=max(bounded_ends) + context_pad_ms,
+            limit=max(1, min(256, int(tracked_limit))),
+            offset=0,
+        )
+
+        def observation_ids(incident: Mapping[str, Any]) -> set[str]:
+            values: set[str] = set()
+            anchor = incident.get("anchor_ref")
+            if isinstance(anchor, Mapping):
+                value = str(anchor.get("observation_id") or "").strip()
+                if value:
+                    values.add(value)
+            for item in incident.get("timeline_refs") or []:
+                if not isinstance(item, Mapping):
+                    continue
+                value = str(item.get("observation_id") or "").strip()
+                if value:
+                    values.add(value)
+            return values
+
+        def grounded_priority(incident: Mapping[str, Any]) -> tuple[int, int]:
+            report = incident.get("report")
+            report = report if isinstance(report, Mapping) else {}
+            priority = str(report.get("priority") or "").strip().lower()
+            severity = str(report.get("severity") or "").strip().lower()
+            severity_rank = {
+                "": 0,
+                "info": 1,
+                "low": 2,
+                "normal": 3,
+                "medium": 3,
+                "high": 4,
+                "critical": 5,
+                "emergency": 5,
+            }.get(severity, 0)
+            if priority == "safety":
+                return (2, severity_rank)
+            if priority == "operator_criterion" and severity_rank >= 4:
+                return (1, severity_rank)
+            return (0, severity_rank)
+
+        grounded = [
+            (dict(item), observation_ids(item), grounded_priority(item))
+            for item in incidents
+            if isinstance(item, Mapping) and grounded_priority(item)[0] > 0
+        ]
+        attached = 0
+        episode_count = 0
+        skipped = 0
+        failures: list[str] = []
+        parent_incident_ids: list[str] = []
+        rollup_id = str(rollup.get("rollup_id") or "").strip()
+        for composition in compositions:
+            composition_id = str(composition.get("composition_id") or "").strip()
+            if (
+                not composition_id
+                or str(composition.get("promotion_policy") or "")
+                != "extend_grounded_anchor"
+                or composition.get("automatic_merge") is not False
+            ):
+                skipped += 1
+                continue
+            parent_observation_ids = {
+                str(value or "").strip()
+                for value in (
+                    composition.get("parent_observation_ids")
+                    or composition.get("anchor_observation_ids")
+                    or []
+                )
+                if str(value or "").strip()
+            }
+            matches = [
+                item
+                for item in grounded
+                if parent_observation_ids.intersection(item[1])
+            ]
+            if not matches:
+                skipped += 1
+                continue
+            parent, _known_observations, _priority = max(
+                matches,
+                key=lambda item: (
+                    item[2][0],
+                    item[2][1],
+                    int(item[0].get("revision") or 0),
+                ),
+            )
+            parent_id = str(parent.get("id") or "").strip()
+            if not parent_id:
+                skipped += 1
+                continue
+            nested_ids = [
+                str(value or "").strip()
+                for value in composition.get("nested_episode_ids") or []
+                if str(value or "").strip()
+            ][:127]
+            try:
+                for episode_id in nested_ids:
+                    episode = episodes_by_id.get(episode_id)
+                    if not episode:
+                        continue
+                    start_ms = self._optional_int(episode.get("start_ms"))
+                    end_ms = self._optional_int(
+                        episode.get("boundary_at_ms")
+                        or episode.get("last_observed_ms")
+                    )
+                    if start_ms is None:
+                        continue
+                    end_ms = max(start_ms, end_ms or start_ms)
+                    status = str(episode.get("status") or "open").strip().lower()
+                    is_ended = status != "open"
+                    episode_digest = hashlib.sha256(
+                        f"{composition_id}:{episode_id}".encode("utf-8")
+                    ).hexdigest()
+                    evidence_refs = [
+                        {"kind": "vlm_snapshot", "ref": str(value), "role": "context"}
+                        for value in episode.get("evidence_refs") or []
+                        if str(value or "").strip()
+                    ][:128]
+                    episode_appender(
+                        {
+                            "incident_id": parent_id,
+                            "idempotency_key": f"l2-composition:{episode_digest}",
+                            "episode_key": f"l2:{episode_digest}",
+                            "perception_state": "ended" if is_ended else "observed",
+                            "semantic_key": str(episode.get("semantic_key") or "")[:160] or None,
+                            "possible_start_ms": start_ms,
+                            "observed_start_ms": start_ms,
+                            "observed_end_ms": end_ms if is_ended else None,
+                            "possible_end_ms": end_ms if is_ended else None,
+                            "routine_before_ref": {},
+                            "routine_after_ref": {},
+                            "evidence_refs": evidence_refs,
+                            "coverage": {
+                                "source_level": "L2",
+                                "rollup_id": rollup_id,
+                                "composition_id": composition_id,
+                                "scale_disposition": str(
+                                    episode.get("scale_disposition")
+                                    or "unclassified_keep"
+                                ),
+                                "nested_context": True,
+                                "automatic_merge": False,
+                                "operator_review_required": True,
+                            },
+                        },
+                        actor_id=actor_id,
+                    )
+                    episode_count += 1
+                observation_appender(
+                    {
+                        "incident_id": parent_id,
+                        "idempotency_key": f"rollup-composition:{composition_id}"[:200],
+                        "source_kind": "rollup_l2_composition",
+                        "observed_at_ms": self._optional_int(composition.get("end_ms"))
+                        or self._wall_clock_ms(),
+                        "channel_id": normalized_channel,
+                        "perception_state": str(parent.get("perception_state") or "observed"),
+                        "source_ref": {
+                            "rollup_id": rollup_id,
+                            "composition_id": composition_id,
+                        },
+                        "payload": {
+                            "semantic_keys": list(composition.get("semantic_keys") or [])[:32],
+                            "parent_episode_id": composition.get("parent_episode_id"),
+                            "nested_episode_ids": nested_ids,
+                            "promotion_policy": "extend_grounded_anchor",
+                            "automatic_merge": False,
+                            "operator_review_required": True,
+                        },
+                    },
+                    actor_id=actor_id,
+                )
+                attached += 1
+                parent_incident_ids.append(parent_id)
+            except Exception as exc:
+                failures.append(f"{composition_id}:{type(exc).__name__}")
+        return {
+            "supported": True,
+            "compositions": len(compositions),
+            "attached": attached,
+            "episodes": episode_count,
+            "skipped": skipped,
+            "parent_incident_ids": list(dict.fromkeys(parent_incident_ids))[:32],
+            "failures": failures[:8],
+        }
+
     @staticmethod
     def _heartbeat_homeostasis(heartbeat: Mapping[str, Any]) -> dict[str, Any]:
         vector_signal = heartbeat.get("vector_signal")

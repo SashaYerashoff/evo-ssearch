@@ -649,6 +649,7 @@ SummaryArchiveBucketLoaderFn = Callable[[int, float, float, int], List[Dict[str,
 OperatorFeedbackReportLoaderFn = Callable[[int, float, float, int], Mapping[str, Any]]
 AlertProbeCallbackFn = Callable[[int, Sequence[Mapping[str, Any]]], Optional[Mapping[str, Any]]]
 IncidentObservationCallbackFn = Callable[[int, Mapping[str, Any]], Optional[Mapping[str, Any]]]
+RollupIncidentCallbackFn = Callable[[int, Mapping[str, Any]], Optional[Mapping[str, Any]]]
 AttentionEventCallbackFn = Callable[[str, Mapping[str, Any]], None]
 ProbeEmbeddingCallbackFn = Callable[[int, Mapping[str, Any]], None]
 
@@ -5657,6 +5658,8 @@ class LuxriotManager:
         self.operator_feedback_report_loader: Optional[OperatorFeedbackReportLoaderFn] = None
         self.alert_probe_callback: Optional[AlertProbeCallbackFn] = None
         self.incident_observation_callback: Optional[IncidentObservationCallbackFn] = None
+        self.rollup_incident_callback: Optional[RollupIncidentCallbackFn] = None
+        self._rollup_incident_dispatched: Dict[str, float] = {}
         self.attention_event_callback: Optional[AttentionEventCallbackFn] = None
         self.probe_embedding_callback: Optional[ProbeEmbeddingCallbackFn] = None
         self.system_prompt = getattr(config, "LUXRIOT_SYSTEM_PROMPT_DEFAULT", "")
@@ -7960,6 +7963,48 @@ class LuxriotManager:
         """Attach a durable sink for replay-safe L0 incident heartbeats."""
 
         self.incident_observation_callback = callback
+
+    def set_rollup_incident_callback(
+        self,
+        callback: Optional[RollupIncidentCallbackFn],
+    ) -> None:
+        """Attach a replay-safe sink for grounded L2 incident composition."""
+
+        self.rollup_incident_callback = callback
+
+    def _dispatch_rollup_incident_compositions(
+        self,
+        channel_id: int,
+        nodes: Sequence[Dict[str, Any]],
+    ) -> None:
+        callback = self.rollup_incident_callback
+        if callback is None:
+            return
+        for node in nodes:
+            compositions = node.get("incident_compositions")
+            if not compositions:
+                continue
+            rollup_id = str(node.get("rollup_id") or "").strip()
+            source_signature = str(node.get("source_signature") or "").strip()
+            dispatch_key = f"{rollup_id}:{source_signature}"
+            if not rollup_id or dispatch_key in self._rollup_incident_dispatched:
+                continue
+            try:
+                result = callback(int(channel_id), node)
+            except Exception as exc:
+                node["incident_composition_error"] = (
+                    _safe_error_text(exc, 240) or exc.__class__.__name__
+                )
+                continue
+            node.pop("incident_composition_error", None)
+            if isinstance(result, Mapping):
+                node["incident_composition_result"] = dict(result)
+            self._rollup_incident_dispatched[dispatch_key] = time.time()
+            while len(self._rollup_incident_dispatched) > 8192:
+                self._rollup_incident_dispatched.pop(
+                    next(iter(self._rollup_incident_dispatched)),
+                    None,
+                )
 
     def set_attention_event_callback(
         self,
@@ -11117,7 +11162,7 @@ class LuxriotManager:
         high_signal = re.search(
             r"\b(?:"
             r"enter(?:s|ed|ing)?|entry|arriv(?:e|es|ed|ing|al)|"
-            r"exit(?:s|ed|ing)?|leave(?:s|ing)?|left|depart(?:s|ed|ing|ure)?|"
+            r"exit(?:s|ed|ing)?|leave(?:s|ing)?|depart(?:s|ed|ing|ure)?|"
             r"appear(?:s|ed|ing|ance)?|disappear(?:s|ed|ing|ance)?|"
             r"fall(?:s|en|ing)?|fell|collaps(?:e|es|ed|ing)|faint(?:s|ed|ing)?|"
             r"run(?:s|ning)?|sprint(?:s|ed|ing)?|chas(?:e|es|ed|ing)?|"
@@ -11135,7 +11180,12 @@ class LuxriotManager:
             text,
             flags=re.IGNORECASE,
         )
-        if high_signal:
+        explicit_left_egress = re.search(
+            r"\bleft\s+(?:the\s+)?(?:camera\s+)?(?:scene|frame|room|area|view)\b",
+            text,
+            flags=re.IGNORECASE,
+        )
+        if high_signal or explicit_left_egress:
             return True
         if re.search(
             r"\b(?:vehicle|car|truck|vessel|ship|boat|yacht|jetski|jet\s+ski)\b",
@@ -11152,6 +11202,7 @@ class LuxriotManager:
         low_signal = re.search(
             r"\b(?:seated|sitting|stationary|stillness|resting|reclining|"
             r"gaze|gazing|look(?:s|ed|ing)?|head\s+(?:turn|tilt|movement|motion)|"
+            r"turn(?:s|ed|ing)?\s+(?:the\s+)?head|"
             r"(?:person|subject|individual)\s+(?:is\s+)?mov(?:e|es|ed|ing)|"
             r"posture|minor\s+(?:movement|motion|shift|adjustment)|"
             r"hand\s+(?:near|to)\s+(?:face|head)|adjust(?:s|ed|ing)?\s+(?:clothing|fabric)|"
@@ -11240,7 +11291,11 @@ class LuxriotManager:
             ("victory_gesture", r"\b(?:victory|peace|v\s*[- ]?\s*sign|two\s+finger)\b"),
             ("phone_call", r"\b(?:phone\s+call|call(?:s|ed|ing)?\s+(?:on|by|with)\s+(?:a\s+)?phone|talk(?:s|ed|ing)?\s+on\s+(?:a\s+)?phone)\b"),
             ("enter", r"\b(?:enter|entry|arriv|appear)"),
-            ("exit", r"\b(?:exit|leave|left|depart|disappear)"),
+            (
+                "exit",
+                r"\b(?:exit|leave|depart|disappear)|"
+                r"\bleft\s+(?:the\s+)?(?:camera\s+)?(?:scene|frame|room|area|view)\b",
+            ),
             ("fall", r"\b(?:fall|fell|collapse|faint)"),
             ("collision", r"\b(?:collision|collid|crash|impact|near\s+miss)"),
             ("fire_smoke", r"\b(?:fire|flame|smoke|explosion)\b"),
@@ -12440,6 +12495,56 @@ class LuxriotManager:
             return {}
         segmentation = segment_observations(observations)
         episodes = [episode.to_dict() for episode in segmentation.episodes]
+        observations_by_id = {
+            str(row.get("observation_id") or ""): row
+            for row in compact_rows
+            if str(row.get("observation_id") or "")
+        }
+        severity_rank = {
+            "": 0,
+            "info": 1,
+            "low": 2,
+            "normal": 3,
+            "medium": 3,
+            "high": 4,
+            "critical": 5,
+            "emergency": 5,
+        }
+        for episode in episodes:
+            source_rows = [
+                observations_by_id[observation_id]
+                for observation_id in episode.get("observation_ids") or []
+                if observation_id in observations_by_id
+            ]
+            trigger_kinds = list(
+                dict.fromkeys(
+                    str(row.get("trigger_kind") or "").strip().lower()
+                    for row in source_rows
+                    if str(row.get("trigger_kind") or "").strip()
+                )
+            )
+            severity = max(
+                (
+                    str(row.get("severity") or "").strip().lower()
+                    for row in source_rows
+                ),
+                key=lambda value: severity_rank.get(value, 0),
+                default="",
+            )
+            priority = (
+                "operator_criterion"
+                if "operator_alert" in trigger_kinds
+                else "safety"
+                if any(
+                    kind in {"safety_alert", "safety_event"}
+                    for kind in trigger_kinds
+                )
+                else "context"
+            )
+            episode["trigger_kinds"] = trigger_kinds
+            episode["priority"] = priority
+            if severity:
+                episode["severity"] = severity
         by_key: Dict[str, List[Dict[str, Any]]] = {}
         for episode in episodes:
             by_key.setdefault(str(episode.get("semantic_key") or ""), []).append(episode)
@@ -12464,13 +12569,175 @@ class LuxriotManager:
         child_ids = [str(row["observation_id"]) for row in compact_rows]
         proposed = tuple(segmentation.dispositions)
         total_dispositions = complete_child_dispositions(child_ids, proposed)
+        compositions = cls._compose_temporal_incident_candidates(
+            episodes,
+            level=level,
+        )
         return {
             "temporal_observations": compact_rows,
             "incident_ledger": episodes[:128],
             "incident_dispositions": [
                 item.to_dict() for item in total_dispositions[:2048]
             ],
+            **(
+                {"incident_compositions": compositions}
+                if compositions
+                else {}
+            ),
         }
+
+    @staticmethod
+    def _compose_temporal_incident_candidates(
+        episodes: Sequence[Mapping[str, Any]],
+        *,
+        level: str,
+        max_items: int = 32,
+    ) -> List[Dict[str, Any]]:
+        """Build bounded, server-owned L2 composition candidates.
+
+        A composition cannot create attention from ordinary context. It must be
+        rooted in grounded safety evidence or a high/critical operator rule.
+        Nearby ordinary episodes may then become nested context for that root.
+        """
+
+        normalized_level = str(level or "").strip().upper()
+        if normalized_level != "L2":
+            return []
+        rows = [
+            dict(episode)
+            for episode in episodes[:128]
+            if isinstance(episode, Mapping)
+            and str(episode.get("episode_id") or "").strip()
+        ]
+        if len(rows) < 2:
+            return []
+
+        def bounds(row: Mapping[str, Any]) -> Tuple[int, int]:
+            start = max(0, int(_parse_optional_int(row.get("start_ms")) or 0))
+            end = max(
+                start,
+                int(
+                    _parse_optional_int(row.get("boundary_at_ms"))
+                    or _parse_optional_int(row.get("last_observed_ms"))
+                    or start
+                ),
+            )
+            return start, end
+
+        rows.sort(key=lambda row: (*bounds(row), str(row.get("episode_id") or "")))
+        max_gap_ms = 5 * 60 * 1000
+        components: List[List[Dict[str, Any]]] = []
+        current: List[Dict[str, Any]] = []
+        component_end = 0
+        for row in rows:
+            start, end = bounds(row)
+            if current and start > component_end + max_gap_ms:
+                components.append(current)
+                current = []
+            current.append(row)
+            component_end = max(component_end, end) if len(current) > 1 else end
+        if current:
+            components.append(current)
+
+        severity_rank = {
+            "critical": 0,
+            "emergency": 0,
+            "high": 1,
+            "normal": 2,
+            "medium": 2,
+            "low": 3,
+            "info": 4,
+        }
+        out: List[Dict[str, Any]] = []
+        for component in components:
+            semantic_keys = list(
+                dict.fromkeys(
+                    str(row.get("semantic_key") or "").strip().lower()
+                    for row in component
+                    if str(row.get("semantic_key") or "").strip()
+                )
+            )
+            if len(semantic_keys) < 2:
+                continue
+            roots = [
+                row
+                for row in component
+                if str(row.get("priority") or "") == "safety"
+                or (
+                    str(row.get("priority") or "") == "operator_criterion"
+                    and str(row.get("severity") or "").lower()
+                    in {"high", "critical", "emergency"}
+                )
+            ]
+            if not roots:
+                continue
+            parent = min(
+                roots,
+                key=lambda row: (
+                    0 if str(row.get("priority") or "") == "safety" else 1,
+                    severity_rank.get(str(row.get("severity") or "").lower(), 5),
+                    -max(0, bounds(row)[1] - bounds(row)[0]),
+                    bounds(row)[0],
+                ),
+            )
+            episode_ids = [str(row.get("episode_id") or "") for row in component]
+            parent_id = str(parent.get("episode_id") or "")
+            start_ms = min(bounds(row)[0] for row in component)
+            end_ms = max(bounds(row)[1] for row in component)
+            anchor_observation_ids = list(
+                dict.fromkeys(
+                    str(value or "")
+                    for row in roots
+                    for value in (row.get("observation_ids") or [])
+                    if str(value or "")
+                )
+            )[:128]
+            parent_observation_ids = list(
+                dict.fromkeys(
+                    str(value or "")
+                    for value in (parent.get("observation_ids") or [])
+                    if str(value or "")
+                )
+            )[:128]
+            evidence_refs = list(
+                dict.fromkeys(
+                    str(value or "")
+                    for row in component
+                    for value in (row.get("evidence_refs") or [])
+                    if str(value or "")
+                )
+            )[:128]
+            digest = hashlib.sha256(
+                (normalized_level + "\x1f" + "\x1f".join(sorted(episode_ids))).encode(
+                    "utf-8"
+                )
+            ).hexdigest()[:32]
+            out.append(
+                {
+                    "composition_id": f"composition-{digest}",
+                    "level": normalized_level,
+                    "channel_id": int(parent.get("channel_id") or 0),
+                    "parent_episode_id": parent_id,
+                    "parent_priority": str(parent.get("priority") or ""),
+                    "parent_severity": str(parent.get("severity") or ""),
+                    "episode_ids": episode_ids[:128],
+                    "nested_episode_ids": [
+                        episode_id for episode_id in episode_ids if episode_id != parent_id
+                    ][:127],
+                    "anchor_observation_ids": anchor_observation_ids,
+                    "parent_observation_ids": parent_observation_ids,
+                    "semantic_keys": semantic_keys[:32],
+                    "start_ms": start_ms,
+                    "end_ms": end_ms,
+                    "evidence_refs": evidence_refs,
+                    "promotion_policy": "extend_grounded_anchor",
+                    "operator_review_required": True,
+                    "automatic_merge": False,
+                }
+            )
+            if len(out) >= max(1, int(max_items)):
+                break
+        return out
 
     @staticmethod
     def _finite_float(value: object) -> Optional[float]:
@@ -17069,7 +17336,6 @@ class LuxriotManager:
             "exited": "leave",
             "exiting": "leave",
             "exits": "leave",
-            "left": "leave",
             "leaves": "leave",
             "leaving": "leave",
             "move": "move",
@@ -17100,6 +17366,24 @@ class LuxriotManager:
         return value
 
     @classmethod
+    def _alert_policy_match_stems(cls, value: object) -> List[str]:
+        """Tokenize policy evidence without confusing direction with egress."""
+
+        match_text = str(value or "").casefold()
+        # ``left`` is an irregular form of leave only with an explicit egress
+        # object.  In visual prose it much more often means direction (turning
+        # head left, vehicle on the left), which must not satisfy a leave rule.
+        match_text = re.sub(
+            r"\bleft(?=\s+(?:the\s+)?(?:camera\s+)?(?:scene|frame|room|area|view)\b)",
+            "leave",
+            match_text,
+        )
+        return [
+            cls._alert_policy_match_stem(raw_token)
+            for raw_token in re.findall(r"[a-z0-9]+", match_text)
+        ]
+
+    @classmethod
     def _alert_policy_match_tokens(cls, value: object) -> Set[str]:
         tokens: Set[str] = set()
         match_text = re.sub(
@@ -17110,8 +17394,7 @@ class LuxriotManager:
             str(value or "").casefold(),
             flags=re.IGNORECASE,
         )
-        for raw_token in re.findall(r"[a-z0-9]+", match_text):
-            token = cls._alert_policy_match_stem(raw_token)
+        for token in cls._alert_policy_match_stems(match_text):
             if (
                 len(token) < 2
                 or token in _ALERT_POLICY_MATCH_STOPWORDS
@@ -17261,8 +17544,7 @@ class LuxriotManager:
         if criterion_actions:
             positive_actions: Set[str] = set()
             for clause in re.split(r"[.;!?]|\bbut\b|\bhowever\b", evidence_text.casefold()):
-                raw_tokens = re.findall(r"[a-z0-9]+", clause)
-                stems = [cls._alert_policy_match_stem(token) for token in raw_tokens]
+                stems = cls._alert_policy_match_stems(clause)
                 for index, stem in enumerate(stems):
                     if stem not in criterion_actions:
                         continue
@@ -19820,6 +20102,11 @@ class LuxriotManager:
             for item in (entry.get("incident_dispositions") or [])[:2048]
             if isinstance(item, Mapping)
         ]
+        incident_compositions = [
+            dict(item)
+            for item in (entry.get("incident_compositions") or [])[:32]
+            if isinstance(item, Mapping)
+        ]
         state_transition_total = int(max(0, _parse_optional_int(entry.get("state_transition_total")) or 0))
         vector_signal_total = int(max(0, _parse_optional_int(entry.get("vector_signal_total")) or 0))
         created_at = self._coerce_float(entry.get("created_at"))
@@ -19864,6 +20151,8 @@ class LuxriotManager:
             normalized["incident_ledger"] = incident_ledger
         if incident_dispositions:
             normalized["incident_dispositions"] = incident_dispositions
+        if incident_compositions:
+            normalized["incident_compositions"] = incident_compositions
         generation_error = str(entry.get("generation_error") or "").strip()
         if generation_error:
             normalized["generation_error"] = generation_error[:240]
@@ -21224,6 +21513,43 @@ class LuxriotManager:
             key=lambda pair: float(self._coerce_float(pair[0].get("window_start")) or 0.0),
             reverse=True,
         )
+
+        def incident_memory_meta(node: Mapping[str, Any]) -> Dict[str, Any]:
+            return {
+                key: node.get(key)
+                for key in (
+                    "routine_ledger",
+                    "temporal_observations",
+                    "incident_ledger",
+                    "incident_dispositions",
+                    "incident_compositions",
+                )
+                if node.get(key)
+            }
+
+        def backfill_cached_incident_memory(
+            rollup_id: str,
+            cached: Mapping[str, Any],
+            node: Mapping[str, Any],
+        ) -> None:
+            memory_meta = incident_memory_meta(node)
+            if not memory_meta or all(
+                cached.get(key) == value for key, value in memory_meta.items()
+            ):
+                return
+            cached_summary = str(cached.get("summary") or "").strip()
+            if not cached_summary:
+                return
+            merged_meta = dict(cached)
+            merged_meta.update(memory_meta)
+            merged_meta.pop("rollup_id", None)
+            merged_meta.pop("summary", None)
+            self._put_cached_rollup_summary(
+                rollup_id,
+                cached_summary,
+                **merged_meta,
+            )
+
         for node, children in pairs:
             rollup_id = str(node.get("rollup_id") or "").strip()
             if not rollup_id:
@@ -21294,6 +21620,7 @@ class LuxriotManager:
                     node["summary_kind"] = "legacy_cached" if cached_legacy else "llm_cached"
                     node["generation_status"] = "legacy_ready" if cached_legacy else "cached"
                     node["format_version"] = cached_format_version
+                    backfill_cached_incident_memory(rollup_id, cached, node)
                     if cached_legacy and cached_signature != source_signature:
                         node["legacy_source_changed"] = True
                     if level != "L3":
@@ -21342,6 +21669,7 @@ class LuxriotManager:
                     signal_digest=node.get("signal_digest"),
                     event_ledger=node.get("event_ledger"),
                     state_ledger=node.get("state_ledger"),
+                    **incident_memory_meta(node),
                     alert_delivery_breakdown=node.get("alert_delivery_breakdown"),
                     alert_events=node.get("alert_events"),
                     alert_parser_breakdown=node.get("alert_parser_breakdown"),
@@ -21426,10 +21754,7 @@ class LuxriotManager:
                         signal_digest=node.get("signal_digest"),
                         event_ledger=node.get("event_ledger"),
                         state_ledger=node.get("state_ledger"),
-                        routine_ledger=node.get("routine_ledger"),
-                        temporal_observations=node.get("temporal_observations"),
-                        incident_ledger=node.get("incident_ledger"),
-                        incident_dispositions=node.get("incident_dispositions"),
+                        **incident_memory_meta(node),
                         alert_delivery_breakdown=node.get("alert_delivery_breakdown"),
                         alert_events=node.get("alert_events"),
                         alert_parser_breakdown=node.get("alert_parser_breakdown"),
@@ -21469,6 +21794,13 @@ class LuxriotManager:
                             alert_total=node.get("alert_total"),
                             alert_severities=node.get("alert_severities"),
                             signal_digest=node.get("signal_digest"),
+                            event_ledger=node.get("event_ledger"),
+                            state_ledger=node.get("state_ledger"),
+                            **incident_memory_meta(node),
+                            alert_delivery_breakdown=node.get("alert_delivery_breakdown"),
+                            alert_events=node.get("alert_events"),
+                            alert_parser_breakdown=node.get("alert_parser_breakdown"),
+                            state_transition_total=node.get("state_transition_total"),
                             summary_kind="degraded",
                             operator_summary=fallback,
                             memory_update={},
@@ -21910,6 +22242,7 @@ class LuxriotManager:
                 "temporal_observations",
                 "incident_ledger",
                 "incident_dispositions",
+                "incident_compositions",
             ):
                 temporal_value = temporal_memory.get(temporal_key)
                 if temporal_value:
@@ -21979,6 +22312,17 @@ class LuxriotManager:
                 max_new=max_new,
                 workload_class=workload_class,
                 force_synthesis=force_synthesis,
+            )
+        if synthesize and level == "L2":
+            now = time.time()
+            self._dispatch_rollup_incident_compositions(
+                channel_id,
+                [
+                    node
+                    for node in out
+                    if float(self._coerce_float(node.get("window_end")) or now + 1.0)
+                    <= now
+                ],
             )
         return out
 

@@ -27,6 +27,7 @@ from archive_store import PostgresRuntimeStateStore
 from attention_policy import AttentionMode, CostBudgetState
 from incident_attention import PromptBudgetError
 from luxriot_connector import LuxriotCaptureSession, LuxriotManager, _intel_hwaccel_for_config
+from temporal_memory import make_observation as make_temporal_observation
 
 
 def build_manager(
@@ -7078,6 +7079,150 @@ class LuxriotCaptureDispatchTests(unittest.TestCase):
             self.assertIn("briefly left", result["levels"]["L1"][0]["summary"])
             self.assertEqual(result["levels"]["L1"][0]["generation_status"], "ready")
 
+    def test_successful_rollup_persists_temporal_incident_memory(self):
+        with tempfile.TemporaryDirectory() as temp:
+            state_store = DurableRollupMemoryStateStore()
+            manager = build_manager(
+                Path(temp),
+                runtime_state_store=state_store,
+                lm_callback=lambda _messages, _model: operator_rollup_response(
+                    "A vehicle collision was observed in the sampled window.",
+                    observations="A collision remained the grounded exception.",
+                    alerts="One critical safety alert was preserved.",
+                    coverage="The statement is limited to sampled frames.",
+                ),
+            )
+            manager.rollup_llm_levels = {"L1"}
+            manager.rollup_llm_max_new_per_call = 10
+            base = 1_781_700_000.0
+            manager.record_summary_log(
+                7,
+                {
+                    "channel_id": 7,
+                    "run_id": "run-7",
+                    "batch_id": "batch-collision",
+                    "summary": "Two vehicles collide in the sampled frames.",
+                    "frame_count": 12,
+                    "created_at": base,
+                    "batch_start_ms": int(base * 1000),
+                    "batch_end_ms": int((base + 30.0) * 1000),
+                    "batch_state": {
+                        "events": [],
+                        "alerts": [
+                            {
+                                "title": "Vehicle collision",
+                                "description": "Two vehicles visibly collide.",
+                                "severity": "critical",
+                                "state": "new",
+                                "snapshot_indices": [4, 5],
+                            }
+                        ],
+                    },
+                    "alert_counts": {"critical": 1},
+                },
+            )
+
+            row = manager.summary_rollups(
+                7,
+                run_selector="all",
+                target_level="L1",
+                level_limit=10,
+            )["levels"]["L1"][0]
+            stored = state_store.load_rollup(row["rollup_id"])
+
+            self.assertIsNotNone(stored)
+            self.assertTrue(stored["temporal_observations"])
+            self.assertTrue(stored["incident_ledger"])
+            self.assertTrue(stored["incident_dispositions"])
+            self.assertEqual(
+                stored["incident_ledger"][0]["priority"],
+                "safety",
+            )
+
+    def test_cached_rollup_backfills_new_l2_composition_without_llm_call(self):
+        with tempfile.TemporaryDirectory() as temp:
+            state_store = DurableRollupMemoryStateStore()
+            lm_calls = []
+            manager = build_manager(
+                Path(temp),
+                runtime_state_store=state_store,
+                lm_callback=lambda _messages, _model: lm_calls.append(True) or "unexpected",
+            )
+            manager.rollup_llm_levels = {"L2"}
+            rollup_id = "l2-ch7-w3600-1781700000"
+            summary = operator_rollup_response(
+                "A collision and its nearby response were observed."
+            )
+            manager._put_cached_rollup_summary(
+                rollup_id,
+                summary,
+                channel_id=7,
+                level="L2",
+                source_level="L1",
+                window_start=1_781_700_000.0,
+                window_end=1_781_703_600.0,
+                window_sec=3600,
+                source_tokens=1200,
+                source_ids=["l1-a"],
+                source_signature="same-source",
+                summary_kind="llm",
+                generation_status="ready",
+                format_version=2,
+            )
+            temporal = make_temporal_observation(
+                channel_id=7,
+                source_batch_id="batch-collision",
+                ordinal=0,
+                kind="event",
+                state="new",
+                semantic_key="vehicle collision",
+                label="Vehicle collision",
+                start_ms=10_000,
+                end_ms=12_000,
+            ).to_dict()
+            temporal.update(trigger_kind="safety_alert", severity="critical")
+            node = {
+                "rollup_id": rollup_id,
+                "channel_id": 7,
+                "level": "L2",
+                "source_level": "L1",
+                "window_start": 1_781_700_000.0,
+                "window_end": 1_781_703_600.0,
+                "window_sec": 3600,
+                "source_tokens": 1200,
+                "source_ids": ["l1-a"],
+                "source_signature": "same-source",
+                "summary": summary,
+                "routine_ledger": [{"routine_id": "routine-a"}],
+                "temporal_observations": [temporal],
+                "incident_ledger": [{"episode_id": "episode-a"}],
+                "incident_dispositions": [
+                    {"observation_id": temporal["observation_id"]}
+                ],
+                "incident_compositions": [{"composition_id": "composition-a"}],
+            }
+
+            manager._apply_rollup_llm_summaries(
+                7,
+                "L2",
+                "L1",
+                [(node, [])],
+                max_new=1,
+            )
+            stored = state_store.load_rollup(rollup_id)
+
+            self.assertEqual(lm_calls, [])
+            self.assertEqual(stored["routine_ledger"][0]["routine_id"], "routine-a")
+            self.assertEqual(
+                stored["temporal_observations"][0]["observation_id"],
+                temporal["observation_id"],
+            )
+            self.assertEqual(stored["incident_ledger"][0]["episode_id"], "episode-a")
+            self.assertEqual(
+                stored["incident_compositions"][0]["composition_id"],
+                "composition-a",
+            )
+
     def test_durable_rollup_range_read_skips_duplicate_and_off_channel_hot_normalization(self):
         with tempfile.TemporaryDirectory() as temp:
             state_store = DurableRollupMemoryStateStore()
@@ -8937,6 +9082,182 @@ class LuxriotCaptureDispatchTests(unittest.TestCase):
         self.assertEqual(len(observations), 1)
         self.assertEqual(observations[0]["semantic_key"], "person exit")
         self.assertEqual(observations[0]["trigger_kind"], "operator_alert")
+
+    def test_operator_leave_policy_does_not_treat_left_direction_as_egress(self):
+        criterion = "person entering or leaving scene, severity - info"
+
+        self.assertIsNone(
+            LuxriotManager._operator_policy_event_match(
+                criterion,
+                {
+                    "label": "Person turning head",
+                    "summary": "Person turns head slightly, then further left.",
+                    "state": "new",
+                    "snapshot_indices": [7, 8],
+                },
+            )
+        )
+        self.assertIsNotNone(
+            LuxriotManager._operator_policy_event_match(
+                criterion,
+                {
+                    "label": "Person left the scene",
+                    "summary": "The person left the camera view through the doorway.",
+                    "state": "new",
+                    "snapshot_indices": [3, 4],
+                },
+            )
+        )
+
+    def test_temporal_memory_rejects_false_leave_alert_from_left_direction(self):
+        observations = LuxriotManager._l0_temporal_observations(
+            channel_id=112,
+            source_batch_id="vlm-room-head-left",
+            operator_alert_policy=(
+                "Alert if person entering or leaving scene, severity - info"
+            ),
+            batch_state={
+                "events": [
+                    {
+                        "event_id": "person_head_movement",
+                        "label": "Person turning head",
+                        "summary": "Person turns head slightly, then further left.",
+                        "state": "new",
+                        "novelty": "novel",
+                        "pass_up": True,
+                        "snapshot_indices": [7, 8],
+                    }
+                ],
+                "alerts": [
+                    {
+                        "title": "Person turning head — operator criterion",
+                        "description": "Person turns head slightly, then further left.",
+                        "severity": "info",
+                        "state": "new",
+                        "snapshot_indices": [7, 8],
+                    }
+                ],
+            },
+            batch_start_ms=1_000,
+            batch_end_ms=2_000,
+        )
+
+        self.assertEqual(observations, [])
+
+    def test_l2_temporal_composition_is_rooted_in_safety_and_keeps_context_nested(self):
+        collision = make_temporal_observation(
+            channel_id=112,
+            source_batch_id="batch-collision",
+            ordinal=0,
+            kind="event",
+            state="new",
+            semantic_key="vehicle collision",
+            label="Two vehicles collided",
+            start_ms=10_000,
+            end_ms=12_000,
+            evidence_refs=["batch-collision:snapshot:3"],
+        ).to_dict()
+        collision.update(trigger_kind="safety_alert", severity="critical")
+        phone = make_temporal_observation(
+            channel_id=112,
+            source_batch_id="batch-phone",
+            ordinal=0,
+            kind="event",
+            state="new",
+            semantic_key="person phone_call",
+            label="Bystander calls by phone",
+            start_ms=30_000,
+            end_ms=32_000,
+            evidence_refs=["batch-phone:snapshot:4"],
+        ).to_dict()
+        phone.update(trigger_kind="episode_event", severity="info")
+        memory = LuxriotManager._aggregate_temporal_memory(
+            [
+                {"temporal_observations": [collision]},
+                {"temporal_observations": [phone]},
+            ],
+            level="L2",
+        )
+
+        self.assertEqual(len(memory["incident_compositions"]), 1)
+        composition = memory["incident_compositions"][0]
+        episodes = {
+            item["semantic_key"]: item for item in memory["incident_ledger"]
+        }
+        self.assertEqual(episodes["vehicle collision"]["priority"], "safety")
+        self.assertEqual(episodes["person phone_call"]["priority"], "context")
+        self.assertEqual(
+            composition["parent_episode_id"],
+            episodes["vehicle collision"]["episode_id"],
+        )
+        self.assertEqual(
+            composition["parent_observation_ids"],
+            [collision["observation_id"]],
+        )
+        self.assertIn(
+            episodes["person phone_call"]["episode_id"],
+            composition["nested_episode_ids"],
+        )
+        self.assertFalse(composition["automatic_merge"])
+        self.assertTrue(composition["operator_review_required"])
+
+    def test_l2_temporal_composition_does_not_promote_info_operator_signal(self):
+        thumb = make_temporal_observation(
+            channel_id=112,
+            source_batch_id="batch-thumb",
+            ordinal=0,
+            kind="event",
+            state="new",
+            semantic_key="person thumbs_up",
+            label="Thumb-up gesture",
+            start_ms=10_000,
+            end_ms=11_000,
+        ).to_dict()
+        thumb.update(trigger_kind="operator_alert", severity="info")
+        head = make_temporal_observation(
+            channel_id=112,
+            source_batch_id="batch-head",
+            ordinal=0,
+            kind="event",
+            state="new",
+            semantic_key="person head_turn",
+            label="Person turns head",
+            start_ms=12_000,
+            end_ms=13_000,
+        ).to_dict()
+        head.update(trigger_kind="episode_event", severity="info")
+        memory = LuxriotManager._aggregate_temporal_memory(
+            [{"temporal_observations": [thumb, head]}],
+            level="L2",
+        )
+
+        self.assertNotIn("incident_compositions", memory)
+
+    def test_rollup_incident_dispatch_retries_failure_then_coalesces_replay(self):
+        with tempfile.TemporaryDirectory() as temp:
+            manager = build_manager(Path(temp))
+            calls = []
+
+            def callback(channel_id, node):
+                calls.append((channel_id, node["rollup_id"]))
+                if len(calls) == 1:
+                    raise RuntimeError("incident store warming")
+                return {"attached": 1}
+
+            manager.set_rollup_incident_callback(callback)
+            node = {
+                "rollup_id": "l2-ch112-w3600-0",
+                "source_signature": "source-a",
+                "incident_compositions": [{"composition_id": "composition-a"}],
+            }
+
+            manager._dispatch_rollup_incident_compositions(112, [node])
+            self.assertIn("incident_composition_error", node)
+            manager._dispatch_rollup_incident_compositions(112, [node])
+            manager._dispatch_rollup_incident_compositions(112, [node])
+
+            self.assertEqual(calls, [(112, node["rollup_id"])] * 2)
+            self.assertEqual(node["incident_composition_result"], {"attached": 1})
 
     def test_temporal_keys_ignore_generated_ids_and_preserve_parallel_events(self):
         first = LuxriotManager._l0_temporal_observations(

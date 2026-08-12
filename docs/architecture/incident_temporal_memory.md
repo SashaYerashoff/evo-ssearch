@@ -46,11 +46,29 @@ three decisions:
    routine does not end its enclosing incident.
 
 The first two gates and provenance-preserving priority are implemented. The
-third is the remaining production composition step: deterministic child
-dispositions exist in rollup metadata, but automatic durable promotion of a
-multi-action L1/L2 episode is not yet allowed. Until that binding is grounded,
-EVA prefers retaining evidence without opening a case over flooding the
-operator queue with speculative micro-incidents.
+first production slice of the third gate is also implemented at L2:
+
+- successful and degraded rollups preserve routine, temporal, episode and
+  disposition ledgers in the durable rollup row; existing semantic rollups are
+  backfilled from the same deterministic children without another LLM call;
+- a bounded five-minute temporal component may propose a composition only when
+  it contains at least two semantic tracks and is rooted in independent safety
+  evidence or a high/critical saved operator criterion;
+- the composition can append replay-safe nested episodes only to the already
+  existing grounded parent incident; it cannot create a parent from ordinary
+  context, merge incident IDs, close a case, or change risk state;
+- info-level operator gestures remain valid configured incidents but cannot
+  absorb nearby scene narration merely because they occurred in the same L2
+  window;
+- the operator-facing temporal projection marks nested episodes as review
+  required and records `automatic_merge=false`.
+
+This is conservative durable enrichment, not complete scene understanding.
+Promotion of a nested episode into its own related incident, explicit causal or
+concurrent relations, L3 cross-window composition, and a learned
+weekday/time-of-day baseline remain future production steps. Until those
+bindings are grounded, EVA prefers retaining evidence without opening a case
+over flooding the operator queue with speculative micro-incidents.
 
 Design basis:
 
@@ -190,6 +208,11 @@ candidate. It may extend only an already grounded operator/safety incident with
 the same canonical key. A later grounded operator or safety observation upgrades
 an older matching candidate's provenance and review priority monotonically; it
 does not bulk-reclassify the historical queue.
+
+Policy matching treats the irregular word `left` as `leave` only in an explicit
+egress phrase such as `left the scene` or `left the camera view`. Directional
+descriptions such as `turned the head left` remain ordinary context and cannot
+satisfy an entering/leaving alert criterion.
 
 ## Operator lifecycle review
 
