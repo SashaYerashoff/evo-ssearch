@@ -792,10 +792,10 @@ class Config:
     LIVE_CLIP_BATCH_SIZE = max(1, min(32, LIVE_CLIP_BATCH_SIZE))
     try:
         LIVE_CLIP_BATCH_WAIT_MS = float(
-            os.getenv('EVOSSEARCH_LIVE_CLIP_BATCH_WAIT_MS', '75')
+            os.getenv('EVOSSEARCH_LIVE_CLIP_BATCH_WAIT_MS', '8')
         )
     except (TypeError, ValueError):
-        LIVE_CLIP_BATCH_WAIT_MS = 75.0
+        LIVE_CLIP_BATCH_WAIT_MS = 8.0
     LIVE_CLIP_BATCH_WAIT_MS = max(0.0, min(500.0, LIVE_CLIP_BATCH_WAIT_MS))
     try:
         LIVE_CLIP_BATCH_QUEUE_CAPACITY = int(

@@ -968,6 +968,53 @@ class ApiDataflowSmokeTests(unittest.TestCase):
         send.assert_called_once()
         embed.assert_not_called()
 
+    def test_probe_bookmark_gate_serializes_realtime_and_daemon_delivery(self) -> None:
+        timestamp_ms = int(time.time() * 1000.0)
+        send_started = threading.Event()
+        release_send = threading.Event()
+        results: List[Tuple[bool, Dict[str, Any]]] = []
+        probe = {
+            "id": f"probe-race-{timestamp_ms}",
+            "name": "Concurrent lane watch",
+            "channel_id": 112,
+            "bookmark": True,
+            "bookmark_authorized": True,
+            "bookmark_cooldown_sec": 60,
+            "bookmark_dedupe_window_sec": 60,
+        }
+        hit = {
+            "timestamp_ms": timestamp_ms,
+            "pos_score": 0.9,
+            "neg_score": 0.1,
+            "margin": 0.8,
+            "clip_vec": np.asarray([1.0, 0.0], dtype=np.float32),
+        }
+
+        def send_bookmark(**_kwargs: Any) -> Dict[str, Any]:
+            send_started.set()
+            self.assertTrue(release_send.wait(2.0))
+            return {"success": True}
+
+        def deliver(source: str) -> None:
+            results.append(oldapp._maybe_send_probe_bookmark(probe, hit, source=source))
+
+        with (
+            patch.object(oldapp.luxriot_manager, "is_local_channel", return_value=False),
+            patch.object(oldapp.luxriot_manager, "send_bookmark_event", side_effect=send_bookmark) as send,
+        ):
+            first = threading.Thread(target=deliver, args=("probe_realtime",))
+            second = threading.Thread(target=deliver, args=("probe_daemon",))
+            first.start()
+            self.assertTrue(send_started.wait(2.0))
+            second.start()
+            release_send.set()
+            first.join(2.0)
+            second.join(2.0)
+
+        self.assertEqual(sum(1 for sent, _gate in results if sent), 1)
+        self.assertEqual(sorted(gate["reason"] for _sent, gate in results), ["cooldown", "sent"])
+        send.assert_called_once()
+
     def test_fast_vlm_alert_waits_for_post_roll_after_burst(self) -> None:
         runtime = oldapp._FastVlmAlertRuntime()
         try:
@@ -997,6 +1044,33 @@ class ApiDataflowSmokeTests(unittest.TestCase):
                     trigger_ms + runtime.post_roll_ms,
                 )
         finally:
+            runtime.shutdown()
+
+    def test_fast_vlm_alert_allows_only_one_inflight_episode_per_channel(self) -> None:
+        runtime = oldapp._FastVlmAlertRuntime()
+        started = threading.Event()
+        release = threading.Event()
+
+        def run_episode(_channel_id: int, _episode: Dict[str, Any]) -> None:
+            started.set()
+            self.assertTrue(release.wait(2.0))
+
+        try:
+            with patch.object(runtime, "_run_episode", side_effect=run_episode):
+                runtime._submit(112, {"trigger_timestamp_ms": 100_000})
+                self.assertTrue(started.wait(2.0))
+                runtime._submit(112, {"trigger_timestamp_ms": 101_000})
+                status = runtime.status()
+                self.assertEqual(status["submitted_total"], 1)
+                self.assertEqual(status["suppressed_while_inflight_total"], 1)
+                self.assertEqual(status["inflight_channels"], 1)
+                release.set()
+                deadline = time.time() + 2.0
+                while runtime.status()["inflight_channels"] and time.time() < deadline:
+                    time.sleep(0.01)
+                self.assertEqual(runtime.status()["inflight_channels"], 0)
+        finally:
+            release.set()
             runtime.shutdown()
 
     def test_realtime_probe_lane_coalesces_stale_channel_work(self) -> None:

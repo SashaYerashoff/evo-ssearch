@@ -56,7 +56,7 @@ class ImageEmbeddingBatcher:
         embed_many: Callable[[Sequence[Any]], np.ndarray],
         *,
         max_batch_size: int = 8,
-        max_wait_ms: float = 75.0,
+        max_wait_ms: float = 8.0,
         queue_capacity: int = 128,
         request_timeout_sec: float = 15.0,
         autostart: bool = True,

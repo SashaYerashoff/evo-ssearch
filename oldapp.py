@@ -1,5 +1,25 @@
 import os
 os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
+# This worker already multiplexes HTTP, capture, probe, archive, and VLM I/O
+# with Python threads.  Letting every NumPy/OpenMP call create a machine-wide
+# native pool multiplies one 16-CPU host into dozens of runnable workers and
+# starves the CUDA submission thread.  Keep native kernels single-threaded by
+# default; operators can explicitly raise the bounded limit for CPU-only
+# deployments without changing the embedding contract.
+try:
+    _EVA_NATIVE_THREAD_LIMIT = max(
+        1,
+        min(8, int(os.getenv("EVOSSEARCH_NATIVE_THREAD_LIMIT", "1"))),
+    )
+except (TypeError, ValueError):
+    _EVA_NATIVE_THREAD_LIMIT = 1
+for _thread_env_name in (
+    "OMP_NUM_THREADS",
+    "MKL_NUM_THREADS",
+    "OPENBLAS_NUM_THREADS",
+    "NUMEXPR_NUM_THREADS",
+):
+    os.environ.setdefault(_thread_env_name, str(_EVA_NATIVE_THREAD_LIMIT))
 if str(os.getenv("EVOSSEARCH_OFFLINE_MODE", "true") or "true").strip().lower() in {
     "1",
     "true",
@@ -49,6 +69,16 @@ import torch
 import cv2
 from PIL import Image, ImageDraw
 from transformers import AutoModel, AutoProcessor
+
+try:
+    torch.set_num_threads(_EVA_NATIVE_THREAD_LIMIT)
+    torch.set_num_interop_threads(1)
+except (RuntimeError, AttributeError):
+    pass
+try:
+    cv2.setNumThreads(_EVA_NATIVE_THREAD_LIMIT)
+except (AttributeError, TypeError):
+    pass
 from flask import Flask, g, request, jsonify, send_file, send_from_directory, make_response, render_template, Response, stream_with_context
 from flask_cors import CORS
 from werkzeug.middleware.proxy_fix import ProxyFix
@@ -1992,7 +2022,7 @@ def _clip_image_batch_with_space_locked(
     cuda_start: Any = None
     cuda_end: Any = None
     cuda_stream: Any = None
-    with torch.no_grad():
+    with torch.inference_mode():
         if clip_backend_kind == "siglip2":
             if clip_processor is None or clip_model is None:
                 raise RuntimeError("SigLIP2 clip backend is not initialized")
@@ -2125,7 +2155,7 @@ def _clip_text_embeddings(texts: Sequence[str]) -> np.ndarray:
         acquired_at = time.perf_counter()
         try:
             ensure_embedder_loaded("clip")
-            with torch.no_grad():
+            with torch.inference_mode():
                 if clip_backend_kind == "siglip2":
                     if clip_processor is None or clip_model is None:
                         raise RuntimeError("SigLIP2 clip backend is not initialized")
@@ -6557,6 +6587,10 @@ def _embedder_loaded_state() -> Dict[str, Any]:
         clip_model=clip_runtime_model or None,
         backend=clip_backend_kind if clip_model is not None else None,
         device=clip_runtime_device if clip_model is not None else None,
+        native_thread_limit=_EVA_NATIVE_THREAD_LIMIT,
+        torch_intraop_threads=int(torch.get_num_threads()),
+        torch_interop_threads=int(torch.get_num_interop_threads()),
+        opencv_threads=int(cv2.getNumThreads()),
         embedding_space=embedding_space or None,
     )
 
@@ -9532,6 +9566,21 @@ class _ProbeBookmarkGate:
 
 
 probe_bookmark_gate = _ProbeBookmarkGate()
+_probe_bookmark_delivery_locks_guard = threading.Lock()
+_probe_bookmark_delivery_locks: Dict[str, threading.Lock] = {}
+
+
+def _probe_bookmark_delivery_lock(
+    channel_id: int,
+    probe_key: str,
+) -> threading.Lock:
+    key = f"{int(channel_id)}:{str(probe_key)}"
+    with _probe_bookmark_delivery_locks_guard:
+        lock = _probe_bookmark_delivery_locks.get(key)
+        if lock is None:
+            lock = threading.Lock()
+            _probe_bookmark_delivery_locks[key] = lock
+        return lock
 
 
 def _select_probe_bookmark_hit(hits: Sequence[Mapping[str, Any]]) -> Optional[Mapping[str, Any]]:
@@ -9547,7 +9596,7 @@ def _select_probe_bookmark_hit(hits: Sequence[Mapping[str, Any]]) -> Optional[Ma
     return best_hit
 
 
-def _maybe_send_probe_bookmark(
+def _maybe_send_probe_bookmark_serialized(
     probe_like: Mapping[str, Any],
     hit: Mapping[str, Any],
     *,
@@ -9642,6 +9691,27 @@ def _maybe_send_probe_bookmark(
     gate_meta["bookmark_delivery_ms"] = max(0, bookmark_ack_at_ms - bookmark_attempted_at_ms)
     gate_meta["event_to_bookmark_ack_ms"] = max(0, bookmark_ack_at_ms - ts_ms)
     return True, gate_meta
+
+
+def _maybe_send_probe_bookmark(
+    probe_like: Mapping[str, Any],
+    hit: Mapping[str, Any],
+    *,
+    source: str,
+) -> Tuple[bool, Dict[str, Any]]:
+    """Serialize gate-check + delivery across realtime and daemon lanes."""
+
+    channel_id = _to_int(
+        probe_like.get("channel_id"),
+        config.LUXRIOT_DEFAULT_CHANNEL_ID,
+    )
+    probe_key = _probe_bookmark_identity(probe_like)
+    with _probe_bookmark_delivery_lock(channel_id, probe_key):
+        return _maybe_send_probe_bookmark_serialized(
+            probe_like,
+            hit,
+            source=source,
+        )
 
 
 def _archive_embedding_shard_key(
@@ -9837,6 +9907,7 @@ class _FastVlmAlertRuntime:
         self._capacity = threading.BoundedSemaphore(max(4, workers * 2))
         self._lock = threading.RLock()
         self._pending: Dict[int, Dict[str, Any]] = {}
+        self._inflight_channels: Set[int] = set()
         self._last_dispatched_ms: Dict[int, int] = {}
         self._previous_embeddings: Dict[int, np.ndarray] = {}
         self._trigger_counts: Dict[str, int] = {
@@ -9850,6 +9921,7 @@ class _FastVlmAlertRuntime:
             "workers": workers,
             "submitted_total": 0,
             "completed_total": 0,
+            "suppressed_while_inflight_total": 0,
             "alert_batches_total": 0,
             "bookmarks_sent_total": 0,
             "rejected_total": 0,
@@ -9929,8 +10001,11 @@ class _FastVlmAlertRuntime:
             )
             pending = self._pending.get(channel)
             last_dispatched = int(self._last_dispatched_ms.get(channel, 0))
+            if trigger_reason and channel in self._inflight_channels:
+                self._status["suppressed_while_inflight_total"] += 1
             if (
                 pending is None
+                and channel not in self._inflight_channels
                 and trigger_reason
                 and int(timestamp_ms) - last_dispatched >= self.cooldown_ms
             ):
@@ -9968,6 +10043,11 @@ class _FastVlmAlertRuntime:
                 self._status["last_error"] = "fast VLM queue capacity exhausted"
             return
         with self._lock:
+            if int(channel_id) in self._inflight_channels:
+                self._capacity.release()
+                self._status["suppressed_while_inflight_total"] += 1
+                return
+            self._inflight_channels.add(int(channel_id))
             self._status["submitted_total"] += 1
 
         def run() -> None:
@@ -9977,6 +10057,15 @@ class _FastVlmAlertRuntime:
                 with self._lock:
                     self._status["last_error"] = f"{type(exc).__name__}: {exc}"[:500]
             finally:
+                with self._lock:
+                    self._inflight_channels.discard(int(channel_id))
+                    # Cooldown starts after completion. A 20-second inference
+                    # must not immediately be followed by another episode that
+                    # became eligible while the first one was still running.
+                    self._last_dispatched_ms[int(channel_id)] = max(
+                        int(self._last_dispatched_ms.get(int(channel_id), 0)),
+                        int(time.time() * 1000.0),
+                    )
                 self._capacity.release()
 
         try:
@@ -9984,6 +10073,7 @@ class _FastVlmAlertRuntime:
         except Exception as exc:
             self._capacity.release()
             with self._lock:
+                self._inflight_channels.discard(int(channel_id))
                 self._status["rejected_total"] += 1
                 self._status["last_error"] = f"{type(exc).__name__}: {exc}"[:500]
 
@@ -10343,6 +10433,7 @@ class _FastVlmAlertRuntime:
                     str(channel_id): dict(decision)
                     for channel_id, decision in self._last_decisions.items()
                 },
+                "inflight_channels": len(self._inflight_channels),
             }
 
     def shutdown(self) -> None:
