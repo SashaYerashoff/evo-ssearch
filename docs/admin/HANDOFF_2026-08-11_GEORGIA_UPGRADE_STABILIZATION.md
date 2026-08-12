@@ -89,16 +89,17 @@ Primary working repository:
 ```text
 path:   /home/sasha/Projects/evo-ssearch-office-demo
 branch: main
-latest code commit: 8969893 fix: ground probe inventory and compact list payloads
+latest code commit: 4f5842a fix: make settings provenance explicit
 ```
 
-The stabilization work is split into four reviewed code commits:
+The stabilization work is split into five reviewed code commits:
 
 ```text
 15ad09f fix: stabilize Georgia upgrade rehearsal runtime
 645f4f5 fix: bound rollup and operator-mode reads
 2adc0cb fix: avoid monolithic rollup cache rewrites
 8969893 fix: ground probe inventory and compact list payloads
+4f5842a fix: make settings provenance explicit
 ```
 
 The working tree is expected to be clean after committing this handoff update.
@@ -1095,6 +1096,68 @@ the second HUP is `2567031` under master `2014970`. Recoverable copies are:
 /home/sasha/Projects/eva-georgia-upgrade-repro/agent.py.pre-20260812-probe-agent-readonly-negation
 ```
 
+### Bookmark-enabled probe, VLM latency, and Settings provenance acceptance
+
+Sasha completed the remaining manual bookmark-enabled semantic-probe acceptance
+with a thumbs-up criterion. A bookmark became visible in the Evo monitor about five
+seconds after the gesture. The SigLIP2 positive/negative signal separated a thumbs-up
+from a victory gesture by a meaningful margin. The probe capture, scoring, bookmark,
+and operator-visible delivery path are therefore accepted for this rehearsal.
+
+Fresh persisted VLM traces were measured independently. For 30 `sent` VLM alerts in
+a bounded 30-minute sample, event-frame to Evo bookmark acknowledgement was median
+39.41 s, p95 89.37 s, and maximum 146.20 s. Evo `createBookmark` delivery itself was
+fast: median 55 ms. A per-stage sample showed that the latency is accumulated before
+delivery: event-to-batch-end median 16.30 s, queue/preparation median 7.55 s, VLM
+inference median 21.77 s, and post-inference-to-ack median 0.11 s. Stage medians are
+not additive percentiles. Channel 112 was materially faster than channel 118 in the
+same sample (total median 28.53 s versus 47.42 s). The latest one-hour archive had
+37 sent and 29 deduplicated alerts with no failed deliveries. Eleven failed rows in
+the six-hour view were older transient connection failures to Luxriot and must not be
+mixed into the current successful latency distribution.
+
+Commit `4f5842a` removes the Settings source ambiguity. The root defect was that
+`config.py` froze pre-dotenv provenance at module level while the API looked for it
+on the `Config` instance. The service had always declared the correct source:
+
+```text
+EnvironmentFile=/home/sasha/Projects/eva-georgia-upgrade-repro/.env
+EVOSSEARCH_CONFIG_ENV_FILE=/home/sasha/Projects/eva-georgia-upgrade-repro/.env
+```
+
+The fixed API now reports that absolute file as the persistence source, the started
+process as the effective runtime source, and startup/file differences explicitly.
+Secure deployments fail closed with HTTP 409 instead of writing an ambiguous `.env`
+when no persistence source is declared. The Environment tab now round-trips the file
+it edits rather than overlaying startup values. Server `host`, `port`, and `debug`
+are persistence-only/restart-required and are no longer mutated in the Python config
+as if Gunicorn had rebound live. Other Settings writes retain surgical PATCH
+semantics and report runtime-applied versus restart-required fields.
+
+Verification and live deployment acceptance:
+
+```text
+focused backend Settings/provenance: 6 passed
+security + Settings focus:           4 passed
+full security/UI contract suites:    82 passed
+React Settings tests:                2 passed
+React production build:              passed
+live /settings: declared_aligned, write_allowed=true, different_count=0
+live /settings/env: declared source, file host=127.0.0.1, port=5081
+strict /ready:                        HTTP 200
+```
+
+The controlled HUP took about 160 seconds because of the known cold SigLIP startup.
+The active worker is `3201333` under master `2014970`. Both llama.cpp processes kept
+their PIDs (`1499650` VLM and `2916440` agent), and the rehearsal `.env` hash remains
+unchanged. Recoverable copies are:
+
+```text
+/home/sasha/Projects/eva-georgia-upgrade-repro/config.py.pre-20260812-settings-provenance
+/home/sasha/Projects/eva-georgia-upgrade-repro/oldapp.py.pre-20260812-settings-provenance
+/home/sasha/Projects/eva-georgia-upgrade-repro/react-ui/dist.pre-20260812-settings-provenance
+```
+
 ### Immediate next stabilization work
 
 A final read-only 24-hour `run=all` durable check showed that ordinary current
@@ -1116,11 +1179,12 @@ scheduler does not perform an arbitrary historical sweep, so these now require t
 existing explicit restore/backfill preview and trusted UI Apply if the operator wants
 them repaired. Do not silently synthesize them from this handoff.
 
-Next run a deliberate bookmark-enabled probe acceptance with an operator-reviewed
-criterion so the realtime path has an eligible target. The ordinary probe board,
-agent inventory, VLM secondary-signal path and fast-alert execution are accepted.
-Keep the slow Gunicorn HUP/SigLIP startup behavior as a separate reliability defect;
-do not mask it by weakening health checks or changing the preserved inference policy.
+The bookmark-enabled semantic-probe path, ordinary probe board, agent inventory,
+VLM secondary-signal path and fast-alert execution are accepted. The measured VLM
+delivery latency is dominated by batching/queueing/inference, not Evo delivery; use
+the stored stage trace when deciding whether to tune cadence or concurrency. Keep the
+slow Gunicorn HUP/SigLIP startup behavior as a separate reliability defect; do not
+mask it by weakening health checks or changing the preserved inference policy.
 
 ## Next work
 
