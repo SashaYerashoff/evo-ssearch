@@ -89,10 +89,10 @@ Primary working repository:
 ```text
 path:   /home/sasha/Projects/evo-ssearch-office-demo
 branch: main
-latest code commit: c6417c7 fix: reuse buffered vectors in probe daemon
+latest code commit: 623cec4 fix: preserve service during cold worker reload
 ```
 
-The stabilization work is split into five reviewed code commits:
+The reviewed stabilization tail includes:
 
 ```text
 15ad09f fix: stabilize Georgia upgrade rehearsal runtime
@@ -103,6 +103,10 @@ The stabilization work is split into five reviewed code commits:
 1d6d518 fix: keep probe preview responsive
 47c70d5 fix: correlate live probe frames and scores
 c6417c7 fix: reuse buffered vectors in probe daemon
+8884b86 docs: record backend realtime stabilization
+9066706 fix: isolate live semantic capture latency
+21412fe fix: align live inference with served capacity
+623cec4 fix: preserve service during cold worker reload
 ```
 
 The working tree is expected to be clean after committing this handoff update.
@@ -1462,6 +1466,97 @@ settings provenance, fast-alert timing, realtime probe recovery, dense capture
 and async CLIP dispatch. Live service acceptance additionally covered both
 channels, the SigLIP path, llama queue metrics, agent inference and durable
 L1-L3 lineage.
+
+## 2026-08-12 readiness-gated Gunicorn handover
+
+Commit `623cec4` removes the known hard HTTP outage during a one-worker Gunicorn
+HUP without changing the inference topology or `.env`. Gunicorn normally creates
+the replacement and immediately retires the old worker. EVA now temporarily keeps
+both processes while the replacement performs cold import, CUDA model load, exact
+image-path warm-up, persisted probe-text warm-up, and LM capacity discovery. The
+old worker remains the sole owner of cameras, inference queues, rollup workers and
+maintenance daemons during that interval.
+
+The replacement does not restore camera/background ownership until all of the
+following are true:
+
+- its configured embedder loaded and the synthetic live-image warm-up succeeded;
+- its durable writers started;
+- the previous worker retired after a master-side `TTOU` transition;
+- no sibling worker remains under the Gunicorn master.
+
+During overlap, writes routed to the warming process fail with an explicit HTTP
+503 `runtime_handover_in_progress`. Readiness now requires both the embedder and
+desired Luxriot-session restoration whenever live analytics sessions exist, even
+if `EVOSSEARCH_EMBEDDER_REQUIRED=false`. A failed replacement leaves the previous
+worker serving and resets the temporary worker target. If the previous worker dies
+during warm-up, Gunicorn keeps only the candidate and that candidate acquires the
+deferred runtime after it is ready; it cannot remain permanently ownerless.
+
+The live rehearsal HUP began at `17:15:11`. The replacement and serving worker
+coexisted during a roughly 240-second cold bootstrap; the master requested `TTOU`
+at `17:19:11`, the superseded process retired about ten seconds later, and exactly
+one replacement remained. Under a deliberately harsh one-second curl deadline,
+14 of 117 `/health` samples exceeded the deadline and the longest bad streak was
+two samples. This is still a noticeable latency tail from running a cold
+Transformers load beside the active process, but it replaces the former continuous
+132-160-second connection outage. Do not call HUP latency-free: the old worker
+preserves service while the candidate warms, but the shared host is busier.
+
+Post-handover live state was:
+
+```text
+EVA workers:                1
+systemd NRestarts:          0
+/health:                    HTTP 200, about 18 ms in the spot check
+/ready:                     HTTP 200, about 0.96-1.3 s
+embedder:                   loaded on CUDA
+desired/restored sessions:  2 / 2 (channels 112 and 118)
+SigLIP queue:               depth 0, one in flight at the sample boundary
+probe/summary errors:       none on either channel
+VLM PID / Agent PID:        unchanged
+```
+
+`/ready` is intentionally a heavyweight dependency check and must not be used as
+a routine high-frequency UI poll. Its one-second deadline can still expire while
+it checks PostgreSQL, inference profiles and Luxriot. `/health` is the lightweight
+liveness surface.
+
+The same pass made rollup/incident workers explicit single-owner services instead
+of constructor/import side effects. It also closes an L0 publication race: manager
+history is now canonical before the per-session status feed advertises completion,
+so the operator cannot observe a completed summary that rollup/archive readers do
+not yet see.
+
+Verification for this pass:
+
+```text
+Luxriot runtime + lifecycle/bootstrap: 230 passed
+focused lifecycle/bootstrap rerun:      17 passed
+installer/update/watchdog bundle:       82 passed
+L0 publication race repeated:           5/5 passed
+Python compilation / git diff check:     passed
+```
+
+All four staged runtime files match the reviewed source by SHA-256. The final
+post-rehearsal edge-case and L0 ordering edits are copied into the rehearsal tree
+but are not active in worker memory until its next controlled reload/restart; do
+not trigger another cold HUP solely for those two non-current edge cases. The live
+worker already runs the primary readiness handover implementation. The rehearsal
+`.env` remains byte-for-byte unchanged:
+
+```text
+2c254527143f62bbdbcf7a14914872e2a6f1e0f4f776ef02024c0f27aac76325
+```
+
+Settings provenance was also rechecked read-only. The system unit and current
+worker both declare `/home/sasha/Projects/eva-georgia-upgrade-repro/.env` through
+`EnvironmentFile` and `EVOSSEARCH_CONFIG_ENV_FILE`; the worker has 66
+`EVOSSEARCH_*` startup keys. Therefore the React Settings banner should report the
+declared source after a fresh settings request. React already sends only dirty
+writable fields and omits blank port/write-only secrets. If the old undeclared
+banner persists after a hard refresh, inspect the authenticated `/settings`
+response and asset cache rather than writing the env file.
 
 ## Next work
 
