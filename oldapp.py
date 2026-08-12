@@ -1969,30 +1969,112 @@ def _clip_image_batch_with_space_locked(
 ) -> EmbeddingBatchOutput:
     """Encode a microbatch while the caller owns ``_clip_init_lock``."""
 
+    stage_started = time.perf_counter()
     ensure_embedder_loaded("clip")
+    _record_clip_runtime_timing(
+        "image_init",
+        wait_ms=0.0,
+        work_ms=(time.perf_counter() - stage_started) * 1000.0,
+    )
     if not images:
         return EmbeddingBatchOutput(
             np.zeros((0, 0), dtype=np.float32),
             _current_clip_embedding_space_locked(),
         )
 
+    stage_started = time.perf_counter()
     normalized_images = [img.convert("RGB") for img in images]
+    _record_clip_runtime_timing(
+        "image_convert",
+        wait_ms=0.0,
+        work_ms=(time.perf_counter() - stage_started) * 1000.0,
+    )
+    cuda_start: Any = None
+    cuda_end: Any = None
+    cuda_stream: Any = None
     with torch.no_grad():
         if clip_backend_kind == "siglip2":
             if clip_processor is None or clip_model is None:
                 raise RuntimeError("SigLIP2 clip backend is not initialized")
+            stage_started = time.perf_counter()
             processor_inputs = cast(Any, clip_processor)(images=normalized_images, return_tensors="pt")
+            _record_clip_runtime_timing(
+                "image_preprocess",
+                wait_ms=0.0,
+                work_ms=(time.perf_counter() - stage_started) * 1000.0,
+            )
+            stage_started = time.perf_counter()
             model_inputs = _processor_to_device(cast(Mapping[str, Any], processor_inputs), clip_runtime_device)
+            _record_clip_runtime_timing(
+                "image_to_device",
+                wait_ms=0.0,
+                work_ms=(time.perf_counter() - stage_started) * 1000.0,
+            )
+            if str(clip_runtime_device or "").lower().startswith("cuda") and torch.cuda.is_available():
+                try:
+                    cuda_stream = torch.cuda.current_stream(torch.device(clip_runtime_device))
+                    cuda_start = torch.cuda.Event(enable_timing=True)
+                    cuda_end = torch.cuda.Event(enable_timing=True)
+                    cuda_start.record(cuda_stream)
+                except Exception:
+                    cuda_start = None
+                    cuda_end = None
+                    cuda_stream = None
+            stage_started = time.perf_counter()
             image_features = _siglip_feature_tensor(
                 cast(Any, clip_model).get_image_features(**model_inputs)
+            )
+            _record_clip_runtime_timing(
+                "image_model_submit",
+                wait_ms=0.0,
+                work_ms=(time.perf_counter() - stage_started) * 1000.0,
             )
         else:
             if clip_preprocess is None or clip_model is None:
                 raise RuntimeError("CLIP backend is not initialized")
+            stage_started = time.perf_counter()
             image_batch = torch.stack([clip_preprocess(img) for img in normalized_images], dim=0).to(clip_runtime_device)  # type: ignore[operator]
+            _record_clip_runtime_timing(
+                "image_preprocess",
+                wait_ms=0.0,
+                work_ms=(time.perf_counter() - stage_started) * 1000.0,
+            )
+            if str(clip_runtime_device or "").lower().startswith("cuda") and torch.cuda.is_available():
+                try:
+                    cuda_stream = torch.cuda.current_stream(torch.device(clip_runtime_device))
+                    cuda_start = torch.cuda.Event(enable_timing=True)
+                    cuda_end = torch.cuda.Event(enable_timing=True)
+                    cuda_start.record(cuda_stream)
+                except Exception:
+                    cuda_start = None
+                    cuda_end = None
+                    cuda_stream = None
+            stage_started = time.perf_counter()
             image_features = cast(Any, clip_model).encode_image(image_batch)
+            _record_clip_runtime_timing(
+                "image_model_submit",
+                wait_ms=0.0,
+                work_ms=(time.perf_counter() - stage_started) * 1000.0,
+            )
+        stage_started = time.perf_counter()
         image_features = _normalize_l2_embeddings(cast(torch.Tensor, image_features))
+        if cuda_end is not None and cuda_stream is not None:
+            cuda_end.record(cuda_stream)
     matrix = image_features.cpu().numpy().astype(np.float32, copy=False)
+    _record_clip_runtime_timing(
+        "image_materialize",
+        wait_ms=0.0,
+        work_ms=(time.perf_counter() - stage_started) * 1000.0,
+    )
+    if cuda_start is not None and cuda_end is not None:
+        try:
+            _record_clip_runtime_timing(
+                "image_cuda",
+                wait_ms=0.0,
+                work_ms=float(cuda_start.elapsed_time(cuda_end)),
+            )
+        except Exception:
+            pass
     return EmbeddingBatchOutput(
         matrix,
         _current_clip_embedding_space_locked(),
@@ -7036,6 +7118,13 @@ def _check_attention_ready() -> Dict[str, Any]:
                     "channel_id",
                     "running",
                     "active_capture_source",
+                    "interval_sec",
+                    "recent_frame_count",
+                    "last_snapshot_latency_sec",
+                    "avg_snapshot_latency_sec",
+                    "max_snapshot_latency_sec",
+                    "slow_snapshot_count",
+                    "snapshot_slow_streak",
                     "live_segment_inflight",
                     "live_segment_inflight_frames",
                     "live_segment_inflight_represented_seconds",

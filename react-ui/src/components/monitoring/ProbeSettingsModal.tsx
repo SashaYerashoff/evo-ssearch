@@ -109,11 +109,13 @@ export function ProbeSettingsModal({ probe, channels, busy, canControlCapture, c
   // live preview + capture status of the selected channel
   const [previewSrc, setPreviewSrc] = useState('')
   const [pvErr, setPvErr] = useState(true)
+  const [scoredFrameSrc, setScoredFrameSrc] = useState('')
   const [st, setSt] = useState<ChannelStatus>({ channel_id: d.channel_id ?? 0 })
   const [displayedSignal, setDisplayedSignal] = useState<ProbeLiveSignal | null>(null)
   const [signalFrameError, setSignalFrameError] = useState(false)
   const [applyMessage, setApplyMessage] = useState<string | null>(null)
   const previewBlobUrlRef = useRef<string | null>(null)
+  const scoredFrameBlobUrlRef = useRef<string | null>(null)
   useEffect(() => {
     let disposed = false
     let requestNumber = 0
@@ -127,8 +129,12 @@ export function ProbeSettingsModal({ probe, channels, busy, canControlCapture, c
     const previousBlobUrl = previewBlobUrlRef.current
     previewBlobUrlRef.current = null
     if (previousBlobUrl) URL.revokeObjectURL(previousBlobUrl)
+    const previousScoredBlobUrl = scoredFrameBlobUrlRef.current
+    scoredFrameBlobUrlRef.current = null
+    if (previousScoredBlobUrl) URL.revokeObjectURL(previousScoredBlobUrl)
     setPreviewSrc('')
     setPvErr(true)
+    setScoredFrameSrc('')
     setSt({ channel_id: d.channel_id ?? 0 })
     setDisplayedSignal(null)
     setSignalFrameError(false)
@@ -148,10 +154,9 @@ export function ProbeSettingsModal({ probe, channels, busy, canControlCapture, c
       revokeTimers.set(timer, url)
     }
     async function loadPreview() {
-      // Before a probe exists there is no score-correlated frame yet. A plain
-      // source preview is still useful for drawing ROI; saved probes use only
-      // the exact semantic frame loaded by pollSignal().
-      if (disposed || d.channel_id == null || d.id) return
+      // The operator preview must remain live independently of semantic
+      // throughput. P/N/M is paired with a separate exact scored frame below.
+      if (disposed || d.channel_id == null) return
       const controller = new AbortController()
       previewController = controller
       const watchdog = window.setTimeout(() => controller.abort(), 12_000)
@@ -190,7 +195,7 @@ export function ProbeSettingsModal({ probe, channels, busy, canControlCapture, c
     async function loadSignalFrame(signal: ProbeLiveSignal): Promise<boolean> {
       const timestampMs = Number(signal.timestamp_ms)
       if (!d.id || !Number.isFinite(timestampMs) || timestampMs <= 0) return false
-      if (timestampMs === displayedTimestampMs && previewBlobUrlRef.current) {
+      if (timestampMs === displayedTimestampMs && scoredFrameBlobUrlRef.current) {
         setDisplayedSignal(signal)
         setSignalFrameError(false)
         return true
@@ -211,14 +216,13 @@ export function ProbeSettingsModal({ probe, channels, busy, canControlCapture, c
         const blob = await response.blob()
         if (disposed) return false
         const nextBlobUrl = URL.createObjectURL(blob)
-        const oldBlobUrl = previewBlobUrlRef.current
-        previewBlobUrlRef.current = nextBlobUrl
+        const oldBlobUrl = scoredFrameBlobUrlRef.current
+        scoredFrameBlobUrlRef.current = nextBlobUrl
         displayedTimestampMs = timestampMs
         // React batches these updates: the operator never sees new P/N/M on
         // the previous image or a new image carrying the previous score.
-        setPreviewSrc(nextBlobUrl)
+        setScoredFrameSrc(nextBlobUrl)
         setDisplayedSignal(signal)
-        setPvErr(false)
         setSignalFrameError(false)
         if (oldBlobUrl) retireBlobUrl(oldBlobUrl)
         return true
@@ -242,7 +246,6 @@ export function ProbeSettingsModal({ probe, channels, busy, canControlCapture, c
           const paired = await loadSignalFrame(nextStatus.live_signal)
           if (!disposed && !paired) {
             setSignalFrameError(true)
-            if (!displayedTimestampMs) setPvErr(true)
           }
         }
       } catch {
@@ -255,7 +258,7 @@ export function ProbeSettingsModal({ probe, channels, busy, canControlCapture, c
     }
 
     void pollSignal()
-    if (!d.id) void loadPreview()
+    void loadPreview()
     return () => {
       disposed = true
       if (previewTimer != null) window.clearTimeout(previewTimer)
@@ -270,6 +273,9 @@ export function ProbeSettingsModal({ probe, channels, busy, canControlCapture, c
       const blobUrl = previewBlobUrlRef.current
       previewBlobUrlRef.current = null
       if (blobUrl) URL.revokeObjectURL(blobUrl)
+      const scoredBlobUrl = scoredFrameBlobUrlRef.current
+      scoredFrameBlobUrlRef.current = null
+      if (scoredBlobUrl) URL.revokeObjectURL(scoredBlobUrl)
     }
   }, [d.channel_id, d.id])
 
@@ -412,12 +418,7 @@ export function ProbeSettingsModal({ probe, channels, busy, canControlCapture, c
             onMouseDown={roiDown} onMouseMove={roiMove} onMouseUp={roiUp} onMouseLeave={roiUp}>
             {previewSrc && <img src={previewSrc} alt="stream preview" draggable={false} onError={() => setPvErr(true)} />}
             {pvErr && <div className="vid-overlay"><IconVideoOff size={18} /> PREVIEW UNAVAILABLE</div>}
-            {signal && !pvErr && (
-              <div className={`probe-frame-stamp ${signal.stale ? 'stale' : ''}`}>
-                Scored frame · {signalTime || 'now'}
-                {signalAgeSec != null ? ` · ${signalAgeSec.toFixed(signalAgeSec < 10 ? 1 : 0)}s old` : ''}
-              </div>
-            )}
+            {!pvErr && <div className="probe-frame-stamp live">Live operator preview</div>}
             {d.roiOn && d.roi && (
               <div className="probe-roi-rect" style={{ left: pct(d.roi.x), top: pct(d.roi.y), width: pct(d.roi.w), height: pct(d.roi.h) }} />
             )}
@@ -496,10 +497,23 @@ export function ProbeSettingsModal({ probe, channels, busy, canControlCapture, c
             {st.semantic_error ? (
               <div className="probe-live-error"><IconAlertTriangle size={15} /> {st.semantic_error}</div>
             ) : (
-              <div className="probe-live-values">
-                <div><span>P</span><b>{signal?.pos_score == null ? '—' : Number(signal.pos_score).toFixed(3)}</b><em>floor {d.pos_floor.toFixed(3)}</em></div>
-                <div><span>N</span><b>{signal?.neg_score == null ? '—' : Number(signal.neg_score).toFixed(3)}</b><em>negative</em></div>
-                <div><span>M</span><b>{signal?.margin == null ? '—' : Number(signal.margin).toFixed(3)}</b><em>floor {d.margin.toFixed(3)}</em></div>
+              <div className="probe-signal-pair">
+                <div className={`probe-scored-frame ${signal?.stale ? 'stale' : ''}`}>
+                  {scoredFrameSrc ? (
+                    <img src={scoredFrameSrc} alt="exact frame scored by semantic probe" />
+                  ) : (
+                    <div className="probe-scored-placeholder"><IconVideoOff size={16} /> Waiting for scored frame</div>
+                  )}
+                  <div className="probe-scored-stamp">
+                    Scored frame · {signalTime || 'waiting'}
+                    {signalAgeSec != null ? ` · ${signalAgeSec.toFixed(signalAgeSec < 10 ? 1 : 0)}s old` : ''}
+                  </div>
+                </div>
+                <div className="probe-live-values">
+                  <div><span>P</span><b>{signal?.pos_score == null ? '—' : Number(signal.pos_score).toFixed(3)}</b><em>floor {d.pos_floor.toFixed(3)}</em></div>
+                  <div><span>N</span><b>{signal?.neg_score == null ? '—' : Number(signal.neg_score).toFixed(3)}</b><em>negative</em></div>
+                  <div><span>M</span><b>{signal?.margin == null ? '—' : Number(signal.margin).toFixed(3)}</b><em>floor {d.margin.toFixed(3)}</em></div>
+                </div>
               </div>
             )}
             {!st.semantic_error && signalFrameError && (
@@ -508,7 +522,7 @@ export function ProbeSettingsModal({ probe, channels, busy, canControlCapture, c
             {!st.semantic_error && st.embedding_calibration_state && st.embedding_calibration_state !== 'calibrated' && (
               <div className="probe-live-error"><IconAlertTriangle size={15} /> Legacy thresholds are in shadow mode. Apply after reviewing the live SigLIP2 scores to reactivate alerts/bookmarks.</div>
             )}
-            <div className="probe-live-note">P/N/M belongs to the scored frame shown at left. A hit or bookmark is raised only after the configured gates pass.</div>
+            <div className="probe-live-note">P/N/M belongs only to the scored frame above. The large preview at left stays live for operator framing and ROI.</div>
           </div>
 
           {advOpen && (
