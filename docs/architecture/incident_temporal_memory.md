@@ -185,6 +185,12 @@ the operator case in the review queue. Automatic creation is bounded to four
 new candidates per accepted batch and to the per-channel hot-set admission
 limit; it has no bookmark or external alarm side effect.
 
+An ordinary `episode_event` also cannot refresh a legacy context-only
+candidate. It may extend only an already grounded operator/safety incident with
+the same canonical key. A later grounded operator or safety observation upgrades
+an older matching candidate's provenance and review priority monotonically; it
+does not bulk-reclassify the historical queue.
+
 ## Operator lifecycle review
 
 Incident Review exposes five explicit, revision-guarded operator decisions:

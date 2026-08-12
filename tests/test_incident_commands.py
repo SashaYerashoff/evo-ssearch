@@ -591,6 +591,78 @@ def test_l0_operator_alert_candidate_preserves_admission_priority():
     assert record["timeline_refs"][0]["operator_criterion"] == "you spot a thumbs-up gesture"
 
 
+def test_episode_event_does_not_refresh_legacy_candidate_but_grounded_signal_upgrades_it():
+    class _PriorityStore:
+        def __init__(self):
+            self.records = []
+            self.observations = []
+
+        def list_incidents(self, **_kwargs):
+            return [dict(item) for item in self.records], len(self.records)
+
+        def create_incident(self, record, **_kwargs):
+            stored = {**dict(record), "id": "incident-priority", "revision": 1}
+            self.records.append(stored)
+            return dict(stored)
+
+        def update_incident(self, incident_id, *, expected_revision, changes, **_kwargs):
+            record = next(item for item in self.records if item["id"] == incident_id)
+            assert record["revision"] == expected_revision
+            record.update(dict(changes))
+            record["revision"] += 1
+            return dict(record)
+
+        def append_observation(self, observation, **_kwargs):
+            self.observations.append(dict(observation))
+            return dict(observation)
+
+    store = _PriorityStore()
+    service = _service(store, _Runtime())
+    heartbeat = {
+        "batch_id": "batch-priority-1",
+        "batch_start_ms": 1_000,
+        "batch_end_ms": 2_000,
+    }
+    legacy = {
+        "observation_id": "obs-legacy",
+        "kind": "event",
+        "state": "new",
+        "semantic_key": "person thumbs_up",
+        "label": "Person gesture",
+        "start_ms": 1_000,
+        "end_ms": 2_000,
+    }
+    service.ingest_l0_temporal_observations(112, heartbeat, [legacy])
+    initial_revision = store.records[0]["revision"]
+
+    skipped = service.ingest_l0_temporal_observations(
+        112,
+        {**heartbeat, "batch_id": "batch-priority-2", "batch_end_ms": 3_000},
+        [{**legacy, "observation_id": "obs-episode", "trigger_kind": "episode_event"}],
+    )
+
+    assert skipped["associated"] == 0
+    assert skipped["skipped"] == 1
+    assert store.records[0]["revision"] == initial_revision
+
+    upgraded = service.ingest_l0_temporal_observations(
+        112,
+        {**heartbeat, "batch_id": "batch-priority-3", "batch_end_ms": 4_000},
+        [
+            {
+                **legacy,
+                "observation_id": "obs-operator",
+                "trigger_kind": "operator_alert",
+                "operator_criterion": "you spot a thumbs-up gesture",
+            }
+        ],
+    )
+
+    assert upgraded["associated"] == 1
+    assert store.records[0]["report"]["priority"] == "operator_criterion"
+    assert store.records[0]["report"]["source"] == "operator_alert_l0"
+
+
 def test_open_automatic_incident_waits_for_boundary_before_episode_materialization():
     class _ProjectionStore:
         def __init__(self):

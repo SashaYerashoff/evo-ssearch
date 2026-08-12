@@ -809,12 +809,24 @@ class IncidentCommandService:
                 continue
             incident = active_by_key.get(semantic_key)
             trigger_kind = str(observation.get("trigger_kind") or "").strip().lower()
-            if incident is None and trigger_kind == "episode_event":
-                # Preserve the observation in L0-L3 temporal memory, but wait
-                # for a wider-scale composition before asking an operator to
-                # review an ordinary transition as a durable case.
-                skipped += 1
-                continue
+            if trigger_kind == "episode_event":
+                report = (
+                    incident.get("report")
+                    if isinstance(incident, Mapping)
+                    and isinstance(incident.get("report"), Mapping)
+                    else {}
+                )
+                if incident is None or str(report.get("priority") or "") not in {
+                    "operator_criterion",
+                    "safety",
+                }:
+                    # Preserve the observation in L0-L3 temporal memory, but
+                    # wait for wider-scale composition. An ordinary episode
+                    # must not create a case or keep a legacy noisy candidate
+                    # artificially fresh. It may continue an already grounded
+                    # operator/safety incident with the same canonical key.
+                    skipped += 1
+                    continue
             if incident is None and event_state in {"resolved", "finished"}:
                 skipped += 1
                 continue
@@ -1070,6 +1082,47 @@ class IncidentCommandService:
             "observed_end_ms": effective_end_ms,
             "perception_state": "ended" if terminal else "observed",
         }
+        trigger_kind = str(observation.get("trigger_kind") or "").strip().lower()
+        incoming_priority = (
+            "operator_criterion"
+            if trigger_kind == "operator_alert"
+            else "safety"
+            if trigger_kind in {"safety_alert", "safety_event"}
+            else ""
+        )
+        report = (
+            dict(incident.get("report") or {})
+            if isinstance(incident.get("report"), Mapping)
+            else {}
+        )
+        priority_rank = {"": 0, "context": 0, "safety": 1, "operator_criterion": 2}
+        if priority_rank.get(incoming_priority, 0) > priority_rank.get(
+            str(report.get("priority") or ""), 0
+        ):
+            report["priority"] = incoming_priority
+            report["source"] = (
+                "operator_alert_l0"
+                if trigger_kind == "operator_alert"
+                else "safety_alert_l0"
+                if trigger_kind == "safety_alert"
+                else "safety_event_l0"
+            )
+            incoming_severity = str(observation.get("severity") or "").strip().lower()
+            severity_rank = {
+                "": 0,
+                "info": 1,
+                "low": 2,
+                "normal": 3,
+                "medium": 3,
+                "high": 4,
+                "critical": 5,
+                "emergency": 5,
+            }
+            if severity_rank.get(incoming_severity, 0) > severity_rank.get(
+                str(report.get("severity") or "").strip().lower(), 0
+            ):
+                report["severity"] = incoming_severity
+            changes["report"] = report
         if terminal:
             changes["possible_end_ms"] = effective_end_ms
             if current_legacy in {"candidate", "draft"}:

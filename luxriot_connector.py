@@ -11228,12 +11228,12 @@ class LuxriotManager:
             for key, limit in (("label", 220), ("summary", 260), ("event_id", 120))
         ).casefold()
         entity_patterns = (
-            ("person", r"\b(?:person|individual|subject|man|woman|pedestrian)\b"),
-            ("cat", r"\b(?:cat|feline|sphynx)\b"),
-            ("dog", r"\b(?:dog|canine)\b"),
-            ("vessel", r"\b(?:vessel|ship|boat|yacht|sailboat|watercraft)\b"),
-            ("vehicle", r"\b(?:vehicle|car|truck|van|motorcycle|jetski|jet\s+ski)\b"),
-            ("object", r"\b(?:bag|package|parcel|object|item|weapon|gun|knife)\b"),
+            ("person", r"\b(?:person|people|individuals?|subjects?|m[ae]n|wom[ae]n|pedestrians?)\b"),
+            ("cat", r"\b(?:cats?|felines?|sphynx)\b"),
+            ("dog", r"\b(?:dogs?|canines?)\b"),
+            ("vessel", r"\b(?:vessels?|ships?|boats?|yachts?|sailboats?|watercraft)\b"),
+            ("vehicle", r"\b(?:vehicles?|cars?|trucks?|vans?|motorcycles?|jetskis?|jet\s+skis?)\b"),
+            ("object", r"\b(?:bags?|packages?|parcels?|objects?|items?|weapons?|guns?|knives?)\b"),
         )
         action_patterns = (
             ("thumbs_up", r"\bthumbs?\s*[- ]?\s*up\b"),

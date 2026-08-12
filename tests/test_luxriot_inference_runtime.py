@@ -9020,6 +9020,49 @@ class LuxriotCaptureDispatchTests(unittest.TestCase):
 
         self.assertEqual(keys, {"vehicle maneuver"})
 
+    def test_temporal_memory_merges_plural_vehicle_event_and_alert(self):
+        observations = LuxriotManager._l0_temporal_observations(
+            channel_id=118,
+            source_batch_id="vlm-traffic-drift",
+            batch_state={
+                "events": [
+                    {
+                        "event_id": "drift_smoke",
+                        "label": "Drift with smoke",
+                        "summary": "Orange and red cars drift with smoke",
+                        "state": "new",
+                        "novelty": "novel",
+                        "pass_up": True,
+                        "snapshot_indices": [5, 6, 7, 8],
+                    }
+                ],
+                "alerts": [
+                    {
+                        "title": "Dangerous vehicle behavior",
+                        "description": "Orange and red cars drift with smoke",
+                        "severity": "normal",
+                        "state": "new",
+                        "snapshot_indices": [5, 6, 7, 8],
+                    }
+                ],
+            },
+            batch_start_ms=1_000,
+            batch_end_ms=2_000,
+        )
+
+        self.assertEqual(len(observations), 1)
+        self.assertEqual(observations[0]["semantic_key"], "vehicle maneuver")
+        self.assertEqual(observations[0]["trigger_kind"], "safety_alert")
+        self.assertEqual(
+            observations[0]["evidence_refs"],
+            [
+                "vlm-traffic-drift:snapshot:5",
+                "vlm-traffic-drift:snapshot:6",
+                "vlm-traffic-drift:snapshot:7",
+                "vlm-traffic-drift:snapshot:8",
+            ],
+        )
+
     def test_rollup_event_ledger_drops_static_pass_up_noise(self):
         ledger = LuxriotManager._l0_event_ledger(
             rollup_id="l0-ch7-static",
