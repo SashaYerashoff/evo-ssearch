@@ -541,6 +541,10 @@ class ApiDataflowSmokeTests(unittest.TestCase):
             "/lm/models",
             "/luxriot/recent_frame/<int:channel_id>",
             "/luxriot/rollups/l3-schedule",
+            # ProbeSettingsModal builds this timestamped URL from the live
+            # semantic-signal payload, so the static frontend path collector
+            # cannot recover its Flask route template.
+            "/probes/signal_frame/<int:channel_id>/<int:timestamp_ms>",
             "/ready",
             "/reports/false-positives",
             "/reports/false-positives/export",
