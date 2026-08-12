@@ -2255,8 +2255,13 @@ class PostgresRuntimeStateStore(_TenantRepository):
     _SUMMARY_STATE_KEY = "luxriot_summary_state"
     _SUMMARY_META_KEY = "luxriot_summary_state:meta"
     _SUMMARY_HISTORY_PREFIX = "luxriot_summary_state:history:"
+    _SUMMARY_HISTORY_ITEM_PREFIX = "luxriot_summary_state:history_item:"
     _SUMMARY_RUNS_PREFIX = "luxriot_summary_state:runs:"
     _ROLLUP_PREFIX = "luxriot_rollup:"
+
+    def __init__(self, pool: PsycopgPool, tenant_id: str | uuid.UUID) -> None:
+        super().__init__(pool, tenant_id)
+        self._summary_history_items_last_pruned_at = 0.0
 
     def health(self) -> Dict[str, Any]:
         try:
@@ -2464,6 +2469,7 @@ class PostgresRuntimeStateStore(_TenantRepository):
     def _save_split_summary_state(self, payload: Mapping[str, Any]) -> None:
         history_raw = payload.get("summary_history")
         runs_raw = payload.get("summary_runs")
+        history_storage = str(payload.get("summary_history_storage") or "").strip()
         meta_payload = {
             "version": payload.get("version", 2),
             "revision": payload.get("revision", 0),
@@ -2478,14 +2484,43 @@ class PostgresRuntimeStateStore(_TenantRepository):
         entries: Dict[str, Dict[str, Any]] = {self._SUMMARY_META_KEY: meta_payload}
         if isinstance(history_raw, Mapping):
             for channel_id, logs in history_raw.items():
-                entries[f"{self._SUMMARY_HISTORY_PREFIX}{channel_id}"] = {
-                    "logs": _plain_value(
-                        logs
-                        if isinstance(logs, Sequence)
-                        and not isinstance(logs, (str, bytes, bytearray))
-                        else []
-                    )
-                }
+                normalized_logs = (
+                    logs
+                    if isinstance(logs, Sequence)
+                    and not isinstance(logs, (str, bytes, bytearray))
+                    else []
+                )
+                if history_storage == "upsert_items":
+                    for log in normalized_logs:
+                        if not isinstance(log, Mapping):
+                            continue
+                        identity = {
+                            "channel_id": str(channel_id),
+                            "batch_id": str(log.get("batch_id") or "").strip(),
+                            "run_id": str(log.get("run_id") or "").strip(),
+                            "created_at": log.get("created_at"),
+                            "frame_count": log.get("frame_count"),
+                            "summary": str(log.get("summary") or "").strip()[:160],
+                        }
+                        item_id = hashlib.sha256(
+                            json.dumps(
+                                identity,
+                                ensure_ascii=False,
+                                sort_keys=True,
+                                separators=(",", ":"),
+                                default=str,
+                            ).encode("utf-8")
+                        ).hexdigest()[:32]
+                        entries[
+                            f"{self._SUMMARY_HISTORY_ITEM_PREFIX}{channel_id}:{item_id}"
+                        ] = {
+                            "channel_id": str(channel_id),
+                            "log": _plain_value(log),
+                        }
+                else:
+                    entries[f"{self._SUMMARY_HISTORY_PREFIX}{channel_id}"] = {
+                        "logs": _plain_value(normalized_logs)
+                    }
         if isinstance(runs_raw, Mapping):
             for channel_id, runs in runs_raw.items():
                 entries[f"{self._SUMMARY_RUNS_PREFIX}{channel_id}"] = {
@@ -2507,6 +2542,30 @@ class PostgresRuntimeStateStore(_TenantRepository):
                         continue
                     self._upsert_state_locked(connection, normalized_key, entry_payload)
                     self._last_state_hashes[cache_key] = digest
+                retention_cutoff = payload.get("summary_history_retention_cutoff")
+                prune_now = time.monotonic()
+                if (
+                    history_storage == "upsert_items"
+                    and isinstance(retention_cutoff, (int, float))
+                    and (
+                        self._summary_history_items_last_pruned_at <= 0
+                        or prune_now - self._summary_history_items_last_pruned_at >= 3600.0
+                    )
+                ):
+                    connection.execute(
+                        """
+                        DELETE FROM archive.runtime_state
+                        WHERE tenant_id = %s
+                          AND state_key LIKE %s
+                          AND (payload_json->'log'->>'created_at')::double precision < %s
+                        """,
+                        (
+                            self.tenant_id,
+                            f"{self._SUMMARY_HISTORY_ITEM_PREFIX}%",
+                            float(retention_cutoff),
+                        ),
+                    )
+                    self._summary_history_items_last_pruned_at = prune_now
 
     def _load_split_summary_state(self) -> Optional[Dict[str, Any]]:
         with self.lock:
@@ -2531,6 +2590,7 @@ class PostgresRuntimeStateStore(_TenantRepository):
             return None
         meta: Dict[str, Any] = {}
         summary_history: Dict[str, Any] = {}
+        summary_history_items: Dict[str, List[Any]] = {}
         summary_runs: Dict[str, Any] = {}
         for key, raw_payload in rows:
             state_key = str(key or "")
@@ -2539,6 +2599,11 @@ class PostgresRuntimeStateStore(_TenantRepository):
                 continue
             if state_key == self._SUMMARY_META_KEY:
                 meta = payload
+            elif state_key.startswith(self._SUMMARY_HISTORY_ITEM_PREFIX):
+                channel_id = str(payload.get("channel_id") or "").strip()
+                log = payload.get("log")
+                if channel_id and isinstance(log, dict):
+                    summary_history_items.setdefault(channel_id, []).append(log)
             elif state_key.startswith(self._SUMMARY_HISTORY_PREFIX):
                 channel_id = state_key[len(self._SUMMARY_HISTORY_PREFIX) :]
                 logs = payload.get("logs")
@@ -2549,6 +2614,8 @@ class PostgresRuntimeStateStore(_TenantRepository):
                 runs = payload.get("runs")
                 if isinstance(runs, list):
                     summary_runs[str(channel_id)] = runs
+        for channel_id, logs in summary_history_items.items():
+            summary_history.setdefault(channel_id, []).extend(logs)
         return {
             "version": meta.get("version", 2),
             "revision": meta.get("revision", 0),

@@ -5768,6 +5768,13 @@ class LuxriotManager:
         self.channel_prompt_overrides: Dict[int, Dict[str, Any]] = {}
         self._summary_state_last_persist = 0.0
         self._summary_state_dirty = False
+        # PostgreSQL stores new L0 history entries as independent idempotent
+        # rows.  Keep only entries that have not been acknowledged by the
+        # persistence worker here; rebuilding every channel's multi-megabyte
+        # history document on every L0 result starves realtime GPU dispatch.
+        self._summary_state_pending_history_entries: Dict[
+            int, Dict[str, Dict[str, Any]]
+        ] = {}
         self.summary_state_revision = 0
         self._summary_state_revision_issued = 0
         self.summary_state_last_success_at: Optional[float] = None
@@ -15009,12 +15016,47 @@ class LuxriotManager:
             "json_alert_prompt",
         }
 
+    @classmethod
+    def _summary_history_item_token(cls, log: Mapping[str, Any]) -> str:
+        return json.dumps(
+            cls._summary_log_key(log),
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
+
+    def _queue_summary_history_entries_locked(
+        self,
+        channel_id: int,
+        entries: Sequence[Mapping[str, Any]],
+    ) -> None:
+        if not entries:
+            return
+        pending = self._summary_state_pending_history_entries.setdefault(
+            int(channel_id), {}
+        )
+        for entry in entries:
+            if not isinstance(entry, Mapping):
+                continue
+            compact = dict(entry)
+            pending[self._summary_history_item_token(compact)] = compact
+        if pending:
+            self._summary_state_dirty = True
+
     def _build_summary_state_payload_locked(self, revision: Optional[int] = None) -> Dict[str, Any]:
         history_payload: Dict[str, List[Dict[str, Any]]] = {}
-        for channel_id, logs in self.summary_history.items():
+        incremental_history = self._summary_state_async_persistence_enabled()
+        history_source: Mapping[int, Any]
+        if incremental_history:
+            history_source = self._summary_state_pending_history_entries
+        else:
+            history_source = self.summary_history
+        for channel_id, logs in history_source.items():
             if not logs:
                 continue
-            history_payload[str(channel_id)] = [dict(log) for log in logs if isinstance(log, Mapping)]
+            log_values = logs.values() if isinstance(logs, Mapping) else logs
+            history_payload[str(channel_id)] = [
+                dict(log) for log in log_values if isinstance(log, Mapping)
+            ]
         runs_payload: Dict[str, List[Dict[str, Any]]] = {}
         for channel_id, runs in self.summary_runs.items():
             if not runs:
@@ -15072,6 +15114,9 @@ class LuxriotManager:
             },
             "prompt_settings": prompt_payload,
         }
+        if incremental_history:
+            payload["summary_history_storage"] = "upsert_items"
+            payload["summary_history_retention_cutoff"] = self._summary_retention_cutoff()
         return payload
 
     def _write_summary_state_payload(self, payload: Mapping[str, Any]) -> Optional[str]:
@@ -15106,10 +15151,41 @@ class LuxriotManager:
             self.summary_state_revision = revision
             self.summary_state_last_success_at = self._coerce_float(payload.get("updated_at")) or time.time()
             self.summary_state_last_error = None
+        if str(payload.get("summary_history_storage") or "") == "upsert_items":
+            saved_history = payload.get("summary_history")
+            if isinstance(saved_history, Mapping):
+                for raw_channel_id, raw_logs in saved_history.items():
+                    channel_id = _parse_optional_int(raw_channel_id)
+                    if (
+                        channel_id is None
+                        or not isinstance(raw_logs, Sequence)
+                        or isinstance(raw_logs, (str, bytes, bytearray))
+                    ):
+                        continue
+                    pending = self._summary_state_pending_history_entries.get(
+                        int(channel_id)
+                    )
+                    if not pending:
+                        continue
+                    for raw_log in raw_logs:
+                        if not isinstance(raw_log, Mapping):
+                            continue
+                        token = self._summary_history_item_token(raw_log)
+                        current = pending.get(token)
+                        if current == dict(raw_log):
+                            pending.pop(token, None)
+                    if not pending:
+                        self._summary_state_pending_history_entries.pop(
+                            int(channel_id), None
+                        )
+        else:
+            self._summary_state_pending_history_entries.clear()
         with self._summary_persist_condition:
             has_newer_pending = self._summary_persist_pending is not None
         self._summary_state_dirty = bool(
-            has_newer_pending or revision < int(self._summary_state_revision_issued)
+            self._summary_state_pending_history_entries
+            or has_newer_pending
+            or revision < int(self._summary_state_revision_issued)
         )
         self._persisted_prompt_default_fields.update(self._prompt_default_field_names())
         return True
@@ -21540,6 +21616,7 @@ class LuxriotManager:
         key_to_index: Dict[Tuple[str, str, str, str], int] = {}
         last_created: Optional[float] = None
         out_of_order = False
+        touched_keys: Set[Tuple[str, str, str, str]] = set()
 
         for item in existing:
             key = self._summary_log_key(item)
@@ -21558,6 +21635,7 @@ class LuxriotManager:
                 continue
             incoming = self._compact_summary_history_entry(raw_log)
             key = self._summary_log_key(incoming)
+            touched_keys.add(key)
             index = key_to_index.get(key)
             if index is not None:
                 existing_item = merged[index]
@@ -21591,6 +21669,11 @@ class LuxriotManager:
             merged = merged[-self.summary_history_limit :]
         self.summary_history[channel_id] = merged
         self._update_channel_status_digest_locked(channel_id, merged)
+        merged_by_key = {self._summary_log_key(item): item for item in merged}
+        touched_entries = [
+            merged_by_key[key] for key in touched_keys if key in merged_by_key
+        ]
+        self._queue_summary_history_entries_locked(channel_id, touched_entries)
         self._persist_summary_state_if_due_locked()
 
     def record_summary_log(self, channel_id: int, entry: Mapping[str, Any]) -> None:

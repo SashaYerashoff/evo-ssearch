@@ -530,6 +530,76 @@ class LuxriotCaptureApexDeciderTests(unittest.TestCase):
                 time.sleep(0.01)
             self.assertEqual(manager.summary_state_revision, 1)
 
+    def test_postgres_history_persistence_writes_only_new_l0_items(self):
+        class CapturingPostgresRuntimeStateStore(MemoryRuntimeStateStore):
+            backend = "postgres"
+
+            def __init__(self):
+                super().__init__()
+                self.saved = []
+
+            def save_state(self, key, payload):
+                self.saved.append((key, dict(payload)))
+                super().save_state(key, payload)
+
+        with tempfile.TemporaryDirectory() as temp:
+            store = CapturingPostgresRuntimeStateStore()
+            manager = build_manager(Path(temp), runtime_state_store=store)
+            manager.summary_history[7] = [
+                {
+                    "channel_id": 7,
+                    "run_id": "old-run",
+                    "batch_id": f"old-{index}",
+                    "summary": f"Historical summary {index}",
+                    "frame_count": 1,
+                    "created_at": 1_781_600_000.0 + index,
+                }
+                for index in range(50)
+            ]
+
+            manager.record_summary_log(
+                7,
+                {
+                    "channel_id": 7,
+                    "run_id": "run-7",
+                    "batch_id": "new-1",
+                    "summary": "First new summary.",
+                    "frame_count": 2,
+                    "created_at": 1_781_700_000.0,
+                },
+            )
+            deadline = time.monotonic() + 2.0
+            while manager.summary_state_revision < 1 and time.monotonic() < deadline:
+                time.sleep(0.01)
+
+            self.assertEqual(len(manager.summary_history[7]), 51)
+            first_payload = store.saved[-1][1]
+            self.assertEqual(first_payload["summary_history_storage"], "upsert_items")
+            self.assertEqual(len(first_payload["summary_history"]["7"]), 1)
+            self.assertEqual(
+                first_payload["summary_history"]["7"][0]["batch_id"],
+                "new-1",
+            )
+
+            manager.record_summary_log(
+                7,
+                {
+                    "channel_id": 7,
+                    "run_id": "run-7",
+                    "batch_id": "new-2",
+                    "summary": "Second new summary.",
+                    "frame_count": 2,
+                    "created_at": 1_781_700_001.0,
+                },
+            )
+            self.assertTrue(manager.persist_summary_state())
+            second_payload = store.saved[-1][1]
+            self.assertEqual(len(second_payload["summary_history"]["7"]), 1)
+            self.assertEqual(
+                second_payload["summary_history"]["7"][0]["batch_id"],
+                "new-2",
+            )
+
     def test_manager_cache_lock_allows_layered_runtime_reads(self):
         with tempfile.TemporaryDirectory() as temp:
             manager = build_manager(Path(temp))
@@ -2531,7 +2601,18 @@ class LuxriotCaptureDispatchTests(unittest.TestCase):
                             "capture_baselines": {"7": {"level": 0.012, "buckets": 600}},
                             "prompt_settings": {"bookmark_enabled": False},
                         },
-                    )
+                    ),
+                    (
+                        "luxriot_summary_state:history:7",
+                        {"logs": [{"batch_id": "legacy", "summary": "Legacy"}]},
+                    ),
+                    (
+                        "luxriot_summary_state:history_item:7:abc",
+                        {
+                            "channel_id": "7",
+                            "log": {"batch_id": "item", "summary": "New item"},
+                        },
+                    ),
                 ]
 
         class Connection:
@@ -2558,6 +2639,67 @@ class LuxriotCaptureDispatchTests(unittest.TestCase):
             "high",
         )
         self.assertEqual(payload["capture_baselines"]["7"]["buckets"], 600)
+        self.assertEqual(
+            [entry["batch_id"] for entry in payload["summary_history"]["7"]],
+            ["legacy", "item"],
+        )
+
+    def test_postgres_incremental_summary_history_does_not_rewrite_legacy_row(self):
+        calls = []
+
+        class Connection:
+            def execute(self, query, params=None):
+                calls.append((query, params))
+                return SimpleNamespace(rowcount=1)
+
+        class Transaction:
+            def __enter__(self):
+                return Connection()
+
+            def __exit__(self, *_args):
+                return False
+
+        class Pool:
+            def transaction(self, *_args, **_kwargs):
+                return Transaction()
+
+        store = PostgresRuntimeStateStore(Pool(), uuid4())
+        store.save_state(
+            "luxriot_summary_state",
+            {
+                "version": 2,
+                "revision": 8,
+                "updated_at": 123.0,
+                "summary_history_storage": "upsert_items",
+                "summary_history": {
+                    "7": [
+                        {
+                            "channel_id": 7,
+                            "run_id": "run-7",
+                            "batch_id": "new-1",
+                            "created_at": 123.0,
+                            "frame_count": 2,
+                            "summary": "New summary",
+                        }
+                    ]
+                },
+                "summary_runs": {},
+            },
+        )
+
+        inserted_keys = [
+            str(params[1])
+            for query, params in calls
+            if params and "INSERT INTO archive.runtime_state" in query
+        ]
+        self.assertIn("luxriot_summary_state:meta", inserted_keys)
+        self.assertTrue(
+            any(
+                key.startswith("luxriot_summary_state:history_item:7:")
+                for key in inserted_keys
+            )
+        )
+        self.assertNotIn("luxriot_summary_state:history:7", inserted_keys)
 
     def test_postgres_runtime_state_bulk_promotes_rollups_with_queryable_keys(self):
         calls = []
