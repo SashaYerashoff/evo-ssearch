@@ -1978,3 +1978,64 @@ The previous Codex session was opened with workspace root
 edits outside the stale root. The user had already granted full access. This was a
 session/workspace-root mismatch, not an EVA issue. Start the next session from the
 primary repository path above.
+
+## 2026-08-12 disk cleanup and nested-incident source checkpoint
+
+Disk cleanup was completed before the next incident-logic step. Free space rose
+from about 21 GiB / 4.65% to 27.29 GB / 5.57%, so the archive retention disk
+check returned from `low_space` to `ready` before the operator intentionally
+stopped EVA for about 30 minutes.
+
+Removed, with exact bounded targets:
+
+- ten superseded Georgia upgrade archives in `~/Downloads`; the current
+  `b18876b` archive remains and still hashes to
+  `41afc3689e15a951b396089779f35efac11f03acedd282c5ec6a2593ce676401`;
+- the unused vLLM torch compile cache;
+- 1.027 GB of Docker build cache and 529.5 MB of unused Docker image layers.
+
+Preserved deliberately:
+
+- `/home/sasha/Downloads/eva-checked-media-runtime-4529b67`;
+- all model files, both llama.cpp command lines, the Georgia PostgreSQL volume,
+  and `.env` (control hash remained
+  `2c254527143f62bbdbcf7a14914872e2a6f1e0f4f776ef02024c0f27aac76325`);
+- the stopped legacy `eva_ai_postgres_data` volume, about 40.04 GB. It is not a
+  cache and must not be deleted without an explicit data-retention decision;
+- the Ubuntu installer ISO and unrelated user files.
+
+About 4.1 GB of persistent journal plus large rotated `syslog`/`kern.log` files
+remain because journal vacuum and rsyslog rotation require interactive `sudo`.
+Inspection showed two main sources: verbose llama-server request timing in
+`syslog`, and repeated AppArmor denials from the Mission Center snap in the
+kernel log. Cleanup did not alter inference flags or logging configuration.
+
+Source commit `f25028e` (`feat: materialize nested incident context`) implements
+the next conservative hierarchy slice:
+
+- L2 nested tracks receive deterministic, replay-safe incident IDs;
+- each child remains a first-class directly addressable incident linked to the
+  grounded parent by candidate `concurrent_with` context; this asserts neither
+  causality nor merge;
+- nested children are excluded in PostgreSQL before review-board
+  `COUNT/LIMIT/OFFSET`, so they cannot flood or sparsify top-level review pages;
+- the parent modal can navigate to each separate child and the child back to its
+  parent;
+- explicit operator `confirm`, `reopen`, or `follow` promotes a child to the
+  top-level review board. Rollup/model output cannot promote it.
+
+Local acceptance at this commit:
+
+- 51 focused incident command/store/API tests passed;
+- 322 related incident and Luxriot inference-runtime tests passed;
+- 97 React tests passed;
+- TypeScript/Vite production build passed, producing
+  `index-BJEko90E.js` and `index-ToIv3F5P.css`;
+- Python compile and `git diff --check` passed.
+
+This commit has **not** been deployed to the rehearsal instance and no new
+upgrade archive or Desktop launcher pin has been created. The operator
+explicitly switched EVA off during local development. When EVA is available
+again, first confirm the service/process ownership and `.env` hash, then perform
+the ordinary readiness-gated rollout, live API/UI acceptance, immutable bundle
+verification, launcher update, and final handoff amendment.
