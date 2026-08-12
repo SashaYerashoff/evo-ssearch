@@ -89,7 +89,7 @@ Primary working repository:
 ```text
 path:   /home/sasha/Projects/evo-ssearch-office-demo
 branch: main
-latest release-source commit: 8a476dc test: register probe signal frame route
+latest release-source commit: 1a69745 fix: keep archive batch review immutable
 ```
 
 The reviewed stabilization tail includes:
@@ -110,6 +110,7 @@ c6417c7 fix: reuse buffered vectors in probe daemon
 4394e6a docs: record readiness-gated reload rehearsal
 760fdc2 fix: allow verified cold model startup
 8a476dc test: register probe signal frame route
+1a69745 fix: keep archive batch review immutable
 ```
 
 The working tree is expected to be clean after committing this handoff update.
@@ -1576,18 +1577,35 @@ timestamped semantic-signal frame route in the API dataflow contract. The route
 was already implemented and used by `ProbeSettingsModal`; only the static contract
 allowlist was stale.
 
+Commit `1a69745` fixes the Archive research review filmstrip at both layers. The
+React modal previously depended on the complete `channels` array. App-level
+inventory polling replaces that array every 30 seconds, so an open immutable batch
+was cleared to its selected frame and fetched again on every inventory refresh.
+The modal now depends only on the selected evidence/batch identity, coalesces
+concurrent reads, and keeps a bounded least-recently-used cache of eight completed
+batches.
+
+The same request was slow on PostgreSQL despite the existing
+`ix_archive_detections_vlm_batch` index. The index is partial and requires
+`payload_json ? 'batch_id'`, but the generated query only had an equality on
+`payload_json->>'batch_id'`; PostgreSQL cannot infer the partial predicate. On a
+live six-frame batch the COUNT and page query therefore used parallel sequential
+scans and took 7.904 and 6.141 seconds. With the explicit predicate they use the
+existing index and measured 1.473 and 22.587 milliseconds respectively. No schema
+migration or new index was needed.
+
 The resulting checked archive is:
 
 ```text
-/home/sasha/Downloads/eva-ai-georgia-upgrade-0.8.1-to-0.8.7-8a476dc.tar.gz
-git commit: 8a476dc22b8512bc5b4a0d7a7c71494110d72c3c
-size:       169622717 bytes
-SHA-256:    3af9ff1be42d50a8bd21e485626632c942198952268e97ad960ddbb2eabac16b
+/home/sasha/Downloads/eva-ai-georgia-upgrade-0.8.1-to-0.8.7-1a69745.tar.gz
+git commit: 1a697459c329bb47733a7e096a59904bee793701
+size:       169628563 bytes
+SHA-256:    a38c809234a13e5f3ee7f2e08c3528991cce72be712889f53fae3bfa9db11a5d
 ```
 
 Its outer checksum and every checksum in `runtime/SHA256SUMS` pass. The manifest
 reports a clean `main` snapshot, beta 0.8.7 and an included Linux x86-64 media
-runtime. The React payload contains `index-Ci6oa427.js` and
+runtime. The React payload contains `index-OsWNZcqb.js` and
 `index-CzNIZODy.css`; the four staged runtime files match the reviewed source
 hashes. As with the previously successful rehearsal artifact, this incremental
 upgrade bundle reuses the preserved application venv: it does not include a full
@@ -1597,6 +1615,17 @@ wheelhouse or a SigLIP model.
 commit and also waits up to 300 seconds in its independent post-update health
 gate. Shell syntax validation passes. The launcher still requires an explicit
 interactive confirmation after its read-only preflight.
+
+The archive-review patch is also active on the rehearsal service. A
+readiness-gated HUP overlapped old worker `3837700` with replacement `3945636`
+from `18:36:00` until `18:39:57`; every five-second one-second-deadline health
+sample succeeded. Afterwards `/ready` reported the CUDA embedder loaded, Luxriot
+reachable and both desired channel sessions restored (2/2). `NRestarts` remained
+zero, the two inference PIDs were unchanged, and the served React index references
+`index-OsWNZcqb.js`.
+
+Focused verification for this fix was `86 passed, 2 skipped` with `128` subtests,
+plus the React suite at 95/95 and a successful TypeScript/Vite production build.
 
 No destructive reset or upgrade rehearsal was run while preparing the archive.
 The current beta 0.8.7 service remained available, and the rehearsal `.env` still
@@ -1643,7 +1672,7 @@ focused and broader commands were run.
 
 ### 3. Keep the verified bundle immutable
 
-The Desktop wrapper points at the checked `8a476dc` archive above. Do not edit that
+The Desktop wrapper points at the checked `1a69745` archive above. Do not edit that
 tarball in place. If release-source code changes, build a newly named bundle and
 repeat the manifest, outer checksum, internal runtime checksum and React-dist
 checks before changing the wrapper.
