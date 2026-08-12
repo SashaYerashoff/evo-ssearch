@@ -9579,6 +9579,9 @@ def _store_probe_hits(
     bookmark_hit_timestamp_ms: Optional[int] = None,
     precomputed_clip_vec: Optional[np.ndarray] = None,
     precomputed_embedding_space: Optional[Mapping[str, Any]] = None,
+    precomputed_frames: Optional[
+        Mapping[int, Tuple[np.ndarray, Mapping[str, Any]]]
+    ] = None,
     extra_payload: Optional[Dict[str, Any]] = None,
 ) -> int:
     if not hits:
@@ -9615,7 +9618,18 @@ def _store_probe_hits(
         margin = _to_float(hit.get("margin"), 0.0)
         thumbnail_b64 = hit.get("thumbnail")
         archive_thumbnail_b64 = _resolve_archive_thumbnail(thumbnail_b64, ts_ms)
-        if (
+        exact_precomputed = (
+            precomputed_frames.get(ts_ms)
+            if precomputed_frames is not None
+            else None
+        )
+        if exact_precomputed is not None:
+            clip_vec = np.asarray(
+                exact_precomputed[0],
+                dtype=np.float32,
+            ).flatten()
+            embedding_space = dict(exact_precomputed[1] or {})
+        elif (
             precomputed_clip_vec is not None
             and bookmark_hit_timestamp_ms is not None
             and ts_ms == int(bookmark_hit_timestamp_ms)
@@ -11398,6 +11412,32 @@ def _probe_daemon() -> None:
                             recent = probe.get('recent_hits') or []
                             recent = (hits + recent)[:PROBE_MAX_STORED_HITS]
                             probe['recent_hits'] = recent
+                            precomputed_frames: Dict[
+                                int,
+                                Tuple[np.ndarray, Mapping[str, Any]],
+                            ] = {}
+                            for hit in hits:
+                                hit_timestamp_ms = _to_optional_int(
+                                    hit.get("timestamp_ms")
+                                )
+                                if hit_timestamp_ms is None:
+                                    continue
+                                frame_vector, frame_space = (
+                                    probe_manager.frame_embedding(
+                                        ch,
+                                        hit_timestamp_ms,
+                                        roi_norm=(
+                                            probe_roi_norm
+                                            if probe_roi_enabled
+                                            else None
+                                        ),
+                                    )
+                                )
+                                if frame_vector is not None and frame_vector.size:
+                                    precomputed_frames[hit_timestamp_ms] = (
+                                        frame_vector,
+                                        frame_space,
+                                    )
                             bookmark_sent = False
                             bookmark_hit_timestamp_ms: Optional[int] = None
                             bookmark_gate: Dict[str, Any] = {"reason": "bookmark_disabled", "source": "probe_daemon"}
@@ -11407,9 +11447,21 @@ def _probe_daemon() -> None:
                                     bookmark_hit_timestamp_ms = _to_optional_int(
                                         bookmark_hit.get("timestamp_ms")
                                     )
+                                    bookmark_payload = dict(bookmark_hit)
+                                    bookmark_precomputed = (
+                                        precomputed_frames.get(
+                                            bookmark_hit_timestamp_ms
+                                        )
+                                        if bookmark_hit_timestamp_ms is not None
+                                        else None
+                                    )
+                                    if bookmark_precomputed is not None:
+                                        bookmark_payload["clip_vec"] = (
+                                            bookmark_precomputed[0]
+                                        )
                                     bookmark_sent, bookmark_gate = _maybe_send_probe_bookmark(
                                         probe,
-                                        bookmark_hit,
+                                        bookmark_payload,
                                         source='probe_daemon',
                                     )
                                     if (not bookmark_sent) and str(bookmark_gate.get("reason") or "") == "send_error":
@@ -11435,6 +11487,7 @@ def _probe_daemon() -> None:
                                     source='probe_daemon',
                                     bookmark_sent=bookmark_sent,
                                     bookmark_hit_timestamp_ms=bookmark_hit_timestamp_ms,
+                                    precomputed_frames=precomputed_frames,
                                     extra_payload={
                                         'frames_indexed': result.get('frames_indexed'),
                                         'roi_enabled': probe_roi_enabled,

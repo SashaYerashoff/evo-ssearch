@@ -67,6 +67,39 @@ class ProbeManagerAttentionTests(unittest.TestCase):
         self.assertEqual(manager.frame_thumbnail(7, 2_000), "jpeg")
         self.assertIsNone(manager.frame_thumbnail(7, 1_500))
         self.assertIsNone(manager.frame_thumbnail(8, 2_000))
+        first_vector, first_space = manager.frame_embedding(7, 1_000)
+        missing_vector, missing_space = manager.frame_embedding(7, 1_500)
+        np.testing.assert_allclose(first_vector, np.asarray([1.0, 0.0]))
+        self.assertEqual(first_space, {})
+        self.assertIsNone(missing_vector)
+        self.assertEqual(missing_space, {})
+
+    def test_frame_embedding_preserves_encoder_space_and_exact_roi_vector(self):
+        manager, _calls = self._manager()
+        manager.embed_image_with_metadata_fn = lambda _image: (
+            np.asarray([1.0, 0.0], dtype=np.float32),
+            {"backend": "siglip2", "model": "model-a", "contract": "contract-a"},
+        )
+        with patch.object(ProbeBuffer, "_rebuild_index", return_value=None):
+            manager.add_frame(
+                7,
+                Image.new("RGB", (4, 4), color=(255, 255, 255)),
+                1_000,
+            )
+        roi = (0.0, 0.0, 0.5, 0.5)
+        self.assertTrue(
+            manager._remember_roi_frame_embedding(
+                7,
+                1_000,
+                roi,
+                np.asarray([0.0, 1.0], dtype=np.float32),
+            )
+        )
+
+        vector, space = manager.frame_embedding(7, 1_000, roi_norm=roi)
+
+        np.testing.assert_allclose(vector, np.asarray([0.0, 1.0]))
+        self.assertEqual(space["model"], "model-a")
 
     def test_live_append_does_not_rebuild_unused_faiss_index(self):
         manager, _calls = self._manager()

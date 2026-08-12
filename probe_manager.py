@@ -529,6 +529,7 @@ class ProbeManager:
         self.embedding_space_fn = embedding_space_fn
         self.embed_texts_fn = embed_texts_fn
         self._buffer_embedding_fingerprints: Dict[int, str] = {}
+        self._buffer_embedding_spaces: Dict[int, Dict[str, Any]] = {}
         self._embedding_space_fingerprint = ""
         self._embedding_space_fingerprint_lock = threading.Lock()
         self.embed_text_fn = embed_text_fn
@@ -593,6 +594,7 @@ class ProbeManager:
                 return True
             self.buffers.pop(int(channel_id), None)
             self._buffer_embedding_fingerprints.pop(int(channel_id), None)
+            self._buffer_embedding_spaces.pop(int(channel_id), None)
         return False
 
     def _buffer(self, channel_id: int) -> ProbeBuffer:
@@ -628,10 +630,15 @@ class ProbeManager:
                 and frame_fingerprint != previous_fingerprint
             ):
                 self.buffers.pop(int(channel_id), None)
+                self._buffer_embedding_spaces.pop(int(channel_id), None)
             buf = self._buffer(channel_id)
             if frame_fingerprint:
                 self._buffer_embedding_fingerprints[int(channel_id)] = (
                     frame_fingerprint
+                )
+            if embedding_space:
+                self._buffer_embedding_spaces[int(channel_id)] = dict(
+                    embedding_space
                 )
             frame_uid = buf.add(
                 emb,
@@ -1112,15 +1119,53 @@ class ProbeManager:
                 return thumbnail or None
         return None
 
+    def frame_embedding(
+        self,
+        channel_id: int,
+        timestamp_ms: int,
+        *,
+        roi_norm: Optional[Tuple[float, float, float, float]] = None,
+    ) -> Tuple[Optional[np.ndarray], Dict[str, Any]]:
+        """Return the already-computed vector for one exact buffered frame."""
+
+        wanted_timestamp_ms = int(timestamp_ms)
+        with self.lock:
+            buf = self.buffers.get(int(channel_id))
+            embedding_space = dict(
+                self._buffer_embedding_spaces.get(int(channel_id)) or {}
+            )
+            if buf is None:
+                return None, embedding_space
+            for index in range(len(buf.meta) - 1, -1, -1):
+                row = buf.meta[index]
+                if int(row.get("timestamp_ms") or 0) != wanted_timestamp_ms:
+                    continue
+                if roi_norm is None:
+                    if index >= len(buf.embeddings):
+                        return None, embedding_space
+                    return np.asarray(
+                        buf.embeddings[index],
+                        dtype=np.float32,
+                    ).copy(), embedding_space
+                frame_uid = int(row.get("uid") or 0)
+                roi_key = buf._roi_key(roi_norm)
+                cached = buf.roi_cache.get(roi_key, {}).get(frame_uid)
+                if cached is None:
+                    return None, embedding_space
+                return np.asarray(cached, dtype=np.float32).copy(), embedding_space
+        return None, embedding_space
+
     def clear(self, channel_id: int) -> None:
         with self.lock:
             self.buffers.pop(channel_id, None)
             self._buffer_embedding_fingerprints.pop(channel_id, None)
+            self._buffer_embedding_spaces.pop(channel_id, None)
 
     def clear_all(self) -> None:
         with self.lock:
             self.buffers.clear()
             self._buffer_embedding_fingerprints.clear()
+            self._buffer_embedding_spaces.clear()
         with self._text_embedding_cache_lock:
             self._text_embedding_cache.clear()
         with self._embedding_space_fingerprint_lock:
