@@ -420,7 +420,7 @@ export function InspectorModal({
           </div>
 
           <aside className="inspect-side archive-review-side">
-            <div className="kv">
+            <div className="kv archive-review-meta">
               <span className="k">Channel</span><span className="v">{active.channelTitle || `ch ${active.channelId ?? '—'}`}</span>
               <span className="k">Source</span><span className="v">{active.sourceLabel}</span>
               <span className="k">Time</span><span className="v">{fmtFull(active.tsMs)}</span>

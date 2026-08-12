@@ -540,6 +540,18 @@ Legacy endpoints, вызываемые старым UI, но не вызывае
   `Collapse all / Expand all` объединены в stateful action.
 - [x] Если в группе вторичных toolbar-команд доступен только один action, он
   выводится напрямую обычной кнопкой вместо бессмысленного dropdown `Actions`.
+- [x] `Archive research review` адаптирован под стеклянную тему: тяжёлые вложенные
+  панели убраны, кадр стал визуальным центром, метаданные и описание разложены на
+  лёгкие строки/плоскости, filmstrip и действия используют единую тихую геометрию.
+- [x] `Selected semantic probe` адаптирован под тот же стеклянный язык: signal
+  scores больше не рисуются тремя карточками, configuration стал лёгким списком,
+  а settings/run/delete собраны в компактный action-footer без ярких плит.
+- [x] Редактор `Semantic probe settings` разгружен в единое стеклянное рабочее
+  окно: preview, prompt pairs, technical telemetry и advanced settings больше не
+  выглядят набором вложенных таблиц, а footer сохраняет тихую action-иерархию.
+- [x] Геометрия `Semantic probe settings` стабилизирована: раскрытие `Technical details` и `Advanced settings` больше не меняет размер модалки или preview; preview имеет неизменяемый слот без `flex-grow`/`flex-shrink`, а содержимое прокручивается внутри заранее зарезервированных колонок без скачка от scrollbar.
+- [x] Анимация светового Bifrost-фона `atp-tabpanel-content` отделена от состояния dropdown: открытие меню больше не меняет `overflow`/`inset` анимированных слоёв и не сбрасывает их геометрию или визуальную фазу.
+- [x] Dropdown фильтров вынесены в отдельный fixed floating-layer: toolbar остаётся постоянным горизонтальным scroll-контейнером, поэтому открытие списка не пересоздаёт его layout/compositing и не сдвигает подписи кнопок.
 - [x] Есть L0 feed и L1/L2/L3 rollups.
 - [x] Есть manual refresh, live polling и history range для L1/L2/L3.
 - [x] L0 History передаёт `from_ts` в `/luxriot/session`.

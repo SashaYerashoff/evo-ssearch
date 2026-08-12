@@ -43,7 +43,7 @@ export function ProbeInspector({ probe, status, runtime, busy, settingsBlockedRe
   const originView = PROBE_ORIGIN_LABELS[origin]
   const ttl = probeTemporaryTtl(probe)
   return (
-    <div className="mon-panel">
+    <div className="mon-panel probe-inspector-panel">
       <div className="mon-panel-title">Selected semantic probe</div>
 
       {/* who: one clean identity row */}

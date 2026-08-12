@@ -14,6 +14,7 @@ import {
 import type { Channel, ArchiveFilters } from '../../api/types'
 import { Dropdown } from '../shell/Dropdown'
 import { ToolbarActionMenu } from '../shell/ToolbarActionMenu'
+import { FloatingPopover } from '../shell/FloatingPopover'
 import { DateRangeModal } from './DateRangeModal'
 import type { ArchiveProbeOption } from '../../api/detections'
 
@@ -45,6 +46,7 @@ function ChannelPicker({
   const [open, setOpen] = useState(false)
   const [query, setQuery] = useState('')
   const rootRef = useRef<HTMLDivElement>(null)
+  const popRef = useRef<HTMLDivElement>(null)
   const selectedSet = useMemo(() => new Set(selected), [selected])
   const selectedChannels = channels.filter((channel) => selectedSet.has(String(channel.id)))
   const filtered = channels.filter((channel) => {
@@ -60,7 +62,8 @@ function ChannelPicker({
   useEffect(() => {
     if (!open) return
     const close = (event: MouseEvent) => {
-      if (!rootRef.current?.contains(event.target as Node)) setOpen(false)
+      const target = event.target as Node
+      if (!rootRef.current?.contains(target) && !popRef.current?.contains(target)) setOpen(false)
     }
     document.addEventListener('mousedown', close)
     return () => document.removeEventListener('mousedown', close)
@@ -88,7 +91,8 @@ function ChannelPicker({
         <IconChevronDown size={13} />
       </button>
       {open && (
-        <div className="archive-channel-picker-pop" role="dialog" aria-label="Select archive streams">
+        <FloatingPopover anchorRef={rootRef} popoverRef={popRef} className="archive-channel-picker-pop floating-popover" offset={7}>
+        <div role="dialog" aria-label="Select archive streams">
           <div className="archive-channel-picker-tools">
             <label>
               <IconSearch size={14} />
@@ -133,6 +137,7 @@ function ChannelPicker({
             <button type="button" className="btn primary compact" onClick={() => setOpen(false)}>Done</button>
           </div>
         </div>
+        </FloatingPopover>
       )}
     </div>
   )
