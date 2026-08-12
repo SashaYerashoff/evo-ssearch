@@ -1257,6 +1257,66 @@ pressure). The heavyweight API smoke could not import a second `oldapp` safely;
 complete the authenticated live contract check in the existing worker after the
 operator hard-refreshes the new assets.
 
+## 2026-08-12 backend realtime follow-up
+
+The test appliance remains the only active EVA runtime. Its inference `.env`
+was not edited; SHA-256 remained
+`2c254527143f62bbdbcf7a14914872e2a6f1e0f4f776ef02024c0f27aac76325`.
+The two llama.cpp servers and their model/context flags were not restarted or
+changed.
+
+Four additional stabilization commits were deployed:
+
+- `461a878 fix: remove summary history from realtime hot path`
+- `2a82eb3 fix: stop replaying settled incident projections`
+- `7ba6ff6 perf: bound incident projection backfill`
+- `2d8a4ee fix: honor disabled probe bookmark cooldown`
+
+The principal backend starvation source was not CV or React. PostgreSQL summary
+state persistence rebuilt, serialized and hashed the complete per-channel L0
+history every persist interval: 9.1 MB for channel 118 and 7.2 MB for channel
+112. The `eva-summary-state` thread consumed about 55% of one CPU core and the
+same synchronous path made `/luxriot/start_capture` exceed 30 seconds. New L0
+history is now stored as independent idempotent rows while the two legacy history
+documents remain readable and untouched. At the final check, 59 new item rows
+used 244 KB total; the 16.2 MB of legacy history had not been rewritten.
+`eva-summary-state` fell to roughly 0.1-0.3% CPU and a channel restart completed
+in 4.10 seconds.
+
+Incident temporal-projection backfill was another periodic CPU consumer: it
+replayed expensive episode/relation reads for unchanged incidents every 15
+seconds. It now caches completed incident revisions and processes at most eight
+backfill records per pass. Measured `eva-incident-maintenance` CPU fell from
+about 12% to 0.3% in the observed steady interval. Follow-TTL reconciliation is
+unchanged and retains its configured page size.
+
+CV/semantic queue audit found no duplicate encoder path. In the final 20-second
+steady window channel 112 accepted 19 semantic frames and channel 118 accepted
+20; the microbatcher received 40 frames, completed 39 and had exactly one
+in-flight at the sample boundary with queue depth zero. The last image encode
+was 78 ms, including 45 ms attributed to the CUDA stage, with 8 ms queue wait;
+realtime probe evaluation was 64 ms. The first cold encode after each worker
+reload remains very slow because probe text embeddings and CUDA warm-up share
+the encoder lock. Cold startup/first-frame latency is still an explicit defect.
+
+Both persisted channel overrides and desired-session state now specify a
+one-second capture interval for channels 112 and 118. Reload restored both as
+running, batch size 8, VLM profile selected. Channel 112 uses the snapshot lane;
+channel 118 uses the dense live-segment fallback because its snapshot endpoint
+still has multi-second stalls.
+
+Probe cooldown/dedupe executes after P/N/M scoring and temporal confirmation; it
+cannot slow the live score. A live Thumbs-up test produced two confirmed hits:
+the first bookmark was sent and the second, 1015 ms later, was correctly marked
+`cooldown` under its configured eight-second gate. Gate check, send and mark are
+serialized across realtime and legacy daemon lanes. A separate correctness bug
+where explicit cooldown `0` reverted to the global default was fixed and tested.
+
+Verification for this follow-up: 214/214 Luxriot inference runtime tests, 57/57
+additional Luxriot/archive tests, 22/22 incident maintenance/command tests, and
+4/4 focused bookmark dataflow tests. Final service state was `/ready=200`, one
+Gunicorn worker, and systemd `NRestarts=0`.
+
 ## Next work
 
 ### 1. Confirm the committed baseline
