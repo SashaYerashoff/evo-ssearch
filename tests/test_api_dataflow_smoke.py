@@ -1778,6 +1778,7 @@ class ApiDataflowSmokeTests(unittest.TestCase):
             patch.object(oldapp.probe_manager, "score_frames", return_value=scores),
             patch.object(oldapp.luxriot_manager, "sessions", {7: Session()}),
             patch("oldapp._probe_embedding_calibration_state", return_value="calibrated"),
+            patch("oldapp.time.time", return_value=2.5),
         ):
             response = self.client.get(
                 "/probes/status?channel_id=7&probe_id=probe-live"
@@ -1789,7 +1790,40 @@ class ApiDataflowSmokeTests(unittest.TestCase):
         self.assertEqual(payload["semantic_state"], "ready")
         self.assertEqual(payload["live_signal"]["pos_score"], 0.47)
         self.assertEqual(payload["live_signal"]["threshold_state"], "below_both")
+        self.assertEqual(payload["live_signal"]["age_ms"], 500)
+        self.assertFalse(payload["live_signal"]["stale"])
+        self.assertEqual(
+            payload["live_signal"]["frame_url"],
+            "/probes/signal_frame/7/2000",
+        )
         self.assertEqual(len(payload["signal_history"]), 2)
+
+    def test_probe_signal_frame_returns_exact_buffered_jpeg_without_cache(self) -> None:
+        encoded = base64.b64encode(b"exact-semantic-jpeg").decode("ascii")
+        with patch.object(
+            oldapp.probe_manager,
+            "frame_thumbnail",
+            return_value=encoded,
+        ) as frame_thumbnail:
+            response = self.client.get("/probes/signal_frame/7/2000")
+
+        self.assertEqual(response.status_code, 200, response.get_json())
+        self.assertEqual(response.data, b"exact-semantic-jpeg")
+        self.assertEqual(response.content_type, "image/jpeg")
+        self.assertIn("no-store", response.headers["Cache-Control"])
+        self.assertEqual(response.headers["X-EVA-Frame-Timestamp-Ms"], "2000")
+        frame_thumbnail.assert_called_once_with(7, 2000)
+
+    def test_probe_signal_frame_does_not_substitute_a_newer_frame(self) -> None:
+        with patch.object(
+            oldapp.probe_manager,
+            "frame_thumbnail",
+            return_value=None,
+        ):
+            response = self.client.get("/probes/signal_frame/7/1500")
+
+        self.assertEqual(response.status_code, 404)
+        self.assertEqual(response.get_json()["error"], "semantic_frame_unavailable")
 
     def test_probe_status_exposes_embedder_failure_instead_of_false_running(self) -> None:
         class Session:

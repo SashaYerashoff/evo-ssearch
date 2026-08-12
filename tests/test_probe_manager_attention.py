@@ -49,6 +49,25 @@ class ProbeManagerAttentionTests(unittest.TestCase):
         self.assertEqual(second["embedding_ref"], "probe-buffer:7:2")
         self.assertEqual(first["timestamp_ms"], 1_000)
 
+    def test_frame_thumbnail_returns_only_the_exact_scored_frame(self):
+        manager, _calls = self._manager()
+        with patch.object(ProbeBuffer, "_rebuild_index", return_value=None):
+            manager.add_frame(
+                7,
+                Image.new("RGB", (4, 4), color=(255, 255, 255)),
+                1_000,
+            )
+            manager.add_frame(
+                7,
+                Image.new("RGB", (4, 4), color=(0, 0, 0)),
+                2_000,
+            )
+
+        self.assertEqual(manager.frame_thumbnail(7, 1_000), "jpeg")
+        self.assertEqual(manager.frame_thumbnail(7, 2_000), "jpeg")
+        self.assertIsNone(manager.frame_thumbnail(7, 1_500))
+        self.assertIsNone(manager.frame_thumbnail(8, 2_000))
+
     def test_live_append_does_not_rebuild_unused_faiss_index(self):
         manager, _calls = self._manager()
         with patch.object(ProbeBuffer, "_rebuild_index") as rebuild:

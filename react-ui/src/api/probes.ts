@@ -109,12 +109,18 @@ export interface ProbeThresholdDefaults {
 // without first manufacturing a hit.
 export interface ProbeLiveSignal extends ProbeHit {
   threshold_state?: 'hit' | 'below_pos' | 'below_margin' | 'below_both' | string
+  age_ms?: number
+  stale?: boolean
+  frame_url?: string
 }
 export interface ChannelStatus {
   channel_id: number
   runtime_state?: 'running' | 'paused' | 'idle' | string
-  semantic_state?: 'ready' | 'warming_up' | 'degraded' | string
+  semantic_state?: 'ready' | 'stale' | 'warming_up' | 'degraded' | string
   semantic_error?: string | null
+  semantic_age_ms?: number | null
+  semantic_stale_after_ms?: number | null
+  semantic_stale?: boolean
   capture_error?: string | null
   last_snapshot_ms?: number
   buffer_frames?: number
@@ -150,9 +156,24 @@ export function probeRangeDurationMs(status: {
 
 export interface Benchmark {
   batch: number
+  iterations?: number
+  requested_iterations?: number
+  truncated?: boolean
+  budget_ms?: number
   elapsed_sec: number
   approx_fps: number
+  encoder_fps?: number
+  effective_fps?: number
+  average_compute_ms?: number
+  average_lock_wait_ms?: number
+  max_lock_wait_ms?: number
+  warmup_ms?: number
+  warmup_compute_ms?: number
+  warmup_lock_wait_ms?: number
+  samples?: { lock_wait_ms: number; compute_ms: number; total_ms: number }[]
   device: string
+  device_name?: string
+  cuda_visible_devices?: string
   backend: string
   model: string
   resolution: number

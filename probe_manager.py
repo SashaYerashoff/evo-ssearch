@@ -1092,6 +1092,26 @@ class ProbeManager:
                 return {"frames": 0, "time_range_ms": None}
             return buf.status()
 
+    def frame_thumbnail(self, channel_id: int, timestamp_ms: int) -> Optional[str]:
+        """Return the JPEG belonging to one exact scored semantic frame.
+
+        Operator tuning must never pair a score with whichever capture frame
+        happens to be newest.  Keep this lookup deliberately metadata-only:
+        it neither enters the encoder lifecycle lock nor performs inference.
+        """
+
+        wanted_timestamp_ms = int(timestamp_ms)
+        with self.lock:
+            buf = self.buffers.get(int(channel_id))
+            if buf is None:
+                return None
+            for row in reversed(buf.meta):
+                if int(row.get("timestamp_ms") or 0) != wanted_timestamp_ms:
+                    continue
+                thumbnail = str(row.get("thumb") or "").strip()
+                return thumbnail or None
+        return None
+
     def clear(self, channel_id: int) -> None:
         with self.lock:
             self.buffers.pop(channel_id, None)

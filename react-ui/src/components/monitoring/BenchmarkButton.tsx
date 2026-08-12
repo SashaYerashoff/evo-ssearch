@@ -15,15 +15,24 @@ export function BenchmarkButton() {
     finally { setBusy(false) }
   }
 
+  const deviceLabel = String(bench?.device_name || bench?.device || '')
+    .replace(/^NVIDIA\s+/i, '')
+
   return (
     <button
       className={`bench-btn ${busy ? 'busy' : ''} ${bench ? 'done' : ''}`}
       onClick={run}
       disabled={busy}
-      title="Run embedding throughput benchmark (GPU embed fps)"
+      title={bench
+        ? `Encoder ${bench.encoder_fps ?? bench.approx_fps} fps · effective ${bench.effective_fps ?? bench.approx_fps} fps · lock wait ${bench.average_lock_wait_ms ?? 0} ms · warm-up wait ${bench.warmup_lock_wait_ms ?? 0} ms · ${bench.device_name || bench.device}${bench.truncated ? ' · time-budget reached' : ''}`
+        : 'Run synchronized embedding benchmark (encoder throughput vs shared-runtime wait)'}
     >
       <IconBolt size={14} />
-      {busy ? 'Benchmarking…' : bench ? <span className="mono">~{bench.approx_fps} fps · {bench.device}</span> : 'Benchmark'}
+      {busy
+        ? 'Benchmarking…'
+        : bench
+          ? <span className="mono">{bench.encoder_fps ?? bench.approx_fps} enc / {bench.effective_fps ?? bench.approx_fps} eff · {deviceLabel}</span>
+          : 'Benchmark'}
     </button>
   )
 }

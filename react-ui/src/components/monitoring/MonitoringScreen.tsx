@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from 'react'
+import { useCallback, useEffect, useMemo, useState, type ReactNode } from 'react'
 import {
   IconLayoutGrid,
   IconList,
@@ -148,8 +148,6 @@ export function MonitoringScreen({
   const [collapsed, setCollapsed] = useState<Set<string>>(readCollapsed)
   const [groupEditor, setGroupEditor] = useState<ProbeChannelGroup | null | undefined>()
   const [groupError, setGroupError] = useState<string | null>(null)
-  const [, setClock] = useState(0)
-  const pollRef = useRef<number | undefined>(undefined)
 
   const refresh = useCallback(async () => {
     setLoading(true)
@@ -173,12 +171,11 @@ export function MonitoringScreen({
 
   useEffect(() => { void refresh() }, [refresh])
   useEffect(() => {
-    const timer = window.setInterval(() => setClock((value) => value + 1), 1_000)
-    return () => window.clearInterval(timer)
-  }, [])
-
-  useEffect(() => {
     let alive = true
+    let timer: number | null = null
+    // The modal owns the live channel while it is open. Avoid duplicate status
+    // requests from the obscured board competing with its operator feedback.
+    if (editing) return () => { alive = false }
     const channelIds = [...new Set(
       probes
         .map((probe) => probe.channel_id)
@@ -197,14 +194,19 @@ export function MonitoringScreen({
       const next: Record<number, ChannelStatus> = {}
       for (const [channelId, status] of values) if (status) next[channelId] = status
       setSemanticRuntime(next)
+      timer = window.setTimeout(tick, 5_000)
     }
     void tick()
-    const timer = window.setInterval(tick, 5_000)
-    return () => { alive = false; window.clearInterval(timer) }
-  }, [probes])
+    return () => {
+      alive = false
+      if (timer != null) window.clearTimeout(timer)
+    }
+  }, [editing, probes])
 
   useEffect(() => {
     let alive = true
+    let timer: number | null = null
+    if (editing) return () => { alive = false }
     const probe = probes.find((candidate) => candidate.id === inspectId)
     if (!probe || probe.channel_id == null) {
       setInspectedRuntime(null)
@@ -213,31 +215,37 @@ export function MonitoringScreen({
     const tick = async () => {
       const status = await probesApi.status(probe.channel_id!, probe.id).catch(() => null)
       if (alive) setInspectedRuntime(status)
+      if (alive) timer = window.setTimeout(tick, 1_200)
     }
     void tick()
-    const timer = window.setInterval(tick, 1_200)
-    return () => { alive = false; window.clearInterval(timer) }
-  }, [inspectId, probes])
+    return () => {
+      alive = false
+      if (timer != null) window.clearTimeout(timer)
+    }
+  }, [editing, inspectId, probes])
 
   useEffect(() => {
     let alive = true
+    let timer: number | null = null
+    if (editing) return () => { alive = false }
     const tick = async () => {
       const response = await videoApi.streams().catch(() => null)
-      if (!alive || !response) return
-      const next: Record<number, string> = {}
-      for (const stream of response.analytics_streams || []) {
-        if (stream.channel_id == null) continue
-        next[stream.channel_id] = stream.paused ? 'paused' : stream.running ? 'running' : 'idle'
+      if (alive && response) {
+        const next: Record<number, string> = {}
+        for (const stream of response.analytics_streams || []) {
+          if (stream.channel_id == null) continue
+          next[stream.channel_id] = stream.paused ? 'paused' : stream.running ? 'running' : 'idle'
+        }
+        setRuntime(next)
       }
-      setRuntime(next)
+      if (alive) timer = window.setTimeout(tick, 5_000)
     }
     void tick()
-    pollRef.current = window.setInterval(tick, 5_000)
     return () => {
       alive = false
-      if (pollRef.current) window.clearInterval(pollRef.current)
+      if (timer != null) window.clearTimeout(timer)
     }
-  }, [])
+  }, [editing])
 
   useEffect(() => {
     if (!drive || drive.effect.target !== 'probes') return

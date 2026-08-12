@@ -174,6 +174,8 @@ _clip_module: Optional[Any] = None
 _clip_init_lock = RLock()
 _clip_reset_lock = Lock()
 _clip_resetting = False
+_clip_runtime_timing_lock = Lock()
+_clip_runtime_timing: Dict[str, Dict[str, float]] = {}
 _live_clip_batcher: Optional[ImageEmbeddingBatcher] = None
 _live_clip_batcher_lock = Lock()
 dino_encoder: Optional[DINOEncoder] = None
@@ -396,6 +398,7 @@ _SENSITIVE_ENDPOINT_PERMISSIONS: Dict[str, Permission] = {
     "luxriot_rollup_l3_schedule": Permission.STREAMS_VIEW,
     "luxriot_streams_status": Permission.STREAMS_VIEW,
     "probes_status": Permission.STREAMS_VIEW,
+    "probes_signal_frame": Permission.STREAMS_VIEW,
     "probes_list": Permission.REPORTS_VIEW,
     "probes_channel_groups_list": Permission.REPORTS_VIEW,
     "probes_bench": Permission.DIAGNOSTICS_VIEW,
@@ -1890,35 +1893,110 @@ def _clip_image_batch_with_space(
 ) -> EmbeddingBatchOutput:
     """Encode a whole microbatch under one immutable model-generation lock."""
 
+    requested_at = time.perf_counter()
     with _clip_init_lock:
-        ensure_embedder_loaded("clip")
-        if not images:
-            return EmbeddingBatchOutput(
-                np.zeros((0, 0), dtype=np.float32),
-                _current_clip_embedding_space_locked(),
+        acquired_at = time.perf_counter()
+        try:
+            return _clip_image_batch_with_space_locked(images)
+        finally:
+            finished_at = time.perf_counter()
+            _record_clip_runtime_timing(
+                "image",
+                wait_ms=(acquired_at - requested_at) * 1000.0,
+                work_ms=(finished_at - acquired_at) * 1000.0,
             )
 
-        normalized_images = [img.convert("RGB") for img in images]
-        with torch.no_grad():
-            if clip_backend_kind == "siglip2":
-                if clip_processor is None or clip_model is None:
-                    raise RuntimeError("SigLIP2 clip backend is not initialized")
-                processor_inputs = cast(Any, clip_processor)(images=normalized_images, return_tensors="pt")
-                model_inputs = _processor_to_device(cast(Mapping[str, Any], processor_inputs), clip_runtime_device)
-                image_features = _siglip_feature_tensor(
-                    cast(Any, clip_model).get_image_features(**model_inputs)
-                )
-            else:
-                if clip_preprocess is None or clip_model is None:
-                    raise RuntimeError("CLIP backend is not initialized")
-                image_batch = torch.stack([clip_preprocess(img) for img in normalized_images], dim=0).to(clip_runtime_device)  # type: ignore[operator]
-                image_features = cast(Any, clip_model).encode_image(image_batch)
-            image_features = _normalize_l2_embeddings(cast(torch.Tensor, image_features))
-        matrix = image_features.cpu().numpy().astype(np.float32, copy=False)
+
+def _record_clip_runtime_timing(
+    kind: str,
+    *,
+    wait_ms: float,
+    work_ms: float,
+) -> None:
+    """Keep lock-vs-work telemetry without logging prompts or image data."""
+
+    normalized_kind = str(kind or "unknown")[:24]
+    wait_value = max(0.0, float(wait_ms))
+    work_value = max(0.0, float(work_ms))
+    with _clip_runtime_timing_lock:
+        row = _clip_runtime_timing.setdefault(
+            normalized_kind,
+            {
+                "calls": 0.0,
+                "wait_ms_total": 0.0,
+                "work_ms_total": 0.0,
+                "wait_ms_max": 0.0,
+                "work_ms_max": 0.0,
+                "wait_ms_last": 0.0,
+                "work_ms_last": 0.0,
+            },
+        )
+        row["calls"] += 1.0
+        row["wait_ms_total"] += wait_value
+        row["work_ms_total"] += work_value
+        row["wait_ms_max"] = max(row["wait_ms_max"], wait_value)
+        row["work_ms_max"] = max(row["work_ms_max"], work_value)
+        row["wait_ms_last"] = wait_value
+        row["work_ms_last"] = work_value
+
+
+def _clip_runtime_timing_status() -> Dict[str, Dict[str, Any]]:
+    with _clip_runtime_timing_lock:
+        snapshot = copy.deepcopy(_clip_runtime_timing)
+    result: Dict[str, Dict[str, Any]] = {}
+    for kind, row in snapshot.items():
+        calls = max(0, int(row.get("calls") or 0))
+        result[kind] = {
+            "calls": calls,
+            "average_lock_wait_ms": round(
+                float(row.get("wait_ms_total") or 0.0) / calls,
+                3,
+            ) if calls else 0.0,
+            "average_work_ms": round(
+                float(row.get("work_ms_total") or 0.0) / calls,
+                3,
+            ) if calls else 0.0,
+            "last_lock_wait_ms": round(float(row.get("wait_ms_last") or 0.0), 3),
+            "last_work_ms": round(float(row.get("work_ms_last") or 0.0), 3),
+            "max_lock_wait_ms": round(float(row.get("wait_ms_max") or 0.0), 3),
+            "max_work_ms": round(float(row.get("work_ms_max") or 0.0), 3),
+        }
+    return result
+
+
+def _clip_image_batch_with_space_locked(
+    images: Sequence[Image.Image],
+) -> EmbeddingBatchOutput:
+    """Encode a microbatch while the caller owns ``_clip_init_lock``."""
+
+    ensure_embedder_loaded("clip")
+    if not images:
         return EmbeddingBatchOutput(
-            matrix,
+            np.zeros((0, 0), dtype=np.float32),
             _current_clip_embedding_space_locked(),
         )
+
+    normalized_images = [img.convert("RGB") for img in images]
+    with torch.no_grad():
+        if clip_backend_kind == "siglip2":
+            if clip_processor is None or clip_model is None:
+                raise RuntimeError("SigLIP2 clip backend is not initialized")
+            processor_inputs = cast(Any, clip_processor)(images=normalized_images, return_tensors="pt")
+            model_inputs = _processor_to_device(cast(Mapping[str, Any], processor_inputs), clip_runtime_device)
+            image_features = _siglip_feature_tensor(
+                cast(Any, clip_model).get_image_features(**model_inputs)
+            )
+        else:
+            if clip_preprocess is None or clip_model is None:
+                raise RuntimeError("CLIP backend is not initialized")
+            image_batch = torch.stack([clip_preprocess(img) for img in normalized_images], dim=0).to(clip_runtime_device)  # type: ignore[operator]
+            image_features = cast(Any, clip_model).encode_image(image_batch)
+        image_features = _normalize_l2_embeddings(cast(torch.Tensor, image_features))
+    matrix = image_features.cpu().numpy().astype(np.float32, copy=False)
+    return EmbeddingBatchOutput(
+        matrix,
+        _current_clip_embedding_space_locked(),
+    )
 
 
 def _clip_image_embeddings_from_pils(images: Sequence[Image.Image]) -> np.ndarray:
@@ -1960,32 +2038,42 @@ def _clip_text_embeddings(texts: Sequence[str]) -> np.ndarray:
     if not prepared:
         return np.zeros((0, 0), dtype=np.float32)
 
+    requested_at = time.perf_counter()
     with _clip_init_lock:
-        ensure_embedder_loaded("clip")
-        with torch.no_grad():
-            if clip_backend_kind == "siglip2":
-                if clip_processor is None or clip_model is None:
-                    raise RuntimeError("SigLIP2 clip backend is not initialized")
-                # This preprocessing is part of the persisted embedding contract.
-                normalized_texts = [text.lower() for text in prepared]
-                processor_inputs = cast(Any, clip_processor)(
-                    text=normalized_texts,
-                    padding="max_length",
-                    truncation=True,
-                    max_length=64,
-                    return_tensors="pt",
-                )
-                model_inputs = _processor_to_device(cast(Mapping[str, Any], processor_inputs), clip_runtime_device)
-                text_features = _siglip_feature_tensor(
-                    cast(Any, clip_model).get_text_features(**model_inputs)
-                )
-            else:
-                if clip_model is None:
-                    raise RuntimeError("CLIP backend is not initialized")
-                text_tokens = _get_clip_module().tokenize(prepared).to(clip_runtime_device)
-                text_features = cast(Any, clip_model).encode_text(text_tokens)
-            text_features = _normalize_l2_embeddings(cast(torch.Tensor, text_features))
-        return text_features.cpu().numpy().astype(np.float32, copy=False)
+        acquired_at = time.perf_counter()
+        try:
+            ensure_embedder_loaded("clip")
+            with torch.no_grad():
+                if clip_backend_kind == "siglip2":
+                    if clip_processor is None or clip_model is None:
+                        raise RuntimeError("SigLIP2 clip backend is not initialized")
+                    # This preprocessing is part of the persisted embedding contract.
+                    normalized_texts = [text.lower() for text in prepared]
+                    processor_inputs = cast(Any, clip_processor)(
+                        text=normalized_texts,
+                        padding="max_length",
+                        truncation=True,
+                        max_length=64,
+                        return_tensors="pt",
+                    )
+                    model_inputs = _processor_to_device(cast(Mapping[str, Any], processor_inputs), clip_runtime_device)
+                    text_features = _siglip_feature_tensor(
+                        cast(Any, clip_model).get_text_features(**model_inputs)
+                    )
+                else:
+                    if clip_model is None:
+                        raise RuntimeError("CLIP backend is not initialized")
+                    text_tokens = _get_clip_module().tokenize(prepared).to(clip_runtime_device)
+                    text_features = cast(Any, clip_model).encode_text(text_tokens)
+                text_features = _normalize_l2_embeddings(cast(torch.Tensor, text_features))
+            return text_features.cpu().numpy().astype(np.float32, copy=False)
+        finally:
+            finished_at = time.perf_counter()
+            _record_clip_runtime_timing(
+                "text",
+                wait_ms=(acquired_at - requested_at) * 1000.0,
+                work_ms=(finished_at - acquired_at) * 1000.0,
+            )
 
 
 def init_dino() -> None:
@@ -6978,6 +7066,7 @@ def _check_attention_ready() -> Dict[str, Any]:
         writer=writer_stats,
         semantic_snapshot_archive=semantic_status,
         clip_microbatcher=clip_batch_status,
+        clip_encoder_timing=_clip_runtime_timing_status(),
         realtime_probe_bookmarks=realtime_probe_bookmarks.status(),
         fast_vlm_alerts=fast_vlm_alerts.status(),
         capture_runtime=sorted(
@@ -16901,7 +16990,34 @@ def probes_status():
                             }
                         )
                     if live_history:
-                        result['live_signal'] = live_history[-1]
+                        live_signal = live_history[-1]
+                        signal_timestamp_ms = _to_int(
+                            live_signal.get('timestamp_ms'), 0
+                        )
+                        signal_age_ms = max(0, now_ms - signal_timestamp_ms)
+                        try:
+                            capture_interval_sec = float(
+                                session_status.get('interval_sec') or 0.0
+                            )
+                        except (TypeError, ValueError):
+                            capture_interval_sec = 0.0
+                        stale_after_ms = max(
+                            5_000,
+                            min(
+                                30_000,
+                                int(max(1.0, capture_interval_sec) * 3_000.0),
+                            ),
+                        )
+                        live_signal['age_ms'] = signal_age_ms
+                        live_signal['stale'] = signal_age_ms > stale_after_ms
+                        live_signal['frame_url'] = (
+                            f"/probes/signal_frame/{int(channel_id)}/"
+                            f"{signal_timestamp_ms}"
+                        )
+                        result['semantic_age_ms'] = signal_age_ms
+                        result['semantic_stale_after_ms'] = stale_after_ms
+                        result['semantic_stale'] = bool(live_signal['stale'])
+                        result['live_signal'] = live_signal
                         result['signal_history'] = live_history
             except Exception as exc:
                 semantic_error = f'{type(exc).__name__}: {exc}'[:500]
@@ -16911,6 +17027,8 @@ def probes_status():
         result['semantic_state'] = 'degraded'
     elif int(result.get('frames') or 0) <= 0:
         result['semantic_state'] = 'warming_up'
+    elif bool(result.get('semantic_stale')):
+        result['semantic_state'] = 'stale'
     else:
         result['semantic_state'] = 'ready'
     result['embedding_backend'] = (
@@ -16920,6 +17038,49 @@ def probes_status():
     result['embedding_revision'] = str(config.CLIP_MODEL_REVISION or '')
     response = jsonify(result)
     response.headers['Cache-Control'] = 'no-cache, no-store, must-revalidate'
+    return response
+
+
+@app.route(
+    '/probes/signal_frame/<int:channel_id>/<int:timestamp_ms>',
+    methods=['GET'],
+)
+def probes_signal_frame(channel_id: int, timestamp_ms: int):
+    """Serve the exact buffered JPEG used for one semantic P/N/M sample."""
+
+    context = _current_auth_context()
+    if (
+        _auth_enabled()
+        and context is not None
+        and not _can_access_context_channel(context, int(channel_id))
+    ):
+        return jsonify({'error': 'Access denied'}), 403
+    encoded = probe_manager.frame_thumbnail(channel_id, timestamp_ms)
+    if not encoded:
+        return jsonify(
+            {
+                'error': 'semantic_frame_unavailable',
+                'channel_id': int(channel_id),
+                'timestamp_ms': int(timestamp_ms),
+            }
+        ), 404
+    try:
+        image_bytes = base64.b64decode(
+            _strip_image_data_url_prefix(encoded),
+            validate=True,
+        )
+    except Exception:
+        return jsonify({'error': 'semantic_frame_invalid'}), 500
+    if not image_bytes:
+        return jsonify({'error': 'semantic_frame_invalid'}), 500
+    response = make_response(image_bytes)
+    response.headers['Content-Type'] = 'image/jpeg'
+    response.headers['Content-Length'] = str(len(image_bytes))
+    response.headers['Cache-Control'] = 'no-store, private, max-age=0'
+    response.headers['Pragma'] = 'no-cache'
+    response.headers['X-Content-Type-Options'] = 'nosniff'
+    response.headers['X-EVA-Frame-Timestamp-Ms'] = str(int(timestamp_ms))
+    response.headers['X-EVA-Media-Source'] = 'semantic_probe_buffer'
     return response
 
 
@@ -17807,7 +17968,7 @@ def probes_run():
 
 @app.route('/probes/bench', methods=['GET'])
 def probes_bench():
-    """Lightweight throughput estimate (image embedding)."""
+    """Measure encoder throughput separately from shared-runtime lock wait."""
     try:
         import torch  # type: ignore
         init_clip()
@@ -17817,6 +17978,17 @@ def probes_bench():
         }), 400
     batch = int(request.args.get('batch', PROBE_BENCH_BATCH))
     batch = max(4, min(64, batch))
+    requested_iterations = max(
+        1,
+        min(6, _to_int(request.args.get('iterations'), 3)),
+    )
+    # This endpoint shares the production encoder by design. Bound its work so
+    # a diagnostic click cannot turn into tens of seconds without live probe
+    # embeddings when the GPU is already contended.
+    benchmark_budget_ms = max(
+        1_000,
+        min(10_000, _to_int(request.args.get('budget_ms'), 5_000)),
+    )
     try:
         # Use a repeated random image batch so benchmark works across CLIP and SigLIP2 backends.
         target_size = 224
@@ -17830,19 +18002,93 @@ def probes_bench():
         rnd = np.random.randint(0, 256, (target_size, target_size, 3), dtype=np.uint8)
         probe_image = Image.fromarray(rnd, mode='RGB')
         images = [probe_image] * batch
-        started = time.time()
-        feats = _clip_image_embeddings_from_pils(images)
-        _ = feats.shape[0]
-        elapsed = time.time() - started
-        fps = batch / elapsed if elapsed > 0 else 0
+
+        def synchronize() -> None:
+            if str(clip_runtime_device or '').lower().startswith('cuda') and torch.cuda.is_available():
+                torch.cuda.synchronize(torch.device(clip_runtime_device))
+
+        # Warm-up is intentionally excluded. It makes first-use graph/kernel
+        # setup visible as warmup_ms instead of randomly depressing the only
+        # sample returned to the operator.
+        warmup_requested_at = time.perf_counter()
+        with _clip_init_lock:
+            warmup_acquired_at = time.perf_counter()
+            synchronize()
+            warmup_compute_started = time.perf_counter()
+            warmup_output = _clip_image_batch_with_space_locked(images[: min(4, batch)])
+            synchronize()
+            warmup_compute_finished = time.perf_counter()
+        _ = warmup_output.embeddings.shape[0]
+        warmup_lock_wait_ms = max(
+            0.0,
+            (warmup_acquired_at - warmup_requested_at) * 1000.0,
+        )
+        warmup_compute_ms = max(
+            0.0,
+            (warmup_compute_finished - warmup_compute_started) * 1000.0,
+        )
+
+        samples: List[Dict[str, float]] = []
+        benchmark_started = time.perf_counter()
+        for _iteration in range(requested_iterations):
+            requested_at = time.perf_counter()
+            with _clip_init_lock:
+                acquired_at = time.perf_counter()
+                synchronize()
+                compute_started = time.perf_counter()
+                output = _clip_image_batch_with_space_locked(images)
+                synchronize()
+                compute_finished = time.perf_counter()
+            _ = output.embeddings.shape[0]
+            samples.append(
+                {
+                    'lock_wait_ms': max(0.0, (acquired_at - requested_at) * 1000.0),
+                    'compute_ms': max(0.0, (compute_finished - compute_started) * 1000.0),
+                    'total_ms': max(0.0, (compute_finished - requested_at) * 1000.0),
+                }
+            )
+            if (time.perf_counter() - benchmark_started) * 1000.0 >= benchmark_budget_ms:
+                break
+
+        iterations = len(samples)
+        compute_ms = sum(sample['compute_ms'] for sample in samples)
+        wait_ms = sum(sample['lock_wait_ms'] for sample in samples)
+        total_ms = sum(sample['total_ms'] for sample in samples)
+        image_count = batch * iterations
+        encoder_fps = image_count / (compute_ms / 1000.0) if compute_ms > 0 else 0.0
+        effective_fps = image_count / (total_ms / 1000.0) if total_ms > 0 else 0.0
+        device_name = ''
+        if str(clip_runtime_device or '').lower().startswith('cuda') and torch.cuda.is_available():
+            device_name = str(torch.cuda.get_device_name(torch.device(clip_runtime_device)))
         return jsonify({
             "batch": batch,
-            "elapsed_sec": round(elapsed, 3),
-            "approx_fps": round(fps, 1),
+            "iterations": iterations,
+            "requested_iterations": requested_iterations,
+            "truncated": iterations < requested_iterations,
+            "budget_ms": benchmark_budget_ms,
+            "elapsed_sec": round(total_ms / 1000.0, 3),
+            # Backward-compatible field: it now means actual encoder work and
+            # no longer silently includes time spent waiting for another task.
+            "approx_fps": round(encoder_fps, 1),
+            "encoder_fps": round(encoder_fps, 1),
+            "effective_fps": round(effective_fps, 1),
+            "average_compute_ms": round(compute_ms / iterations, 3),
+            "average_lock_wait_ms": round(wait_ms / iterations, 3),
+            "max_lock_wait_ms": round(max(sample['lock_wait_ms'] for sample in samples), 3),
+            "warmup_ms": round(warmup_lock_wait_ms + warmup_compute_ms, 3),
+            "warmup_compute_ms": round(warmup_compute_ms, 3),
+            "warmup_lock_wait_ms": round(warmup_lock_wait_ms, 3),
+            "samples": [
+                {key: round(value, 3) for key, value in sample.items()}
+                for sample in samples
+            ],
             "device": clip_runtime_device,
+            "device_name": device_name,
+            "cuda_visible_devices": str(os.getenv('CUDA_VISIBLE_DEVICES') or ''),
             "backend": clip_backend_kind,
             "model": clip_runtime_model or config.CLIP_MODEL,
             "resolution": target_size,
+            "live_encoder_timing": _clip_runtime_timing_status(),
         })
     except Exception as exc:
         app.logger.exception(

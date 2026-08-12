@@ -12,6 +12,7 @@ import {
   type ChannelStatus,
   type Probe,
   type ProbeInput,
+  type ProbeLiveSignal,
   type ProbeThresholdDefaults,
   type RoiNorm,
 } from '../../api/probes'
@@ -109,6 +110,8 @@ export function ProbeSettingsModal({ probe, channels, busy, canControlCapture, c
   const [previewSrc, setPreviewSrc] = useState('')
   const [pvErr, setPvErr] = useState(true)
   const [st, setSt] = useState<ChannelStatus>({ channel_id: d.channel_id ?? 0 })
+  const [displayedSignal, setDisplayedSignal] = useState<ProbeLiveSignal | null>(null)
+  const [signalFrameError, setSignalFrameError] = useState(false)
   const [applyMessage, setApplyMessage] = useState<string | null>(null)
   const previewBlobUrlRef = useRef<string | null>(null)
   useEffect(() => {
@@ -116,7 +119,10 @@ export function ProbeSettingsModal({ probe, channels, busy, canControlCapture, c
     let requestNumber = 0
     let lastGoodAtMs = 0
     let previewTimer: number | null = null
-    let activeController: AbortController | null = null
+    let signalTimer: number | null = null
+    let previewController: AbortController | null = null
+    let signalFrameController: AbortController | null = null
+    let displayedTimestampMs = 0
     const revokeTimers = new Map<number, string>()
     const previousBlobUrl = previewBlobUrlRef.current
     previewBlobUrlRef.current = null
@@ -124,6 +130,8 @@ export function ProbeSettingsModal({ probe, channels, busy, canControlCapture, c
     setPreviewSrc('')
     setPvErr(true)
     setSt({ channel_id: d.channel_id ?? 0 })
+    setDisplayedSignal(null)
+    setSignalFrameError(false)
 
     const schedulePreview = (delayMs: number) => {
       if (previewTimer != null) window.clearTimeout(previewTimer)
@@ -140,9 +148,12 @@ export function ProbeSettingsModal({ probe, channels, busy, canControlCapture, c
       revokeTimers.set(timer, url)
     }
     async function loadPreview() {
-      if (disposed || d.channel_id == null) return
+      // Before a probe exists there is no score-correlated frame yet. A plain
+      // source preview is still useful for drawing ROI; saved probes use only
+      // the exact semantic frame loaded by pollSignal().
+      if (disposed || d.channel_id == null || d.id) return
       const controller = new AbortController()
-      activeController = controller
+      previewController = controller
       const watchdog = window.setTimeout(() => controller.abort(), 12_000)
       try {
         const response = await fetch(
@@ -172,20 +183,85 @@ export function ProbeSettingsModal({ probe, channels, busy, canControlCapture, c
         schedulePreview(2_000)
       } finally {
         window.clearTimeout(watchdog)
-        if (activeController === controller) activeController = null
+        if (previewController === controller) previewController = null
       }
     }
-    const poll = () => {
-      if (d.channel_id != null) probesApi.status(d.channel_id, d.id).then(setSt).catch(() => {})
+
+    async function loadSignalFrame(signal: ProbeLiveSignal): Promise<boolean> {
+      const timestampMs = Number(signal.timestamp_ms)
+      if (!d.id || !Number.isFinite(timestampMs) || timestampMs <= 0) return false
+      if (timestampMs === displayedTimestampMs && previewBlobUrlRef.current) {
+        setDisplayedSignal(signal)
+        setSignalFrameError(false)
+        return true
+      }
+      const controller = new AbortController()
+      signalFrameController = controller
+      const watchdog = window.setTimeout(() => controller.abort(), 12_000)
+      try {
+        const frameUrl = signal.frame_url
+          || `/probes/signal_frame/${d.channel_id}/${timestampMs}`
+        const response = await fetch(frameUrl, {
+          credentials: 'include',
+          cache: 'no-store',
+          signal: controller.signal,
+        })
+        const contentType = String(response.headers.get('content-type') || '').toLowerCase()
+        if (!response.ok || !contentType.startsWith('image/')) return false
+        const blob = await response.blob()
+        if (disposed) return false
+        const nextBlobUrl = URL.createObjectURL(blob)
+        const oldBlobUrl = previewBlobUrlRef.current
+        previewBlobUrlRef.current = nextBlobUrl
+        displayedTimestampMs = timestampMs
+        // React batches these updates: the operator never sees new P/N/M on
+        // the previous image or a new image carrying the previous score.
+        setPreviewSrc(nextBlobUrl)
+        setDisplayedSignal(signal)
+        setPvErr(false)
+        setSignalFrameError(false)
+        if (oldBlobUrl) retireBlobUrl(oldBlobUrl)
+        return true
+      } finally {
+        window.clearTimeout(watchdog)
+        if (signalFrameController === controller) signalFrameController = null
+      }
     }
-    poll()
-    void loadPreview()
-    const signals = window.setInterval(poll, 1200)
+
+    const scheduleSignal = (delayMs: number) => {
+      if (signalTimer != null) window.clearTimeout(signalTimer)
+      signalTimer = window.setTimeout(pollSignal, delayMs)
+    }
+    async function pollSignal() {
+      if (disposed || d.channel_id == null) return
+      try {
+        const nextStatus = await probesApi.status(d.channel_id, d.id)
+        if (disposed) return
+        setSt(nextStatus)
+        if (d.id && nextStatus.live_signal) {
+          const paired = await loadSignalFrame(nextStatus.live_signal)
+          if (!disposed && !paired) {
+            setSignalFrameError(true)
+            if (!displayedTimestampMs) setPvErr(true)
+          }
+        }
+      } catch {
+        // Keep the last complete image+score pair during a transient control
+        // plane stall. The age badge makes that retained evidence explicit.
+        if (!disposed) setSignalFrameError(true)
+      } finally {
+        if (!disposed) scheduleSignal(800)
+      }
+    }
+
+    void pollSignal()
+    if (!d.id) void loadPreview()
     return () => {
       disposed = true
       if (previewTimer != null) window.clearTimeout(previewTimer)
-      activeController?.abort()
-      window.clearInterval(signals)
+      if (signalTimer != null) window.clearTimeout(signalTimer)
+      previewController?.abort()
+      signalFrameController?.abort()
       for (const [timer, url] of revokeTimers) {
         window.clearTimeout(timer)
         URL.revokeObjectURL(url)
@@ -294,10 +370,15 @@ export function ProbeSettingsModal({ probe, channels, busy, canControlCapture, c
   const rangeDurationMs = probeRangeDurationMs(st)
   const rangeLabel = rangeDurationMs != null ? `${Math.round(rangeDurationMs / 1000)}s` : 'N/A'
   const lastLabel = st.last_timestamp_ms ? new Date(st.last_timestamp_ms).toLocaleTimeString() : 'n/a'
-  const signal = st.live_signal
+  // Only expose scores whose exact frame has finished loading. `st.live_signal`
+  // may already point at the next sample while its JPEG is still in flight.
+  const signal = displayedSignal
   const signalTime = signal?.timestamp_ms
     ? new Date(Number(signal.timestamp_ms)).toLocaleTimeString()
     : null
+  const signalAgeSec = signal?.age_ms == null
+    ? null
+    : Math.max(0, Number(signal.age_ms) / 1000)
 
   async function applyProbe() {
     setApplyMessage(null)
@@ -331,6 +412,12 @@ export function ProbeSettingsModal({ probe, channels, busy, canControlCapture, c
             onMouseDown={roiDown} onMouseMove={roiMove} onMouseUp={roiUp} onMouseLeave={roiUp}>
             {previewSrc && <img src={previewSrc} alt="stream preview" draggable={false} onError={() => setPvErr(true)} />}
             {pvErr && <div className="vid-overlay"><IconVideoOff size={18} /> PREVIEW UNAVAILABLE</div>}
+            {signal && !pvErr && (
+              <div className={`probe-frame-stamp ${signal.stale ? 'stale' : ''}`}>
+                Scored frame · {signalTime || 'now'}
+                {signalAgeSec != null ? ` · ${signalAgeSec.toFixed(signalAgeSec < 10 ? 1 : 0)}s old` : ''}
+              </div>
+            )}
             {d.roiOn && d.roi && (
               <div className="probe-roi-rect" style={{ left: pct(d.roi.x), top: pct(d.roi.y), width: pct(d.roi.w), height: pct(d.roi.h) }} />
             )}
@@ -390,12 +477,14 @@ export function ProbeSettingsModal({ probe, channels, busy, canControlCapture, c
           </div>
           </div>{/* /probe-detect-card */}
 
-          <div className={`probe-live-signal ${st.semantic_state || 'warming_up'}`}>
+          <div className={`probe-live-signal ${signal?.stale ? 'stale' : (st.semantic_state || 'warming_up')}`}>
             <div className="probe-live-head">
               <div>
                 <span>Live semantic signal</span>
                 <b>{st.semantic_state === 'degraded'
                   ? 'Scorer unavailable'
+                  : signal?.stale
+                    ? `stale · ${signalTime || 'unknown sample time'}`
                   : signal
                     ? `${String(signal.threshold_state || 'sample').replace(/_/g, ' ')} · ${signalTime || 'now'}`
                     : d.id
@@ -413,10 +502,13 @@ export function ProbeSettingsModal({ probe, channels, busy, canControlCapture, c
                 <div><span>M</span><b>{signal?.margin == null ? '—' : Number(signal.margin).toFixed(3)}</b><em>floor {d.margin.toFixed(3)}</em></div>
               </div>
             )}
+            {!st.semantic_error && signalFrameError && (
+              <div className="probe-live-warning"><IconAlertTriangle size={15} /> Waiting for the next complete scored frame. The last matched image and values are retained.</div>
+            )}
             {!st.semantic_error && st.embedding_calibration_state && st.embedding_calibration_state !== 'calibrated' && (
               <div className="probe-live-error"><IconAlertTriangle size={15} /> Legacy thresholds are in shadow mode. Apply after reviewing the live SigLIP2 scores to reactivate alerts/bookmarks.</div>
             )}
-            <div className="probe-live-note">Raw pre-threshold scores update from saved one-second embeddings; a hit or bookmark is raised only after the configured gates pass.</div>
+            <div className="probe-live-note">P/N/M belongs to the scored frame shown at left. A hit or bookmark is raised only after the configured gates pass.</div>
           </div>
 
           {advOpen && (
