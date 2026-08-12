@@ -144,6 +144,65 @@ def test_follow_uses_explicit_optimistic_revision():
     assert "Craft crossing the port gate" in runtime.start_context
 
 
+def test_explicit_follow_promotes_nested_incident_to_review_board():
+    store = _Store()
+    store.record.update(
+        {
+            "state": "candidate",
+            "case_state": "candidate",
+            "attention_state": "inactive",
+            "report": {
+                "presentation": {
+                    "scope": "nested",
+                    "parent_incident_id": "00000000-0000-0000-0000-000000000999",
+                }
+            },
+        }
+    )
+
+    updated, _lease = _service(store, _Runtime()).follow(
+        INCIDENT_ID,
+        actor_id="operator-1",
+        mode="follow",
+        ttl_seconds=120,
+        expected_revision=1,
+    )
+
+    presentation = updated["report"]["presentation"]
+    assert presentation["scope"] == "top_level"
+    assert presentation["promoted_by_action"] == "follow"
+    assert presentation["parent_incident_id"].endswith("0999")
+
+
+def test_operator_confirmation_promotes_nested_incident_to_review_board():
+    store = _Store()
+    store.record.update(
+        {
+            "state": "candidate",
+            "case_state": "candidate",
+            "attention_state": "inactive",
+            "report": {
+                "presentation": {
+                    "scope": "nested",
+                    "parent_incident_id": "00000000-0000-0000-0000-000000000999",
+                }
+            },
+        }
+    )
+
+    updated = _service(store, _Runtime()).review_incident(
+        INCIDENT_ID,
+        actor_id="operator-1",
+        action="confirm",
+        expected_revision=1,
+    )
+
+    presentation = updated["report"]["presentation"]
+    assert presentation["scope"] == "top_level"
+    assert presentation["promoted_by_action"] == "confirm"
+    assert updated["case_state"] == "open"
+
+
 def test_operator_confirm_opens_case_without_inventing_risk_or_perception():
     store = _Store()
     store.record.update(
@@ -724,6 +783,8 @@ def test_l2_composition_replay_attaches_context_only_to_grounded_safety_case():
             self.records = list(records)
             self.episodes = {}
             self.observations = {}
+            self.created = {}
+            self.relations = {}
             self.list_calls = []
 
         def list_incidents(self, **kwargs):
@@ -738,11 +799,31 @@ def test_l2_composition_replay_attaches_context_only_to_grounded_safety_case():
             self.observations.setdefault(record["idempotency_key"], dict(record))
             return dict(self.observations[record["idempotency_key"]])
 
-        def list_episodes(self, *_args, **_kwargs):
-            return [dict(item) for item in self.episodes.values()], len(self.episodes)
+        def create_incident(self, record, **_kwargs):
+            self.created.setdefault(record["idempotency_key"], dict(record))
+            return dict(self.created[record["idempotency_key"]])
 
-        def list_relations(self, *_args, **_kwargs):
-            return [], 0
+        def append_relation(self, record, **_kwargs):
+            stored = {"id": f"relation-{len(self.relations) + 1}", **dict(record)}
+            self.relations.setdefault(record["idempotency_key"], stored)
+            return dict(self.relations[record["idempotency_key"]])
+
+        def list_episodes(self, incident_id, **_kwargs):
+            rows = [
+                dict(item)
+                for item in self.episodes.values()
+                if item["incident_id"] == incident_id
+            ]
+            return rows, len(rows)
+
+        def list_relations(self, incident_id, **_kwargs):
+            rows = [
+                dict(item)
+                for item in self.relations.values()
+                if incident_id
+                in {item["subject_incident_id"], item["object_incident_id"]}
+            ]
+            return rows, len(rows)
 
     rollup = {
         "rollup_id": "l2-ch112-w3600-0",
@@ -795,7 +876,7 @@ def test_l2_composition_replay_attaches_context_only_to_grounded_safety_case():
 
     assert first["attached"] == 1
     assert replay["attached"] == 1
-    assert len(store.episodes) == 2
+    assert len(store.episodes) == 3
     parent = next(
         item
         for item in store.episodes.values()
@@ -805,6 +886,7 @@ def test_l2_composition_replay_attaches_context_only_to_grounded_safety_case():
         item
         for item in store.episodes.values()
         if item["semantic_key"] == "person phone_call"
+        and item["incident_id"] == INCIDENT_ID
     )
     assert parent["incident_id"] == INCIDENT_ID
     assert parent["coverage"]["composition_parent"] is True
@@ -817,7 +899,26 @@ def test_l2_composition_replay_attaches_context_only_to_grounded_safety_case():
     assert temporal["episodes"][0]["nested_context"] is False
     assert temporal["episodes"][1]["nested_context"] is True
     assert temporal["episodes"][1]["automatic_merge"] is False
-    assert len(store.observations) == 1
+    assert first["child_incidents"] == 1
+    assert first["child_episodes"] == 1
+    assert first["child_relations"] == 1
+    assert len(store.created) == 1
+    child = next(iter(store.created.values()))
+    assert child["report"]["presentation"]["scope"] == "nested"
+    assert child["report"]["presentation"]["parent_incident_id"] == INCIDENT_ID
+    assert child["case_state"] == "candidate"
+    assert len(store.relations) == 1
+    relation = next(iter(store.relations.values()))
+    assert relation["relation_type"] == "concurrent_with"
+    assert relation["relation_state"] == "candidate"
+    assert relation["payload"]["automatic_merge"] is False
+    assert len(store.observations) == 2
+    assert temporal["nested_incidents"][0]["direction"] == "child"
+    assert temporal["nested_incidents"][0]["related_incident_id"] == child["id"]
+    child_temporal = service.temporal_context(child)
+    assert child_temporal["nested_incidents"][0]["direction"] == "parent"
+    assert child_temporal["nested_incidents"][0]["related_incident_id"] == INCIDENT_ID
+    assert child_temporal["nested_incidents"][0]["title"] == safety["title"]
     assert store.list_calls[0]["case_states"] == ["candidate", "open"]
 
 

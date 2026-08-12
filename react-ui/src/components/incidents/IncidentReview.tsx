@@ -398,6 +398,7 @@ export function IncidentReview({
           canExport={canExport}
           canManage={canManage}
           onChanged={() => void load(true)}
+          onNavigate={setSelectedId}
           onClose={() => setSelectedId(null)}
         />
       )}

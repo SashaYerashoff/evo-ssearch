@@ -503,6 +503,7 @@ class IncidentCommandService:
                 "episodes": [],
                 "episode_total": 0,
                 "series_links": [],
+                "nested_incidents": [],
                 "relation_total": 0,
                 "correction_count": 0,
                 "lifecycle_history": [],
@@ -627,6 +628,65 @@ class IncidentCommandService:
                 str(item.get("related_incident_id") or ""),
             )
         )
+        nested_incidents: list[dict[str, Any]] = []
+        for raw in raw_relations:
+            if not isinstance(raw, Mapping):
+                continue
+            relation_state = str(raw.get("relation_state") or "")
+            payload = (
+                dict(raw.get("payload") or {})
+                if isinstance(raw.get("payload"), Mapping)
+                else {}
+            )
+            if (
+                str(raw.get("relation_type") or "") != "concurrent_with"
+                or relation_state not in {"candidate", "confirmed"}
+                or str(payload.get("relationship_role") or "")
+                != "nested_context"
+            ):
+                continue
+            parent_id = str(payload.get("parent_incident_id") or "")
+            child_id = str(payload.get("child_incident_id") or "")
+            if not parent_id or not child_id or incident_id not in {parent_id, child_id}:
+                continue
+            direction = "child" if incident_id == parent_id else "parent"
+            related_id = child_id if direction == "child" else parent_id
+            nested_incidents.append(
+                {
+                    "relation_id": str(raw.get("id") or ""),
+                    "relation_state": relation_state,
+                    "confidence": str(raw.get("confidence") or "unknown"),
+                    "related_incident_id": related_id,
+                    "direction": direction,
+                    "title": (
+                        str(payload.get("child_title") or "Nested incident")[:200]
+                        if direction == "child"
+                        else str(payload.get("parent_title") or "Parent incident")[:200]
+                    ),
+                    "semantic_key": str(payload.get("semantic_key") or "")[:160],
+                    "possible_start_ms": self._optional_int(
+                        payload.get("possible_start_ms")
+                    ),
+                    "possible_end_ms": self._optional_int(
+                        payload.get("possible_end_ms")
+                    ),
+                    "scale_disposition": str(
+                        payload.get("scale_disposition") or "unclassified_keep"
+                    ),
+                    "presentation_scope": "nested",
+                    "automatic_merge": False,
+                    "operator_review_required": (
+                        payload.get("operator_review_required") is not False
+                    ),
+                    "rationale": str(raw.get("rationale") or "")[:500],
+                }
+            )
+        nested_incidents.sort(
+            key=lambda item: (
+                self._optional_int(item.get("possible_start_ms")) or 0,
+                str(item.get("related_incident_id") or ""),
+            )
+        )
         lifecycle_history = [
             {
                 "id": str(item.get("id") or ""),
@@ -646,6 +706,7 @@ class IncidentCommandService:
             "episodes": episodes,
             "episode_total": int(episode_total),
             "series_links": series_links,
+            "nested_incidents": nested_incidents,
             "relation_total": int(relation_total),
             "correction_count": len(superseded_relation_ids),
             "lifecycle_history": lifecycle_history,
@@ -934,6 +995,9 @@ class IncidentCommandService:
                 "compositions": 0,
                 "attached": 0,
                 "episodes": 0,
+                "child_incidents": 0,
+                "child_episodes": 0,
+                "child_relations": 0,
                 "skipped": "not_l2",
             }
         compositions = [
@@ -953,17 +1017,25 @@ class IncidentCommandService:
                 "compositions": len(compositions),
                 "attached": 0,
                 "episodes": 0,
+                "child_incidents": 0,
+                "child_episodes": 0,
+                "child_relations": 0,
                 "skipped": "no_compositions" if not compositions else "no_episode_ledger",
             }
         lister = getattr(self.incident_store, "list_incidents", None)
         episode_appender = getattr(self.incident_store, "append_episode", None)
         observation_appender = getattr(self.incident_store, "append_observation", None)
+        incident_creator = getattr(self.incident_store, "create_incident", None)
+        relation_appender = getattr(self.incident_store, "append_relation", None)
         if not all(callable(item) for item in (lister, episode_appender, observation_appender)):
             return {
                 "supported": False,
                 "compositions": len(compositions),
                 "attached": 0,
                 "episodes": 0,
+                "child_incidents": 0,
+                "child_episodes": 0,
+                "child_relations": 0,
             }
 
         starts = [self._optional_int(item.get("start_ms")) for item in compositions]
@@ -976,6 +1048,9 @@ class IncidentCommandService:
                 "compositions": len(compositions),
                 "attached": 0,
                 "episodes": 0,
+                "child_incidents": 0,
+                "child_episodes": 0,
+                "child_relations": 0,
                 "skipped": "missing_bounds",
             }
         context_pad_ms = 5 * 60 * 1000
@@ -1031,6 +1106,9 @@ class IncidentCommandService:
         ]
         attached = 0
         episode_count = 0
+        child_incident_count = 0
+        child_episode_count = 0
+        child_relation_count = 0
         skipped = 0
         failures: list[str] = []
         parent_incident_ids: list[str] = []
@@ -1125,6 +1203,8 @@ class IncidentCommandService:
                             "episode_key": f"l2:{episode_digest}",
                             "perception_state": "ended" if is_ended else "observed",
                             "semantic_key": str(episode.get("semantic_key") or "")[:160] or None,
+                            "entity_key": str(episode.get("entity_key") or "")[:160] or None,
+                            "zone_key": str(episode.get("zone_key") or "")[:160] or None,
                             "possible_start_ms": start_ms,
                             "observed_start_ms": start_ms,
                             "observed_end_ms": end_ms if is_ended else None,
@@ -1149,6 +1229,205 @@ class IncidentCommandService:
                         actor_id=actor_id,
                     )
                     episode_count += 1
+                    if (
+                        nested_context
+                        and callable(incident_creator)
+                        and callable(relation_appender)
+                    ):
+                        semantic_key = str(
+                            episode.get("semantic_key") or "nested incident"
+                        ).strip()[:160]
+                        child_title = (
+                            semantic_key.replace("_", " ").strip().capitalize()
+                            or "Nested incident"
+                        )[:200]
+                        child_id = str(
+                            uuid.uuid5(
+                                uuid.NAMESPACE_URL,
+                                (
+                                    "eva:l2-nested-incident:"
+                                    f"{parent_id}:{composition_id}:{episode_id}"
+                                ),
+                            )
+                        )
+                        child_identity = f"l2-child:{episode_digest}"[:200]
+                        child_report = {
+                            "severity": str(episode.get("severity") or "info")[:32],
+                            "summary": child_title,
+                            "source": "rollup_l2_nested_episode",
+                            "priority": "context",
+                            "automatic_merge": False,
+                            "presentation": {
+                                "scope": "nested",
+                                "parent_incident_id": parent_id,
+                                "composition_id": composition_id,
+                                "relationship": "concurrent_context",
+                            },
+                        }
+                        child = incident_creator(
+                            {
+                                "id": child_id,
+                                "state": "ended" if is_ended else "candidate",
+                                "perception_state": (
+                                    "ended" if is_ended else "observed"
+                                ),
+                                "risk_state": "unknown",
+                                "case_state": "candidate",
+                                "attention_state": "inactive",
+                                "identity_key": child_identity,
+                                "idempotency_key": child_identity,
+                                "title": child_title,
+                                "channel_ids": [normalized_channel],
+                                "possible_start_ms": start_ms,
+                                "observed_start_ms": start_ms,
+                                "observed_end_ms": end_ms,
+                                "possible_end_ms": end_ms if is_ended else None,
+                                "anchor_ref": {
+                                    "rollup_id": rollup_id,
+                                    "composition_id": composition_id,
+                                    "episode_id": episode_id,
+                                },
+                                "timeline_refs": [
+                                    {
+                                        "timestamp_ms": start_ms,
+                                        "start_ms": start_ms,
+                                        "end_ms": end_ms,
+                                        "semantic_key": semantic_key,
+                                        "label": child_title,
+                                        "source": "rollup_l2_composition",
+                                    }
+                                ],
+                                "evidence_refs": evidence_refs,
+                                "qualia_refs": [],
+                                "coverage": {
+                                    "status": "covered",
+                                    "source_level": "L2",
+                                    "rollup_id": rollup_id,
+                                    "composition_id": composition_id,
+                                    "scale_disposition": str(
+                                        episode.get("scale_disposition")
+                                        or "unclassified_keep"
+                                    ),
+                                },
+                                "uncertainties": [
+                                    "Nested L2 context remains separate and requires operator review."
+                                ],
+                                "report": child_report,
+                                "follow_policy": {},
+                            },
+                            actor_id=actor_id,
+                        )
+                        child_id = str(child.get("id") or child_id)
+                        child_incident_count += 1
+                        episode_appender(
+                            {
+                                "incident_id": child_id,
+                                "idempotency_key": (
+                                    f"l2-child-episode:{episode_digest}"
+                                ),
+                                "episode_key": f"l2-child:{episode_digest}",
+                                "perception_state": (
+                                    "ended" if is_ended else "observed"
+                                ),
+                                "semantic_key": semantic_key or None,
+                                "entity_key": str(
+                                    episode.get("entity_key") or ""
+                                )[:160]
+                                or None,
+                                "zone_key": str(episode.get("zone_key") or "")[:160]
+                                or None,
+                                "possible_start_ms": start_ms,
+                                "observed_start_ms": start_ms,
+                                "observed_end_ms": end_ms if is_ended else None,
+                                "possible_end_ms": end_ms if is_ended else None,
+                                "routine_before_ref": {},
+                                "routine_after_ref": {},
+                                "evidence_refs": evidence_refs,
+                                "coverage": {
+                                    "source_level": "L2",
+                                    "rollup_id": rollup_id,
+                                    "composition_id": composition_id,
+                                    "parent_incident_id": parent_id,
+                                    "scale_disposition": str(
+                                        episode.get("scale_disposition")
+                                        or "unclassified_keep"
+                                    ),
+                                    "composition_child": True,
+                                    "nested_context": False,
+                                    "automatic_merge": False,
+                                    "operator_review_required": True,
+                                },
+                            },
+                            actor_id=actor_id,
+                        )
+                        child_episode_count += 1
+                        observation_appender(
+                            {
+                                "incident_id": child_id,
+                                "idempotency_key": (
+                                    f"rollup-nested:{episode_digest}"
+                                )[:200],
+                                "source_kind": "rollup_l2_nested_incident",
+                                "observed_at_ms": end_ms,
+                                "channel_id": normalized_channel,
+                                "perception_state": (
+                                    "ended" if is_ended else "observed"
+                                ),
+                                "source_ref": {
+                                    "rollup_id": rollup_id,
+                                    "composition_id": composition_id,
+                                    "episode_id": episode_id,
+                                },
+                                "payload": {
+                                    "parent_incident_id": parent_id,
+                                    "semantic_key": semantic_key,
+                                    "presentation_scope": "nested",
+                                    "automatic_merge": False,
+                                    "operator_review_required": True,
+                                },
+                            },
+                            actor_id=actor_id,
+                        )
+                        relation_appender(
+                            {
+                                "subject_incident_id": child_id,
+                                "object_incident_id": parent_id,
+                                "idempotency_key": (
+                                    f"nested-context:{episode_digest}"
+                                )[:200],
+                                "relation_type": "concurrent_with",
+                                "relation_state": "candidate",
+                                "confidence": "medium",
+                                "rationale": (
+                                    "A bounded L2 episode overlaps the grounded "
+                                    "parent incident; concurrency does not imply "
+                                    "causality or automatic merge."
+                                ),
+                                "payload": {
+                                    "relationship_role": "nested_context",
+                                    "parent_incident_id": parent_id,
+                                    "child_incident_id": child_id,
+                                    "child_title": child_title,
+                                    "parent_title": str(
+                                        parent.get("title") or "Parent incident"
+                                    )[:200],
+                                    "semantic_key": semantic_key,
+                                    "possible_start_ms": start_ms,
+                                    "possible_end_ms": (
+                                        end_ms if is_ended else None
+                                    ),
+                                    "scale_disposition": str(
+                                        episode.get("scale_disposition")
+                                        or "unclassified_keep"
+                                    ),
+                                    "composition_id": composition_id,
+                                    "automatic_merge": False,
+                                    "operator_review_required": True,
+                                },
+                            },
+                            actor_id=actor_id,
+                        )
+                        child_relation_count += 1
                 observation_appender(
                     {
                         "incident_id": parent_id,
@@ -1182,6 +1461,9 @@ class IncidentCommandService:
             "compositions": len(compositions),
             "attached": attached,
             "episodes": episode_count,
+            "child_incidents": child_incident_count,
+            "child_episodes": child_episode_count,
+            "child_relations": child_relation_count,
             "skipped": skipped,
             "parent_incident_ids": list(dict.fromkeys(parent_incident_ids))[:32],
             "failures": failures[:8],
@@ -1571,6 +1853,40 @@ class IncidentCommandService:
                 default=str,
             )
 
+    @staticmethod
+    def _promoted_nested_report(
+        incident: Mapping[str, Any],
+        *,
+        action: str,
+        promoted_at_ms: int,
+    ) -> dict[str, Any] | None:
+        """Promote a nested-only incident after explicit operator attention."""
+
+        report = (
+            dict(incident.get("report") or {})
+            if isinstance(incident.get("report"), Mapping)
+            else {}
+        )
+        presentation = (
+            dict(report.get("presentation") or {})
+            if isinstance(report.get("presentation"), Mapping)
+            else {}
+        )
+        if (
+            str(presentation.get("scope") or "") != "nested"
+            or not str(presentation.get("parent_incident_id") or "").strip()
+        ):
+            return None
+        presentation.update(
+            {
+                "scope": "top_level",
+                "promoted_at_ms": int(promoted_at_ms),
+                "promoted_by_action": str(action or "operator"),
+            }
+        )
+        report["presentation"] = presentation
+        return report
+
     def follow(
         self,
         incident_id: str,
@@ -1622,15 +1938,23 @@ class IncidentCommandService:
             )
         try:
             focus_payload = self._active_focus_payload(lease, ttl, incident)
+            changes: dict[str, Any] = {
+                "state": "following",
+                "case_state": "open",
+                "attention_state": normalized_mode,
+                "follow_policy": focus_payload,
+            }
+            promoted_report = self._promoted_nested_report(
+                incident,
+                action="follow",
+                promoted_at_ms=int(focus_payload["started_at_ms"]),
+            )
+            if promoted_report is not None:
+                changes["report"] = promoted_report
             updated = self.incident_store.update_incident(
                 incident_id,
                 expected_revision=revision,
-                changes={
-                    "state": "following",
-                    "case_state": "open",
-                    "attention_state": normalized_mode,
-                    "follow_policy": focus_payload,
-                },
+                changes=changes,
                 actor_id=actor_id,
                 transition={
                     "transitioned_at_ms": int(focus_payload["started_at_ms"]),
@@ -1800,6 +2124,14 @@ class IncidentCommandService:
             else {}
         )
         reviewed_at_ms = self._wall_clock_ms()
+        if normalized_action in {"confirm", "reopen"}:
+            promoted_report = self._promoted_nested_report(
+                incident,
+                action=normalized_action,
+                promoted_at_ms=reviewed_at_ms,
+            )
+            if promoted_report is not None:
+                report = promoted_report
         report["last_operator_review"] = {
             "action": normalized_action,
             "reviewed_at_ms": reviewed_at_ms,

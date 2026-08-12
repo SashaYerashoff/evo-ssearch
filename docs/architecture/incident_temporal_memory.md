@@ -58,21 +58,30 @@ first production slice of the third gate is also implemented at L2:
 - a safety root may retain cross-entity scene context, while an operator-rule
   root is limited to the same primary entity so a specific `cat enter` rule
   cannot absorb nearby person gestures or exits;
-- the composition can append replay-safe nested episodes only to the already
-  existing grounded parent incident; it cannot create a parent from ordinary
-  context, merge incident IDs, close a case, or change risk state;
+- the composition appends replay-safe nested episodes to the already existing
+  grounded parent and may materialize each nested track as its own deterministic
+  incident ID; it still cannot create a parent from ordinary context, merge
+  incident IDs, close a case, or change risk state;
 - info-level operator gestures remain valid configured incidents but cannot
   absorb nearby scene narration merely because they occurred in the same L2
   window;
-- the operator-facing temporal projection marks nested episodes as review
-  required and records `automatic_merge=false`.
+- a child incident is linked to its grounded parent by candidate
+  `concurrent_with` context. The relation asserts overlap only, never causality,
+  and records `automatic_merge=false`;
+- child rows use `report.presentation.scope=nested` and are excluded in
+  PostgreSQL before review-board `COUNT/LIMIT/OFFSET`. They remain directly
+  addressable by ID and navigable from the parent report, so nested context
+  cannot flood or sparsify the top-level operator queue;
+- an explicit operator `confirm`, `reopen`, or `follow` action promotes the
+  child to `presentation.scope=top_level`. Model output and ordinary rollup
+  replay cannot promote it.
 
 This is conservative durable enrichment, not complete scene understanding.
-Promotion of a nested episode into its own related incident, explicit causal or
-concurrent relations, L3 cross-window composition, and a learned
+Operator-reviewed causal relations, L3 cross-window composition, and a learned
 weekday/time-of-day baseline remain future production steps. Until those
-bindings are grounded, EVA prefers retaining evidence without opening a case
-over flooding the operator queue with speculative micro-incidents.
+bindings are grounded, EVA prefers retaining separately addressable evidence
+without raising top-level attention over flooding the operator queue with
+speculative micro-incidents.
 
 Design basis:
 

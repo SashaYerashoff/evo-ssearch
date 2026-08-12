@@ -57,6 +57,7 @@ class _IncidentStore:
         self.record = None
         self.appended_observations = []
         self.transitions = []
+        self.list_calls = []
         self.relations = [
             {
                 "id": "00000000-0000-0000-0000-000000000120",
@@ -104,6 +105,7 @@ class _IncidentStore:
         return dict(self.record)
 
     def list_incidents(self, **_kwargs):
+        self.list_calls.append(dict(_kwargs))
         rows = [dict(self.record)] if self.record else []
         return rows, len(rows)
 
@@ -245,6 +247,7 @@ def test_incident_draft_follow_stop_and_export_contracts():
             assert review["evidence_count"] == 1
             assert "timeline" not in review
             assert "evidence" not in review
+            assert store.list_calls[-1]["top_level_only"] is True
 
             response = client.get(f"/incidents/{INCIDENT_ID}/observations")
             assert response.status_code == 200, response.get_json()

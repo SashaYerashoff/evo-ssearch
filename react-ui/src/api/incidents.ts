@@ -173,6 +173,23 @@ export interface IncidentSeriesLink {
   rationale: string
 }
 
+export interface IncidentNestedLink {
+  relation_id: string
+  relation_state: 'candidate' | 'confirmed' | string
+  confidence: string
+  related_incident_id: string
+  direction: 'child' | 'parent' | string
+  title: string
+  semantic_key: string
+  possible_start_ms?: number | null
+  possible_end_ms?: number | null
+  scale_disposition: string
+  presentation_scope: 'nested' | string
+  automatic_merge: false
+  operator_review_required: boolean
+  rationale: string
+}
+
 export interface IncidentLifecycleTransition {
   id: string
   axis: 'perception' | 'risk' | 'case' | 'attention' | 'legacy' | string
@@ -190,6 +207,7 @@ export interface IncidentTemporalContext {
   episodes: IncidentTemporalEpisode[]
   episode_total: number
   series_links: IncidentSeriesLink[]
+  nested_incidents: IncidentNestedLink[]
   relation_total: number
   correction_count: number
   lifecycle_history: IncidentLifecycleTransition[]

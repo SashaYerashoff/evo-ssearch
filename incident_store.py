@@ -1631,6 +1631,7 @@ class PostgresIncidentStore:
         attention_states: Sequence[str] | None = None,
         since_ms: int | None = None,
         until_ms: int | None = None,
+        top_level_only: bool = False,
         limit: int = 100,
         offset: int = 0,
     ) -> tuple[list[dict[str, Any]], int]:
@@ -1673,6 +1674,20 @@ class PostgresIncidentStore:
         if end is not None:
             clauses.append("possible_start_ms <= %s")
             params.append(end)
+        if top_level_only:
+            # Nested incidents remain first-class rows addressable by id, but
+            # they must not consume review-board pagination or totals until an
+            # operator promotes them.  Keep the predicate in PostgreSQL rather
+            # than filtering a bounded page in Python, which could otherwise
+            # return sparse/empty pages on a busy multi-channel deployment.
+            clauses.append(
+                "NOT ("
+                "COALESCE(report_json #>> '{presentation,scope}', '') = 'nested' "
+                "AND COALESCE("
+                "report_json #>> '{presentation,parent_incident_id}', ''"
+                ") <> ''"
+                ")"
+            )
         bounded_limit = max(1, min(500, int(limit or 100)))
         bounded_offset = max(0, int(offset or 0))
         where_sql = "WHERE " + " AND ".join(clauses)

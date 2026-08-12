@@ -85,6 +85,7 @@ export function IncidentModal({
   canExport,
   canManage = false,
   onChanged,
+  onNavigate,
   onClose,
 }: {
   draftInput?: IncidentDraftInput
@@ -92,6 +93,7 @@ export function IncidentModal({
   canExport: boolean
   canManage?: boolean
   onChanged?: (incident: Incident) => void
+  onNavigate?: (incidentId: string) => void
   onClose: () => void
 }) {
   const [incident, setIncident] = useState<Incident | null>(null)
@@ -160,6 +162,10 @@ export function IncidentModal({
     let alive = true
     setLoading(true)
     setError('')
+    setIncident(null)
+    setObservations([])
+    setObservationTotal(0)
+    setTemporal(null)
     const request = incidentIdValue
       ? incidentsApi.get(incidentIdValue)
       : draftInput
@@ -364,6 +370,7 @@ export function IncidentModal({
     .slice(0, 8)
   const disposition = temporalDisposition(primaryEpisode?.scale_disposition)
   const seriesLinks = temporal?.series_links || []
+  const nestedIncidentLinks = temporal?.nested_incidents || []
   const lifecycleHistory = temporal?.lifecycle_history || []
   const normalizedCaseState = String(incident?.case_state || 'candidate').toLowerCase()
   const historicalCase = ['closed', 'dismissed', 'false_positive'].includes(normalizedCaseState)
@@ -495,6 +502,33 @@ export function IncidentModal({
                             })}
                           </ol>
                           <small>Context is attached to the grounded parent; no incidents were merged automatically.</small>
+                        </div>
+                      )}
+                      {nestedIncidentLinks.length > 0 && (
+                        <div className="incident-nested-incidents">
+                          <span>
+                            {nestedIncidentLinks.some((link) => link.direction === 'parent')
+                              ? 'Parent incident'
+                              : 'Separate nested incidents'}
+                          </span>
+                          <ul>
+                            {nestedIncidentLinks.slice(0, 8).map((link) => (
+                              <li key={link.relation_id}>
+                                <button
+                                  type="button"
+                                  onClick={() => onNavigate?.(link.related_incident_id)}
+                                  disabled={!onNavigate || busyAction != null}
+                                >
+                                  <strong>{link.title || `Incident #${link.related_incident_id.slice(0, 8)}`}</strong>
+                                  <small>
+                                    {fmtTime(link.possible_start_ms)}
+                                    {link.semantic_key ? ` · ${link.semantic_key.replace(/_/g, ' ')}` : ''}
+                                  </small>
+                                </button>
+                              </li>
+                            ))}
+                          </ul>
+                          <small>Separate records linked by concurrent context; causality and merge remain unconfirmed.</small>
                         </div>
                       )}
                       {seriesLinks.length > 0 && (

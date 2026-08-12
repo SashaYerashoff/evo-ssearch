@@ -3273,6 +3273,7 @@ def incident_list():
                 attention_states=_incident_query_values("attention_state") or None,
                 since_ms=since_ms,
                 until_ms=until_ms,
+                top_level_only=view == "review",
                 limit=limit,
                 offset=offset,
             )
