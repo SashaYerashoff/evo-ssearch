@@ -36,6 +36,21 @@ export function ToolbarActionMenu({ actions, label = 'Actions' }: {
 
   if (!actions.length) return null
 
+  if (actions.length === 1) {
+    const action = actions[0]
+    return (
+      <button
+        type="button"
+        className={`toolbar-actions-trigger toolbar-action-single ${action.danger ? 'danger' : ''} ${action.active ? 'active' : ''}`}
+        disabled={action.disabled}
+        onClick={action.onSelect}
+      >
+        {action.icon}
+        <span>{action.label}</span>
+      </button>
+    )
+  }
+
   return (
     <div className="toolbar-action-menu" ref={ref}>
       <button

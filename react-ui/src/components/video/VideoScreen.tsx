@@ -1025,15 +1025,6 @@ export function VideoScreen({
       {activeTab === 'review' ? (
         <div className="vid-review-main">
           <div className="vid-feed-card vid-review-feed">
-          <div className="vid-feed-heading">
-            <div>
-              <div className="mon-panel-title">{t('video.summaries')}</div>
-              <div className="vid-feed-meta">
-                {channelName(reviewChannelId ?? -1) || t('video.noChannel')} · #{reviewChannelId ?? '—'} · {resolution === 'AUTO' ? `${t('resolution.auto')} → ${renderedDepth}` : renderedDepth} · {feed.length} summaries
-                {live ? ' · following live' : ' · fixed view'}
-              </div>
-            </div>
-          </div>
           {error && <div className="chat-error"><IconAlertTriangle size={14} /> {error}</div>}
           <div className="vid-feed" ref={feedRef}>
             {feed.length === 0 && (
@@ -1074,15 +1065,11 @@ export function VideoScreen({
         <div className="vid-settings-main">
           <section className="vid-settings-preview">
             {previewCard}
-            <p>Model view shows EVA-selected input without opening another recorder stream. Full live is intended for short source verification.</p>
           </section>
           <div className="vid-settings-stack">
-          <section className="vid-selected-card vid-settings-status">
+          <section className="vid-settings-status">
             <div className="vid-settings-status-head">
-              <div>
-                <div className="mon-panel-title">Runtime and attention</div>
-                <div className="vid-preview-sub">Current state for the independently selected settings channel</div>
-              </div>
+              <div className="mon-panel-title">Runtime and attention</div>
               <span className="vid-sel-cur">{settingsChannelId != null ? `#${settingsChannelId}` : '—'}</span>
             </div>
             {error && <div className="chat-error"><IconAlertTriangle size={14} /> {error}</div>}
@@ -1125,7 +1112,7 @@ export function VideoScreen({
                 <div><span>Probe capture</span><b>{settingsRt?.probe?.running ? (settingsRt.probe.paused ? 'paused' : 'active') : 'idle'}</b></div>
                 <div><span>Last preview</span><b>{previewLoading ? 'opening' : previewError ? 'never' : fmtAge(previewReadyAt)}</b></div>
                 {settingsRt?.video?.frozen_signal && <div><span>Signal</span><b className="bad">frozen</b></div>}
-                {settingsRt?.video?.last_error && <div><span>Last error</span><b className="bad">{String(settingsRt.video.last_error)}</b></div>}
+                {settingsRt?.video?.last_error && <div className="vid-sel-list-error"><span>Last error</span><b className="bad">{String(settingsRt.video.last_error)}</b></div>}
               </div>
             </div>
           </section>

@@ -15,7 +15,7 @@ export function DetectionCard({ d, onClick }: { d: Detection; onClick: () => voi
   const sev = d.severity.toLowerCase()
   useEffect(() => setImageFailed(false), [src])
   return (
-    <button className="card" onClick={onClick}>
+    <button className="card archive-card" onClick={onClick}>
       <div className="card-thumb">
         <span className="card-tag">{d.sourceLabel}</span>
         {src && !imageFailed
