@@ -1724,6 +1724,39 @@ traffic collision containing a smaller phone-call episode) remains the next
 production implementation step. Card information architecture also remains to
 be tightened now that source and priority are trustworthy.
 
+Commit `4529b67` completes the first card information-architecture pass. Incident
+cards are now horizontal triage rows rather than a large three-column poster
+gallery. They lead with the server-owned reason for attention (operator
+criterion, safety signal, or context candidate), then severity, event title,
+channel and last-evidence time. Only meaningful lifecycle deviations are shown:
+ongoing/ended evidence, active/critical risk, open case, and active Follow. The
+four raw state axes remain available in the incident report but no longer consume
+the scanning surface. A summary identical to the title is suppressed, full UUIDs
+are shortened visually, and the grounded cover is a compact evidence anchor on
+the left. All new labels have English and Latvian translations.
+
+This UI-only change was copied live without a worker reload. The service stayed
+on worker `4078032`, `NRestarts=0`, the inference PIDs and `.env` invariant stayed
+unchanged, and the served assets are `index-DT6XXN8D.js` and
+`index-D60Ji9I7.css`. The previous UI is recoverable at
+`react-ui/dist.pre-20260812-incident-cards-4529b67`. The React suite passed 97/97,
+the focused card test passed 4/4 after the final risk-label addition, and the
+TypeScript/Vite production build passed.
+
+The Desktop rehearsal launcher now points to the final checked archive:
+
+```text
+/home/sasha/Downloads/eva-ai-georgia-upgrade-0.8.1-to-0.8.7-4529b67.tar.gz
+git commit: 4529b67f077727adb54cfc603c1f8cd72a3dacc5
+size:       169635001 bytes
+SHA-256:    eb859c4d08ca4712e81c747477c8d1f914334da267419cdde0aeadbc01d4ec22
+```
+
+The outer checksum, clean manifest, all runtime checksums, backend source hashes
+and React asset names passed. The intermediate `cdeb6bb` archive remains
+immutable but is no longer selected by the launcher. No RECOVER or upgrade
+rehearsal was run.
+
 ## Next work
 
 ### 1. Confirm the committed baseline
