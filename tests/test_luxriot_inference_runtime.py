@@ -7960,6 +7960,7 @@ class LuxriotCaptureDispatchTests(unittest.TestCase):
                     {"window_start": base, "window_end": base + 900.0}
                 ],
             )
+            manager.start_rollup_workers()
             deadline = time.monotonic() + 3.0
             status = manager.rollup_backfill_status()
             while status["status"] not in {"completed", "failed"} and time.monotonic() < deadline:

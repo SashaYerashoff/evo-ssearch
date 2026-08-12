@@ -62,6 +62,7 @@ def test_runtime_services_start_only_from_explicit_idempotent_bootstrap():
         }
         oldapp.config.EMBEDDER_EAGER_LOAD = True
         with (
+            patch("oldapp._gunicorn_worker_sibling_pids", return_value=[]),
             patch("oldapp.ensure_embedder_loaded") as load_embedder,
             patch(
                 "oldapp._warm_live_embedding_runtime",
@@ -69,6 +70,7 @@ def test_runtime_services_start_only_from_explicit_idempotent_bootstrap():
             ) as warm_live,
             patch("oldapp._prime_lm_runtime_capacities") as prime_lm,
             patch("oldapp._configure_inference_queue") as configure_queue,
+            patch.object(oldapp.luxriot_manager, "start_rollup_workers") as rollups,
             patch.object(
                 oldapp.luxriot_manager,
                 "restore_desired_live_sessions",
@@ -82,6 +84,7 @@ def test_runtime_services_start_only_from_explicit_idempotent_bootstrap():
         warm_live.assert_called_once_with()
         prime_lm.assert_called_once_with()
         configure_queue.assert_called_once_with()
+        rollups.assert_called_once_with()
         restore.assert_called_once_with()
         assert oldapp._luxriot_restore_result["status"] == "restored"
     finally:
@@ -89,6 +92,121 @@ def test_runtime_services_start_only_from_explicit_idempotent_bootstrap():
         oldapp._runtime_embedder_result = original_embedder
         oldapp._luxriot_restore_result = original_restore
         oldapp.config.EMBEDDER_EAGER_LOAD = original_eager
+
+
+def test_runtime_services_defer_capture_until_old_gunicorn_worker_exits():
+    original_initialized = oldapp._runtime_services_initialized
+    original_embedder = dict(oldapp._runtime_embedder_result)
+    original_restore = dict(oldapp._luxriot_restore_result)
+    original_deferred = oldapp._runtime_handover_deferred
+    original_eager = oldapp.config.EMBEDDER_EAGER_LOAD
+    try:
+        oldapp._runtime_services_initialized = False
+        oldapp._runtime_embedder_result = {"ok": False, "status": "not_initialized"}
+        oldapp._luxriot_restore_result = {"ok": False, "status": "not_initialized"}
+        oldapp._runtime_handover_deferred = False
+        oldapp.config.EMBEDDER_EAGER_LOAD = True
+        with (
+            patch("oldapp._gunicorn_worker_sibling_pids", return_value=[1234]),
+            patch("oldapp.ensure_embedder_loaded"),
+            patch("oldapp._warm_live_embedding_runtime", return_value={"status": "ready"}),
+            patch("oldapp._prime_lm_runtime_capacities"),
+            patch("oldapp._configure_inference_queue") as configure_queue,
+            patch.object(oldapp.luxriot_manager, "restore_desired_live_sessions") as restore,
+        ):
+            oldapp.initialize_runtime_services()
+
+        configure_queue.assert_not_called()
+        restore.assert_not_called()
+        assert oldapp.runtime_handover_pending() is True
+        assert oldapp.runtime_handover_candidate_ready() is True
+        assert oldapp._luxriot_restore_result["status"] == "handover_pending"
+
+        with (
+            patch("oldapp._gunicorn_worker_sibling_pids", return_value=[]),
+            patch("oldapp._configure_inference_queue") as configure_queue,
+            patch.object(
+                oldapp.luxriot_manager,
+                "start_rollup_workers",
+            ) as start_rollups,
+            patch.object(
+                oldapp.luxriot_manager,
+                "restore_desired_live_sessions",
+                return_value={"ok": True, "status": "restored", "desired_count": 2},
+            ) as restore,
+            patch("oldapp.ensure_probe_daemon_thread") as probe_daemon,
+            patch("oldapp.ensure_incident_maintenance_worker") as maintenance,
+            patch("oldapp.ensure_archive_retention_thread") as retention,
+        ):
+            result = oldapp.complete_runtime_handover()
+
+        configure_queue.assert_called_once_with()
+        start_rollups.assert_called_once_with()
+        restore.assert_called_once_with()
+        probe_daemon.assert_called_once_with()
+        maintenance.assert_called_once_with()
+        retention.assert_called_once_with()
+        assert result["status"] == "restored"
+        assert oldapp.runtime_handover_pending() is False
+    finally:
+        oldapp._runtime_services_initialized = original_initialized
+        oldapp._runtime_embedder_result = original_embedder
+        oldapp._luxriot_restore_result = original_restore
+        oldapp._runtime_handover_deferred = original_deferred
+        oldapp.config.EMBEDDER_EAGER_LOAD = original_eager
+
+
+def test_ready_requires_embedder_and_restore_for_desired_live_sessions():
+    original_embedder = dict(oldapp._runtime_embedder_result)
+    original_restore = dict(oldapp._luxriot_restore_result)
+    original_secure = oldapp.config.SECURE_DEPLOYMENT_REQUIRED
+    try:
+        oldapp._runtime_embedder_result = {"ok": True, "status": "not_eager"}
+        oldapp._luxriot_restore_result = {
+            "ok": False,
+            "status": "handover_pending",
+            "desired_count": 2,
+        }
+        oldapp.config.SECURE_DEPLOYMENT_REQUIRED = False
+        optional_ok = {"ok": True, "status": "ready", "required": False}
+        database_ok = {"ok": True, "status": "ready", "required": True}
+        with (
+            patch.dict("oldapp.os.environ", {"EVOSSEARCH_EMBEDDER_REQUIRED": "false"}),
+            patch("oldapp._embedder_loaded_state", return_value={"ok": False, "status": "not_loaded"}),
+            patch("oldapp._check_database_ready", return_value=database_ok),
+            patch("oldapp._check_postgres_ready", return_value=optional_ok),
+            patch("oldapp._check_auth_ready", return_value=optional_ok),
+            patch("oldapp._check_deployment_security_ready", return_value=optional_ok),
+            patch("oldapp._check_inference_queue_ready", return_value=optional_ok),
+            patch("oldapp._check_vlm_vision_health", return_value=optional_ok),
+            patch("oldapp._check_attention_ready", return_value=optional_ok),
+            patch("oldapp._check_lm_profiles_ready", return_value=optional_ok),
+            patch("oldapp._check_luxriot_ready", return_value=optional_ok),
+        ):
+            response = oldapp.app.test_client().get("/ready")
+
+        assert response.status_code == 503
+        payload = response.get_json()
+        assert "embedder" in payload["required"]
+        assert "luxriot_restore" in payload["required"]
+        assert payload["checks"]["luxriot_restore"]["required"] is True
+    finally:
+        oldapp._runtime_embedder_result = original_embedder
+        oldapp._luxriot_restore_result = original_restore
+        oldapp.config.SECURE_DEPLOYMENT_REQUIRED = original_secure
+
+
+def test_mutations_are_rejected_while_replacement_waits_for_ownership():
+    with (
+        oldapp.app.test_request_context("/settings", method="POST"),
+        patch("oldapp.runtime_handover_pending", return_value=True),
+        patch("oldapp._mutation_guard") as auth_guard,
+    ):
+        response, status = oldapp._mutation_guard_error()
+
+    assert status == 503
+    assert response.get_json()["error"] == "runtime_handover_in_progress"
+    auth_guard.assert_not_called()
 
 
 def test_live_embedding_warmup_runs_image_before_persisted_probe_texts():

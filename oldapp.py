@@ -1553,6 +1553,16 @@ def _mutation_guard():
 
 
 def _mutation_guard_error():
+    if runtime_handover_pending():
+        return jsonify(
+            {
+                "error": "runtime_handover_in_progress",
+                "message": (
+                    "EVA is completing a worker handover; retry this action "
+                    "after readiness is restored."
+                ),
+            }
+        ), 503
     guard = _mutation_guard()
     if guard is None:
         return None
@@ -6161,8 +6171,13 @@ incident_maintenance = IncidentMaintenanceWorker(
     interval_sec=float(getattr(config, "INCIDENT_MAINTENANCE_INTERVAL_SEC", 15.0)),
     batch_size=int(getattr(config, "LUXRIOT_INCIDENT_TRACKED_LIMIT", 64)),
 )
-if bool(getattr(config, "INCIDENT_MAINTENANCE_ENABLED", True)):
-    incident_maintenance.start()
+
+
+def ensure_incident_maintenance_worker() -> None:
+    """Start the single-owner incident worker from a production entrypoint."""
+
+    if bool(getattr(config, "INCIDENT_MAINTENANCE_ENABLED", True)):
+        incident_maintenance.start()
 
 
 def _append_l0_incident_observations(
@@ -7575,6 +7590,48 @@ _luxriot_restore_result: Dict[str, Any] = {
     "ok": False,
     "status": "not_initialized",
 }
+_runtime_handover_deferred = False
+
+
+def _gunicorn_worker_sibling_pids() -> List[int]:
+    """Return sibling worker PIDs under this process's Gunicorn master."""
+
+    parent_pid = os.getppid()
+    try:
+        raw = Path(
+            f"/proc/{parent_pid}/task/{parent_pid}/children"
+        ).read_text(encoding="utf-8")
+    except OSError:
+        return []
+    own_pid = os.getpid()
+    siblings: List[int] = []
+    for token in raw.split():
+        try:
+            pid = int(token)
+        except ValueError:
+            continue
+        if pid > 0 and pid != own_pid:
+            siblings.append(pid)
+    return siblings
+
+
+def runtime_handover_pending() -> bool:
+    return bool(_runtime_handover_deferred)
+
+
+def runtime_handover_candidate_ready() -> bool:
+    return bool(
+        _runtime_handover_deferred
+        and _runtime_embedder_result.get("ok")
+        and _runtime_services_initialized
+    )
+
+
+def runtime_background_services_allowed() -> bool:
+    return bool(
+        _runtime_capture_bootstrap_allowed()
+        and not _runtime_handover_deferred
+    )
 
 
 def _runtime_capture_bootstrap_allowed() -> bool:
@@ -7593,6 +7650,7 @@ def initialize_runtime_services() -> None:
 
     global _runtime_services_initialized, _runtime_embedder_result
     global _luxriot_restore_result
+    global _runtime_handover_deferred
     with _runtime_services_lock:
         if _runtime_services_initialized:
             return
@@ -7644,6 +7702,10 @@ def initialize_runtime_services() -> None:
         # that ground truth before restored streams can fill the server's own
         # opaque FIFO and bypass EVA's alert priority.
         _prime_lm_runtime_capacities()
+        # Start empty durable writers as a replacement preflight. They receive
+        # no capture/attention events until ownership is transferred, but a
+        # database/writer startup failure must be discovered while the healthy
+        # serving worker is still available.
         try:
             if _attention_writer is not None:
                 _attention_writer.start()
@@ -7669,7 +7731,24 @@ def initialize_runtime_services() -> None:
             )
             _runtime_services_initialized = True
             return
+        # During a one-worker Gunicorn HUP the previous process remains the
+        # sole capture owner while this replacement performs cold model
+        # startup.  Defer queue/camera/daemon ownership until Gunicorn's
+        # post-worker hook has retired that sibling.  This avoids both the old
+        # 137-second connection-refused window and duplicate L0 writers.
+        sibling_pids = _gunicorn_worker_sibling_pids()
+        if sibling_pids:
+            _runtime_handover_deferred = True
+            _luxriot_restore_result = {
+                "ok": False,
+                "status": "handover_pending",
+                "required": True,
+                "previous_worker_pids": sibling_pids,
+            }
+            _runtime_services_initialized = True
+            return
         _configure_inference_queue()
+        luxriot_manager.start_rollup_workers()
         try:
             _luxriot_restore_result = (
                 luxriot_manager.restore_desired_live_sessions()
@@ -7681,6 +7760,38 @@ def initialize_runtime_services() -> None:
                 "error": type(exc).__name__,
             }
         _runtime_services_initialized = True
+
+
+def complete_runtime_handover() -> Dict[str, Any]:
+    """Acquire capture ownership after the previous worker has exited."""
+
+    global _runtime_handover_deferred, _luxriot_restore_result
+    with _runtime_services_lock:
+        if not _runtime_handover_deferred:
+            return dict(_luxriot_restore_result)
+        if _gunicorn_worker_sibling_pids():
+            return {
+                "ok": False,
+                "status": "handover_blocked_previous_worker",
+            }
+        try:
+            _configure_inference_queue()
+            luxriot_manager.start_rollup_workers()
+            _luxriot_restore_result = (
+                luxriot_manager.restore_desired_live_sessions()
+            )
+        except Exception as exc:
+            _luxriot_restore_result = {
+                "ok": False,
+                "status": "error",
+                "error": type(exc).__name__,
+            }
+        _runtime_handover_deferred = False
+    if _runtime_capture_bootstrap_allowed():
+        ensure_probe_daemon_thread()
+    ensure_incident_maintenance_worker()
+    ensure_archive_retention_thread()
+    return dict(_luxriot_restore_result)
 
 
 @app.route('/health', methods=['GET'])
@@ -7717,9 +7828,32 @@ def ready():
         if guard is not None:
             return guard
         details_allowed = True
-    embedder_required = str(
+    configured_embedder_required = str(
         os.getenv("EVOSSEARCH_EMBEDDER_REQUIRED", "true") or "true"
     ).strip().lower() in TRUE_BOOL_STRINGS
+    restore_status = str(
+        _luxriot_restore_result.get("status") or "unknown"
+    ).strip().lower()
+    restore_desired_count = max(
+        0,
+        _to_int(_luxriot_restore_result.get("desired_count"), 0),
+    )
+    restore_required = bool(
+        restore_desired_count > 0
+        or restore_status
+        in {
+            "handover_pending",
+            "handover_blocked_previous_worker",
+            "blocked_embedder",
+            "blocked_writer",
+            "error",
+        }
+    )
+    # A site with restored analytics sessions cannot call SigLIP optional:
+    # those sessions promise a live semantic signal and archive contract.
+    embedder_required = bool(
+        configured_embedder_required or restore_required
+    )
 
     embedder_check = _embedder_loaded_state()
     if _runtime_embedder_result.get("status") in {
@@ -7748,11 +7882,11 @@ def ready():
         "luxriot_restore": _component_result(
             bool(_luxriot_restore_result.get("ok", True)),
             str(_luxriot_restore_result.get("status") or "unknown"),
-            required=False,
+            required=restore_required,
             **{
                 key: value
                 for key, value in _luxriot_restore_result.items()
-                if key not in {"ok", "status"}
+                if key not in {"ok", "status", "required"}
             },
         ),
     }
@@ -7793,6 +7927,8 @@ def ready():
         required_names.append("attention")
     if checks["lm_profiles"].get("required"):
         required_names.append("lm_profiles")
+    if checks["luxriot_restore"].get("required"):
+        required_names.append("luxriot_restore")
     if strict or checks["luxriot"].get("required"):
         required_names.append("luxriot")
 
@@ -21314,6 +21450,7 @@ def _shutdown_background_workers() -> None:
         pass
     try:
         luxriot_manager.stop_attention_scheduler()
+        luxriot_manager.stop_rollup_workers()
         luxriot_manager.stop_all_streams(
             stop_video=True,
             stop_analytics=True,
@@ -21420,5 +21557,6 @@ if __name__ == '__main__':
     initialize_runtime_services()
     if _runtime_capture_bootstrap_allowed():
         ensure_probe_daemon_thread()
+        ensure_incident_maintenance_worker()
     ensure_archive_retention_thread()
     app.run(host=config.HOST, port=config.PORT, debug=config.DEBUG)

@@ -6626,16 +6626,33 @@ class LuxriotManager:
         self._rollup_backfill_candidate_cache: Dict[Tuple[str, int, str], List[float]] = {}
         self._rollup_backfill_state = self._load_rollup_backfill_state()
         self._rollup_backfill_thread: Optional[threading.Thread] = None
-        if runtime_state_store is not None:
+        # Background rollup workers are single-owner runtime services. Starting
+        # them in the constructor made every warming Gunicorn replacement run
+        # schedulers and durable backfill beside the still-serving worker.
+
+    def start_rollup_workers(self) -> None:
+        """Start durable rollup workers after this process owns the runtime."""
+
+        self._start_rollup_backfill_worker()
+        if self.rollup_scheduler_enabled:
+            self._start_rollup_l3_worker()
+            self._start_rollup_scheduler()
+
+    def _start_rollup_backfill_worker(self) -> None:
+        if (
+            self.runtime_state_store is not None
+            and (
+                self._rollup_backfill_thread is None
+                or not self._rollup_backfill_thread.is_alive()
+            )
+        ):
+            self._rollup_backfill_stop.clear()
             self._rollup_backfill_thread = threading.Thread(
                 target=self._rollup_backfill_loop,
                 daemon=True,
                 name="eva-rollup-backfill",
             )
             self._rollup_backfill_thread.start()
-        if self.rollup_scheduler_enabled:
-            self._start_rollup_l3_worker()
-            self._start_rollup_scheduler()
 
     def get_rollup_l3_deep_schedule(self) -> Dict[str, Any]:
         """Return the operator-persistable quiet-window policy and runtime gate."""
@@ -9287,6 +9304,10 @@ class LuxriotManager:
             end_ts=end_ts,
             levels=levels,
         )
+        # An explicit operator command owns starting its durable worker. The
+        # constructor remains side-effect free so a warming Gunicorn worker
+        # cannot resume backfill beside the current runtime owner.
+        self._start_rollup_backfill_worker()
         with self._rollup_backfill_condition:
             current = dict(self._rollup_backfill_state)
             if current and not self._backfill_terminal_status(current.get("status")):
@@ -23065,6 +23086,12 @@ class LuxriotManager:
             )
             accepted["latency_trace"] = latency_trace
 
+            # Publish the canonical manager history before exposing the same
+            # entry through the per-session status feed.  Operators poll the
+            # session feed as the completion signal; publishing it first left
+            # a small window where the UI showed a finished L0 while archive
+            # and rollup readers still saw no corresponding history row.
+            self.record_summary_log(channel_id, accepted)
             with self.cache_lock:
                 session = self.sessions.get(channel_id)
             if session is not None:
@@ -23081,7 +23108,6 @@ class LuxriotManager:
                             if len(session.logs) > 50:
                                 session.logs = session.logs[-50:]
                         session._mark_summary_success_locked()
-            self.record_summary_log(channel_id, accepted)
             self.complete_attention_job(
                 channel_id,
                 str(accepted.get("attention_job_id") or ""),
