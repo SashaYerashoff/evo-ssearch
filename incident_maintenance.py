@@ -30,12 +30,15 @@ class IncidentMaintenanceWorker:
         self._thread: threading.Thread | None = None
         self._lock = threading.RLock()
         self._projection_offset = 0
+        self._projected_revisions: dict[str, str] = {}
+        self._projection_cache_limit = max(1024, self.batch_size * 32)
         self._status: dict[str, Any] = {
             "running": False,
             "passes": 0,
             "records_scanned": 0,
             "records_finalized": 0,
             "projections_scanned": 0,
+            "projections_reused": 0,
             "episodes_materialized": 0,
             "series_candidates_materialized": 0,
             "series_candidates_rejected": 0,
@@ -53,6 +56,7 @@ class IncidentMaintenanceWorker:
         errors = 0
         last_error: str | None = None
         projection_scanned = 0
+        projection_reused = 0
         episodes_materialized = 0
         series_materialized = 0
         series_rejected = 0
@@ -96,11 +100,45 @@ class IncidentMaintenanceWorker:
                     if not isinstance(raw, Mapping):
                         continue
                     projection_scanned += 1
+                    incident_id = str(raw.get("id") or "").strip()
+                    revision = raw.get("revision")
+                    if revision is not None:
+                        projection_token = str(revision)
+                    else:
+                        projection_token = repr(
+                            (
+                                raw.get("state"),
+                                raw.get("perception_state"),
+                                raw.get("possible_start_ms"),
+                                raw.get("observed_start_ms"),
+                                raw.get("observed_end_ms"),
+                                raw.get("possible_end_ms"),
+                                raw.get("updated_at"),
+                            )
+                        )
+                    with self._lock:
+                        already_projected = bool(
+                            incident_id
+                            and self._projected_revisions.get(incident_id)
+                            == projection_token
+                        )
+                    if already_projected:
+                        projection_reused += 1
+                        continue
                     try:
                         result = projector(raw)
                         episodes_materialized += int(bool(result.get("episode_created")))
                         series_materialized += int(bool(result.get("relation_created")))
                         series_rejected += max(0, int(result.get("relations_rejected") or 0))
+                        if incident_id:
+                            with self._lock:
+                                self._projected_revisions[incident_id] = projection_token
+                                while (
+                                    len(self._projected_revisions)
+                                    > self._projection_cache_limit
+                                ):
+                                    oldest = next(iter(self._projected_revisions))
+                                    self._projected_revisions.pop(oldest, None)
                     except Exception as exc:
                         if exc.__class__.__name__ == "IncidentRevisionConflict":
                             conflicts += 1
@@ -121,6 +159,7 @@ class IncidentMaintenanceWorker:
             self._status["records_scanned"] = int(self._status["records_scanned"]) + scanned
             self._status["records_finalized"] = int(self._status["records_finalized"]) + finalized
             self._status["projections_scanned"] = int(self._status["projections_scanned"]) + projection_scanned
+            self._status["projections_reused"] = int(self._status["projections_reused"]) + projection_reused
             self._status["episodes_materialized"] = int(self._status["episodes_materialized"]) + episodes_materialized
             self._status["series_candidates_materialized"] = int(
                 self._status["series_candidates_materialized"]

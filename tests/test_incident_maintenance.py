@@ -129,3 +129,48 @@ def test_maintenance_backfills_temporal_projection_in_bounded_pages():
     assert second["projections_scanned"] == 3
     assert second["episodes_materialized"] == 3
     assert second["series_candidates_materialized"] == 2
+
+
+def test_maintenance_reuses_projection_until_incident_revision_changes():
+    records = [
+        {
+            **_record(index, expired=False),
+            "revision": 1,
+        }
+        for index in range(2)
+    ]
+    store = _Store(records)
+
+    class _Projecting(_Service):
+        def __init__(self, incident_store):
+            super().__init__(incident_store)
+            self.projection_calls = []
+
+        def ensure_temporal_projection(self, record):
+            self.projection_calls.append((record["id"], record["revision"]))
+            return {"episode_created": False, "relation_created": False}
+
+    service = _Projecting(store)
+    worker = IncidentMaintenanceWorker(store, lambda: service, batch_size=2)
+    original_list = store.list_incidents
+
+    def list_incidents(**kwargs):
+        if kwargs.get("states") == ["following"]:
+            return original_list(**kwargs)
+        return [dict(item) for item in store.records], len(store.records)
+
+    store.list_incidents = list_incidents
+
+    first = worker.run_once()
+    second = worker.run_once()
+    store.records[1]["revision"] = 2
+    third = worker.run_once()
+
+    assert first["projections_reused"] == 0
+    assert second["projections_reused"] == 2
+    assert third["projections_reused"] == 3
+    assert service.projection_calls == [
+        ("incident-0", 1),
+        ("incident-1", 1),
+        ("incident-1", 2),
+    ]
