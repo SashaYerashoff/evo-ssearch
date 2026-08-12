@@ -1689,7 +1689,12 @@ def apply_install(prepared: PreparedInstall) -> Path:
                 verify,
                 "--service", options.service_name,
                 "--base-url", options.base_url,
-                "--timeout", "90",
+                # A production worker eagerly loads and exercises SigLIP before
+                # exposing /health.  Field cold starts have reached 240 seconds
+                # on the shared rehearsal host; a shorter verification budget
+                # falsely declares a healthy install failed and triggers an
+                # automatic rollback while the worker is still warming.
+                "--timeout", "300",
             ))
         if prepared.inference_policy_hash is not None:
             _assert_inference_policy_file(

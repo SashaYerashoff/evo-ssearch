@@ -12,6 +12,7 @@ BUILD_SCRIPT = (ROOT / "scripts" / "build_patch_bundle.sh").read_text(encoding="
 ROLLBACK_SCRIPT = (ROOT / "scripts" / "rollback.sh").read_text(encoding="utf-8")
 INSTALL_SCRIPT = (ROOT / "scripts" / "install_patch.sh").read_text(encoding="utf-8")
 VERIFY_SCRIPT = (ROOT / "scripts" / "verify_patch.sh").read_text(encoding="utf-8")
+OFFLINE_INSTALLER_SCRIPT = (ROOT / "scripts" / "install_eva_083.py").read_text(encoding="utf-8")
 
 
 class UpdateBundleTests(unittest.TestCase):
@@ -107,6 +108,13 @@ class UpdateBundleTests(unittest.TestCase):
         self.assertIn("READY_DEADLINE=$((SECONDS + 240))", SCRIPT)
         self.assertIn("while (( SECONDS < READY_DEADLINE ))", SCRIPT)
         self.assertIn('"${BASE_URL}/ready?load=1"', SCRIPT)
+
+    def test_offline_install_and_rollback_allow_eager_embedder_cold_start(self):
+        self.assertIn('"--timeout", "300"', OFFLINE_INSTALLER_SCRIPT)
+        self.assertIn('--timeout 300', INSTALL_SCRIPT)
+        self.assertIn('--timeout 300', ROLLBACK_SCRIPT)
+        self.assertIn('EVA_VERIFY_TIMEOUT_SECONDS:-300', VERIFY_SCRIPT)
+        self.assertIn('Default: 300.', VERIFY_SCRIPT)
 
     def test_agent_context_mismatch_requires_confirmation_but_is_not_rewritten(self):
         context_check = SCRIPT.index("Agent context compatibility decision")

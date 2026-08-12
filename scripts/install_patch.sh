@@ -486,7 +486,7 @@ if [[ "${RUN_VERIFY}" == true ]]; then
     VERIFY_SCRIPT="${APP_DIR}/scripts/verify_patch.sh"
   fi
   [[ -x "${VERIFY_SCRIPT}" ]] || die "verify script not found"
-  "${VERIFY_SCRIPT}" --service "${SERVICE_NAME}" --base-url "${BASE_URL}" --timeout 60
+  "${VERIFY_SCRIPT}" --service "${SERVICE_NAME}" --base-url "${BASE_URL}" --timeout 300
 fi
 
 ok "install completed"

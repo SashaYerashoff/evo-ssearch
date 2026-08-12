@@ -3,7 +3,7 @@ set -Eeuo pipefail
 
 SERVICE_NAME="${EVA_SERVICE_NAME:-eva-ai}"
 BASE_URL="${EVA_BASE_URL:-http://127.0.0.1:5000}"
-TIMEOUT_SECONDS="${EVA_VERIFY_TIMEOUT_SECONDS:-45}"
+TIMEOUT_SECONDS="${EVA_VERIFY_TIMEOUT_SECONDS:-300}"
 CHECK_SERVICE=true
 USER_SERVICE=false
 CURL_INSECURE="${EVA_PATCH_CURL_INSECURE:-false}"
@@ -27,7 +27,7 @@ Usage: scripts/verify_patch.sh [options]
 Options:
   --service NAME      systemd service name. Default: eva-ai.
   --base-url URL      App base URL. Default: http://127.0.0.1:5000.
-  --timeout SECONDS   Wait timeout for endpoints. Default: 45.
+  --timeout SECONDS   Wait timeout for endpoints. Default: 300.
   --user-service      Check a per-user systemd service with systemctl --user.
   --skip-service      Do not check systemd service state.
   --curl-insecure     Allow self-signed HTTPS checks.
