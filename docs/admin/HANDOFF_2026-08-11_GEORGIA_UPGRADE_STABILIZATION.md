@@ -89,7 +89,7 @@ Primary working repository:
 ```text
 path:   /home/sasha/Projects/evo-ssearch-office-demo
 branch: main
-latest code commit: 4f5842a fix: make settings provenance explicit
+latest code commit: c6417c7 fix: reuse buffered vectors in probe daemon
 ```
 
 The stabilization work is split into five reviewed code commits:
@@ -100,6 +100,9 @@ The stabilization work is split into five reviewed code commits:
 2adc0cb fix: avoid monolithic rollup cache rewrites
 8969893 fix: ground probe inventory and compact list payloads
 4f5842a fix: make settings provenance explicit
+1d6d518 fix: keep probe preview responsive
+47c70d5 fix: correlate live probe frames and scores
+c6417c7 fix: reuse buffered vectors in probe daemon
 ```
 
 The working tree is expected to be clean after committing this handoff update.
@@ -1185,6 +1188,74 @@ delivery latency is dominated by batching/queueing/inference, not Evo delivery; 
 the stored stage trace when deciding whether to tune cadence or concurrency. Keep the
 slow Gunicorn HUP/SigLIP startup behavior as a separate reliability defect; do not
 mask it by weakening health checks or changing the preserved inference policy.
+
+## Live semantic signal correlation and probe-daemon cleanup
+
+The probe editor now treats one scored image and its P/N/M values as an atomic
+operator evidence unit. `/probes/status` reports semantic age/staleness and an
+exact timestamped frame URL; `/probes/signal_frame/<channel>/<timestamp>` serves
+only the JPEG stored with that embedding and never substitutes a newer preview.
+React commits the image and values together, retains the last complete pair on a
+transient failure, labels the scored timestamp/age and uses single-flight polling.
+The hidden probe board no longer competes with the open modal, and the unused
+one-second full-board rerender was removed.
+
+The embedding benchmark now separates encoder work from shared-lock wait, warms
+up before measuring, repeats within a five-second diagnostic budget and exposes
+the actual CUDA device name. On this host the EVA/SigLIP process is on the RTX
+5060 Ti while the VLM llama.cpp process is on the RTX 4060; watching the 4060
+during an embedding benchmark was therefore misleading. The benchmark still
+shares the production encoder and is intentionally bounded.
+
+Live lock/work telemetry then exposed a legacy functional ghost. Every five
+seconds the old probe daemon queried top hits and re-embedded their thumbnails
+even though the exact vectors were already in `ProbeBuffer`. Before the fix,
+39 image calls accompanied only 27 microbatch calls, average image lock wait was
+about 1.15 seconds and maximum wait was 9.6 seconds. The daemon now reuses the
+exact full-frame or ROI vector and its embedding-space identity for bookmark
+dedupe and archive persistence. After deployment, image calls exactly equalled
+microbatch batches and the latest warmed lock waits fell to near zero.
+
+The remaining variance is inside SigLIP image work rather than lock contention:
+warmed calls ranged from roughly 0.24 seconds to occasional 4-10 second outliers
+while the RTX 5060 Ti monitor remained almost idle and the EVA process showed
+CPU/OpenMP activity. This points to CPU preprocessing/thread scheduling as the
+next bottleneck. Do not change inference server flags or the rehearsal `.env` to
+mask it. First split processor/model/materialization stages in the existing
+telemetry or profile them in the one live worker; a second parallel Transformers
+runtime is too expensive while swap is full.
+
+Deployment details:
+
+```text
+source commits: 47c70d5, c6417c7
+active worker after HUP: one worker under eva-ai-georgia-repro.service
+service NRestarts: 0
+.env sha256: 2c254527143f62bbdbcf7a14914872e2a6f1e0f4f776ef02024c0f27aac76325
+llama.cpp PIDs: unchanged across both HUP reloads
+```
+
+Recoverable overlays are in:
+
+```text
+/home/sasha/Projects/eva-georgia-upgrade-repro/oldapp.py.pre-20260812-live-signal-correlation
+/home/sasha/Projects/eva-georgia-upgrade-repro/probe_manager.py.pre-20260812-live-signal-correlation
+/home/sasha/Projects/eva-georgia-upgrade-repro/react-ui/dist.pre-20260812-live-signal-correlation
+/home/sasha/Projects/eva-georgia-upgrade-repro/oldapp.py.pre-20260812-probe-vector-reuse
+/home/sasha/Projects/eva-georgia-upgrade-repro/probe_manager.py.pre-20260812-probe-vector-reuse
+```
+
+Both HUPs reproduced the cold/reload reliability defect: old and new workers
+overlapped, `/health` stopped responding and readiness recovered only after about
+two to three minutes. This is not acceptable as the final appliance deployment
+strategy even though the process recovered to one worker and `/ready=200`.
+
+Verification completed for this pass: Python compilation, 14/14 focused
+ProbeManager tests, React production build, and all 94 React tests (run in bounded
+groups because the full process was terminated under the already-full swap
+pressure). The heavyweight API smoke could not import a second `oldapp` safely;
+complete the authenticated live contract check in the existing worker after the
+operator hard-refreshes the new assets.
 
 ## Next work
 
