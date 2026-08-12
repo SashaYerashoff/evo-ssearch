@@ -1015,6 +1015,35 @@ class ApiDataflowSmokeTests(unittest.TestCase):
         self.assertEqual(sorted(gate["reason"] for _sent, gate in results), ["cooldown", "sent"])
         send.assert_called_once()
 
+    def test_probe_bookmark_gate_respects_explicit_zero_cooldown(self) -> None:
+        gate = oldapp._ProbeBookmarkGate()
+        probe_key = f"zero-cooldown-{time.time_ns()}"
+        first_timestamp_ms = int(time.time() * 1000.0)
+        gate.mark_sent(
+            channel_id=112,
+            probe_key=probe_key,
+            timestamp_ms=first_timestamp_ms,
+            clip_vec=np.asarray([1.0, 0.0], dtype=np.float32),
+            pos_score=0.9,
+            neg_score=0.1,
+            margin=0.8,
+        )
+
+        allowed, metadata = gate.evaluate(
+            channel_id=112,
+            probe_key=probe_key,
+            timestamp_ms=first_timestamp_ms + 100,
+            clip_vec=np.asarray([0.0, 1.0], dtype=np.float32),
+            pos_score=0.9,
+            neg_score=0.1,
+            margin=0.8,
+            fps_hint=1.0,
+            probe_config={"cooldown_ms": 0, "dedupe_window_ms": 500},
+        )
+
+        self.assertTrue(allowed)
+        self.assertEqual(metadata["reason"], "novel_or_spaced")
+
     def test_fast_vlm_alert_waits_for_post_roll_after_burst(self) -> None:
         runtime = oldapp._FastVlmAlertRuntime()
         try:

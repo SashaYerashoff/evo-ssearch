@@ -9469,8 +9469,18 @@ class _ProbeBookmarkGate:
         frame_interval_ms = self._estimate_frame_interval_ms(fps_hint)
         normalized_vec = self._normalize_vec(clip_vec)
         cfg = dict(probe_config or {})
-        cooldown_ms = int(max(0, int(cfg.get("cooldown_ms", self.cooldown_ms) or self.cooldown_ms)))
-        dedupe_window_ms = int(max(500, int(cfg.get("dedupe_window_ms", self.dedupe_window_ms) or self.dedupe_window_ms)))
+        raw_cooldown_ms = (
+            cfg.get("cooldown_ms")
+            if "cooldown_ms" in cfg
+            else self.cooldown_ms
+        )
+        raw_dedupe_window_ms = (
+            cfg.get("dedupe_window_ms")
+            if "dedupe_window_ms" in cfg
+            else self.dedupe_window_ms
+        )
+        cooldown_ms = int(max(0, int(raw_cooldown_ms)))
+        dedupe_window_ms = int(max(500, int(raw_dedupe_window_ms)))
         sim_high = float(cfg.get("sim_high", self.sim_high) or self.sim_high)
         margin_delta_thr = float(cfg.get("margin_delta_thr", self.margin_delta_thr) or self.margin_delta_thr)
         score_delta_thr = float(cfg.get("score_delta_thr", self.score_delta_thr) or self.score_delta_thr)
