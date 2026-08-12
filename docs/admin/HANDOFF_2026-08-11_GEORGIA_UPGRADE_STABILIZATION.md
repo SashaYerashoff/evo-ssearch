@@ -89,7 +89,7 @@ Primary working repository:
 ```text
 path:   /home/sasha/Projects/evo-ssearch-office-demo
 branch: main
-latest code commit: 623cec4 fix: preserve service during cold worker reload
+latest release-source commit: 8a476dc test: register probe signal frame route
 ```
 
 The reviewed stabilization tail includes:
@@ -107,6 +107,9 @@ c6417c7 fix: reuse buffered vectors in probe daemon
 9066706 fix: isolate live semantic capture latency
 21412fe fix: align live inference with served capacity
 623cec4 fix: preserve service during cold worker reload
+4394e6a docs: record readiness-gated reload rehearsal
+760fdc2 fix: allow verified cold model startup
+8a476dc test: register probe signal frame route
 ```
 
 The working tree is expected to be clean after committing this handoff update.
@@ -1558,6 +1561,49 @@ writable fields and omits blank port/write-only secrets. If the old undeclared
 banner persists after a hard refresh, inspect the authenticated `/settings`
 response and asset cache rather than writing the env file.
 
+## 2026-08-12 verified cold-start rehearsal bundle
+
+The updater originally allowed only 45-90 seconds for post-install verification,
+while the measured one-worker SigLIP cold start on this shared rehearsal host took
+roughly 132-240 seconds. A correct install could therefore be declared failed and
+automatically rolled back while the replacement worker was still warming. Commit
+`760fdc2` gives the universal installer, patch installer, rollback verifier and
+standalone verifier a consistent 300-second readiness budget. This does not alter
+Gunicorn's request timeout, inference endpoints or model settings.
+
+The final clean release snapshot also includes `8a476dc`, which registers the
+timestamped semantic-signal frame route in the API dataflow contract. The route
+was already implemented and used by `ProbeSettingsModal`; only the static contract
+allowlist was stale.
+
+The resulting checked archive is:
+
+```text
+/home/sasha/Downloads/eva-ai-georgia-upgrade-0.8.1-to-0.8.7-8a476dc.tar.gz
+git commit: 8a476dc22b8512bc5b4a0d7a7c71494110d72c3c
+size:       169622717 bytes
+SHA-256:    3af9ff1be42d50a8bd21e485626632c942198952268e97ad960ddbb2eabac16b
+```
+
+Its outer checksum and every checksum in `runtime/SHA256SUMS` pass. The manifest
+reports a clean `main` snapshot, beta 0.8.7 and an included Linux x86-64 media
+runtime. The React payload contains `index-Ci6oa427.js` and
+`index-CzNIZODy.css`; the four staged runtime files match the reviewed source
+hashes. As with the previously successful rehearsal artifact, this incremental
+upgrade bundle reuses the preserved application venv: it does not include a full
+wheelhouse or a SigLIP model.
+
+`/home/sasha/Desktop/EVA_GEORGIA_UPGRADE_TEST.sh` now pins this archive and exact
+commit and also waits up to 300 seconds in its independent post-update health
+gate. Shell syntax validation passes. The launcher still requires an explicit
+interactive confirmation after its read-only preflight.
+
+No destructive reset or upgrade rehearsal was run while preparing the archive.
+The current beta 0.8.7 service remained available, and the rehearsal `.env` still
+hashes to the invariant value recorded above. The next state-changing action is
+therefore deliberately still `EVA_GEORGIA_UPGRADE_RECOVER.sh` followed by the
+interactive test launcher.
+
 ## Next work
 
 ### 1. Confirm the committed baseline
@@ -1573,9 +1619,10 @@ git diff --check
 The expected result is a clean tree at the committed stabilization baseline. If
 new changes appear, inspect and preserve them.
 
-### 2. Run the broader relevant tests
+### 2. Preserve the recorded regression baseline
 
-At minimum rerun the 82-test command above. Then run the broader suites covering:
+The focused installer/update/watchdog bundle passed 83 tests. A broader pass also
+covered:
 
 - installer and update bundle;
 - migration `0006 -> 0013`;
@@ -1587,13 +1634,19 @@ At minimum rerun the 82-test command above. Then run the broader suites covering
 - incident creation, covers and review;
 - watchdog and readiness gates.
 
-Do not claim a full green suite unless the exact command and count are recorded.
+That exact broader command completed with `236 passed, 2 skipped` and `128`
+subtests passed. Its only two warnings were upstream Python 3.14 deprecations from
+`clip`/`pkg_resources` and `torch.jit.load`.
 
-### 3. Build a new rehearsal bundle from the current reviewed source
+Do not claim the repository's entire test corpus is green; only the recorded
+focused and broader commands were run.
 
-The current Desktop wrapper may still point at an older checksummed archive. Do not
-edit a released tarball in place. Build a new bundle so its source commit, manifests,
-wheelhouse/runtime checksums and React dist agree.
+### 3. Keep the verified bundle immutable
+
+The Desktop wrapper points at the checked `8a476dc` archive above. Do not edit that
+tarball in place. If release-source code changes, build a newly named bundle and
+repeat the manifest, outer checksum, internal runtime checksum and React-dist
+checks before changing the wrapper.
 
 Build only from the reviewed committed source; do not fold unrelated later changes
 into the release archive.
