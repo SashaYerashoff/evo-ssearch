@@ -1633,6 +1633,97 @@ hashes to the invariant value recorded above. The next state-changing action is
 therefore deliberately still `EVA_GEORGIA_UPGRADE_RECOVER.sh` followed by the
 interactive test launcher.
 
+## 2026-08-12 bounded incident admission and review navigation
+
+Commits `f1b2959` and `cdeb6bb` make the Incident Review entry path bounded and
+separate operator/safety attention from ordinary L0 episode memory. The review
+toolbar now lives in the upper Incident tab panel. Its safe first-open query is
+one channel over 24 hours, not all channels over 30 days. Channel and period are
+persisted in browser storage; completed query results have a four-entry LRU cache
+and concurrent identical requests are coalesced. Switching away and back keeps
+the mounted result instead of issuing the default wide query again. Explicit
+Refresh remains the only forced reload for the current filter.
+
+The live incident flood was not a React problem. Structured `alerts` produced by
+the VLM had been accepted as operator incidents even when they did not match a
+saved channel criterion, and ordinary meaningful `events` opened durable cases
+at L0. The new server-owned admission boundary is:
+
+- ordinary entry/exit, gesture, object-handling and similar transitions remain
+  `episode_event` evidence for L1-L3 rollups;
+- a deterministic saved-policy match may create `operator_alert` with
+  `priority=operator_criterion`;
+- an independently actionable grounded hazard may create `safety_event` or
+  `safety_alert` with `priority=safety`;
+- an ordinary episode cannot create or refresh a context-only legacy candidate;
+- a later grounded operator/safety observation may only upgrade an existing
+  matching candidate's provenance and priority;
+- event and alert phrasings share canonical entity/action keys, including plural
+  entities, so one batch cannot create separate `scene maneuver` and
+  `vehicle maneuver` incidents for the same drifting cars.
+
+No historical incident was deleted, closed or bulk-reclassified. Immediately
+before the final live handover there were 144 candidate rows. A subsequent real
+configured thumbs-up produced one new row with `source=operator_alert_l0` and
+`priority=operator_criterion`, so the total became 145. Repeated live emu1 drift
+batches updated one existing `vehicle maneuver` safety case and did not create a
+new row; its older `scene maneuver` duplicate stopped receiving updates. The old
+noise queue still needs a separately reviewed reconciliation action.
+
+The final live worker is `4078032` under master `2014970`. `/ready?details=1`
+reports the CUDA embedder loaded, Luxriot sessions restored 2/2, database and LM
+profiles ready, and both semantic/CLIP queues at zero. `NRestarts=0`. The VLM and
+agent llama.cpp processes retained PIDs `1499650` and `2916440`. The rehearsal
+`.env` was not edited and still hashes to:
+
+```text
+2c254527143f62bbdbcf7a14914872e2a6f1e0f4f776ef02024c0f27aac76325
+```
+
+Both controlled HUPs kept the previous worker serving during the roughly
+3 minute 40 second cold bootstrap. One-second health probes each observed one or
+two isolated deadline misses during Transformers load or ownership transfer, but
+there was no continuous outage. This is the known host latency tail, not an
+incident-path queue, and inference flags were not changed. Recoverable copies are
+stored beside the deployed files with suffixes
+`pre-20260812-incident-admission-f1b2959` and
+`pre-20260812-incident-dedupe-cdeb6bb`; the previous React dist is
+`react-ui/dist.pre-20260812-incident-admission-f1b2959`.
+
+Verification for this pass:
+
+```text
+focused admission/dedup regression: 23 passed
+expanded incident/runtime backend:  288 passed
+React suite:                        96 passed
+TypeScript/Vite production build:   passed
+Python compilation / diff check:    passed
+```
+
+The new immutable rehearsal archive is:
+
+```text
+/home/sasha/Downloads/eva-ai-georgia-upgrade-0.8.1-to-0.8.7-cdeb6bb.tar.gz
+git commit: cdeb6bbcf18f99460c7f61f5ee330c58b47f2cce
+size:       169632741 bytes
+SHA-256:    b1829f603787a126297da250cc720755b0209ca9073323f3a10309477d1fb978
+```
+
+Its outer checksum, every `runtime/SHA256SUMS` entry, the staged backend hashes,
+and React assets `index-ClBMw_wN.js` / `index-CKjVPy8G.css` were verified. The
+manifest records a clean `main` snapshot, beta 0.8.7 and the Linux x86-64 media
+runtime; as before, it reuses the target venv and does not contain a wheelhouse or
+SigLIP model. `/home/sasha/Desktop/EVA_GEORGIA_UPGRADE_TEST.sh` now pins this
+archive and exact commit, and `bash -n` passes. No destructive reset or upgrade
+rehearsal was run.
+
+The larger incident hierarchy is not falsely marked complete. L1-L3 already
+retain temporal/routine evidence and deterministic scale dispositions, but
+automatic durable composition of nested multi-action cases (for example one
+traffic collision containing a smaller phone-call episode) remains the next
+production implementation step. Card information architecture also remains to
+be tightened now that source and priority are trustworthy.
+
 ## Next work
 
 ### 1. Confirm the committed baseline
