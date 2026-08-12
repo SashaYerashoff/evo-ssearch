@@ -211,9 +211,14 @@ class SecuritySmokeTests(unittest.TestCase):
 
     def test_env_endpoint_never_returns_secret_values(self) -> None:
         with (
-            patch.object(config, "ADMIN_TOKEN", "admin-secret"),
-            patch.object(config, "LM_API_KEY", "lm-secret"),
-            patch.object(config, "LUXRIOT_PASSWORD", "camera-secret"),
+            patch(
+                "oldapp._read_env_file_map",
+                return_value={
+                    "EVOSSEARCH_ADMIN_TOKEN": "admin-secret",
+                    "EVOSSEARCH_LM_API_KEY": "lm-secret",
+                    "EVOSSEARCH_LUXRIOT_PASSWORD": "camera-secret",
+                },
+            ),
         ):
             resp = self.client.get(
                 "/settings/env",

@@ -438,6 +438,62 @@ class ApiDataflowSmokeTests(unittest.TestCase):
         serialized = str(report)
         self.assertNotIn("file-secret", serialized)
 
+    def test_runtime_config_exposes_pre_dotenv_provenance(self) -> None:
+        self.assertTrue(hasattr(config, "ENV_KEYS_BEFORE_DOTENV"))
+        self.assertTrue(hasattr(config, "ENV_VALUE_HASHES_BEFORE_DOTENV"))
+        self.assertTrue(hasattr(config, "CONFIG_ENV_FILE_BEFORE_DOTENV"))
+
+    def test_secure_settings_source_fails_closed_when_undeclared(self) -> None:
+        with patch.object(config, "SECURE_DEPLOYMENT_REQUIRED", True), patch.object(
+            config,
+            "CONFIG_ENV_FILE_BEFORE_DOTENV",
+            "",
+        ):
+            report = _env_precedence_report(file_map={}, file_path=Path(".env"))
+
+        self.assertFalse(report["write_allowed"])
+        self.assertEqual(report["config_source_status"], "undeclared")
+        self.assertIsNone(report["persistence_source"])
+
+    def test_secure_settings_write_refuses_undeclared_source(self) -> None:
+        config.ADMIN_TOKEN = "unit-token"
+        headers = {"X-Admin-Token": "unit-token"}
+        with patch.object(config, "SECURE_DEPLOYMENT_REQUIRED", True), patch.object(
+            config,
+            "CONFIG_ENV_FILE_BEFORE_DOTENV",
+            "",
+        ), patch("oldapp._write_env_file_atomic") as write_env:
+            response = self.client.post(
+                "/settings",
+                headers=headers,
+                json={"host": "0.0.0.0"},
+            )
+
+        self.assertEqual(response.status_code, 409)
+        self.assertEqual(response.get_json()["code"], "settings_source_undeclared")
+        write_env.assert_not_called()
+
+    def test_environment_editor_reads_persisted_file_not_runtime_overlay(self) -> None:
+        config.ADMIN_TOKEN = "unit-token"
+        headers = {"X-Admin-Token": "unit-token"}
+        with tempfile.TemporaryDirectory() as temp_dir:
+            env_path = Path(temp_dir) / ".env"
+            env_path.write_text(
+                "EVOSSEARCH_PORT=5999\nEVOSSEARCH_LUXRIOT_PASSWORD=file-secret\n",
+                encoding="utf-8",
+            )
+            with patch("oldapp._settings_env_path", return_value=env_path):
+                response = self.client.get("/settings/env", headers=headers)
+
+        self.assertEqual(response.status_code, 200, response.get_json())
+        payload = response.get_json()
+        self.assertEqual(payload["envVariables"]["EVOSSEARCH_PORT"], "5999")
+        self.assertEqual(
+            payload["envVariables"]["EVOSSEARCH_LUXRIOT_PASSWORD"],
+            oldapp.ENV_SECRET_REDACTION,
+        )
+        self.assertNotIn("file-secret", payload["envText"])
+
     def test_backend_only_endpoints_are_known(self) -> None:
         frontend_paths, backend_routes = _collect_frontend_and_backend_paths()
         backend_only = {
@@ -2048,6 +2104,8 @@ class ApiDataflowSmokeTests(unittest.TestCase):
     def test_host_only_settings_patch_keeps_visible_port_when_browser_sends_blank(self) -> None:
         config.ADMIN_TOKEN = "unit-token"
         headers = {"X-Admin-Token": "unit-token"}
+        running_host = config.HOST
+        running_port = config.PORT
         with tempfile.TemporaryDirectory() as temp_dir:
             env_path = Path(temp_dir) / ".env"
             env_path.write_text(
@@ -2071,6 +2129,11 @@ class ApiDataflowSmokeTests(unittest.TestCase):
             self.assertEqual(saved["EVOSSEARCH_HOST"], "0.0.0.0")
             self.assertEqual(saved["EVOSSEARCH_PORT"], "5081")
             self.assertEqual(saved["EXTERNAL_SENTINEL"], "preserve-me")
+            self.assertEqual(config.HOST, running_host)
+            self.assertEqual(config.PORT, running_port)
+            payload = response.get_json()
+            self.assertEqual(payload["restartRequiredFields"], ["host"])
+            self.assertNotIn("host", payload["runtimeAppliedFields"])
 
     def test_luxriot_capture_flow_with_token_and_stubs(self) -> None:
         config.ADMIN_TOKEN = "unit-token"

@@ -38,13 +38,17 @@ export function EnvTab() {
     <div className="set-section">
       <h3>Environment</h3>
       <p className="set-section-help">Edit <code>EVOSSEARCH_*</code> overrides saved to <code>{envFile}</code>. Secrets are masked and preserved unless you replace them. Restart the server to apply environment-backed changes.</p>
-      {precedence?.declared_file_matches_project === false && (
-        <div className="set-load-error">This file is not declared as the service configuration source. Verify the systemd EnvironmentFile before relying on a restart.</div>
+      {precedence && (
+        <div className={`set-source-state ${precedence.declared_file_matches_project ? 'aligned' : 'unknown'}`}>
+          {precedence.declared_file_matches_project
+            ? <><b>Persistence source:</b> <code>{precedence.persistence_source || envFile}</code>. The running process keeps its startup values until restart.</>
+            : <><b>Persistence source is not declared.</b> Environment writes are disabled for a secure deployment.</>}
+        </div>
       )}
-      <textarea className="set-env" spellCheck={false} value={text} onChange={(e) => setText(e.target.value)} rows={18} placeholder="EVOSSEARCH_KEY=value" />
+      <textarea className="set-env" disabled={precedence?.write_allowed === false} spellCheck={false} value={text} onChange={(e) => setText(e.target.value)} rows={18} placeholder="EVOSSEARCH_KEY=value" />
       <div className="set-env-actions">
         <button className="mon-btn" onClick={load} disabled={busy}><IconReload size={15} className={busy ? 'spin' : ''} /> Reload</button>
-        <button className="mon-btn accent" onClick={save} disabled={busy}><IconDeviceFloppy size={15} /> Save .env</button>
+        <button className="mon-btn accent" onClick={save} disabled={busy || precedence?.write_allowed === false}><IconDeviceFloppy size={15} /> Save .env</button>
         {status && <span className={`set-status ${status.ok ? 'ok' : 'err'}`}>{status.msg}</span>}
       </div>
     </div>

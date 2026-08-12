@@ -18728,6 +18728,14 @@ def _env_precedence_report(
             declared_matches_project = Path(declared_env_file).resolve(strict=False) == resolved_file_path.resolve(strict=False)
         except Exception:
             declared_matches_project = False
+    secure_deployment = bool(getattr(config, "SECURE_DEPLOYMENT_REQUIRED", False))
+    write_allowed = declared_matches_project or not secure_deployment
+    if not declared_matches_project:
+        config_source_status = "undeclared"
+    elif different_keys:
+        config_source_status = "declared_pending_or_overridden"
+    else:
+        config_source_status = "declared_aligned"
     return {
         "order": ["process_environment", "project_.env", "runtime_default"],
         "process_environment_keys": sorted(process_env_keys),
@@ -18741,11 +18749,38 @@ def _env_precedence_report(
         "declared_config_env_file": declared_env_file or None,
         "declared_file_matches_project": declared_matches_project,
         "source_confidence": "declared_env_file" if declared_matches_project else "process_origin_unknown",
+        "config_source_status": config_source_status,
+        "persistence_source": str(resolved_file_path) if declared_matches_project else None,
+        "running_source": "started_process_environment",
+        "write_allowed": write_allowed,
+        "write_block_reason": (
+            None
+            if write_allowed
+            else "Secure deployment has no declared EVOSSEARCH_CONFIG_ENV_FILE; refusing an ambiguous settings write."
+        ),
         "note": (
             "Process environment wins at runtime. A differing value is either pending restart "
             "or supplied by an external service override; declared_config_env_file distinguishes the known file case."
         ),
     }
+
+
+def _settings_source_write_guard() -> Optional[Response]:
+    """Fail closed when a secure service has no declared persistence source."""
+
+    precedence = _env_precedence_report(file_path=_settings_env_path())
+    if precedence.get("write_allowed", True):
+        return None
+    return jsonify(
+        {
+            "success": False,
+            "error": precedence.get("write_block_reason")
+            or "Settings persistence source is not declared",
+            "code": "settings_source_undeclared",
+            "envFile": str(_settings_env_path()),
+            "precedence": precedence,
+        }
+    ), 409
 
 
 def _env_values_different_from_started_process(values: Mapping[str, str]) -> List[str]:
@@ -18836,6 +18871,11 @@ _SETTINGS_ENV_KEYS_BY_FIELD: Dict[str, Tuple[str, ...]] = {
     "maxCommentLength": ("EVOSSEARCH_MAX_COMMENT_LENGTH",),
     "maxFileSize": ("EVOSSEARCH_MAX_FILE_SIZE_MB",),
 }
+
+# These values describe the listener/process bootstrap itself. Updating the
+# Config object cannot rebind Gunicorn or enable Flask debug mode, so reporting
+# them as live-applied would make GET /settings disagree with the real service.
+_SETTINGS_RESTART_ONLY_FIELDS = frozenset({"host", "port", "debug"})
 
 
 def _settings_env_keys_for_fields(
@@ -19128,7 +19168,10 @@ def get_settings_env():
         return guard
     try:
         env_path = _settings_env_path()
-        env_map = _redact_env_map(_effective_env_map(env_path))
+        # This endpoint is a persistence-file editor, not an effective-runtime
+        # dump. Showing process values here used to mask changes already saved
+        # to disk until restart and made the editor an unreliable round trip.
+        env_map = _redact_env_map(_read_env_file_map(env_path))
         precedence = _env_precedence_report(file_path=env_path)
         return jsonify(
             {
@@ -19153,6 +19196,9 @@ def save_settings_env():
     guard = _settings_guard(write=True)
     if guard is not None:
         return guard
+    source_guard = _settings_source_write_guard()
+    if source_guard is not None:
+        return source_guard
     data = _json_body()
     try:
         env_path = _settings_env_path()
@@ -19171,11 +19217,8 @@ def save_settings_env():
         if not target_env:
             return jsonify({'success': False, 'error': 'No EVOSSEARCH_* entries to save'}), 400
 
-        target_env = _restore_redacted_env_secrets(
-            target_env,
-            _effective_env_map(env_path),
-        )
         existing_map = _read_env_file_map(env_path)
+        target_env = _restore_redacted_env_secrets(target_env, existing_map)
         preserved_other = {
             key: value
             for key, value in existing_map.items()
@@ -19342,6 +19385,7 @@ def get_settings():
             'envCount': len(_effective_env_map(env_path)),
             'envFile': str(env_path),
             'envPrecedence': precedence,
+            'restartOnlyFields': sorted(_SETTINGS_RESTART_ONLY_FIELDS),
             'lmProfiles': [
                 _public_lm_profile(profile)
                 for profile in _configured_lm_profiles().values()
@@ -19361,6 +19405,9 @@ def save_settings():
     guard = _settings_guard(write=True)
     if guard is not None:
         return guard
+    source_guard = _settings_source_write_guard()
+    if source_guard is not None:
+        return source_guard
     try:
         data = _json_body()
         if not data:
@@ -19896,9 +19943,9 @@ EVOSSEARCH_ALLOWED_ROOTS={os.pathsep.join(config.ALLOWED_ROOTS)}
 
         _write_env_file_atomic(env_content, env_path)
 
-        config.HOST = data['host']
-        config.PORT = port
-        config.DEBUG = debug_enabled
+        # host/port/debug are deliberately persistence-only. Config mutations
+        # here cannot rebind the already-running Gunicorn listener, and made
+        # subsequent Settings reads claim a runtime state that did not exist.
         embedder_state_changed = (
             str(config.EMBEDDER) != str(embedder)
             or str(config.CLIP_MODEL) != str(clip_model)
@@ -20027,6 +20074,12 @@ EVOSSEARCH_ALLOWED_ROOTS={os.pathsep.join(config.ALLOWED_ROOTS)}
             'success': True,
             'message': message,
             'appliedFields': sorted(submitted_fields),
+            'runtimeAppliedFields': sorted(
+                submitted_fields.difference(_SETTINGS_RESTART_ONLY_FIELDS)
+            ),
+            'restartRequiredFields': sorted(
+                submitted_fields.intersection(_SETTINGS_RESTART_ONLY_FIELDS)
+            ),
             'writtenEnvKeys': sorted(written_env_values),
             'envFile': str(env_path),
             'pendingOrOverriddenKeys': pending_or_overridden_keys,

@@ -158,9 +158,12 @@ export function SettingsModal({
       setS((current) => ({ ...current, luxriotPassword: '', vlmApiKey: '', agentApiKey: '' }))
       setDirtyKeys(new Set())
       const pending = r.pendingOrOverriddenKeys || []
+      const restartFields = r.restartRequiredFields || []
       const sourceUnknown = r.precedence?.declared_file_matches_project === false
-      const detail = pending.length
-        ? ` Restart required for ${pending.length} environment-backed change${pending.length === 1 ? '' : 's'}.`
+      const detail = restartFields.length
+        ? ` Restart required for: ${restartFields.join(', ')}.`
+        : pending.length
+          ? ` ${pending.length} persisted environment value${pending.length === 1 ? '' : 's'} differ from the startup environment; runtime-safe fields were applied.`
         : ''
       const sourceWarning = sourceUnknown
         ? ' Service env ownership is not declared; verify the systemd EnvironmentFile before restart.'
@@ -199,6 +202,9 @@ export function SettingsModal({
   const activeId = visibleTabs.some((t) => t.id === tab) ? tab : (visibleTabs[0]?.id ?? tab)
   const activeTab = permittedTabs.find((t) => t.id === activeId) ?? permittedTabs[0]
   const capacitySummary = normalizeArchiveCapacity(capacity)
+  const sourceDeclared = s.envPrecedence?.declared_file_matches_project === true
+  const sourceWritable = s.envPrecedence?.write_allowed !== false
+  const pendingSourceKeys = s.envPrecedence?.different_process_and_file_keys || []
 
   return (
     <div className="scrim" onClick={onClose}>
@@ -249,9 +255,20 @@ export function SettingsModal({
             {!loading && settingsLoadError && (
               <div className="set-load-error">{settingsLoadError}. Showing safe defaults; saving is disabled until the live configuration can be read.</div>
             )}
-            {!loading && !settingsLoadError && s.envPrecedence?.declared_file_matches_project === false && (
-              <div className="set-load-error">
-                The service configuration file is not declared. Settings can update {s.envFile || './.env'}, but a restart may load different process-level values.
+            {!loading && !settingsLoadError && (
+              <div className={`set-source-state ${sourceDeclared ? (pendingSourceKeys.length ? 'pending' : 'aligned') : 'unknown'}`}>
+                {sourceDeclared ? (
+                  <>
+                    <b>Configuration source:</b> <code>{s.envPrecedence?.persistence_source || s.envFile}</code>.
+                    {pendingSourceKeys.length
+                      ? ` ${pendingSourceKeys.length} persisted value${pendingSourceKeys.length === 1 ? '' : 's'} differ from the startup environment; runtime-safe fields may already be active, while restart-only fields still need a restart.`
+                      : ' The running process was started with this declared file; there are no detected startup/file differences.'}
+                  </>
+                ) : (
+                  <>
+                    <b>Configuration source is not declared.</b> A secure deployment cannot save settings until <code>EVOSSEARCH_CONFIG_ENV_FILE</code> identifies the service-owned file.
+                  </>
+                )}
               </div>
             )}
             {!loading && activeId === 'models' && (
@@ -334,7 +351,7 @@ export function SettingsModal({
                   )}</h3>
                   {sec.help && <p className="set-section-help">{sec.help}</p>}
                   <div className="set-fields">
-                    {fields.map((f) => <FieldRow key={f.key} f={f} value={s[f.key]} disabled={!canManageSettings} onChange={(v) => patch(f.key, v)} />)}
+                    {fields.map((f) => <FieldRow key={f.key} f={f} value={s[f.key]} disabled={!canManageSettings || !sourceWritable} onChange={(v) => patch(f.key, v)} />)}
                   </div>
                 </div>
               )
@@ -346,8 +363,8 @@ export function SettingsModal({
           <div className={`set-status ${status ? (status.ok ? 'ok' : 'err') : ''}`}>{status?.msg || ''}</div>
           {activeTab && !activeTab.custom && canManageSettings && !loading && !settingsLoadError && (
             <div className="set-actions">
-              <button className="mon-btn" onClick={reset}><IconRotate size={15} /> Reset to defaults</button>
-              <button className="mon-btn accent" disabled={saving || dirtyKeys.size === 0} onClick={save}><IconDeviceFloppy size={15} /> {saving ? 'Saving…' : `Save settings${dirtyKeys.size ? ` (${dirtyKeys.size})` : ''}`}</button>
+              <button className="mon-btn" disabled={!sourceWritable} onClick={reset}><IconRotate size={15} /> Reset to defaults</button>
+              <button className="mon-btn accent" disabled={!sourceWritable || saving || dirtyKeys.size === 0} onClick={save}><IconDeviceFloppy size={15} /> {saving ? 'Saving…' : `Save settings${dirtyKeys.size ? ` (${dirtyKeys.size})` : ''}`}</button>
             </div>
           )}
         </div>

@@ -7,6 +7,11 @@ export interface SettingsPrecedence {
   declared_config_env_file?: string | null
   different_process_and_file_keys?: string[]
   source_confidence?: string
+  config_source_status?: 'undeclared' | 'declared_pending_or_overridden' | 'declared_aligned'
+  persistence_source?: string | null
+  running_source?: string
+  write_allowed?: boolean
+  write_block_reason?: string | null
 }
 
 export interface SettingsSaveResult {
@@ -15,6 +20,8 @@ export interface SettingsSaveResult {
   error?: string
   warning?: string
   appliedFields?: string[]
+  runtimeAppliedFields?: string[]
+  restartRequiredFields?: string[]
   writtenEnvKeys?: string[]
   pendingOrOverriddenKeys?: string[]
   envFile?: string

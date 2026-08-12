@@ -175,6 +175,13 @@ def _get_app_version(default: str = "β 0.8.7") -> str:
 
 
 class Config:
+    # Configuration provenance is frozen before python-dotenv mutates the
+    # process environment.  Expose it on the runtime config object because the
+    # Settings API receives ``config = Config()`` rather than this module.
+    ENV_KEYS_BEFORE_DOTENV = ENV_KEYS_BEFORE_DOTENV
+    ENV_VALUE_HASHES_BEFORE_DOTENV = ENV_VALUE_HASHES_BEFORE_DOTENV
+    CONFIG_ENV_FILE_BEFORE_DOTENV = CONFIG_ENV_FILE_BEFORE_DOTENV
+
     # Server configuration
     HOST = os.getenv('EVOSSEARCH_HOST', '0.0.0.0')  # 0.0.0.0 allows network access
     PORT = int(os.getenv('EVOSSEARCH_PORT', '5000'))
