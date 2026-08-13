@@ -803,6 +803,109 @@ def test_l0_grounded_signal_repairs_stale_nested_attention_row():
     assert store.record["report"]["severity"] == "high"
 
 
+def test_l0_same_key_after_observed_gap_starts_a_new_grounded_incident():
+    class _GapStore:
+        def __init__(self):
+            self.records = [
+                {
+                    **_record(state="candidate"),
+                    "id": "incident-old",
+                    "revision": 7,
+                    "case_state": "candidate",
+                    "attention_state": "inactive",
+                    "possible_start_ms": 1_000,
+                    "observed_start_ms": 1_000,
+                    "observed_end_ms": 2_000,
+                    "possible_end_ms": None,
+                    "timeline_refs": [
+                        {
+                            "observation_id": "obs-old",
+                            "semantic_key": "person thumbs_up",
+                            "label": "Thumbs-up gesture detected",
+                        }
+                    ],
+                    "report": {
+                        "priority": "operator_criterion",
+                        "severity": "info",
+                        "source": "operator_alert_l0",
+                    },
+                }
+            ]
+            self.transitions = []
+            self.observations = []
+
+        def list_incidents(self, **_kwargs):
+            return [dict(item) for item in self.records], len(self.records)
+
+        def create_incident(self, record, **_kwargs):
+            stored = {
+                **dict(record),
+                "id": f"incident-new-{len(self.records)}",
+                "revision": 1,
+            }
+            self.records.append(stored)
+            return dict(stored)
+
+        def update_incident(
+            self,
+            incident_id,
+            *,
+            expected_revision,
+            changes,
+            transition=None,
+            **_kwargs,
+        ):
+            record = next(item for item in self.records if item["id"] == incident_id)
+            assert record["revision"] == expected_revision
+            record.update(dict(changes))
+            record["revision"] += 1
+            if transition:
+                self.transitions.append(dict(transition))
+            return dict(record)
+
+        def append_observation(self, observation, **_kwargs):
+            self.observations.append(dict(observation))
+            return dict(observation)
+
+    store = _GapStore()
+    result = _service(store, _Runtime()).ingest_l0_temporal_observations(
+        112,
+        {
+            "batch_id": "batch-after-gap",
+            "batch_start_ms": 4_001,
+            "batch_end_ms": 5_000,
+        },
+        [
+            {
+                "observation_id": "obs-after-gap",
+                "kind": "event",
+                "state": "new",
+                "semantic_key": "person thumbs_up",
+                "label": "Thumbs-up gesture detected",
+                "start_ms": 4_001,
+                "end_ms": 5_000,
+                "trigger_kind": "operator_alert",
+                "severity": "info",
+                "operator_criterion": "you spot a thumbs-up gesture",
+            }
+        ],
+        max_observed_gap_ms=1_000,
+    )
+
+    assert result["ended"] == 1
+    assert result["created"] == 1
+    assert result["associated"] == 1
+    assert len(store.records) == 2
+    assert store.records[0]["state"] == "ended"
+    assert store.records[0]["perception_state"] == "ended"
+    assert store.records[0]["case_state"] == "candidate"
+    assert store.records[0]["possible_end_ms"] == 4_001
+    assert store.records[1]["state"] == "candidate"
+    assert store.records[1]["perception_state"] == "observed"
+    assert store.transitions[0]["source_kind"] == "observed_gap_boundary"
+    assert store.transitions[0]["payload"]["case_closed"] is False
+
+
 def test_open_automatic_incident_waits_for_boundary_before_episode_materialization():
     class _ProjectionStore:
         def __init__(self):

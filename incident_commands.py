@@ -25,6 +25,7 @@ from incident_presentation import (
 )
 from incident_service import IncidentDraftAssembler, IncidentDraftRequest
 from incident_store import IncidentRevisionConflict
+from temporal_memory import DEFAULT_MAX_OBSERVED_GAP_MS
 
 
 _GENERIC_INCIDENT_KEYS = {
@@ -798,6 +799,7 @@ class IncidentCommandService:
         actor_id: str | None = None,
         max_new_incidents: int = 4,
         tracked_limit: int = 64,
+        max_observed_gap_ms: int = DEFAULT_MAX_OBSERVED_GAP_MS,
     ) -> dict[str, Any]:
         """Associate grounded L0 episode observations with durable candidates.
 
@@ -818,6 +820,7 @@ class IncidentCommandService:
             raise ValueError("heartbeat batch bounds are required")
         if batch_end_ms < batch_start_ms:
             raise ValueError("heartbeat batch end must not precede its start")
+        normalized_observed_gap_ms = max(1_000, int(max_observed_gap_ms))
         lister = getattr(self.incident_store, "list_incidents", None)
         creator = getattr(self.incident_store, "create_incident", None)
         updater = getattr(self.incident_store, "update_incident", None)
@@ -896,6 +899,39 @@ class IncidentCommandService:
                 skipped += 1
                 continue
             incident = active_by_key.get(semantic_key)
+            observation_start_ms = (
+                self._optional_int(observation.get("start_ms"))
+                or batch_start_ms
+            )
+            if incident is not None:
+                prior_observed_end_ms = (
+                    self._optional_int(incident.get("observed_end_ms"))
+                    or self._optional_int(incident.get("observed_start_ms"))
+                    or self._optional_int(incident.get("possible_start_ms"))
+                )
+                if (
+                    prior_observed_end_ms is not None
+                    and observation_start_ms - prior_observed_end_ms
+                    > normalized_observed_gap_ms
+                ):
+                    try:
+                        self._end_l0_incident_at_observed_gap(
+                            incident,
+                            boundary_ms=observation_start_ms,
+                            source_batch_id=batch_id,
+                            semantic_key=semantic_key,
+                            max_observed_gap_ms=normalized_observed_gap_ms,
+                            actor_id=actor_id,
+                        )
+                        active_by_key.pop(semantic_key, None)
+                        incident = None
+                        ended += 1
+                    except Exception as exc:
+                        failures.append(
+                            f"{semantic_key}:observed_gap:{type(exc).__name__}"
+                        )
+                        skipped += 1
+                        continue
             trigger_kind = str(observation.get("trigger_kind") or "").strip().lower()
             if trigger_kind == "episode_event":
                 report = (
@@ -1935,6 +1971,60 @@ class IncidentCommandService:
                 },
                 "payload": {
                     "semantic_key": self._primary_semantic_key(incident),
+                    "case_closed": False,
+                },
+            },
+        )
+
+    def _end_l0_incident_at_observed_gap(
+        self,
+        incident: Mapping[str, Any],
+        *,
+        boundary_ms: int,
+        source_batch_id: str,
+        semantic_key: str,
+        max_observed_gap_ms: int,
+        actor_id: str | None,
+    ) -> dict[str, Any]:
+        """End perception before a later same-key episode is associated.
+
+        This mirrors ``temporal_memory.segment_observations``: a later event
+        beyond the observed-gap bound starts a new perceptual episode. Case
+        state and risk remain untouched because a gap is not operator review
+        and does not prove that the underlying risk was resolved.
+        """
+
+        observed_end_ms = (
+            self._optional_int(incident.get("observed_end_ms"))
+            or self._optional_int(incident.get("observed_start_ms"))
+            or self._optional_int(incident.get("possible_start_ms"))
+        )
+        normalized_boundary_ms = max(
+            int(boundary_ms),
+            int(observed_end_ms or 0),
+        )
+        current_legacy = str(incident.get("state") or "candidate")
+        changes: dict[str, Any] = {
+            "perception_state": "ended",
+            "possible_end_ms": normalized_boundary_ms,
+        }
+        if current_legacy in {"candidate", "draft"}:
+            changes["state"] = "ended"
+        return self.incident_store.update_incident(
+            str(incident.get("id") or ""),
+            expected_revision=int(incident.get("revision") or 0),
+            changes=changes,
+            actor_id=actor_id,
+            transition={
+                "transitioned_at_ms": normalized_boundary_ms,
+                "reason": "later same-key observation exceeded the bounded perceptual episode gap",
+                "source_kind": "observed_gap_boundary",
+                "source_ref": {
+                    "batch_id": str(source_batch_id or "")[:160],
+                    "semantic_key": str(semantic_key or "")[:160],
+                },
+                "payload": {
+                    "max_observed_gap_ms": max(1_000, int(max_observed_gap_ms)),
                     "case_closed": False,
                 },
             },
