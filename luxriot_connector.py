@@ -19089,6 +19089,10 @@ class LuxriotManager:
             r"(?:remains?|is|are|stays?)\s+(?:active|open|unresolved)\b",
             r"\b(?:active|open|unresolved)\s+(?:operator\s+)?"
             r"(?:incident|case|episode|event(?:\s+track)?)s?\b",
+            r"\b(?:incident|case|episode|event(?:\s+track)?)s?\b[^.!?]{0,160}"
+            r"\b(?:marked|classified|flagged|treated|listed|recorded)\s+as\s+"
+            r"(?:an?\s+)?(?:active|open|unresolved)\s+"
+            r"(?:safety\s+)?(?:priority|incident|case|episode|event)\b",
         )
         for pattern in patterns:
             for match in re.finditer(pattern, text, flags=re.IGNORECASE):

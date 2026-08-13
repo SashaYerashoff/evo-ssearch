@@ -8810,6 +8810,37 @@ class LuxriotCaptureDispatchTests(unittest.TestCase):
             [],
         )
 
+        passive_case_state_summary = operator_rollup_response(
+            "A repeating drift sequence was sampled.",
+            takeaway=(
+                "The continuous episode was marked as an open safety priority "
+                "in the server ledger."
+            ),
+        )
+        passive_case_state_issues = LuxriotManager._rollup_grounding_guard_issues(
+            passive_case_state_summary,
+            operator_node,
+        )
+        passive_case_state_sanitized = (
+            LuxriotManager._sanitize_rollup_operator_overclaims(
+                passive_case_state_summary,
+                operator_node,
+            )
+        )
+        self.assertIn(
+            "temporal_episode_as_case_state",
+            passive_case_state_issues,
+        )
+        self.assertNotIn("open safety priority", passive_case_state_sanitized)
+        self.assertIn("review its grounded alert", passive_case_state_sanitized)
+        self.assertEqual(
+            LuxriotManager._rollup_grounding_guard_issues(
+                passive_case_state_sanitized,
+                operator_node,
+            ),
+            [],
+        )
+
         active_watchlist_summary = operator_rollup_response(
             "A configured watch remains pending.",
             takeaway=(
