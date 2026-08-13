@@ -118,17 +118,20 @@ class VlmAlertPromptContractTests(unittest.TestCase):
         self.assertEqual(manager.l0_prompt_budget.max_output_tokens, 512)
 
     def test_batch_contract_prioritizes_alerts_before_optional_memory(self):
-        schema = DEFAULT_ALERTS_JSON_PROMPT.split("BATCH_STATE_JSON:\n", 1)[1]
+        schema = DEFAULT_ALERTS_JSON_PROMPT.split(
+            "Required top-level key order:",
+            1,
+        )[1]
 
-        self.assertLess(schema.index('"alerts"'), schema.index('"events"'))
-        self.assertLess(schema.index('"alerts"'), schema.index('"memory_pass"'))
-        self.assertIn("at most 50 words", DEFAULT_ALERTS_JSON_PROMPT)
-        self.assertIn("Keep the JSON compact", DEFAULT_ALERTS_JSON_PROMPT)
+        self.assertLess(schema.index("alerts"), schema.index("events"))
+        self.assertLess(schema.index("alerts"), schema.index("memory_pass"))
+        self.assertIn("no more than 36 words", DEFAULT_ALERTS_JSON_PROMPT)
+        self.assertIn("one COMPLETE, compact JSON object", DEFAULT_ALERTS_JSON_PROMPT)
         self.assertIn(
-            "the four Markdown sections are not a complete response",
+            "always finish with literal BATCH_STATE_JSON:",
             DEFAULT_ALERTS_JSON_PROMPT,
         )
-        self.assertIn("Never stop before this block", DEFAULT_ALERTS_JSON_PROMPT)
+        self.assertIn("including empty arrays", DEFAULT_ALERTS_JSON_PROMPT)
 
     def test_batch_state_recovers_complete_alert_from_truncated_json_prefix(self):
         frames = [
@@ -528,6 +531,50 @@ class VlmAlertPromptContractTests(unittest.TestCase):
             )
             self.assertNotIn("```", patched_summary)
 
+    def test_backend_reconciles_compact_priority_policy_from_settings(self):
+        frames = [
+            {"thumbnail": f"frame-{index}", "captured_at": 100.0 + index}
+            for index in range(3)
+        ]
+        summary = (
+            "A person gives a thumbs-up gesture.\n"
+            "BATCH_STATE_JSON:\n"
+            '{"version":1,"cover":{"snapshot_index":2,"kind":"event"},'
+            '"events":[{"event_id":"thumbs_up","label":"thumbs-up gesture",'
+            '"state":"new","snapshot_indices":[2],'
+            '"summary":"Person visibly gives a thumbs-up gesture.",'
+            '"novelty":"novel","pass_up":true}],'
+            '"observed_states":[],"routines":[],"memory_pass":[],"alerts":[]}'
+        )
+        with tempfile.TemporaryDirectory() as temp:
+            manager = build_manager(Path(temp))
+            manager.update_prompt_settings(
+                channel_id=7,
+                alert_policy_prompt=(
+                    "Alert when see thumbs up gesture, priority low"
+                ),
+            )
+            state = manager._extract_batch_state(summary, frames)
+            _patched_summary, reconciled = (
+                manager._reconcile_operator_alert_contract(
+                    7,
+                    summary,
+                    state,
+                )
+            )
+
+        self.assertEqual(
+            reconciled["contract_status"],
+            "parsed_alert_reconciled",
+        )
+        self.assertEqual(len(reconciled["alerts"]), 1)
+        self.assertEqual(reconciled["alerts"][0]["severity"], "low")
+        self.assertEqual(reconciled["alerts"][0]["snapshot_indices"], [2])
+        self.assertEqual(
+            reconciled["alerts"][0]["source"],
+            "backend_policy_reconciliation",
+        )
+
     def test_backend_reconciles_each_distinct_operator_criterion(self):
         frames = [
             {"thumbnail": f"frame-{index}", "captured_at": 100.0 + index}
@@ -866,9 +913,12 @@ class VlmAlertPromptContractTests(unittest.TestCase):
             normalized = manager._normalize_json_alert_prompt(old_contract)
 
             self.assertNotEqual(normalized, old_contract)
-            self.assertIn("Cover kind must be exactly one of", normalized)
             self.assertIn(
-                "evaluate every operator-defined trigger independently",
+                "kind=event|transition|routine|coverage_issue",
+                normalized,
+            )
+            self.assertIn(
+                "one per distinct current visible operator criterion",
                 normalized,
             )
 
@@ -885,9 +935,9 @@ class VlmAlertPromptContractTests(unittest.TestCase):
             normalized = manager._normalize_json_alert_prompt(old_contract)
 
             self.assertEqual(normalized, DEFAULT_ALERTS_JSON_PROMPT)
-            self.assertIn('"version": 2', normalized)
-            self.assertIn("state=returned", normalized)
-            self.assertIn('"applies_to_event_keys": []', normalized)
+            self.assertIn('"version":2', normalized)
+            self.assertIn("state=continuing|returned|uncertain", normalized)
+            self.assertIn("applies_to_event_keys", normalized)
 
     def test_legacy_stream_alert_prompt_returns_migration_suggestion(self):
         with tempfile.TemporaryDirectory() as temp:

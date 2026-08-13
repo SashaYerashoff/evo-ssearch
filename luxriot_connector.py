@@ -5945,7 +5945,13 @@ class LuxriotManager:
         self.live_session_restore_errors: Dict[int, str] = {}
         self.channel_bookmark_fingerprints: Dict[int, Dict[str, int]] = {}
         self.channel_bookmark_content_keys: Dict[int, Dict[str, int]] = {}
-        self.channel_fast_alert_content_keys: Dict[int, Dict[str, int]] = {}
+        # Fast and full L0 can observe the same physical event at very
+        # different wall-clock times. Keep both the source timestamp and send
+        # timestamp so cross-lane dedupe follows the evidence, not inference
+        # latency. Values from older in-process code may still be plain ints.
+        self.channel_fast_alert_content_keys: Dict[
+            int, Dict[str, Dict[str, int] | int]
+        ] = {}
         self.default_bookmark_enabled = bool(getattr(config, "LUXRIOT_AUTO_BOOKMARKS", False))
         try:
             cooldown_value = float(getattr(config, "LUXRIOT_BOOKMARK_COOLDOWN_SEC", 60.0))
@@ -18070,7 +18076,7 @@ class LuxriotManager:
     def _alert_policy_match_tokens(cls, value: object) -> Set[str]:
         tokens: Set[str] = set()
         match_text = re.sub(
-            r"\b(?:alert\s+)?(?:severity|level)\s*(?:is|=|:|-)?\s*"
+            r"\b(?:alert\s+)?(?:severity|level|priority)\s*(?:is|=|:|-)?\s*"
             r"(?:critical|emergency|high|danger|normal|moderate|medium|low|"
             r"warning|warn|info|informational|information)\b",
             " ",
@@ -18093,6 +18099,8 @@ class LuxriotManager:
                     "operator",
                     "require",
                     "scene",
+                    "see",
+                    "seeing",
                     "severity",
                     "significant",
                     "spot",
@@ -18168,7 +18176,7 @@ class LuxriotManager:
         criterion: object,
     ) -> str:
         inline_severity = re.search(
-            r"\b(?:alert\s+)?(?:severity|level)\s*(?:is|=|:|-)?\s*"
+            r"\b(?:alert\s+)?(?:severity|level|priority)\s*(?:is|=|:|-)?\s*"
             r"(?P<severity>critical|emergency|high|danger|normal|moderate|medium|low|"
             r"warning|warn|info|informational|information)\b",
             str(criterion or ""),
@@ -25192,10 +25200,38 @@ class LuxriotManager:
         return False
 
     @classmethod
-    def _bookmark_content_key(cls, alert: Mapping[str, Any]) -> str:
+    def _bookmark_content_key(
+        cls,
+        alert: Mapping[str, Any],
+        operator_criteria: Sequence[str] = (),
+    ) -> str:
         title = " ".join(str(alert.get("title") or "").casefold().split())
+        identity = title
+        evidence = {
+            "label": alert.get("title"),
+            "summary": alert.get("description"),
+            "state": "new",
+            "snapshot_indices": [1],
+        }
+        best_match: Optional[Tuple[float, str]] = None
+        for criterion in operator_criteria:
+            score = cls._operator_policy_event_match(criterion, evidence)
+            if score is None:
+                continue
+            criterion_key = " ".join(
+                sorted(cls._alert_policy_match_tokens(criterion))
+            )
+            if not criterion_key:
+                continue
+            candidate = (float(score), criterion_key)
+            if best_match is None or candidate[0] > best_match[0]:
+                best_match = candidate
+        if best_match is not None:
+            # Model wording such as "Thumb Up Gesture Detected" and
+            # "Thumbs up gesture" refers to the same configured criterion.
+            identity = f"criterion:{best_match[1]}"
         severity = cls._normalize_alert_severity(alert.get("severity"))
-        return f"{title}|{severity}"
+        return f"{identity}|{severity}"
 
     def _bookmark_content_recently_sent_locked(
         self,
@@ -25292,6 +25328,8 @@ class LuxriotManager:
         )
         with self.cache_lock:
             settings = self._get_channel_bookmark_settings_locked(channel_id)
+            operator_policy = self._get_alert_policy_prompt_locked(channel_id)
+        operator_criteria = self._operator_alert_policy_criteria(operator_policy)
         cooldown_sec = float(settings.get("bookmark_cooldown_sec") or 0.0)
         parsed_alerts = self._parse_structured_alerts(
             summary_text,
@@ -25394,7 +25432,10 @@ class LuxriotManager:
                 alert_events.append({**alert, "delivery_status": "bookmark_disabled"})
                 continue
             fingerprint = self._bookmark_fingerprint(alert)
-            content_key = self._bookmark_content_key(alert)
+            content_key = self._bookmark_content_key(
+                alert,
+                operator_criteria,
+            )
             now_ms = int(time.time() * 1000)
             alert_cooldown_sec = self._bookmark_cooldown_for_severity(cooldown_sec, alert["severity"])
             configured_content_window_sec = float(
@@ -25424,11 +25465,33 @@ class LuxriotManager:
             )
             with self.cache_lock:
                 fast_cache = self.channel_fast_alert_content_keys.get(int(channel_id)) or {}
-                fast_sent_at = fast_cache.get(content_key)
+                fast_record = fast_cache.get(content_key)
+                fast_event_at: Optional[int] = None
+                fast_sent_at: Optional[int] = None
+                if isinstance(fast_record, Mapping):
+                    fast_event_at = _parse_optional_int(
+                        fast_record.get("event_timestamp_ms")
+                    )
+                    fast_sent_at = _parse_optional_int(
+                        fast_record.get("sent_at_ms")
+                    )
+                elif isinstance(fast_record, int):
+                    # Compatibility with a cache populated before this code
+                    # was loaded in the current worker.
+                    fast_sent_at = fast_record
+                same_fast_source_episode = bool(
+                    fast_event_at is not None
+                    and abs(int(alert["timestamp_ms"]) - fast_event_at)
+                    < int(fast_alert_dedupe_window_sec * 1000.0)
+                )
+                recent_fast_delivery = bool(
+                    fast_sent_at is not None
+                    and (now_ms - fast_sent_at)
+                    < int(fast_alert_dedupe_window_sec * 1000.0)
+                )
                 if (
                     normalized_delivery_lane != "fast_alert"
-                    and isinstance(fast_sent_at, int)
-                    and (now_ms - fast_sent_at) < int(fast_alert_dedupe_window_sec * 1000.0)
+                    and (same_fast_source_episode or recent_fast_delivery)
                 ):
                     skipped_duplicate_count += 1
                     alert_events.append({**alert, "delivery_status": "fast_phase_duplicate"})
@@ -25493,12 +25556,27 @@ class LuxriotManager:
                         int(channel_id),
                         {},
                     )
-                    channel_fast_cache[content_key] = now_ms
-                    prune_before = now_ms - int(max(1.0, fast_alert_dedupe_window_sec) * 2000.0)
+                    channel_fast_cache[content_key] = {
+                        "event_timestamp_ms": int(alert["timestamp_ms"]),
+                        "sent_at_ms": now_ms,
+                    }
+                    retention_sec = max(
+                        120.0,
+                        fast_alert_dedupe_window_sec * 4.0,
+                    )
+                    prune_before = now_ms - int(retention_sec * 1000.0)
                     for stale_key in [
                         key
-                        for key, sent_at in channel_fast_cache.items()
-                        if int(sent_at) < prune_before
+                        for key, record in channel_fast_cache.items()
+                        if int(
+                            _parse_optional_int(
+                                record.get("sent_at_ms")
+                                if isinstance(record, Mapping)
+                                else record
+                            )
+                            or 0
+                        )
+                        < prune_before
                     ]:
                         channel_fast_cache.pop(stale_key, None)
             sent_count += 1

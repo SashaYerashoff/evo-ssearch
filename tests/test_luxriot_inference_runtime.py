@@ -6009,6 +6009,104 @@ class LuxriotCaptureDispatchTests(unittest.TestCase):
             self.assertEqual(int(distinct_full), 1)
             self.assertEqual(len(sent), 2)
 
+    def test_fast_full_dedupe_uses_operator_criterion_and_source_time(self):
+        with tempfile.TemporaryDirectory() as temp:
+            current = {
+                "title": "Thumb Up Gesture Detected",
+                "timestamp_ms": 1_781_700_000_000,
+            }
+
+            def parse_alerts(_text, _channel_id, _default_ts_ms=None):
+                return [
+                    {
+                        "title": current["title"],
+                        "description": "A person visibly gives a thumbs-up gesture.",
+                        "severity": "high",
+                        "timestamp_ms": current["timestamp_ms"],
+                    }
+                ]
+
+            manager = build_manager(
+                Path(temp),
+                alert_parser=parse_alerts,
+                config_overrides={"VLM_FAST_ALERT_DEDUPE_WINDOW_SEC": 12.0},
+            )
+            manager.default_bookmark_enabled = True
+            manager.channel_prompt_overrides[7] = {
+                "alert_policy_prompt": "Alert when see thumbs up gesture, priority low"
+            }
+            sent = []
+            now = {"value": 1_785_480_000.0}
+            with (
+                patch(
+                    "luxriot_connector.time.time",
+                    side_effect=lambda: now["value"],
+                ),
+                patch.object(
+                    manager,
+                    "send_bookmark_event",
+                    side_effect=lambda **kwargs: sent.append(kwargs)
+                    or {"success": True},
+                ),
+            ):
+                fast = manager.process_summary_alerts(
+                    7,
+                    "ALERTS_JSON: {}",
+                    default_ts_ms=current["timestamp_ms"],
+                    delivery_lane="fast_alert",
+                )
+                # The full batch finishes much later and uses different model
+                # wording, but points at the same source-time episode.
+                now["value"] += 40.0
+                current["title"] = "Thumbs up gesture"
+                repeated_full = manager.process_summary_alerts(
+                    7,
+                    "ALERTS_JSON: {}",
+                    default_ts_ms=current["timestamp_ms"],
+                )
+                # A later source event outside the bounded episode window is
+                # distinct even though the configured criterion is the same.
+                now["value"] += 1.0
+                current["timestamp_ms"] += 20_000
+                distinct_full = manager.process_summary_alerts(
+                    7,
+                    "ALERTS_JSON: {}",
+                    default_ts_ms=current["timestamp_ms"],
+                )
+
+            criteria = manager._operator_alert_policy_criteria(
+                manager.channel_prompt_overrides[7]["alert_policy_prompt"]
+            )
+            self.assertEqual(
+                manager._alert_policy_match_tokens(criteria[0]),
+                {"thumb", "up", "gesture"},
+            )
+            self.assertEqual(
+                manager._operator_alert_policy_severity(
+                    manager.channel_prompt_overrides[7]["alert_policy_prompt"],
+                    criteria[0],
+                ),
+                "low",
+            )
+            self.assertEqual(
+                manager._bookmark_content_key(
+                    {"title": "Thumb Up Gesture Detected", "severity": "high"},
+                    criteria,
+                ),
+                manager._bookmark_content_key(
+                    {"title": "Thumbs up gesture", "severity": "high"},
+                    criteria,
+                ),
+            )
+            self.assertEqual(int(fast), 1)
+            self.assertEqual(int(repeated_full), 0)
+            self.assertEqual(
+                repeated_full.alert_events[0]["delivery_status"],
+                "fast_phase_duplicate",
+            )
+            self.assertEqual(int(distinct_full), 1)
+            self.assertEqual(len(sent), 2)
+
     def test_rollup_source_selection_preserves_salient_children_under_budget(self):
         with tempfile.TemporaryDirectory() as temp:
             manager = build_manager(Path(temp))
