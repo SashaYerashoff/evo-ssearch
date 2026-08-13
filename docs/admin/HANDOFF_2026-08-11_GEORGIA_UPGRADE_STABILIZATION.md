@@ -2300,6 +2300,20 @@ agent llama.cpp PID:    2916440
 No new immutable upgrade archive or Desktop launcher pin was produced in this
 slice.
 
+## Rehearsal fixture note: emu1 is intentionally looped
+
+On this rehearsal stand, Luxriot channel 118 (`emu1`) is a roughly 30-second
+loop containing three low-quality night-time urban drifting/racing scenes. Its
+repeated safety observations are therefore not evidence of dozens of distinct
+real-world incidents. For incident acceptance on this stand, treat emu1 as one
+continuing/recurrent test narrative and use it to evaluate semantic continuity,
+recurrence and deduplication across repeated cycles.
+
+This is test-fixture knowledge only. Do not add a channel-118 special case to
+runtime logic, suppress its grounded safety evidence, or infer a production
+replay-loop policy from it. General replay/loop detection is explicitly deferred;
+it is not required for the current pilot stabilization scope.
+
 ## 2026-08-13 legacy Incident Review backlog isolation
 
 Commit `5aeff4c` (`fix: hide ungrounded legacy incident noise`) removes the
