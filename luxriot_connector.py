@@ -9999,7 +9999,7 @@ class LuxriotManager:
         level_focus = {
             "L1": "Describe the behavior and changes across this 15-minute window as one short sequence.",
             "L2": "Describe hour-scale episodes, routine shifts, meaningful recurrence, and unresolved exceptions.",
-            "L3": "Describe the longer operational pattern, repeated behavior, unresolved incidents, and coverage quality.",
+            "L3": "Describe the longer operational pattern, repeated behavior, operator-relevant cases, and coverage quality.",
         }.get(normalized_level, "Describe behavior and change across the complete period.")
         operator_word_budget = {
             "L1": 180,
@@ -10043,6 +10043,10 @@ class LuxriotManager:
             "- Repeated event-ledger rows are already grouped into episodes. observation_count means the number of sampled "
             "lower-level windows that observed the episode, not a count of distinct real-world occurrences. Use first_observed_ms "
             "and last_observed_ms as the bounded observed span; never rewrite observation_count as 'times happened'.",
+            "- incident_ledger is a temporal episode ledger, not operator case state. status=open means only that no episode "
+            "boundary was observed in the supplied samples; it does not mean that an operator incident is active or unresolved. "
+            "Use incident/case language or recommend operator follow-up only for entries grounded as priority=safety or "
+            "priority=operator_criterion (or for an explicit incident composition).",
             "- The watched-state ledger counts sampled present/absent/unknown observations once per batch. "
             "Zero present observations means no confirmed occurrence in available samples, not proof that an entity never appeared.",
             "- Keep numeric facts aligned with metadata above (item_count/frame_count/window).",
@@ -19020,6 +19024,87 @@ class LuxriotManager:
             issues.append(issue)
         return issues
 
+    @staticmethod
+    def _rollup_has_operator_incident_basis(
+        node: Optional[Mapping[str, Any]],
+    ) -> bool:
+        """Return whether temporal memory contains an operator-facing case root."""
+
+        if not isinstance(node, Mapping):
+            return False
+        raw_ledger = node.get("incident_ledger")
+        if isinstance(raw_ledger, Sequence) and not isinstance(
+            raw_ledger,
+            (str, bytes, bytearray),
+        ):
+            for raw in raw_ledger:
+                if not isinstance(raw, Mapping):
+                    continue
+                priority = str(raw.get("priority") or "").strip().lower()
+                if priority in {"safety", "operator_criterion"}:
+                    return True
+                raw_trigger_kinds = raw.get("trigger_kinds")
+                trigger_kinds = (
+                    {
+                        str(value or "").strip().lower()
+                        for value in raw_trigger_kinds
+                    }
+                    if isinstance(raw_trigger_kinds, Sequence)
+                    and not isinstance(
+                        raw_trigger_kinds,
+                        (str, bytes, bytearray),
+                    )
+                    else set()
+                )
+                if trigger_kinds.intersection(
+                    {"safety_alert", "safety_event", "operator_alert"}
+                ):
+                    return True
+        raw_compositions = node.get("incident_compositions")
+        return bool(
+            isinstance(raw_compositions, Sequence)
+            and not isinstance(raw_compositions, (str, bytes, bytearray))
+            and any(isinstance(item, Mapping) for item in raw_compositions)
+        )
+
+    @staticmethod
+    def _rollup_temporal_case_state_claim(value: object) -> bool:
+        """Detect temporal episode state presented as authoritative case state."""
+
+        text = " ".join(str(value or "").split())
+        patterns = (
+            r"\b(?:incident|case)s?\s+(?:remains?|is|are|stays?)\s+(?:active|open|unresolved)\b",
+            r"\b(?:active|open|unresolved)\s+(?:operator\s+)?(?:incident|case)s?\b",
+        )
+        for pattern in patterns:
+            for match in re.finditer(pattern, text, flags=re.IGNORECASE):
+                prefix = text[max(0, match.start() - 64) : match.start()]
+                if re.search(
+                    r"\b(?:no|not|never|neither|without|does\s+not|do\s+not|cannot|can't)\b[^.!?]{0,56}$",
+                    prefix,
+                    flags=re.IGNORECASE,
+                ):
+                    continue
+                return True
+        return False
+
+    @staticmethod
+    def _rollup_incident_followup_claim(value: object) -> bool:
+        text = " ".join(str(value or "").split())
+        pattern = re.compile(
+            r"\b(?:incident|case)s?\b[^.!?]{0,160}\b(?:requires?|needs?|warrants?)\s+"
+            r"(?:(?:operator|visual|manual)\s+)?(?:follow[- ]?up|verification|review|attention)\b",
+            flags=re.IGNORECASE,
+        )
+        return any(
+            not re.search(
+                r"\b(?:no|not|never|neither|without|does\s+not|do\s+not|cannot|can't)\b",
+                match.group(0),
+                flags=re.IGNORECASE,
+            )
+            for match in pattern.finditer(text)
+        )
+
     @classmethod
     def _rollup_grounding_guard_issues(
         cls,
@@ -19041,6 +19126,13 @@ class LuxriotManager:
             flags=re.IGNORECASE,
         ):
             issues.append("event_ledger_erased")
+        if cls._rollup_temporal_case_state_claim(value):
+            issues.append("temporal_episode_as_case_state")
+        if (
+            not cls._rollup_has_operator_incident_basis(node)
+            and cls._rollup_incident_followup_claim(value)
+        ):
+            issues.append("unsupported_incident_escalation")
         alert_total = int(
             _parse_optional_int(node.get("alert_total")) or 0
         ) if isinstance(node, Mapping) else 0
@@ -19126,6 +19218,7 @@ class LuxriotManager:
             else None
         )
         output: List[str] = []
+        has_operator_incident_basis = cls._rollup_has_operator_incident_basis(node)
         for raw_line in str(value or "").splitlines():
             line = raw_line
             issues = set(cls._rollup_operator_semantic_guard_issues(line))
@@ -19145,6 +19238,28 @@ class LuxriotManager:
                     prefix
                     + "No operator feedback was supplied for these alerts; they remain unreviewed and unclassified."
                 )
+                output.append(line)
+                continue
+            temporal_case_state = (
+                "temporal_episode_as_case_state" in node_issues
+                and cls._rollup_temporal_case_state_claim(line)
+            )
+            unsupported_incident_escalation = (
+                "unsupported_incident_escalation" in node_issues
+                and cls._rollup_incident_followup_claim(line)
+            )
+            if temporal_case_state or unsupported_incident_escalation:
+                if has_operator_incident_basis:
+                    replacement = (
+                        "The operator-relevant event has no observed boundary in the supplied samples; "
+                        "review its grounded alert and evidence under the configured policy."
+                    )
+                else:
+                    replacement = (
+                        "The temporal episode has no observed boundary in the supplied samples; "
+                        "that alone carries no operator-case state or follow-up requirement."
+                    )
+                line = prefix + replacement
                 output.append(line)
                 continue
             if (
@@ -20889,21 +21004,23 @@ class LuxriotManager:
             generation_status = "cached" if summary_kind in {"llm", "llm_cached"} else "stale"
         semantic_issues = self._rollup_grounding_guard_issues(summary, entry)
         legacy_sanitized = False
-        if semantic_issues and summary_kind == "legacy_cached":
+        semantic_guard_sanitized = False
+        if semantic_issues:
             sanitized = self._sanitize_rollup_operator_overclaims(summary, entry)
             if sanitized and not self._rollup_grounding_guard_issues(
                 sanitized,
                 entry,
             ):
                 summary = sanitized
-                generation_status = "legacy_sanitized"
-                legacy_sanitized = True
+                if summary_kind == "legacy_cached":
+                    generation_status = "legacy_sanitized"
+                    legacy_sanitized = True
+                else:
+                    generation_status = "semantic_guard_sanitized"
+                    semantic_guard_sanitized = True
             else:
                 summary_kind = "degraded"
                 generation_status = "semantic_guard_rejected"
-        elif semantic_issues:
-            summary_kind = "degraded"
-            generation_status = "semantic_guard_rejected"
         memory_raw = entry.get("memory_update")
         memory_update = dict(memory_raw) if isinstance(memory_raw, Mapping) else embedded_memory
         alert_meta = self._alert_meta_from_counts(entry.get("alert_counts"))
@@ -21015,6 +21132,8 @@ class LuxriotManager:
             normalized["vector_signal_total"] = vector_signal_total
         if legacy_sanitized:
             normalized["legacy_sanitized"] = True
+        if semantic_guard_sanitized:
+            normalized["semantic_guard_sanitized"] = True
         return normalized
 
     def _filter_rollup_cache_retention(
@@ -22059,14 +22178,14 @@ class LuxriotManager:
                 "Scale-relative routine ledger (coverage gaps never count as routine):",
                 routine_ledger_text or "none",
                 "",
-                "Server-owned incident episode ledger (IDs and boundaries are authoritative; labels are semantic hints):",
+                "Server-owned temporal episode ledger (not operator case state; IDs and boundaries are authoritative; labels are semantic hints):",
                 incident_ledger_text or "none",
                 "",
                 "Total child dispositions (an omitted child remains unclassified_keep):",
                 incident_dispositions_text or "none",
                 (
-                    "Preserve every listed incident track. Do not merge parallel tracks merely because their times overlap, "
-                    "and do not call an incident resolved solely because an episode returned to routine."
+                    "Preserve every listed temporal episode track. Do not merge parallel tracks merely because their times overlap. "
+                    "A temporal boundary, or the lack of one, does not establish whether an operator case is active or resolved."
                 ),
                 "",
                 "Under the exact heading `### Period Overview`, its first body line must be:",
@@ -22232,6 +22351,7 @@ class LuxriotManager:
                                 "Keep grounded factual content, but resolve internal presence/absence contradictions. "
                                 "Never claim complete coverage, no blind spots, or categorical absence of safety/security concerns from sampled frames. "
                                 "When operator feedback is absent, keep every alert unreviewed; do not dismiss it as harmless, false, or irrelevant. "
+                                "Treat incident_ledger as temporal episode memory, not operator case state: status=open means only that no sampled boundary was observed. "
                                 "Never ask anyone to confirm intent; describe only the observable sequence or uncertainty. "
                                 "Append MEMORY_UPDATE_JSON only after all six sections."
                             ),

@@ -8589,6 +8589,158 @@ class LuxriotCaptureDispatchTests(unittest.TestCase):
         self.assertEqual(memory["routine_baseline"], "domestic activity")
         self.assertEqual(memory["ignore_as_routine"], ["cat sleeping on the shelf"])
 
+    def test_temporal_episode_open_status_is_not_operator_case_state(self):
+        summary = operator_rollup_response(
+            "A person briefly moved near the monitor.",
+            takeaway="The incident remains open and requires visual verification.",
+        )
+        context_node = {
+            "incident_ledger": [
+                {
+                    "episode_id": "episode-context",
+                    "status": "open",
+                    "priority": "context",
+                }
+            ]
+        }
+
+        issues = LuxriotManager._rollup_grounding_guard_issues(
+            summary,
+            context_node,
+        )
+        sanitized = LuxriotManager._sanitize_rollup_operator_overclaims(
+            summary,
+            context_node,
+        )
+
+        self.assertIn("temporal_episode_as_case_state", issues)
+        self.assertIn("unsupported_incident_escalation", issues)
+        self.assertNotIn(
+            "temporal_episode_as_case_state",
+            LuxriotManager._rollup_grounding_guard_issues(
+                sanitized,
+                context_node,
+            ),
+        )
+        self.assertNotIn(
+            "unsupported_incident_escalation",
+            LuxriotManager._rollup_grounding_guard_issues(
+                sanitized,
+                context_node,
+            ),
+        )
+        self.assertIn("carries no operator-case state", sanitized)
+
+        operator_node = {
+            "incident_ledger": [
+                {
+                    "episode_id": "episode-thumb",
+                    "status": "open",
+                    "priority": "operator_criterion",
+                }
+            ]
+        }
+        operator_issues = LuxriotManager._rollup_grounding_guard_issues(
+            summary,
+            operator_node,
+        )
+        operator_sanitized = LuxriotManager._sanitize_rollup_operator_overclaims(
+            summary,
+            operator_node,
+        )
+
+        self.assertIn("temporal_episode_as_case_state", operator_issues)
+        self.assertNotIn("unsupported_incident_escalation", operator_issues)
+        self.assertIn("review its grounded alert", operator_sanitized)
+        self.assertEqual(
+            LuxriotManager._rollup_grounding_guard_issues(
+                operator_sanitized,
+                operator_node,
+            ),
+            [],
+        )
+        self.assertEqual(
+            LuxriotManager._rollup_grounding_guard_issues(
+                operator_rollup_response(
+                    "The observed episode has no sampled boundary.",
+                    takeaway="No operator follow-up is warranted from that fact alone.",
+                ),
+                context_node,
+            ),
+            [],
+        )
+
+    def test_cached_rollup_repairs_temporal_case_overclaim_without_lm_call(self):
+        with tempfile.TemporaryDirectory() as temp:
+            manager = build_manager(Path(temp))
+            normalized = manager._normalize_cached_rollup_entry(
+                {
+                    "rollup_id": "l1-ch7-w900-1781700000",
+                    "channel_id": 7,
+                    "level": "L1",
+                    "source_level": "L0",
+                    "window_start": 1_781_700_000.0,
+                    "window_end": 1_781_700_900.0,
+                    "window_sec": 900,
+                    "summary": operator_rollup_response(
+                        "A person briefly moved near the monitor.",
+                        takeaway=(
+                            "The incident remains open and requires visual verification."
+                        ),
+                    ),
+                    "summary_kind": "llm",
+                    "generation_status": "ready",
+                    "format_version": 2,
+                    "incident_ledger": [
+                        {
+                            "episode_id": "episode-context",
+                            "status": "open",
+                            "priority": "context",
+                        }
+                    ],
+                }
+            )
+
+        self.assertIsNotNone(normalized)
+        self.assertEqual(normalized["summary_kind"], "llm")
+        self.assertEqual(
+            normalized["generation_status"],
+            "semantic_guard_sanitized",
+        )
+        self.assertTrue(normalized["semantic_guard_sanitized"])
+        self.assertIn("carries no operator-case state", normalized["summary"])
+        self.assertTrue(manager._rollup_semantic_ready(normalized))
+
+    def test_rollup_prompt_distinguishes_temporal_episodes_from_cases(self):
+        with tempfile.TemporaryDirectory() as temp:
+            manager = build_manager(Path(temp))
+            messages = manager._build_rollup_messages(
+                7,
+                "L1",
+                "L0",
+                {
+                    "window_start": 1_781_700_000.0,
+                    "window_end": 1_781_700_900.0,
+                    "incident_ledger": [
+                        {
+                            "episode_id": "episode-context",
+                            "status": "open",
+                            "priority": "context",
+                        }
+                    ],
+                },
+                [],
+            )
+
+        system_text = messages[0]["content"][0]["text"]
+        user_text = messages[1]["content"][0]["text"]
+        self.assertIn("status=open means only that no episode boundary", system_text)
+        self.assertIn("not operator case state", user_text)
+        self.assertIn(
+            "does not establish whether an operator case is active or resolved",
+            user_text,
+        )
+
     def test_rollup_temporal_scope_is_guarded_and_sanitized(self):
         short_node = {
             "window_start": 1_000.0,
