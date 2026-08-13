@@ -7995,7 +7995,7 @@ class LuxriotManager:
         self,
         callback: Optional[RollupIncidentCallbackFn],
     ) -> None:
-        """Attach a replay-safe sink for grounded L2 incident composition."""
+        """Attach a replay-safe sink for grounded L2/L3 incident composition."""
 
         self.rollup_incident_callback = callback
 
@@ -12501,13 +12501,23 @@ class LuxriotManager:
         max_observations: int = 2048,
     ) -> Dict[str, Any]:
         raw_rows: List[Dict[str, Any]] = []
+        observation_source_rollups: Dict[str, List[str]] = {}
         for child in children:
-            raw_rows.extend(
-                cls._compact_temporal_observations(
-                    child.get("temporal_observations"),
-                    max_items=max_observations,
-                )
+            child_rows = cls._compact_temporal_observations(
+                child.get("temporal_observations"),
+                max_items=max_observations,
             )
+            raw_rows.extend(child_rows)
+            child_rollup_id = str(child.get("rollup_id") or "").strip()[:160]
+            if not child_rollup_id:
+                continue
+            for row in child_rows:
+                observation_id = str(row.get("observation_id") or "").strip()
+                if not observation_id:
+                    continue
+                source_ids = observation_source_rollups.setdefault(observation_id, [])
+                if child_rollup_id not in source_ids and len(source_ids) < 64:
+                    source_ids.append(child_rollup_id)
         deduped: Dict[str, Dict[str, Any]] = {}
         for row in raw_rows:
             deduped[str(row["observation_id"])] = row
@@ -12607,6 +12617,19 @@ class LuxriotManager:
             episode["priority"] = priority
             if severity:
                 episode["severity"] = severity
+            source_rollup_ids = list(
+                dict.fromkeys(
+                    source_rollup_id
+                    for observation_id in episode.get("observation_ids") or []
+                    for source_rollup_id in observation_source_rollups.get(
+                        str(observation_id or ""),
+                        [],
+                    )
+                    if source_rollup_id
+                )
+            )[:64]
+            if source_rollup_ids:
+                episode["source_rollup_ids"] = source_rollup_ids
         by_key: Dict[str, List[Dict[str, Any]]] = {}
         for episode in episodes:
             by_key.setdefault(str(episode.get("semantic_key") or ""), []).append(episode)
@@ -12828,15 +12851,17 @@ class LuxriotManager:
         level: str,
         max_items: int = 32,
     ) -> List[Dict[str, Any]]:
-        """Build bounded, server-owned L2 composition candidates.
+        """Build bounded, server-owned L2/L3 composition candidates.
 
         A composition cannot create attention from ordinary context. It must be
         rooted in grounded safety evidence or a high/critical operator rule.
         Nearby ordinary episodes may then become nested context for that root.
+        L3 additionally requires evidence from at least two distinct L2 source
+        windows; it must not replay an ordinary one-hour L2 composition.
         """
 
         normalized_level = str(level or "").strip().upper()
-        if normalized_level != "L2":
+        if normalized_level not in {"L2", "L3"}:
             return []
         rows = [
             dict(episode)
@@ -12849,18 +12874,26 @@ class LuxriotManager:
 
         def bounds(row: Mapping[str, Any]) -> Tuple[int, int]:
             start = max(0, int(_parse_optional_int(row.get("start_ms")) or 0))
+            status = str(row.get("status") or "open").strip().lower()
+            last_observed = int(
+                _parse_optional_int(row.get("last_observed_ms")) or start
+            )
             end = max(
                 start,
                 int(
-                    _parse_optional_int(row.get("boundary_at_ms"))
-                    or _parse_optional_int(row.get("last_observed_ms"))
+                    (
+                        None
+                        if status == "ended_by_observed_gap"
+                        else _parse_optional_int(row.get("boundary_at_ms"))
+                    )
+                    or last_observed
                     or start
                 ),
             )
             return start, end
 
         rows.sort(key=lambda row: (*bounds(row), str(row.get("episode_id") or "")))
-        max_gap_ms = 5 * 60 * 1000
+        max_gap_ms = (15 if normalized_level == "L3" else 5) * 60 * 1000
         components: List[List[Dict[str, Any]]] = []
         current: List[Dict[str, Any]] = []
         component_end = 0
@@ -12929,6 +12962,16 @@ class LuxriotManager:
             )
             if len(semantic_keys) < 2:
                 continue
+            source_rollup_ids = list(
+                dict.fromkeys(
+                    str(value or "").strip()
+                    for row in component
+                    for value in (row.get("source_rollup_ids") or [])
+                    if str(value or "").strip()
+                )
+            )[:64]
+            if normalized_level == "L3" and len(source_rollup_ids) < 2:
+                continue
             episode_ids = [str(row.get("episode_id") or "") for row in component]
             parent_id = str(parent.get("episode_id") or "")
             start_ms = min(bounds(row)[0] for row in component)
@@ -12976,6 +13019,9 @@ class LuxriotManager:
                     "anchor_observation_ids": anchor_observation_ids,
                     "parent_observation_ids": parent_observation_ids,
                     "semantic_keys": semantic_keys[:32],
+                    "source_rollup_ids": source_rollup_ids,
+                    "source_window_count": len(source_rollup_ids),
+                    "cross_window": normalized_level == "L3",
                     "start_ms": start_ms,
                     "end_ms": end_ms,
                     "evidence_refs": evidence_refs,
@@ -22581,7 +22627,7 @@ class LuxriotManager:
                 workload_class=workload_class,
                 force_synthesis=force_synthesis,
             )
-        if synthesize and level == "L2":
+        if synthesize and level in {"L2", "L3"}:
             now = time.time()
             self._dispatch_rollup_incident_compositions(
                 channel_id,

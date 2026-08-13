@@ -1000,18 +1000,20 @@ class IncidentCommandService:
         actor_id: str | None = None,
         tracked_limit: int = 128,
     ) -> dict[str, Any]:
-        """Attach L2 context to an existing grounded incident, replay-safely.
+        """Attach L2/L3 context to an existing grounded incident, replay-safely.
 
         Deterministic consolidation may enrich a case which already exists due
         to an operator criterion or an independent safety signal.  It must not
         create attention from ordinary scene narration, and it never merges or
-        closes incidents automatically.
+        closes incidents automatically. L3 is admitted only for compositions
+        which explicitly span at least two L2 source windows.
         """
 
         normalized_channel = int(channel_id)
         if normalized_channel <= 0:
             raise ValueError("channel_id must be positive")
-        if str(rollup.get("level") or "").strip().upper() != "L2":
+        source_level = str(rollup.get("level") or "").strip().upper()
+        if source_level not in {"L2", "L3"}:
             return {
                 "supported": True,
                 "compositions": 0,
@@ -1020,7 +1022,8 @@ class IncidentCommandService:
                 "child_incidents": 0,
                 "child_episodes": 0,
                 "child_relations": 0,
-                "skipped": "not_l2",
+                "reused_child_incidents": 0,
+                "skipped": "not_l2_or_l3",
             }
         compositions = [
             dict(item)
@@ -1042,6 +1045,7 @@ class IncidentCommandService:
                 "child_incidents": 0,
                 "child_episodes": 0,
                 "child_relations": 0,
+                "reused_child_incidents": 0,
                 "skipped": "no_compositions" if not compositions else "no_episode_ledger",
             }
         lister = getattr(self.incident_store, "list_incidents", None)
@@ -1058,6 +1062,7 @@ class IncidentCommandService:
                 "child_incidents": 0,
                 "child_episodes": 0,
                 "child_relations": 0,
+                "reused_child_incidents": 0,
             }
 
         starts = [self._optional_int(item.get("start_ms")) for item in compositions]
@@ -1073,9 +1078,10 @@ class IncidentCommandService:
                 "child_incidents": 0,
                 "child_episodes": 0,
                 "child_relations": 0,
+                "reused_child_incidents": 0,
                 "skipped": "missing_bounds",
             }
-        context_pad_ms = 5 * 60 * 1000
+        context_pad_ms = (15 if source_level == "L3" else 5) * 60 * 1000
         incidents, _total = lister(
             channel_ids=[normalized_channel],
             case_states=["candidate", "open"],
@@ -1142,11 +1148,31 @@ class IncidentCommandService:
                 != "nested"
             )
         ]
+        related_child_by_parent_episode: dict[tuple[str, str], dict[str, Any]] = {}
+        for item in incidents:
+            if not isinstance(item, Mapping):
+                continue
+            report = item.get("report")
+            report = report if isinstance(report, Mapping) else {}
+            presentation = report.get("presentation")
+            presentation = (
+                presentation if isinstance(presentation, Mapping) else {}
+            )
+            anchor = item.get("anchor_ref")
+            anchor = anchor if isinstance(anchor, Mapping) else {}
+            parent_id = str(presentation.get("parent_incident_id") or "").strip()
+            episode_id = str(anchor.get("episode_id") or "").strip()
+            if parent_id and episode_id:
+                related_child_by_parent_episode.setdefault(
+                    (parent_id, episode_id),
+                    dict(item),
+                )
         attached = 0
         episode_count = 0
         child_incident_count = 0
         child_episode_count = 0
         child_relation_count = 0
+        reused_child_incident_count = 0
         skipped = 0
         failures: list[str] = []
         parent_incident_ids: list[str] = []
@@ -1161,6 +1187,19 @@ class IncidentCommandService:
             ):
                 skipped += 1
                 continue
+            if source_level == "L3":
+                source_rollup_ids = {
+                    str(value or "").strip()
+                    for value in composition.get("source_rollup_ids") or []
+                    if str(value or "").strip()
+                }
+                if (
+                    str(composition.get("level") or "").strip().upper() != "L3"
+                    or composition.get("cross_window") is not True
+                    or len(source_rollup_ids) < 2
+                ):
+                    skipped += 1
+                    continue
             parent_observation_ids = {
                 str(value or "").strip()
                 for value in (
@@ -1206,6 +1245,7 @@ class IncidentCommandService:
                     ]
                 )
             )
+            related_incident_ids: list[str] = []
             try:
                 for episode_id in composition_episode_ids:
                     episode = episodes_by_id.get(episode_id)
@@ -1213,15 +1253,33 @@ class IncidentCommandService:
                         continue
                     nested_context = episode_id != parent_episode_id
                     start_ms = self._optional_int(episode.get("start_ms"))
-                    end_ms = self._optional_int(
-                        episode.get("boundary_at_ms")
-                        or episode.get("last_observed_ms")
-                    )
                     if start_ms is None:
                         continue
-                    end_ms = max(start_ms, end_ms or start_ms)
                     status = str(episode.get("status") or "open").strip().lower()
                     is_ended = status != "open"
+                    last_observed_ms = max(
+                        start_ms,
+                        self._optional_int(episode.get("last_observed_ms"))
+                        or start_ms,
+                    )
+                    boundary_ms = self._optional_int(episode.get("boundary_at_ms"))
+                    possible_end_ms = (
+                        max(last_observed_ms, boundary_ms or last_observed_ms)
+                        if is_ended
+                        else None
+                    )
+                    projection_end_ms = max(
+                        last_observed_ms,
+                        boundary_ms or last_observed_ms,
+                    )
+                    projected_observed_end_ms = (
+                        projection_end_ms
+                        if source_level == "L2"
+                        else last_observed_ms
+                    )
+                    projected_possible_end_ms = (
+                        projection_end_ms if source_level == "L2" else possible_end_ms
+                    )
                     episode_digest = hashlib.sha256(
                         f"{composition_id}:{episode_id}".encode("utf-8")
                     ).hexdigest()
@@ -1234,39 +1292,51 @@ class IncidentCommandService:
                         for value in episode.get("evidence_refs") or []
                         if str(value or "").strip()
                     ][:128]
-                    episode_appender(
-                        {
-                            "incident_id": parent_id,
-                            "idempotency_key": f"l2-composition:{episode_digest}",
-                            "episode_key": f"l2:{episode_digest}",
-                            "perception_state": "ended" if is_ended else "observed",
-                            "semantic_key": str(episode.get("semantic_key") or "")[:160] or None,
-                            "entity_key": str(episode.get("entity_key") or "")[:160] or None,
-                            "zone_key": str(episode.get("zone_key") or "")[:160] or None,
-                            "possible_start_ms": start_ms,
-                            "observed_start_ms": start_ms,
-                            "observed_end_ms": end_ms if is_ended else None,
-                            "possible_end_ms": end_ms if is_ended else None,
-                            "routine_before_ref": {},
-                            "routine_after_ref": {},
-                            "evidence_refs": evidence_refs,
-                            "coverage": {
-                                "source_level": "L2",
-                                "rollup_id": rollup_id,
-                                "composition_id": composition_id,
-                                "scale_disposition": str(
-                                    episode.get("scale_disposition")
-                                    or "unclassified_keep"
-                                ),
-                                "nested_context": nested_context,
-                                "composition_parent": not nested_context,
-                                "automatic_merge": False,
-                                "operator_review_required": True,
-                            },
+                    parent_episode_record = {
+                        "incident_id": parent_id,
+                        "idempotency_key": f"l2-composition:{episode_digest}",
+                        "episode_key": f"l2:{episode_digest}",
+                        "perception_state": "ended" if is_ended else "observed",
+                        "semantic_key": str(episode.get("semantic_key") or "")[:160]
+                        or None,
+                        "entity_key": str(episode.get("entity_key") or "")[:160]
+                        or None,
+                        "zone_key": str(episode.get("zone_key") or "")[:160]
+                        or None,
+                        "possible_start_ms": start_ms,
+                        "observed_start_ms": start_ms,
+                        "observed_end_ms": (
+                            projected_observed_end_ms if is_ended else None
+                        ),
+                        "possible_end_ms": (
+                            projected_possible_end_ms if is_ended else None
+                        ),
+                        "routine_before_ref": {},
+                        "routine_after_ref": {},
+                        "evidence_refs": evidence_refs,
+                        "coverage": {
+                            "source_level": "L2",
+                            "rollup_id": rollup_id,
+                            "composition_id": composition_id,
+                            "scale_disposition": str(
+                                episode.get("scale_disposition")
+                                or "unclassified_keep"
+                            ),
+                            "nested_context": nested_context,
+                            "composition_parent": not nested_context,
+                            "automatic_merge": False,
+                            "operator_review_required": True,
                         },
-                        actor_id=actor_id,
-                    )
-                    episode_count += 1
+                    }
+                    if source_level == "L2":
+                        # L2 owns the detailed composition projection on the
+                        # parent. L3 links cross-window child incidents but does
+                        # not append a second copy of every L2 episode.
+                        episode_appender(
+                            parent_episode_record,
+                            actor_id=actor_id,
+                        )
+                        episode_count += 1
                     if (
                         nested_context
                         and callable(incident_creator)
@@ -1279,20 +1349,46 @@ class IncidentCommandService:
                             semantic_key.replace("_", " ").strip().capitalize()
                             or "Nested incident"
                         )[:200]
+                        existing_child = (
+                            related_child_by_parent_episode.get(
+                                (parent_id, episode_id)
+                            )
+                            if source_level == "L3"
+                            else None
+                        )
+                        if existing_child is not None:
+                            existing_child_id = str(
+                                existing_child.get("id") or ""
+                            ).strip()
+                            if existing_child_id:
+                                related_incident_ids.append(existing_child_id)
+                                reused_child_incident_count += 1
+                                continue
+                        child_seed = (
+                            f"{parent_id}:{episode_id}"
+                            if source_level == "L3"
+                            else f"{parent_id}:{composition_id}:{episode_id}"
+                        )
                         child_id = str(
                             uuid.uuid5(
                                 uuid.NAMESPACE_URL,
-                                (
-                                    "eva:l2-nested-incident:"
-                                    f"{parent_id}:{composition_id}:{episode_id}"
-                                ),
+                                f"eva:{source_level.lower()}-nested-incident:{child_seed}",
                             )
                         )
-                        child_identity = f"l2-child:{episode_digest}"[:200]
+                        child_identity = (
+                            f"l2-child:{episode_digest}"
+                            if source_level == "L2"
+                            else (
+                                "l3-child:"
+                                + hashlib.sha256(
+                                    child_seed.encode("utf-8")
+                                ).hexdigest()
+                            )[:200]
+                        )
                         child_report = {
                             "severity": str(episode.get("severity") or "info")[:32],
                             "summary": child_title,
-                            "source": "rollup_l2_nested_episode",
+                            "source": f"rollup_{source_level.lower()}_nested_episode",
                             "priority": "context",
                             "automatic_merge": False,
                             "presentation": {
@@ -1318,8 +1414,10 @@ class IncidentCommandService:
                                 "channel_ids": [normalized_channel],
                                 "possible_start_ms": start_ms,
                                 "observed_start_ms": start_ms,
-                                "observed_end_ms": end_ms,
-                                "possible_end_ms": end_ms if is_ended else None,
+                                "observed_end_ms": projected_observed_end_ms,
+                                "possible_end_ms": (
+                                    projected_possible_end_ms if is_ended else None
+                                ),
                                 "anchor_ref": {
                                     "rollup_id": rollup_id,
                                     "composition_id": composition_id,
@@ -1329,17 +1427,17 @@ class IncidentCommandService:
                                     {
                                         "timestamp_ms": start_ms,
                                         "start_ms": start_ms,
-                                        "end_ms": end_ms,
+                                        "end_ms": projected_observed_end_ms,
                                         "semantic_key": semantic_key,
                                         "label": child_title,
-                                        "source": "rollup_l2_composition",
+                                        "source": f"rollup_{source_level.lower()}_composition",
                                     }
                                 ],
                                 "evidence_refs": evidence_refs,
                                 "qualia_refs": [],
                                 "coverage": {
                                     "status": "covered",
-                                    "source_level": "L2",
+                                    "source_level": source_level,
                                     "rollup_id": rollup_id,
                                     "composition_id": composition_id,
                                     "scale_disposition": str(
@@ -1348,7 +1446,7 @@ class IncidentCommandService:
                                     ),
                                 },
                                 "uncertainties": [
-                                    "Nested L2 context remains separate and requires operator review."
+                                    f"Nested {source_level} context remains separate and requires operator review."
                                 ],
                                 "report": child_report,
                                 "follow_policy": {},
@@ -1356,14 +1454,20 @@ class IncidentCommandService:
                             actor_id=actor_id,
                         )
                         child_id = str(child.get("id") or child_id)
+                        related_child_by_parent_episode[(parent_id, episode_id)] = dict(
+                            child
+                        )
+                        related_incident_ids.append(child_id)
                         child_incident_count += 1
                         episode_appender(
                             {
                                 "incident_id": child_id,
                                 "idempotency_key": (
-                                    f"l2-child-episode:{episode_digest}"
+                                    f"{source_level.lower()}-child-episode:{episode_digest}"
                                 ),
-                                "episode_key": f"l2-child:{episode_digest}",
+                                "episode_key": (
+                                    f"{source_level.lower()}-child:{episode_digest}"
+                                ),
                                 "perception_state": (
                                     "ended" if is_ended else "observed"
                                 ),
@@ -1376,13 +1480,17 @@ class IncidentCommandService:
                                 or None,
                                 "possible_start_ms": start_ms,
                                 "observed_start_ms": start_ms,
-                                "observed_end_ms": end_ms if is_ended else None,
-                                "possible_end_ms": end_ms if is_ended else None,
+                                "observed_end_ms": (
+                                    projected_observed_end_ms if is_ended else None
+                                ),
+                                "possible_end_ms": (
+                                    projected_possible_end_ms if is_ended else None
+                                ),
                                 "routine_before_ref": {},
                                 "routine_after_ref": {},
                                 "evidence_refs": evidence_refs,
                                 "coverage": {
-                                    "source_level": "L2",
+                                    "source_level": source_level,
                                     "rollup_id": rollup_id,
                                     "composition_id": composition_id,
                                     "parent_incident_id": parent_id,
@@ -1405,8 +1513,10 @@ class IncidentCommandService:
                                 "idempotency_key": (
                                     f"rollup-nested:{episode_digest}"
                                 )[:200],
-                                "source_kind": "rollup_l2_nested_incident",
-                                "observed_at_ms": end_ms,
+                                "source_kind": (
+                                    f"rollup_{source_level.lower()}_nested_incident"
+                                ),
+                                "observed_at_ms": projected_observed_end_ms,
                                 "channel_id": normalized_channel,
                                 "perception_state": (
                                     "ended" if is_ended else "observed"
@@ -1426,6 +1536,36 @@ class IncidentCommandService:
                             },
                             actor_id=actor_id,
                         )
+                        relation_payload = {
+                            "relationship_role": "nested_context",
+                            "parent_incident_id": parent_id,
+                            "child_incident_id": child_id,
+                            "child_title": child_title,
+                            "parent_title": str(
+                                parent.get("title") or "Parent incident"
+                            )[:200],
+                            "semantic_key": semantic_key,
+                            "possible_start_ms": start_ms,
+                            "possible_end_ms": (
+                                projected_possible_end_ms if is_ended else None
+                            ),
+                            "scale_disposition": str(
+                                episode.get("scale_disposition")
+                                or "unclassified_keep"
+                            ),
+                            "composition_id": composition_id,
+                            "automatic_merge": False,
+                            "operator_review_required": True,
+                        }
+                        if source_level == "L3":
+                            relation_payload.update(
+                                {
+                                    "source_level": "L3",
+                                    "source_rollup_ids": list(
+                                        composition.get("source_rollup_ids") or []
+                                    )[:64],
+                                }
+                            )
                         relation_appender(
                             {
                                 "subject_incident_id": child_id,
@@ -1437,40 +1577,41 @@ class IncidentCommandService:
                                 "relation_state": "candidate",
                                 "confidence": "medium",
                                 "rationale": (
-                                    "A bounded L2 episode overlaps the grounded "
+                                    f"A bounded {source_level} episode overlaps the grounded "
                                     "parent incident; concurrency does not imply "
                                     "causality or automatic merge."
                                 ),
-                                "payload": {
-                                    "relationship_role": "nested_context",
-                                    "parent_incident_id": parent_id,
-                                    "child_incident_id": child_id,
-                                    "child_title": child_title,
-                                    "parent_title": str(
-                                        parent.get("title") or "Parent incident"
-                                    )[:200],
-                                    "semantic_key": semantic_key,
-                                    "possible_start_ms": start_ms,
-                                    "possible_end_ms": (
-                                        end_ms if is_ended else None
-                                    ),
-                                    "scale_disposition": str(
-                                        episode.get("scale_disposition")
-                                        or "unclassified_keep"
-                                    ),
-                                    "composition_id": composition_id,
-                                    "automatic_merge": False,
-                                    "operator_review_required": True,
-                                },
+                                "payload": relation_payload,
                             },
                             actor_id=actor_id,
                         )
                         child_relation_count += 1
+                parent_observation_payload = {
+                    "semantic_keys": list(composition.get("semantic_keys") or [])[:32],
+                    "parent_episode_id": composition.get("parent_episode_id"),
+                    "nested_episode_ids": nested_ids,
+                    "promotion_policy": "extend_grounded_anchor",
+                    "automatic_merge": False,
+                    "operator_review_required": True,
+                }
+                if source_level == "L3":
+                    parent_observation_payload.update(
+                        {
+                            "related_incident_ids": list(
+                                dict.fromkeys(related_incident_ids)
+                            )[:127],
+                            "source_level": "L3",
+                            "source_rollup_ids": list(
+                                composition.get("source_rollup_ids") or []
+                            )[:64],
+                            "cross_window": True,
+                        }
+                    )
                 observation_appender(
                     {
                         "incident_id": parent_id,
                         "idempotency_key": f"rollup-composition:{composition_id}"[:200],
-                        "source_kind": "rollup_l2_composition",
+                        "source_kind": f"rollup_{source_level.lower()}_composition",
                         "observed_at_ms": self._optional_int(composition.get("end_ms"))
                         or self._wall_clock_ms(),
                         "channel_id": normalized_channel,
@@ -1479,14 +1620,7 @@ class IncidentCommandService:
                             "rollup_id": rollup_id,
                             "composition_id": composition_id,
                         },
-                        "payload": {
-                            "semantic_keys": list(composition.get("semantic_keys") or [])[:32],
-                            "parent_episode_id": composition.get("parent_episode_id"),
-                            "nested_episode_ids": nested_ids,
-                            "promotion_policy": "extend_grounded_anchor",
-                            "automatic_merge": False,
-                            "operator_review_required": True,
-                        },
+                        "payload": parent_observation_payload,
                     },
                     actor_id=actor_id,
                 )
@@ -1502,6 +1636,7 @@ class IncidentCommandService:
             "child_incidents": child_incident_count,
             "child_episodes": child_episode_count,
             "child_relations": child_relation_count,
+            "reused_child_incidents": reused_child_incident_count,
             "skipped": skipped,
             "parent_incident_ids": list(dict.fromkeys(parent_incident_ids))[:32],
             "failures": failures[:8],

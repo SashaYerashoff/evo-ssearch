@@ -6,6 +6,13 @@ Format loosely follows Keep a Changelog.
 
 ## Unreleased
 
+- **Grounded cross-window incident hierarchy:** L3 may now attach bounded
+  context across adjacent L2 windows only when an existing top-level safety or
+  high-priority operator incident anchors the scene. Existing L2 children are
+  reused by server-owned episode identity, context-only children stay out of
+  review pagination, and observed coverage gaps no longer stretch an episode
+  to the timestamp of a much later observation.
+
 - **Site-specific CSRF cookies work in React:** the authentication response now
   publishes the configured non-secret CSRF cookie name, and the shared React
   transport applies it to every mutation and agent stream. Adopted sites no

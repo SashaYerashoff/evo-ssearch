@@ -1144,6 +1144,258 @@ def test_l2_composition_cannot_use_a_nested_incident_as_its_parent():
     assert store.observations == []
 
 
+def test_l3_cross_window_composition_reuses_existing_l2_child_without_duplicates():
+    child_id = "00000000-0000-0000-0000-000000000218"
+    safety = {
+        **_record(state="candidate"),
+        "case_state": "candidate",
+        "possible_start_ms": 10_000,
+        "observed_start_ms": 10_000,
+        "anchor_ref": {"observation_id": "obs-collision"},
+        "timeline_refs": [
+            {
+                "observation_id": "obs-collision",
+                "semantic_key": "vehicle collision",
+                "label": "Vehicle collision",
+            }
+        ],
+        "report": {"priority": "safety", "severity": "critical"},
+    }
+    existing_child = {
+        **_record(state="ended"),
+        "id": child_id,
+        "case_state": "candidate",
+        "perception_state": "ended",
+        "possible_start_ms": 20_000,
+        "observed_start_ms": 20_000,
+        "observed_end_ms": 30_000,
+        "possible_end_ms": 30_000,
+        "anchor_ref": {"episode_id": "episode-phone"},
+        "timeline_refs": [
+            {
+                "semantic_key": "person phone_call",
+                "label": "Person phone call",
+            }
+        ],
+        "report": {
+            "priority": "context",
+            "severity": "info",
+            "presentation": {
+                "scope": "nested",
+                "parent_incident_id": INCIDENT_ID,
+            },
+        },
+    }
+
+    class _L3ReuseStore:
+        def __init__(self):
+            self.observations = []
+
+        def list_incidents(self, **_kwargs):
+            return [dict(safety), dict(existing_child)], 2
+
+        def append_episode(self, *_args, **_kwargs):
+            raise AssertionError("L3 must not duplicate an L2 episode projection")
+
+        def create_incident(self, *_args, **_kwargs):
+            raise AssertionError("the existing L2 child must be reused")
+
+        def append_relation(self, *_args, **_kwargs):
+            raise AssertionError("the existing child relation must be reused")
+
+        def append_observation(self, record, **_kwargs):
+            self.observations.append(dict(record))
+            return dict(record)
+
+    rollup = {
+        "rollup_id": "l3-ch112-w28800-0",
+        "level": "L3",
+        "incident_ledger": [
+            {
+                "episode_id": "episode-collision",
+                "semantic_key": "vehicle collision",
+                "status": "open",
+                "start_ms": 10_000,
+                "last_observed_ms": 12_000,
+                "observation_ids": ["obs-collision"],
+                "priority": "safety",
+                "severity": "critical",
+            },
+            {
+                "episode_id": "episode-phone",
+                "semantic_key": "person phone_call",
+                "status": "ended_by_routine",
+                "start_ms": 20_000,
+                "last_observed_ms": 30_000,
+                "boundary_at_ms": 31_000,
+                "observation_ids": ["obs-phone"],
+                "priority": "context",
+            },
+        ],
+        "incident_compositions": [
+            {
+                "composition_id": "composition-l3-cross-window",
+                "level": "L3",
+                "cross_window": True,
+                "source_rollup_ids": ["l2-window-a", "l2-window-b"],
+                "source_window_count": 2,
+                "parent_episode_id": "episode-collision",
+                "parent_observation_ids": ["obs-collision"],
+                "nested_episode_ids": ["episode-phone"],
+                "semantic_keys": ["vehicle collision", "person phone_call"],
+                "start_ms": 10_000,
+                "end_ms": 31_000,
+                "promotion_policy": "extend_grounded_anchor",
+                "automatic_merge": False,
+            }
+        ],
+    }
+    store = _L3ReuseStore()
+
+    result = _service(store, _Runtime()).ingest_rollup_incident_compositions(
+        112,
+        rollup,
+    )
+
+    assert result["attached"] == 1
+    assert result["episodes"] == 0
+    assert result["child_incidents"] == 0
+    assert result["child_episodes"] == 0
+    assert result["child_relations"] == 0
+    assert result["reused_child_incidents"] == 1
+    assert len(store.observations) == 1
+    assert store.observations[0]["incident_id"] == INCIDENT_ID
+    assert store.observations[0]["source_kind"] == "rollup_l3_composition"
+    assert store.observations[0]["payload"]["related_incident_ids"] == [child_id]
+
+    store.observations.clear()
+    invalid_rollup = {
+        **rollup,
+        "incident_compositions": [
+            {
+                **rollup["incident_compositions"][0],
+                "source_rollup_ids": ["l2-window-a"],
+                "source_window_count": 1,
+            }
+        ],
+    }
+    rejected = _service(store, _Runtime()).ingest_rollup_incident_compositions(
+        112,
+        invalid_rollup,
+    )
+    assert rejected["attached"] == 0
+    assert rejected["skipped"] == 1
+    assert store.observations == []
+
+
+def test_l3_cross_window_composition_materializes_only_new_nested_child():
+    safety = {
+        **_record(state="candidate"),
+        "case_state": "candidate",
+        "possible_start_ms": 10_000,
+        "observed_start_ms": 10_000,
+        "anchor_ref": {"observation_id": "obs-collision"},
+        "timeline_refs": [
+            {
+                "observation_id": "obs-collision",
+                "semantic_key": "vehicle collision",
+                "label": "Vehicle collision",
+            }
+        ],
+        "report": {"priority": "safety", "severity": "critical"},
+    }
+
+    class _L3CreateStore:
+        def __init__(self):
+            self.created = []
+            self.episodes = []
+            self.observations = []
+            self.relations = []
+
+        def list_incidents(self, **_kwargs):
+            return [dict(safety)], 1
+
+        def create_incident(self, record, **_kwargs):
+            stored = dict(record)
+            self.created.append(stored)
+            return dict(stored)
+
+        def append_episode(self, record, **_kwargs):
+            self.episodes.append(dict(record))
+            return dict(record)
+
+        def append_observation(self, record, **_kwargs):
+            self.observations.append(dict(record))
+            return dict(record)
+
+        def append_relation(self, record, **_kwargs):
+            self.relations.append(dict(record))
+            return dict(record)
+
+    rollup = {
+        "rollup_id": "l3-ch112-w28800-0",
+        "level": "L3",
+        "incident_ledger": [
+            {
+                "episode_id": "episode-collision",
+                "semantic_key": "vehicle collision",
+                "status": "open",
+                "start_ms": 10_000,
+                "last_observed_ms": 12_000,
+                "observation_ids": ["obs-collision"],
+                "priority": "safety",
+                "severity": "critical",
+            },
+            {
+                "episode_id": "episode-phone-new",
+                "semantic_key": "person phone_call",
+                "status": "ended_by_routine",
+                "start_ms": 20_000,
+                "last_observed_ms": 30_000,
+                "boundary_at_ms": 31_000,
+                "observation_ids": ["obs-phone-new"],
+                "priority": "context",
+            },
+        ],
+        "incident_compositions": [
+            {
+                "composition_id": "composition-l3-new-child",
+                "level": "L3",
+                "cross_window": True,
+                "source_rollup_ids": ["l2-window-a", "l2-window-b"],
+                "source_window_count": 2,
+                "parent_episode_id": "episode-collision",
+                "parent_observation_ids": ["obs-collision"],
+                "nested_episode_ids": ["episode-phone-new"],
+                "semantic_keys": ["vehicle collision", "person phone_call"],
+                "start_ms": 10_000,
+                "end_ms": 31_000,
+                "promotion_policy": "extend_grounded_anchor",
+                "automatic_merge": False,
+            }
+        ],
+    }
+    store = _L3CreateStore()
+
+    result = _service(store, _Runtime()).ingest_rollup_incident_compositions(
+        112,
+        rollup,
+    )
+
+    assert result["attached"] == 1
+    assert result["episodes"] == 0
+    assert result["child_incidents"] == 1
+    assert result["child_episodes"] == 1
+    assert result["child_relations"] == 1
+    assert result["reused_child_incidents"] == 0
+    assert len(store.created) == 1
+    assert store.created[0]["report"]["source"] == "rollup_l3_nested_episode"
+    assert store.created[0]["coverage"]["source_level"] == "L3"
+    assert len(store.episodes) == 1
+    assert store.episodes[0]["incident_id"] == store.created[0]["id"]
+    assert store.relations[0]["payload"]["source_level"] == "L3"
+
+
 def test_review_projection_is_compact_and_keeps_independent_lifecycle_axes():
     service = IncidentCommandService(
         _Store(),

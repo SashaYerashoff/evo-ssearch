@@ -82,12 +82,31 @@ first production slice of the third gate is also implemented at L2:
   `operator_criterion` or `safety` provenance, so stale presentation metadata
   cannot hide an alert while it waits for the next grounded observation.
 
+The next bounded slice extends composition across L2 window boundaries at L3:
+
+- every L3 episode retains the exact L2 rollup IDs which supplied its immutable
+  observations; a composition is admitted only when the parent-bounded component
+  contains at least two distinct L2 source windows;
+- the L3 neighborhood is limited to fifteen minutes around the grounded parent
+  interval. It remains parent-centered and non-transitive, and uses the same
+  top-level safety/high-policy anchor gate as L2;
+- an `ended_by_observed_gap` episode ends at its last observed frame for
+  proximity. The timestamp of the later observation is retained only as the
+  possible boundary; EVA cannot treat the unseen interval as continuous event
+  duration;
+- L3 reuses an existing L2 child with the same parent and server-owned episode
+  ID. It does not append another copy of L2 episodes to the parent ledger. Only
+  genuinely new cross-window context receives a deterministic child ID and a
+  candidate `concurrent_with` relation;
+- L3 still cannot infer causality, merge incidents, promote context-only
+  children, resolve risk, close a case, or create a parent from routine scene
+  narration.
+
 This is conservative durable enrichment, not complete scene understanding.
-Operator-reviewed causal relations, L3 cross-window composition, and a learned
-weekday/time-of-day baseline remain future production steps. Until those
-bindings are grounded, EVA prefers retaining separately addressable evidence
-without raising top-level attention over flooding the operator queue with
-speculative micro-incidents.
+Operator-reviewed causal relations and a learned weekday/time-of-day baseline
+remain future production steps. Until those bindings are grounded, EVA prefers
+retaining separately addressable evidence without raising top-level attention
+over flooding the operator queue with speculative micro-incidents.
 
 Design basis:
 

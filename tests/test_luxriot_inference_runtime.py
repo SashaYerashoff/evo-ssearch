@@ -9508,6 +9508,66 @@ class LuxriotCaptureDispatchTests(unittest.TestCase):
 
         self.assertNotIn("incident_compositions", memory)
 
+    def test_l3_temporal_composition_requires_distinct_l2_source_windows(self):
+        collision = make_temporal_observation(
+            channel_id=112,
+            source_batch_id="batch-cross-window-collision",
+            ordinal=0,
+            kind="event",
+            state="continuing",
+            semantic_key="vehicle collision",
+            label="Two vehicles remain at the collision scene",
+            start_ms=3_590_000,
+            end_ms=3_599_000,
+        ).to_dict()
+        collision.update(trigger_kind="safety_alert", severity="critical")
+        phone = make_temporal_observation(
+            channel_id=112,
+            source_batch_id="batch-cross-window-phone",
+            ordinal=0,
+            kind="event",
+            state="new",
+            semantic_key="person phone_call",
+            label="Bystander calls by phone",
+            start_ms=3_601_000,
+            end_ms=3_605_000,
+        ).to_dict()
+        phone.update(trigger_kind="episode_event", severity="info")
+
+        cross_window = LuxriotManager._aggregate_temporal_memory(
+            [
+                {
+                    "rollup_id": "l2-ch112-w3600-0",
+                    "temporal_observations": [collision],
+                },
+                {
+                    "rollup_id": "l2-ch112-w3600-3600",
+                    "temporal_observations": [phone],
+                },
+            ],
+            level="L3",
+        )
+        one_window = LuxriotManager._aggregate_temporal_memory(
+            [
+                {
+                    "rollup_id": "l2-ch112-w3600-0",
+                    "temporal_observations": [collision, phone],
+                }
+            ],
+            level="L3",
+        )
+
+        self.assertEqual(len(cross_window["incident_compositions"]), 1)
+        composition = cross_window["incident_compositions"][0]
+        self.assertEqual(composition["level"], "L3")
+        self.assertTrue(composition["cross_window"])
+        self.assertEqual(composition["source_window_count"], 2)
+        self.assertEqual(
+            composition["source_rollup_ids"],
+            ["l2-ch112-w3600-0", "l2-ch112-w3600-3600"],
+        )
+        self.assertNotIn("incident_compositions", one_window)
+
     def test_high_operator_composition_keeps_same_entity_and_rejects_chain_noise(self):
         parent = {
             "episode_id": "episode-cat-enter",
@@ -9568,6 +9628,39 @@ class LuxriotCaptureDispatchTests(unittest.TestCase):
         self.assertNotIn("episode-person-exit", compositions[0]["episode_ids"])
         self.assertNotIn("episode-late-cat", compositions[0]["episode_ids"])
 
+    def test_observed_gap_boundary_does_not_extend_episode_for_composition(self):
+        old_alert = {
+            "episode_id": "episode-old-cat",
+            "channel_id": 112,
+            "semantic_key": "cat enter",
+            "priority": "operator_criterion",
+            "severity": "high",
+            "status": "ended_by_observed_gap",
+            "start_ms": 10_000,
+            "last_observed_ms": 12_000,
+            "boundary_at_ms": 60 * 60 * 1000,
+            "observation_ids": ["obs-old-cat"],
+            "evidence_refs": [],
+        }
+        near_late_boundary = {
+            "episode_id": "episode-late-motion",
+            "channel_id": 112,
+            "semantic_key": "cat movement",
+            "priority": "context",
+            "status": "open",
+            "start_ms": 60 * 60 * 1000 + 1_000,
+            "last_observed_ms": 60 * 60 * 1000 + 2_000,
+            "observation_ids": ["obs-late-motion"],
+            "evidence_refs": [],
+        }
+
+        compositions = LuxriotManager._compose_temporal_incident_candidates(
+            [old_alert, near_late_boundary],
+            level="L2",
+        )
+
+        self.assertEqual(compositions, [])
+
     def test_rollup_incident_dispatch_retries_failure_then_coalesces_replay(self):
         with tempfile.TemporaryDirectory() as temp:
             manager = build_manager(Path(temp))
@@ -9593,6 +9686,86 @@ class LuxriotCaptureDispatchTests(unittest.TestCase):
 
             self.assertEqual(calls, [(112, node["rollup_id"])] * 2)
             self.assertEqual(node["incident_composition_result"], {"attached": 1})
+
+    def test_closed_l3_build_dispatches_only_cross_window_composition(self):
+        with tempfile.TemporaryDirectory() as temp:
+            manager = build_manager(Path(temp))
+            manager.rollup_llm_levels = set()
+            calls = []
+            manager.set_rollup_incident_callback(
+                lambda channel_id, node: calls.append(
+                    (channel_id, node["rollup_id"], node["incident_compositions"])
+                )
+                or {"attached": 1}
+            )
+            collision = make_temporal_observation(
+                channel_id=112,
+                source_batch_id="batch-l3-dispatch-collision",
+                ordinal=0,
+                kind="event",
+                state="continuing",
+                semantic_key="vehicle collision",
+                label="Vehicles remain at a collision scene",
+                start_ms=3_590_000,
+                end_ms=3_599_000,
+            ).to_dict()
+            collision.update(trigger_kind="safety_alert", severity="critical")
+            phone = make_temporal_observation(
+                channel_id=112,
+                source_batch_id="batch-l3-dispatch-phone",
+                ordinal=0,
+                kind="event",
+                state="new",
+                semantic_key="person phone_call",
+                label="Bystander calls by phone",
+                start_ms=3_601_000,
+                end_ms=3_605_000,
+            ).to_dict()
+            phone.update(trigger_kind="episode_event", severity="info")
+            sources = [
+                {
+                    "rollup_id": "l2-ch112-w3600-0",
+                    "channel_id": 112,
+                    "window_start": 0.0,
+                    "window_end": 3_600.0,
+                    "item_count": 1,
+                    "frame_count": 1,
+                    "source_tokens": 10,
+                    "run_ids": ["run-a"],
+                    "summary": "Collision remains visible.",
+                    "temporal_observations": [collision],
+                },
+                {
+                    "rollup_id": "l2-ch112-w3600-3600",
+                    "channel_id": 112,
+                    "window_start": 3_600.0,
+                    "window_end": 7_200.0,
+                    "item_count": 1,
+                    "frame_count": 1,
+                    "source_tokens": 10,
+                    "run_ids": ["run-a"],
+                    "summary": "A bystander uses a phone.",
+                    "temporal_observations": [phone],
+                },
+            ]
+
+            nodes = manager._build_rollup_level(
+                112,
+                "L3",
+                "L2",
+                28_800,
+                sources,
+                synthesize=True,
+            )
+
+            self.assertEqual(len(nodes), 1)
+            self.assertEqual(len(calls), 1)
+            self.assertEqual(calls[0][0], 112)
+            self.assertTrue(calls[0][2][0]["cross_window"])
+            self.assertEqual(
+                nodes[0]["incident_composition_result"],
+                {"attached": 1},
+            )
 
     def test_temporal_keys_ignore_generated_ids_and_preserve_parallel_events(self):
         first = LuxriotManager._l0_temporal_observations(
