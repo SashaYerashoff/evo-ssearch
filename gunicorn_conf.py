@@ -89,8 +89,7 @@ def post_worker_init(worker) -> None:
     def handle_sigterm(signum, frame) -> None:
         if callable(previous):
             previous(signum, frame)
-        _flush_oldapp_runtime("worker_sigterm")
-        completed = _bounded_shutdown_oldapp_runtime(
+        completed = _bounded_retire_oldapp_runtime(
             "worker_sigterm",
             timeout_seconds=8.0,
         )
@@ -296,6 +295,37 @@ def _bounded_shutdown_oldapp_runtime(
         target=run,
         daemon=True,
         name="eva-gunicorn-worker-shutdown",
+    )
+    thread.start()
+    return completed.wait(timeout=max(0.0, float(timeout_seconds)))
+
+
+def _bounded_retire_oldapp_runtime(
+    reason: str,
+    *,
+    timeout_seconds: float,
+) -> bool:
+    """Bound both durable flush and runtime shutdown during SIGTERM.
+
+    A summary writer may own the manager lock while an LM/CLIP request is
+    retiring.  Keeping the flush outside the deadline can deadlock the old
+    worker before the already-bounded shutdown is reached, leaving two EVA
+    runtimes under one Gunicorn master and blocking capture handover.
+    """
+
+    completed = threading.Event()
+
+    def run() -> None:
+        try:
+            _flush_oldapp_runtime(reason)
+            _shutdown_oldapp_runtime(reason)
+        finally:
+            completed.set()
+
+    thread = threading.Thread(
+        target=run,
+        daemon=True,
+        name="eva-gunicorn-worker-retire",
     )
     thread.start()
     return completed.wait(timeout=max(0.0, float(timeout_seconds)))

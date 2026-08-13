@@ -119,6 +119,31 @@ class GunicornRuntimeHookTests(unittest.TestCase):
 
         self.assertFalse(completed)
 
+    def test_bounded_retire_reports_a_stuck_flush(self) -> None:
+        blocker = threading.Event()
+        module = types.SimpleNamespace(
+            luxriot_manager=types.SimpleNamespace(
+                persist_summary_state=lambda: blocker.wait(1.0),
+                persist_rollup_cache=lambda: None,
+            ),
+            _shutdown_background_workers=lambda: None,
+        )
+        previous = sys.modules.get("oldapp")
+        sys.modules["oldapp"] = module
+        try:
+            completed = gunicorn_conf._bounded_retire_oldapp_runtime(
+                "test",
+                timeout_seconds=0.01,
+            )
+        finally:
+            blocker.set()
+            if previous is None:
+                sys.modules.pop("oldapp", None)
+            else:
+                sys.modules["oldapp"] = previous
+
+        self.assertFalse(completed)
+
     def test_warmed_replacement_retires_old_worker_then_restores_runtime(self) -> None:
         calls = []
         module = types.SimpleNamespace(
