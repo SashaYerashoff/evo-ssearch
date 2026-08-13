@@ -8841,6 +8841,38 @@ class LuxriotCaptureDispatchTests(unittest.TestCase):
             [],
         )
 
+        past_tense_case_state_summary = operator_rollup_response(
+            "Drift was visible in the sampled frames.",
+            alerts=(
+                "Several emissions resolved, but a major episode remained "
+                "open at the window close."
+            ),
+        )
+        past_tense_case_state_issues = (
+            LuxriotManager._rollup_grounding_guard_issues(
+                past_tense_case_state_summary,
+                operator_node,
+            )
+        )
+        past_tense_case_state_sanitized = (
+            LuxriotManager._sanitize_rollup_operator_overclaims(
+                past_tense_case_state_summary,
+                operator_node,
+            )
+        )
+        self.assertIn(
+            "temporal_episode_as_case_state",
+            past_tense_case_state_issues,
+        )
+        self.assertNotIn("remained open", past_tense_case_state_sanitized)
+        self.assertEqual(
+            LuxriotManager._rollup_grounding_guard_issues(
+                past_tense_case_state_sanitized,
+                operator_node,
+            ),
+            [],
+        )
+
         active_watchlist_summary = operator_rollup_response(
             "A configured watch remains pending.",
             takeaway=(
