@@ -132,6 +132,17 @@ export interface SemanticPresenceClass {
   samples?: number
   timestamp_ms?: number | null
   history?: SemanticPresencePoint[]
+  spatial_score?: number | null
+  spatial_baseline?: number | null
+  spatial_deviation?: number | null
+  spatial_delta?: number | null
+  spatial_z?: number | null
+  spatial_state?: 'warming_up' | 'routine' | 'above_baseline' | 'below_baseline' | string
+  spatial_warmup?: boolean
+  spatial_samples?: number
+  spatial_timestamp_ms?: number | null
+  spatial_history?: SemanticPresencePoint[]
+  spatial_contrast?: number | null
 }
 export interface SemanticPresenceStatus {
   enabled: boolean
@@ -141,6 +152,8 @@ export interface SemanticPresenceStatus {
   timestamp_ms?: number | null
   age_ms?: number | null
   semantics?: string
+  spatial_semantics?: string
+  spatial_state?: string
   error?: string | null
   classes?: SemanticPresenceClass[]
 }

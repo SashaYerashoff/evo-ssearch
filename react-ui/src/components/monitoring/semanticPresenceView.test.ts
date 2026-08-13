@@ -97,4 +97,21 @@ describe('semantic presence operator ranking', () => {
       ['vehicle drifting through tire smoke'],
     ).map((item) => item.key)).toEqual(['fire', 'vehicle', 'smoke'])
   })
+
+  it('uses same-forward spatial history instead of pooled scene leakage', () => {
+    const person = semanticClass('person', 0.05, [0.05], 'above_baseline')
+    Object.assign(person, {
+      spatial_score: 0.12,
+      spatial_baseline: 0.119,
+      spatial_delta: 0.001,
+      spatial_deviation: 0.002,
+      spatial_z: 0.1,
+      spatial_state: 'routine',
+      spatial_warmup: false,
+      spatial_samples: 60,
+      spatial_history: [{ timestamp_ms: 60_000, score: 0.12, baseline: 0.119 }],
+    })
+
+    expect(presenceReaction(person).reacting).toBe(false)
+  })
 })

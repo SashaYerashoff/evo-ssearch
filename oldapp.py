@@ -139,6 +139,7 @@ from incident_store import (
 )
 from embedding_batcher import EmbeddingBatchOutput, ImageEmbeddingBatcher
 from semantic_patch_attention import build_patch_affinity_payload
+from semantic_presence import SEMANTIC_PRESENCE_PROMPTS
 from embedding_space import (
     embedding_space_fingerprint,
     embedding_space_requires_identity,
@@ -218,6 +219,11 @@ _clip_runtime_canary_state: Dict[str, Any] = {
 }
 _live_clip_batcher: Optional[ImageEmbeddingBatcher] = None
 _live_clip_batcher_lock = Lock()
+_semantic_patch_bank_generation = ""
+_semantic_patch_bank_labels: Tuple[str, ...] = ()
+_semantic_patch_bank_ranges: Tuple[Tuple[int, int], ...] = ()
+_semantic_patch_bank_matrix: Optional[np.ndarray] = None
+_SEMANTIC_PATCH_METADATA_KEY = "_semantic_patch_presence_v1"
 dino_encoder: Optional[DINOEncoder] = None
 mask2former_head: Optional["Mask2FormerHead"] = None
 _mask2former_lock = Lock()
@@ -1944,6 +1950,115 @@ def _siglip_feature_tensor(value: Any) -> torch.Tensor:
     )
 
 
+def _semantic_patch_prompt_bank_locked(
+) -> Tuple[Tuple[str, ...], Tuple[Tuple[int, int], ...], np.ndarray]:
+    """Cache the bounded core presence text bank for same-forward shadow scoring."""
+
+    global _semantic_patch_bank_generation
+    global _semantic_patch_bank_labels
+    global _semantic_patch_bank_ranges
+    global _semantic_patch_bank_matrix
+    labels = tuple(
+        str(label or "").strip().lower()
+        for label in getattr(config, "SEMANTIC_PRESENCE_CLASSES", ())
+        if str(label or "").strip()
+    )
+    if (
+        _semantic_patch_bank_matrix is not None
+        and _semantic_patch_bank_generation == clip_runtime_generation
+        and _semantic_patch_bank_labels == labels
+    ):
+        return (
+            _semantic_patch_bank_labels,
+            _semantic_patch_bank_ranges,
+            _semantic_patch_bank_matrix,
+        )
+    prompts: List[str] = []
+    ranges: List[Tuple[int, int]] = []
+    for label in labels:
+        label_prompts = tuple(
+            SEMANTIC_PRESENCE_PROMPTS.get(label) or (f"a visible {label}",)
+        )
+        start = len(prompts)
+        prompts.extend(label_prompts)
+        ranges.append((start, len(prompts)))
+    matrix = _clip_text_embeddings(prompts)
+    if matrix.ndim != 2 or matrix.shape[0] != len(prompts):
+        raise RuntimeError("semantic patch text bank returned an invalid shape")
+    _semantic_patch_bank_generation = clip_runtime_generation
+    _semantic_patch_bank_labels = labels
+    _semantic_patch_bank_ranges = tuple(ranges)
+    _semantic_patch_bank_matrix = np.asarray(matrix, dtype=np.float32)
+    return labels, tuple(ranges), _semantic_patch_bank_matrix
+
+
+def _siglip_patch_presence_metadata_locked(
+    patch_tensor: torch.Tensor,
+    model_inputs: Mapping[str, Any],
+) -> Tuple[Mapping[str, Any], ...]:
+    """Aggregate small spatial shadow scores without materializing patch tokens."""
+
+    labels, prompt_ranges, text_matrix = _semantic_patch_prompt_bank_locked()
+    if not labels:
+        return tuple({} for _ in range(int(patch_tensor.shape[0])))
+    patches = _normalize_l2_embeddings(patch_tensor.float())
+    text = torch.as_tensor(
+        text_matrix,
+        dtype=patches.dtype,
+        device=patches.device,
+    )
+    if int(patches.shape[-1]) != int(text.shape[-1]):
+        raise RuntimeError("SigLIP patch/text dimension mismatch")
+    prompt_affinity = patches @ text.transpose(0, 1)
+    label_affinity = torch.stack(
+        [
+            prompt_affinity[:, :, start:end].amax(dim=-1)
+            for start, end in prompt_ranges
+        ],
+        dim=-1,
+    )
+    spatial_shapes = model_inputs.get("spatial_shapes")
+    spatial_shape_values: List[List[int]] = []
+    if isinstance(spatial_shapes, torch.Tensor) and spatial_shapes.numel() >= 2:
+        spatial_shape_values = [
+            [int(value) for value in row[:2]]
+            for row in spatial_shapes.detach().cpu().tolist()
+        ]
+    rows: List[torch.Tensor] = []
+    for index in range(int(label_affinity.shape[0])):
+        token_count = int(label_affinity.shape[1])
+        if index < len(spatial_shape_values):
+            token_count = min(
+                token_count,
+                max(
+                    1,
+                    spatial_shape_values[index][0]
+                    * spatial_shape_values[index][1],
+                ),
+            )
+        values = label_affinity[index, :token_count, :].transpose(0, 1)
+        top_count = max(1, int(math.ceil(token_count * 0.10)))
+        top_mean = values.topk(top_count, dim=1).values.mean(dim=1)
+        median = values.median(dim=1).values
+        rows.append(torch.stack((top_mean, top_mean - median), dim=1))
+    materialized = torch.stack(rows, dim=0).float().cpu().numpy()
+    return tuple(
+        {
+            _SEMANTIC_PATCH_METADATA_KEY: {
+                "semantics": "same_forward_top_patch_text_affinity_shadow_v1",
+                "classes": {
+                    label: {
+                        "score": round(float(materialized[index, class_index, 0]), 6),
+                        "contrast": round(float(materialized[index, class_index, 1]), 6),
+                    }
+                    for class_index, label in enumerate(labels)
+                },
+            }
+        }
+        for index in range(int(materialized.shape[0]))
+    )
+
+
 def _siglip_projection_dimension() -> Optional[int]:
     model_config = getattr(clip_model, "config", None)
     candidates = (
@@ -2292,6 +2407,7 @@ def _clip_image_batch_with_space_locked(
     cuda_start: Any = None
     cuda_end: Any = None
     cuda_stream: Any = None
+    item_metadata: Tuple[Mapping[str, Any], ...] = ()
     with torch.inference_mode():
         if clip_backend_kind == "siglip2":
             if clip_processor is None or clip_model is None:
@@ -2321,9 +2437,31 @@ def _clip_image_batch_with_space_locked(
                     cuda_end = None
                     cuda_stream = None
             stage_started = time.perf_counter()
-            image_features = _siglip_feature_tensor(
-                cast(Any, clip_model).get_image_features(**model_inputs)
+            vision_inputs = {
+                key: model_inputs[key]
+                for key in (
+                    "pixel_values",
+                    "pixel_attention_mask",
+                    "spatial_shapes",
+                )
+                if key in model_inputs
+            }
+            vision_outputs = cast(Any, clip_model).vision_model(
+                **vision_inputs,
+                return_dict=True,
             )
+            image_features = _siglip_feature_tensor(vision_outputs)
+            patch_tensor = getattr(vision_outputs, "last_hidden_state", None)
+            if isinstance(patch_tensor, torch.Tensor) and patch_tensor.ndim == 3:
+                try:
+                    item_metadata = _siglip_patch_presence_metadata_locked(
+                        patch_tensor,
+                        model_inputs,
+                    )
+                except Exception:
+                    # Spatial presence is an operator-only shadow seam. It must
+                    # never reject or delay the canonical pooled embedding path.
+                    item_metadata = ()
             _record_clip_runtime_timing(
                 "image_model_submit",
                 wait_ms=0.0,
@@ -2378,6 +2516,7 @@ def _clip_image_batch_with_space_locked(
     return EmbeddingBatchOutput(
         matrix,
         _current_clip_embedding_space_locked(),
+        item_metadata,
     )
 
 

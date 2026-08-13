@@ -35,6 +35,7 @@ class EmbeddingBatchOutput:
 
     embeddings: np.ndarray
     metadata: Mapping[str, Any] = field(default_factory=dict)
+    item_metadata: Sequence[Mapping[str, Any]] = field(default_factory=tuple)
 
 
 @dataclass
@@ -269,8 +270,10 @@ class ImageEmbeddingBatcher:
                     * 1000.0,
                 )
                 metadata: Mapping[str, Any] = {}
+                item_metadata: Sequence[Mapping[str, Any]] = ()
                 if isinstance(raw, EmbeddingBatchOutput):
                     metadata = dict(raw.metadata)
+                    item_metadata = tuple(raw.item_metadata)
                     raw = raw.embeddings
                 matrix = np.asarray(raw, dtype=np.float32)
                 if matrix.ndim == 1 and len(batch) == 1:
@@ -280,12 +283,24 @@ class ImageEmbeddingBatcher:
                         "embed_many returned an invalid batch shape "
                         f"{tuple(matrix.shape)} for {len(batch)} requests"
                     )
+                if item_metadata and len(item_metadata) != len(batch):
+                    raise EmbeddingBatchError(
+                        "embed_many returned invalid per-item metadata "
+                        f"for {len(batch)} requests"
+                    )
                 for index, request in enumerate(batch):
                     request.result = np.asarray(
                         matrix[index],
                         dtype=np.float32,
                     ).reshape(-1)
-                    request.metadata = dict(metadata)
+                    request.metadata = {
+                        **dict(metadata),
+                        **(
+                            dict(item_metadata[index])
+                            if item_metadata
+                            else {}
+                        ),
+                    }
                 with self._condition:
                     self._counters["completed_total"] += len(batch)
                     self._counters["batches_total"] += 1

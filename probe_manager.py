@@ -13,6 +13,9 @@ from embedding_space import embedding_space_fingerprint
 from semantic_presence import SemanticPresenceTracker
 
 
+_SEMANTIC_PATCH_METADATA_KEY = "_semantic_patch_presence_v1"
+
+
 class _FaissTypingStub:
     IndexFlatIP = Any
 
@@ -558,6 +561,16 @@ class ProbeManager:
                 getattr(config, "SEMANTIC_PRESENCE_WARMUP_SAMPLES", 30)
             ),
         )
+        self.semantic_patch_presence_tracker = SemanticPresenceTracker(
+            semantic_presence_classes or (),
+            maximum_classes=int(
+                getattr(config, "SEMANTIC_PRESENCE_MAX_CLASSES", 10)
+            ),
+            warmup_samples=int(
+                getattr(config, "SEMANTIC_PRESENCE_WARMUP_SAMPLES", 30)
+            ),
+            noise_floor=0.005,
+        )
         self.patch_attention_fn = patch_attention_fn
         self.patch_attention_enabled = bool(patch_attention_enabled)
         self._patch_attention_lock = threading.Lock()
@@ -654,10 +667,17 @@ class ProbeManager:
     ) -> Dict[str, Any]:
         ts_ms = timestamp_ms or int(time.time() * 1000)
         embedding_space: Dict[str, Any] = {}
+        spatial_presence: Mapping[str, Any] = {}
         if self.embed_image_with_metadata_fn is not None:
             emb, raw_metadata = self.embed_image_with_metadata_fn(pil_image)
             if isinstance(raw_metadata, Mapping):
                 embedding_space = dict(raw_metadata)
+                raw_spatial_presence = embedding_space.pop(
+                    _SEMANTIC_PATCH_METADATA_KEY,
+                    None,
+                )
+                if isinstance(raw_spatial_presence, Mapping):
+                    spatial_presence = raw_spatial_presence
         else:
             emb = self.embed_image_fn(pil_image)
         frame_fingerprint = self._space_fingerprint(embedding_space)
@@ -694,10 +714,12 @@ class ProbeManager:
             )
         if reset_presence:
             self.semantic_presence_tracker.clear_channel(int(channel_id))
+            self.semantic_patch_presence_tracker.clear_channel(int(channel_id))
         presence = self._observe_semantic_presence(
             int(channel_id),
             int(ts_ms),
             np.asarray(emb, dtype=np.float32),
+            spatial_presence=spatial_presence,
         )
         result = {
             "channel_id": int(channel_id),
@@ -717,22 +739,35 @@ class ProbeManager:
         channel_id: int,
         timestamp_ms: int,
         embedding: np.ndarray,
+        *,
+        spatial_presence: Optional[Mapping[str, Any]] = None,
     ) -> Dict[str, Any]:
         if not self.semantic_presence_enabled:
             return {}
+        spatial_status = self._observe_spatial_presence(
+            channel_id,
+            timestamp_ms,
+            spatial_presence,
+        )
         plan = self.semantic_presence_tracker.prompt_plan(channel_id)
         phrases = [prompt for _label, prompts in plan for prompt in prompts]
         if not phrases:
-            return self.semantic_presence_tracker.status(
-                channel_id,
-                now_ms=timestamp_ms,
+            return self._merge_spatial_presence(
+                self.semantic_presence_tracker.status(
+                    channel_id,
+                    now_ms=timestamp_ms,
+                ),
+                spatial_status,
             )
         try:
             if not self.texts_cached(phrases):
                 self.prewarm_texts_async(phrases)
-                return self.semantic_presence_tracker.status(
-                    channel_id,
-                    now_ms=timestamp_ms,
+                return self._merge_spatial_presence(
+                    self.semantic_presence_tracker.status(
+                        channel_id,
+                        now_ms=timestamp_ms,
+                    ),
+                    spatial_status,
                 )
             text_matrix = self._embed_texts(phrases)
             image_vector = ProbeBuffer._normalize_vec(
@@ -751,17 +786,102 @@ class ProbeManager:
                 width = len(prompts)
                 scores[label] = float(prompt_scores[offset : offset + width].max())
                 offset += width
-            return self.semantic_presence_tracker.update(
+            return self._merge_spatial_presence(
+                self.semantic_presence_tracker.update(
+                    channel_id,
+                    timestamp_ms,
+                    scores,
+                ),
+                spatial_status,
+            )
+        except Exception as exc:
+            self.semantic_presence_tracker.note_error(channel_id, exc)
+            return self._merge_spatial_presence(
+                self.semantic_presence_tracker.status(
+                    channel_id,
+                    now_ms=timestamp_ms,
+                ),
+                spatial_status,
+            )
+
+    def _observe_spatial_presence(
+        self,
+        channel_id: int,
+        timestamp_ms: int,
+        payload: Optional[Mapping[str, Any]],
+    ) -> Dict[str, Any]:
+        classes = payload.get("classes") if isinstance(payload, Mapping) else None
+        scores: Dict[str, float] = {}
+        contrasts: Dict[str, float] = {}
+        if isinstance(classes, Mapping):
+            for label, raw in classes.items():
+                if not isinstance(raw, Mapping):
+                    continue
+                try:
+                    scores[str(label)] = float(raw.get("score"))
+                    contrasts[str(label)] = float(raw.get("contrast"))
+                except (TypeError, ValueError):
+                    continue
+        if scores:
+            status = self.semantic_patch_presence_tracker.update(
                 channel_id,
                 timestamp_ms,
                 scores,
             )
-        except Exception as exc:
-            self.semantic_presence_tracker.note_error(channel_id, exc)
-            return self.semantic_presence_tracker.status(
+        else:
+            status = self.semantic_patch_presence_tracker.status(
                 channel_id,
                 now_ms=timestamp_ms,
             )
+        if contrasts:
+            status = dict(status)
+            status["contrasts"] = contrasts
+        status["semantics"] = str(
+            (payload or {}).get("semantics")
+            or "same_forward_top_patch_text_affinity_shadow_v1"
+        )
+        return status
+
+    @staticmethod
+    def _merge_spatial_presence(
+        pooled_status: Mapping[str, Any],
+        spatial_status: Mapping[str, Any],
+    ) -> Dict[str, Any]:
+        result = dict(pooled_status)
+        spatial_classes = {
+            str(item.get("key") or ""): item
+            for item in spatial_status.get("classes", [])
+            if isinstance(item, Mapping) and item.get("key")
+        }
+        contrasts = spatial_status.get("contrasts")
+        merged_classes: List[Dict[str, Any]] = []
+        for raw in result.get("classes", []):
+            if not isinstance(raw, Mapping):
+                continue
+            item = dict(raw)
+            spatial = spatial_classes.get(str(item.get("key") or ""))
+            if spatial is not None and int(spatial.get("samples") or 0) > 0:
+                for key in (
+                    "score",
+                    "baseline",
+                    "deviation",
+                    "delta",
+                    "z",
+                    "state",
+                    "warmup",
+                    "samples",
+                    "timestamp_ms",
+                    "history",
+                ):
+                    if key in spatial:
+                        item[f"spatial_{key}"] = spatial[key]
+                if isinstance(contrasts, Mapping) and item.get("key") in contrasts:
+                    item["spatial_contrast"] = contrasts[item["key"]]
+            merged_classes.append(item)
+        result["classes"] = merged_classes
+        result["spatial_semantics"] = spatial_status.get("semantics")
+        result["spatial_state"] = spatial_status.get("state")
+        return result
 
     def set_semantic_presence_classes(
         self,
@@ -770,7 +890,12 @@ class ProbeManager:
     ) -> Tuple[str, ...]:
         """Bounded seam for future evidence-backed L1 class proposals."""
 
-        return self.semantic_presence_tracker.set_channel_labels(channel_id, labels)
+        normalized = self.semantic_presence_tracker.set_channel_labels(
+            channel_id,
+            labels,
+        )
+        self.semantic_patch_presence_tracker.set_channel_labels(channel_id, labels)
+        return normalized
 
     def patch_attention(
         self,
@@ -1317,8 +1442,13 @@ class ProbeManager:
             else:
                 result = buf.status()
         if self.semantic_presence_enabled:
-            result["semantic_presence"] = self.semantic_presence_tracker.status(
-                channel_id
+            spatial_status = self.semantic_patch_presence_tracker.status(channel_id)
+            spatial_status["semantics"] = (
+                "same_forward_top_patch_text_affinity_shadow_v1"
+            )
+            result["semantic_presence"] = self._merge_spatial_presence(
+                self.semantic_presence_tracker.status(channel_id),
+                spatial_status,
             )
         return result
 
@@ -1384,6 +1514,7 @@ class ProbeManager:
             self._buffer_embedding_fingerprints.pop(channel_id, None)
             self._buffer_embedding_spaces.pop(channel_id, None)
         self.semantic_presence_tracker.clear_channel(channel_id)
+        self.semantic_patch_presence_tracker.clear_channel(channel_id)
 
     def clear_all(self) -> None:
         with self.lock:
@@ -1395,3 +1526,4 @@ class ProbeManager:
         with self._embedding_space_fingerprint_lock:
             self._embedding_space_fingerprint = ""
         self.semantic_presence_tracker.clear()
+        self.semantic_patch_presence_tracker.clear()

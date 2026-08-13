@@ -29,6 +29,43 @@ def test_batch_metadata_is_returned_with_each_embedding():
     assert metadata == {"fingerprint": "epoch-a", "dimension": 2}
 
 
+def test_per_item_metadata_is_kept_with_its_embedding():
+    def embed_many(images):
+        return EmbeddingBatchOutput(
+            np.asarray([[float(value), 1.0] for value in images], dtype=np.float32),
+            {"fingerprint": "epoch-a", "dimension": 2},
+            tuple({"shadow_score": float(value) / 10.0} for value in images),
+        )
+
+    batcher = ImageEmbeddingBatcher(
+        embed_many,
+        max_batch_size=2,
+        max_wait_ms=100,
+    )
+    gate = threading.Barrier(3)
+    results = {}
+
+    def submit(value):
+        gate.wait()
+        results[value] = batcher.embed_one_with_metadata(value)
+
+    threads = [threading.Thread(target=submit, args=(value,)) for value in (3, 7)]
+    for thread in threads:
+        thread.start()
+    gate.wait()
+    for thread in threads:
+        thread.join(timeout=2)
+    assert batcher.stop()
+
+    for value, (vector, metadata) in results.items():
+        np.testing.assert_allclose(vector, [float(value), 1.0])
+        assert metadata == {
+            "fingerprint": "epoch-a",
+            "dimension": 2,
+            "shadow_score": float(value) / 10.0,
+        }
+
+
 def test_eight_concurrent_channels_are_encoded_in_one_microbatch():
     calls = []
     gate = threading.Barrier(9)

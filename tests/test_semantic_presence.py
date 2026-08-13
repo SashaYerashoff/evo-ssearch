@@ -100,6 +100,61 @@ def test_probe_manager_scores_presence_from_the_existing_image_vector():
     )
 
 
+def test_same_forward_patch_shadow_is_not_part_of_embedding_space():
+    def embed_with_metadata(_image):
+        return np.asarray([1.0, 0.0], dtype=np.float32), {
+            "backend": "siglip2",
+            "model": "test",
+            "dimension": 2,
+            "_semantic_patch_presence_v1": {
+                "semantics": "same_forward_top_patch_text_affinity_shadow_v1",
+                "classes": {
+                    "person": {"score": 0.12, "contrast": 0.04},
+                    "vehicle": {"score": 0.31, "contrast": 0.09},
+                },
+            },
+        }
+
+    manager = ProbeManager(
+        embed_image_fn=lambda _image: np.asarray([1.0, 0.0], dtype=np.float32),
+        embed_image_with_metadata_fn=embed_with_metadata,
+        embed_text_fn=lambda _text: np.asarray([1.0, 0.0], dtype=np.float32),
+        embed_texts_fn=lambda texts: np.asarray(
+            [[1.0, 0.0] for _text in texts],
+            dtype=np.float32,
+        ),
+        jpeg_encoder=lambda _image, **_kwargs: "jpeg",
+        semantic_presence_enabled=True,
+        semantic_presence_classes=("person", "vehicle"),
+    )
+    phrases = [
+        prompt
+        for _label, prompts in manager.semantic_presence_tracker.prompt_plan(7)
+        for prompt in prompts
+    ]
+    manager.prewarm_texts(phrases)
+
+    with patch.object(ProbeBuffer, "_rebuild_index", return_value=None):
+        result = manager.add_frame(
+            7,
+            Image.new("RGB", (4, 4), color=(255, 255, 255)),
+            1_000,
+        )
+
+    assert "_semantic_patch_presence_v1" not in result["embedding_space"]
+    by_label = {
+        item["label"]: item
+        for item in result["semantic_presence"]["classes"]
+    }
+    assert by_label["person"]["spatial_score"] == 0.12
+    assert by_label["vehicle"]["spatial_score"] == 0.31
+    assert by_label["vehicle"]["spatial_contrast"] == 0.09
+    status = manager.status(7)["semantic_presence"]
+    assert status["spatial_semantics"] == (
+        "same_forward_top_patch_text_affinity_shadow_v1"
+    )
+
+
 def test_presence_is_archived_compactly_but_not_injected_into_vlm_prompt():
     raw = {
         "version": 1,

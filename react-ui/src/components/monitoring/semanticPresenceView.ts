@@ -12,6 +12,20 @@ export interface PresenceReaction {
   peakTimestampMs: number | null
 }
 
+export interface PresenceDisplaySignal {
+  spatial: boolean
+  score?: number | null
+  baseline?: number | null
+  deviation?: number | null
+  delta?: number | null
+  z?: number | null
+  state?: string
+  warmup?: boolean
+  samples?: number
+  timestamp_ms?: number | null
+  history?: SemanticPresenceClass['history']
+}
+
 const PRESENCE_CONTEXT_ALIASES: Record<string, string[]> = {
   person: ['person', 'people', 'human', 'hand', 'finger', 'thumb', 'gesture', 'face', 'head', 'headphone', 'worker', 'pedestrian'],
   vehicle: ['vehicle', 'car', 'truck', 'bus', 'van', 'motorcycle', 'road', 'driver', 'drift', 'donut', 'skid', 'tire'],
@@ -49,6 +63,40 @@ export function presenceClassKey(item: SemanticPresenceClass): string {
   return String(item.key || item.label || '').trim()
 }
 
+export function presenceDisplaySignal(
+  item: SemanticPresenceClass,
+): PresenceDisplaySignal {
+  const spatial = Number(item.spatial_samples || 0) > 0
+    && finite(item.spatial_score) != null
+  return spatial
+    ? {
+        spatial: true,
+        score: item.spatial_score,
+        baseline: item.spatial_baseline,
+        deviation: item.spatial_deviation,
+        delta: item.spatial_delta,
+        z: item.spatial_z,
+        state: item.spatial_state,
+        warmup: item.spatial_warmup,
+        samples: item.spatial_samples,
+        timestamp_ms: item.spatial_timestamp_ms,
+        history: item.spatial_history,
+      }
+    : {
+        spatial: false,
+        score: item.score,
+        baseline: item.baseline,
+        deviation: item.deviation,
+        delta: item.delta,
+        z: item.z,
+        state: item.state,
+        warmup: item.warmup,
+        samples: item.samples,
+        timestamp_ms: item.timestamp_ms,
+        history: item.history,
+      }
+}
+
 /**
  * Detect a meaningful response against each class's own baseline.
  *
@@ -60,12 +108,13 @@ export function presenceReaction(
   item: SemanticPresenceClass,
   windowSamples = PRESENCE_REACTION_WINDOW_SAMPLES,
 ): PresenceReaction {
-  if (item.warmup) {
+  const signal = presenceDisplaySignal(item)
+  if (signal.warmup) {
     return { reacting: false, current: false, direction: null, strength: 0, peakTimestampMs: null }
   }
-  const deviation = Math.abs(finite(item.deviation) ?? 0)
+  const deviation = Math.abs(finite(signal.deviation) ?? 0)
   const scale = Math.max(DEFAULT_NOISE_FLOOR, deviation)
-  const history = (item.history || []).slice(-Math.max(1, windowSamples))
+  const history = (signal.history || []).slice(-Math.max(1, windowSamples))
   const candidates = history
     .map((point) => {
       const score = finite(point.score)
@@ -80,13 +129,13 @@ export function presenceReaction(
       }
     })
     .filter((value): value is { delta: number; strength: number; timestampMs: number | null } => value != null)
-  const currentState = String(item.state || '')
+  const currentState = String(signal.state || '')
   const current = currentState === 'above_baseline' || currentState === 'below_baseline'
-  const currentDelta = finite(item.delta) ?? 0
+  const currentDelta = finite(signal.delta) ?? 0
   candidates.push({
     delta: currentDelta,
-    strength: Math.abs(finite(item.z) ?? (currentDelta / scale)),
-    timestampMs: finite(item.timestamp_ms),
+    strength: Math.abs(finite(signal.z) ?? (currentDelta / scale)),
+    timestampMs: finite(signal.timestamp_ms),
   })
   const peak = candidates.reduce(
     (best, candidate) => candidate.strength > best.strength ? candidate : best,
