@@ -575,13 +575,14 @@ class LuxriotCaptureApexDeciderTests(unittest.TestCase):
 
             writer = threading.Thread(target=save_prompt)
             writer.start()
-            time.sleep(0.05)
-            self.assertFalse(completed.is_set())
+            # Operator control-plane state no longer queues behind a running
+            # L0 history write.
+            self.assertTrue(completed.wait(timeout=1.0))
             store.release_first.set()
             writer.join(timeout=2.0)
             self.assertTrue(completed.is_set())
             self.assertTrue(getattr(store, "assert_released", False))
-            persisted = store.load_state("luxriot_summary_state")
+            persisted = store.load_state(manager.PROMPT_SETTINGS_STATE_KEY)
             self.assertEqual(
                 persisted["prompt_settings"]["channel_overrides"]["7"][
                     "alert_policy_prompt"
@@ -2446,6 +2447,17 @@ class LuxriotCaptureDispatchTests(unittest.TestCase):
             )
             self.assertIn("alert_policy_prompt", saved["override_fields"])
             self.assertTrue(saved["persistence"]["persisted"])
+            self.assertEqual(
+                saved["persistence"]["authority"],
+                manager.PROMPT_SETTINGS_STATE_KEY,
+            )
+            dedicated = state_store.load_state(manager.PROMPT_SETTINGS_STATE_KEY)
+            self.assertEqual(
+                dedicated["prompt_settings"]["channel_overrides"]["7"][
+                    "alert_policy_prompt"
+                ],
+                criteria,
+            )
 
             restored = build_manager(
                 Path(temp),
@@ -2458,6 +2470,37 @@ class LuxriotCaptureDispatchTests(unittest.TestCase):
                 "channel_override",
             )
             self.assertIn("alert_policy_prompt", restored_settings["override_fields"])
+
+    def test_dedicated_prompt_state_survives_stale_high_revision_summary_write(self):
+        with tempfile.TemporaryDirectory() as temp:
+            state_store = MemoryRuntimeStateStore()
+            manager = build_manager(Path(temp), runtime_state_store=state_store)
+            criteria = "Alert when a person raises a thumb."
+            manager.update_prompt_settings(
+                channel_id=7,
+                alert_policy_prompt=criteria,
+            )
+
+            # Simulate an overlapping old Gunicorn worker.  Its summary
+            # revision may be much higher, but its embedded prompt snapshot is
+            # stale and must no longer be authoritative.
+            stale_summary = dict(state_store.load_state("luxriot_summary_state") or {})
+            stale_prompt = dict(stale_summary.get("prompt_settings") or {})
+            stale_overrides = dict(stale_prompt.get("channel_overrides") or {})
+            stale_overrides["7"] = {"capture_interval_sec": 1.0}
+            stale_prompt["channel_overrides"] = stale_overrides
+            stale_summary["prompt_settings"] = stale_prompt
+            stale_summary["revision"] = 10_000
+            state_store.save_state("luxriot_summary_state", stale_summary)
+
+            restored = build_manager(Path(temp), runtime_state_store=state_store)
+            restored_settings = restored.get_prompt_settings(channel_id=7)
+            self.assertEqual(restored_settings["alert_policy_prompt"], criteria)
+            self.assertIn("alert_policy_prompt", restored_settings["override_fields"])
+            self.assertEqual(
+                restored_settings["persistence"]["authority"],
+                manager.PROMPT_SETTINGS_STATE_KEY,
+            )
 
     def test_full_form_echo_does_not_pin_inherited_channel_settings(self):
         with tempfile.TemporaryDirectory() as temp:

@@ -5447,6 +5447,7 @@ class LuxriotCaptureSession:
 class LuxriotManager:
     ROLLUP_BACKFILL_STATE_KEY = "luxriot_rollup_backfill:active"
     ROLLUP_L3_DEEP_SCHEDULE_KEY = "luxriot_rollup_l3_deep_schedule:v1"
+    PROMPT_SETTINGS_STATE_KEY = "luxriot_prompt_settings:v1"
     """Coordinator for Luxriot snapshots, summaries, and channel helpers."""
 
     DESIRED_LIVE_SESSIONS_KEY = "luxriot_live_sessions:v1"
@@ -5856,12 +5857,21 @@ class LuxriotManager:
         self._summary_state_revision_issued = 0
         self.summary_state_last_success_at: Optional[float] = None
         self.summary_state_last_error: Optional[str] = None
+        # Prompt/operator policy is control-plane state.  It must not share the
+        # write boundary of the high-churn L0 summary document: during a
+        # graceful multi-worker reload, an older worker can legitimately save
+        # newer history while carrying an obsolete copy of the prompt fields.
+        self.prompt_state_revision = 0
+        self.prompt_state_last_success_at: Optional[float] = None
+        self.prompt_state_last_error: Optional[str] = None
+        self._prompt_state_dirty = False
+        self._prompt_state_write_lock = threading.Lock()
         self._summary_persist_condition = threading.Condition()
         self._summary_persist_pending: Optional[Dict[str, Any]] = None
         self._summary_persist_thread: Optional[threading.Thread] = None
-        # Prompt settings and asynchronous L0 history share one versioned
-        # runtime-state document. Serialize its final write boundary so a
-        # stale history snapshot cannot land after a newer operator save.
+        # Serialize the legacy summary document inside this process.  Prompt
+        # settings have their own durable document below; this lock still
+        # prevents in-process history revisions from landing out of order.
         self._summary_state_write_lock = threading.Lock()
         self.summary_state_backend = "runtime_state" if runtime_state_store is not None else "file"
         self._persisted_prompt_default_fields: Set[str] = set()
@@ -16149,6 +16159,29 @@ class LuxriotManager:
         if pending:
             self._summary_state_dirty = True
 
+    def _build_prompt_settings_payload_locked(self) -> Dict[str, Any]:
+        return {
+            "stream_system_prompt": str(self.system_prompt or ""),
+            "alert_policy_prompt": str(self.alert_policy_prompt or ""),
+            "rollup_prompts": {
+                "L1": str(self.rollup_llm_system_prompts.get("L1") or ""),
+                "L2": str(self.rollup_llm_system_prompts.get("L2") or ""),
+                "L3": str(self.rollup_llm_system_prompts.get("L3") or ""),
+            },
+            "bookmark_enabled": bool(self.default_bookmark_enabled),
+            "bookmark_cooldown_sec": float(self.default_bookmark_cooldown_sec),
+            "capture_selector_enabled": bool(self.default_capture_selector_enabled),
+            "capture_selector_bias": str(self.default_capture_selector_bias or "auto"),
+            "json_alert_prompt": str(
+                self.default_json_alert_prompt or DEFAULT_ALERTS_JSON_PROMPT
+            ),
+            "channel_overrides": {
+                str(channel_id): dict(settings)
+                for channel_id, settings in self.channel_prompt_overrides.items()
+                if isinstance(settings, Mapping)
+            },
+        }
+
     def _build_summary_state_payload_locked(self, revision: Optional[int] = None) -> Dict[str, Any]:
         history_payload: Dict[str, List[Dict[str, Any]]] = {}
         incremental_history = self._summary_state_async_persistence_enabled()
@@ -16174,25 +16207,7 @@ class LuxriotManager:
             if not isinstance(routine, Mapping):
                 continue
             routine_payload[str(channel_id)] = dict(routine)
-        prompt_payload = {
-            "stream_system_prompt": str(self.system_prompt or ""),
-            "alert_policy_prompt": str(self.alert_policy_prompt or ""),
-            "rollup_prompts": {
-                "L1": str(self.rollup_llm_system_prompts.get("L1") or ""),
-                "L2": str(self.rollup_llm_system_prompts.get("L2") or ""),
-                "L3": str(self.rollup_llm_system_prompts.get("L3") or ""),
-            },
-            "bookmark_enabled": bool(self.default_bookmark_enabled),
-            "bookmark_cooldown_sec": float(self.default_bookmark_cooldown_sec),
-            "capture_selector_enabled": bool(self.default_capture_selector_enabled),
-            "capture_selector_bias": str(self.default_capture_selector_bias or "auto"),
-            "json_alert_prompt": str(self.default_json_alert_prompt or DEFAULT_ALERTS_JSON_PROMPT),
-            "channel_overrides": {
-                str(channel_id): dict(settings)
-                for channel_id, settings in self.channel_prompt_overrides.items()
-                if isinstance(settings, Mapping)
-            },
-        }
+        prompt_payload = self._build_prompt_settings_payload_locked()
         payload = {
             "version": 2,
             "revision": int(
@@ -16225,6 +16240,52 @@ class LuxriotManager:
             payload["summary_history_storage"] = "upsert_items"
             payload["summary_history_retention_cutoff"] = self._summary_retention_cutoff()
         return payload
+
+    def _persist_prompt_settings_state_locked(self, *, mirror_summary: bool = True) -> bool:
+        """Persist operator settings independently from high-churn L0 state."""
+
+        state_store = getattr(self, "runtime_state_store", None)
+        if state_store is None:
+            # File-only deployments retain the historical atomic document.
+            return self._persist_summary_state_locked()
+
+        revision = int(self.prompt_state_revision) + 1
+        payload = {
+            "version": 1,
+            "revision": revision,
+            "updated_at": time.time(),
+            "prompt_settings": self._build_prompt_settings_payload_locked(),
+        }
+        try:
+            with self._prompt_state_write_lock:
+                state_store.save_state(self.PROMPT_SETTINGS_STATE_KEY, payload)
+        except Exception as exc:
+            self.prompt_state_last_error = (
+                _safe_error_text(exc, 500) or exc.__class__.__name__
+            )
+            self._prompt_state_dirty = True
+            return False
+
+        self.prompt_state_revision = revision
+        self.prompt_state_last_success_at = (
+            self._coerce_float(payload.get("updated_at")) or time.time()
+        )
+        self.prompt_state_last_error = None
+        self._prompt_state_dirty = False
+        self._persisted_prompt_default_fields.update(
+            self._prompt_default_field_names()
+        )
+
+        # Keep the legacy embedded copy for rollback compatibility, but never
+        # make its success the authority for an already durable prompt save.
+        # PostgreSQL history uses a background writer, so mirroring it there
+        # must not block an operator action behind a running L0 persistence.
+        if mirror_summary:
+            if self._summary_state_async_persistence_enabled():
+                self._schedule_summary_state_persist_locked()
+            elif not self._persist_summary_state_locked():
+                self._summary_state_dirty = True
+        return True
 
     def _write_summary_state_payload(self, payload: Mapping[str, Any]) -> Optional[str]:
         with self._summary_state_write_lock:
@@ -16367,6 +16428,7 @@ class LuxriotManager:
 
     def _load_summary_state_from_disk(self) -> None:
         payload: Optional[Dict[str, Any]] = None
+        prompt_state_payload: Optional[Dict[str, Any]] = None
         state_store = getattr(self, "runtime_state_store", None)
         if state_store is not None:
             try:
@@ -16376,21 +16438,44 @@ class LuxriotManager:
             except Exception as exc:
                 self.summary_state_last_error = _safe_error_text(exc, 500) or exc.__class__.__name__
                 payload = None
+            try:
+                loaded_prompt_state = state_store.load_state(
+                    self.PROMPT_SETTINGS_STATE_KEY
+                )
+                if isinstance(loaded_prompt_state, Mapping):
+                    prompt_state_payload = dict(loaded_prompt_state)
+            except Exception as exc:
+                self.prompt_state_last_error = (
+                    _safe_error_text(exc, 500) or exc.__class__.__name__
+                )
         if payload is None:
             path = self.summary_state_file
-            if not path.exists():
+            if not path.exists() and prompt_state_payload is None:
                 return
-            try:
-                payload = json.loads(path.read_text(encoding="utf-8"))
-            except Exception as exc:
-                self.summary_state_last_error = _safe_error_text(exc, 500) or exc.__class__.__name__
-                return
+            if path.exists():
+                try:
+                    payload = json.loads(path.read_text(encoding="utf-8"))
+                except Exception as exc:
+                    self.summary_state_last_error = _safe_error_text(exc, 500) or exc.__class__.__name__
+                    if prompt_state_payload is None:
+                        return
+        if not isinstance(payload, Mapping):
+            payload = {}
         history_raw = payload.get("summary_history") if isinstance(payload, Mapping) else None
         runs_raw = payload.get("summary_runs") if isinstance(payload, Mapping) else None
         routines_raw = payload.get("channel_routines") if isinstance(payload, Mapping) else None
         road_scene_raw = payload.get("road_scene_calibrations") if isinstance(payload, Mapping) else None
         camera_scene_raw = payload.get("camera_scene_trackers") if isinstance(payload, Mapping) else None
         prompt_settings_raw = payload.get("prompt_settings") if isinstance(payload, Mapping) else None
+        dedicated_prompt_settings = (
+            prompt_state_payload.get("prompt_settings")
+            if isinstance(prompt_state_payload, Mapping)
+            else None
+        )
+        if isinstance(dedicated_prompt_settings, Mapping):
+            # This is the control-plane ground truth.  The legacy copy inside
+            # summary state is read only as a migration fallback.
+            prompt_settings_raw = dedicated_prompt_settings
         loaded_history: Dict[int, List[Dict[str, Any]]] = {}
         if isinstance(history_raw, Mapping):
             for channel_key, logs_value in history_raw.items():
@@ -16687,6 +16772,27 @@ class LuxriotManager:
             self.summary_state_last_success_at = self._coerce_float(payload.get("updated_at"))
             self.summary_state_last_error = None
             self._persisted_prompt_default_fields = set(loaded_prompt_default_fields)
+            if isinstance(prompt_state_payload, Mapping):
+                self.prompt_state_revision = int(
+                    _parse_optional_int(prompt_state_payload.get("revision")) or 0
+                )
+                self.prompt_state_last_success_at = self._coerce_float(
+                    prompt_state_payload.get("updated_at")
+                )
+                self.prompt_state_last_error = None
+                self._prompt_state_dirty = False
+
+        # One-way migration: once a deployment has read the legacy embedded
+        # prompt, create the dedicated authority immediately.  Future L0 saves
+        # (including saves from an overlapping old worker) can then change the
+        # summary document without touching operator policy.
+        if (
+            state_store is not None
+            and prompt_state_payload is None
+            and isinstance(prompt_settings_raw, Mapping)
+        ):
+            with self.cache_lock:
+                self._persist_prompt_settings_state_locked(mirror_summary=False)
 
     def persist_summary_state(self) -> bool:
         with self.cache_lock:
@@ -19834,15 +19940,28 @@ class LuxriotManager:
                         override_fields.add(f"rollup_prompts.{level}")
             has_channel_override = bool(override_fields)
             persisted_default_fields = set(self._persisted_prompt_default_fields)
-            persistence = {
-                "backend": self.summary_state_backend,
-                "persisted": self.summary_state_last_error is None
-                and self.summary_state_last_success_at is not None,
-                "revision": int(self.summary_state_revision),
-                "last_success_at": self.summary_state_last_success_at,
-                "last_error": self.summary_state_last_error,
-                "dirty": bool(self._summary_state_dirty),
-            }
+            if self.runtime_state_store is not None:
+                persistence = {
+                    "backend": self.summary_state_backend,
+                    "authority": self.PROMPT_SETTINGS_STATE_KEY,
+                    "persisted": self.prompt_state_last_error is None
+                    and self.prompt_state_last_success_at is not None,
+                    "revision": int(self.prompt_state_revision),
+                    "last_success_at": self.prompt_state_last_success_at,
+                    "last_error": self.prompt_state_last_error,
+                    "dirty": bool(self._prompt_state_dirty),
+                }
+            else:
+                persistence = {
+                    "backend": self.summary_state_backend,
+                    "authority": "luxriot_summary_state",
+                    "persisted": self.summary_state_last_error is None
+                    and self.summary_state_last_success_at is not None,
+                    "revision": int(self.summary_state_revision),
+                    "last_success_at": self.summary_state_last_success_at,
+                    "last_error": self.summary_state_last_error,
+                    "dirty": bool(self._summary_state_dirty),
+                }
 
         memory_metabolism = {
             "status": "active" if memory_state.get("present") else "awaiting_consolidation",
@@ -20236,7 +20355,7 @@ class LuxriotManager:
                 else:
                     self.channel_prompt_overrides.pop(target_channel_id, None)
             if changed:
-                if not self._persist_summary_state_locked():
+                if not self._persist_prompt_settings_state_locked():
                     self.system_prompt = str(previous_state["system_prompt"] or "")
                     self.alert_policy_prompt = str(previous_state["alert_policy_prompt"] or "")
                     self.default_json_alert_prompt = str(previous_state["default_json_alert_prompt"] or "")
@@ -20264,7 +20383,11 @@ class LuxriotManager:
                         else:
                             self.channel_prompt_overrides.pop(target_channel_id, None)
                     persistence_error = (
-                        self.summary_state_last_error
+                        (
+                            self.prompt_state_last_error
+                            if self.runtime_state_store is not None
+                            else self.summary_state_last_error
+                        )
                         or "runtime state backend rejected the update"
                     )
                     raise RuntimeError(
