@@ -10684,6 +10684,8 @@ class LuxriotManager:
             "image_url_chars",
             "total_payload_chars",
             "system_prompt_chars",
+            "operator_alert_policy_chars",
+            "operator_alert_policy_fingerprint",
             "task_prompt_chars",
             "total_image_base64_chars",
             "largest_frame_base64_chars",
@@ -25362,13 +25364,17 @@ class LuxriotManager:
                     channel_overrides["capture_interval_sec"] = requested_interval_sec
             if channel_overrides != dict(self.channel_prompt_overrides.get(channel_id) or {}):
                 self.channel_prompt_overrides[channel_id] = channel_overrides
-                if not self._persist_summary_state_locked():
+                if not self._persist_prompt_settings_state_locked():
                     if previous_override_present:
                         self.channel_prompt_overrides[channel_id] = previous_channel_overrides
                     else:
                         self.channel_prompt_overrides.pop(channel_id, None)
                     persistence_error = (
-                        self.summary_state_last_error
+                        (
+                            self.prompt_state_last_error
+                            if self.runtime_state_store is not None
+                            else self.summary_state_last_error
+                        )
                         or "runtime state backend rejected the channel settings"
                     )
                     raise RuntimeError(

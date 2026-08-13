@@ -2497,6 +2497,14 @@ class LuxriotCaptureDispatchTests(unittest.TestCase):
                 len(input_stats["operator_alert_policy_fingerprint"]), 16
             )
             self.assertIn(criteria, batch["system_prompt"])
+            compacted_stats = restored._compact_llm_input_stats(input_stats)
+            self.assertEqual(
+                compacted_stats["operator_alert_policy_chars"], len(criteria)
+            )
+            self.assertEqual(
+                compacted_stats["operator_alert_policy_fingerprint"],
+                input_stats["operator_alert_policy_fingerprint"],
+            )
 
     def test_dedicated_prompt_state_migrates_verbose_contract_without_losing_alerts(self):
         with tempfile.TemporaryDirectory() as temp:
