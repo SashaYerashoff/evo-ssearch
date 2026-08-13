@@ -8868,6 +8868,162 @@ class LuxriotCaptureDispatchTests(unittest.TestCase):
                     len(node["temporal_observations"]),
                 )
 
+    def test_two_grounded_routine_windows_close_unmarked_posture_episode(self):
+        event_rows = LuxriotManager._l0_temporal_observations(
+            channel_id=112,
+            source_batch_id="l0-slump",
+            batch_state={
+                "events": [
+                    {
+                        "event_id": "person_posture_change",
+                        "label": "Person leaning forward, head resting on desk",
+                        "summary": "Person changes from typing to head on desk.",
+                        "state": "new",
+                        "novelty": "novel",
+                        "pass_up": True,
+                        "snapshot_indices": [4, 5, 6],
+                    }
+                ]
+            },
+            batch_start_ms=500,
+            batch_end_ms=1_000,
+        )
+
+        def routine_child(
+            rollup_id: str,
+            start_sec: float,
+            label: str,
+            *,
+            coverage_gap: bool = False,
+        ) -> Dict[str, Any]:
+            return {
+                "rollup_id": rollup_id,
+                "channel_id": 112,
+                "window_start": start_sec,
+                "window_end": start_sec + 0.5,
+                "coverage_gap": coverage_gap,
+                "temporal_observations": [],
+                "routine_ledger": [
+                    {
+                        "semantic_key": "person routine",
+                        "label": label,
+                        "scope_level": "L0",
+                        "state": "continuing",
+                        "support_windows": 1,
+                        "covered_windows": 1,
+                        "unknown_windows": 0,
+                        "returned_count": 0,
+                        "source_ids": [rollup_id],
+                    }
+                ],
+            }
+
+        children = [
+            {
+                "rollup_id": "l0-slump",
+                "channel_id": 112,
+                "window_start": 0.5,
+                "window_end": 1.0,
+                "coverage_gap": False,
+                "temporal_observations": event_rows,
+                "routine_ledger": [],
+            },
+            # Persisting abnormal posture must not count as recovery.
+            routine_child("l0-still-slumped", 1.5, "Person slumped over desk"),
+            routine_child("l0-typing-1", 2.5, "Person seated and typing"),
+            routine_child("l0-typing-2", 3.5, "Person continues typing"),
+        ]
+
+        memory = LuxriotManager._aggregate_temporal_memory(children, level="L1")
+
+        self.assertEqual(len(memory["incident_ledger"]), 1)
+        episode = memory["incident_ledger"][0]
+        self.assertEqual(episode["semantic_key"], "person fall")
+        self.assertEqual(episode["status"], "ended_by_routine")
+        inferred = [
+            row
+            for row in memory["temporal_observations"]
+            if row.get("boundary_inference") == "two_covered_l0_routines"
+        ]
+        self.assertEqual(len(inferred), 1)
+        self.assertEqual(inferred[0]["applies_to"], ["person fall"])
+        self.assertEqual(
+            inferred[0]["evidence_refs"],
+            ["l0-typing-1", "l0-typing-2"],
+        )
+
+    def test_coverage_gap_resets_inferred_routine_confirmation(self):
+        event_rows = LuxriotManager._l0_temporal_observations(
+            channel_id=112,
+            source_batch_id="l0-phone",
+            batch_state={
+                "events": [
+                    {
+                        "event_id": "person_phone_use",
+                        "label": "Person speaking on a phone",
+                        "state": "new",
+                        "novelty": "novel",
+                        "pass_up": True,
+                        "snapshot_indices": [2, 3],
+                    }
+                ]
+            },
+            batch_start_ms=500,
+            batch_end_ms=1_000,
+        )
+        routine = {
+            "semantic_key": "person routine",
+            "label": "Person seated and typing",
+            "scope_level": "L0",
+            "state": "continuing",
+            "support_windows": 1,
+            "covered_windows": 1,
+            "unknown_windows": 0,
+            "returned_count": 0,
+            "legacy_unstructured": False,
+        }
+        children = [
+            {
+                "rollup_id": "l0-phone",
+                "window_start": 0.5,
+                "window_end": 1.0,
+                "temporal_observations": event_rows,
+                "routine_ledger": [],
+            },
+            {
+                "rollup_id": "l0-routine-before-gap",
+                "window_start": 1.5,
+                "window_end": 2.0,
+                "temporal_observations": [],
+                "routine_ledger": [routine],
+            },
+            {
+                "rollup_id": "l0-gap",
+                "window_start": 2.5,
+                "window_end": 3.0,
+                "coverage_gap": True,
+                "temporal_observations": [],
+                "routine_ledger": [],
+            },
+            {
+                "rollup_id": "l0-routine-after-gap",
+                "window_start": 3.5,
+                "window_end": 4.0,
+                "temporal_observations": [],
+                "routine_ledger": [routine],
+            },
+        ]
+
+        memory = LuxriotManager._aggregate_temporal_memory(children, level="L1")
+
+        self.assertEqual(memory["incident_ledger"][0]["status"], "open")
+        self.assertFalse(
+            any(
+                row.get("boundary_inference")
+                for row in memory["temporal_observations"]
+            )
+        )
+
     def test_isolated_lower_scale_routine_becomes_long_incident_candidate(self):
         children = [
             {

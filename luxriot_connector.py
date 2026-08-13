@@ -12518,6 +12518,16 @@ class LuxriotManager:
                 str(row.get("observation_id") or ""),
             ),
         )[-max(1, int(max_observations)) :]
+        if str(level or "").strip().upper() == "L1":
+            for row in cls._infer_l1_routine_boundaries(children, compact_rows):
+                deduped[str(row["observation_id"])] = row
+            compact_rows = sorted(
+                deduped.values(),
+                key=lambda row: (
+                    int(row.get("start_ms") or 0),
+                    str(row.get("observation_id") or ""),
+                ),
+            )[-max(1, int(max_observations)) :]
         observations: List[TemporalObservation] = []
         for row in compact_rows:
             try:
@@ -12637,6 +12647,179 @@ class LuxriotManager:
                 else {}
             ),
         }
+
+    @classmethod
+    def _infer_l1_routine_boundaries(
+        cls,
+        children: Sequence[Mapping[str, Any]],
+        temporal_rows: Sequence[Mapping[str, Any]],
+        *,
+        required_confirmations: int = 2,
+        max_confirmation_gap_ms: int = 5 * 60 * 1000,
+    ) -> List[Dict[str, Any]]:
+        """Close an L0 episode after two later, grounded routine windows.
+
+        Small VLMs sometimes describe a visible return to work in the routine
+        ledger but forget the explicit ``state=returned`` marker. One routine
+        mention is not enough: it can be an incidental or mislabeled state.
+        Two distinct covered L0 children for the same primary entity are a
+        conservative episode boundary. Coverage gaps reset confirmation, and a
+        routine that itself passes the incident gate (for example, "person
+        slumped over desk") is never treated as recovery.
+        """
+
+        confirmations_needed = max(2, int(required_confirmations))
+        max_gap = max(1_000, int(max_confirmation_gap_ms))
+
+        def primary_entity(value: object) -> str:
+            text = " ".join(str(value or "").casefold().split())
+            first = text.split(" ", 1)[0] if text else ""
+            if first in {"person", "cat", "dog", "vehicle", "vessel", "object"}:
+                return first
+            patterns = (
+                ("person", r"\b(?:person|people|individuals?|subjects?|m[ae]n|wom[ae]n|pedestrians?)\b"),
+                ("cat", r"\b(?:cats?|felines?|sphynx)\b"),
+                ("dog", r"\b(?:dogs?|canines?)\b"),
+                ("vessel", r"\b(?:vessels?|ships?|boats?|yachts?|watercraft)\b"),
+                ("vehicle", r"\b(?:vehicles?|cars?|trucks?|vans?|motorcycles?)\b"),
+                ("object", r"\b(?:bags?|packages?|parcels?|objects?|items?)\b"),
+            )
+            return next(
+                (name for name, pattern in patterns if re.search(pattern, text)),
+                "",
+            )
+
+        explicit_boundaries = [
+            row
+            for row in temporal_rows
+            if str(row.get("kind") or "") == "routine_gap"
+        ]
+        latest_events: Dict[Tuple[int, str], Mapping[str, Any]] = {}
+        for row in temporal_rows:
+            if (
+                str(row.get("kind") or "") != "event"
+                or str(row.get("state") or "") not in {"new", "continuing"}
+            ):
+                continue
+            channel_id = int(_parse_optional_int(row.get("channel_id")) or 0)
+            semantic_key = str(row.get("semantic_key") or "").strip()
+            if channel_id <= 0 or not semantic_key:
+                continue
+            key = (channel_id, semantic_key)
+            previous = latest_events.get(key)
+            if previous is None or int(row.get("end_ms") or 0) >= int(
+                previous.get("end_ms") or 0
+            ):
+                latest_events[key] = row
+
+        ordered_children = sorted(
+            (child for child in children if isinstance(child, Mapping)),
+            key=lambda child: (
+                float(child.get("window_start") or child.get("created_at") or 0.0),
+                str(child.get("rollup_id") or ""),
+            ),
+        )
+        inferred: List[Dict[str, Any]] = []
+        for ordinal, ((channel_id, semantic_key), event) in enumerate(
+            sorted(latest_events.items(), key=lambda item: item[0])
+        ):
+            event_end_ms = int(event.get("end_ms") or 0)
+            entity = primary_entity(semantic_key) or primary_entity(event.get("label"))
+            if not entity or event_end_ms <= 0:
+                continue
+            if any(
+                int(boundary.get("start_ms") or 0) >= event_end_ms
+                and (
+                    not boundary.get("applies_to")
+                    or semantic_key in (boundary.get("applies_to") or [])
+                )
+                for boundary in explicit_boundaries
+            ):
+                continue
+            confirmations: List[Tuple[str, int, str]] = []
+            for child in ordered_children:
+                child_id = str(child.get("rollup_id") or "").strip()
+                child_end_ms = int(
+                    round(
+                        1000.0
+                        * float(
+                            child.get("window_end")
+                            or child.get("created_at")
+                            or 0.0
+                        )
+                    )
+                )
+                if not child_id or child_end_ms <= event_end_ms:
+                    continue
+                if child_end_ms - event_end_ms > max_gap:
+                    break
+                if bool(child.get("coverage_gap")):
+                    confirmations.clear()
+                    continue
+                matching_label = ""
+                for routine in child.get("routine_ledger") or []:
+                    if not isinstance(routine, Mapping):
+                        continue
+                    if str(routine.get("state") or "").strip().lower() == "uncertain":
+                        continue
+                    if int(_parse_optional_int(routine.get("covered_windows")) or 0) <= 0:
+                        continue
+                    if bool(routine.get("legacy_unstructured")):
+                        continue
+                    routine_label = cls._truncate_text(
+                        routine.get("label") or routine.get("semantic_key"),
+                        180,
+                    )
+                    routine_key = str(routine.get("semantic_key") or "").strip()
+                    if primary_entity(routine_key or routine_label) != entity:
+                        continue
+                    if cls._temporal_incident_candidate(
+                        {
+                            "kind": "event",
+                            "event_id": routine_key,
+                            "label": routine_label,
+                            "state": "continuing",
+                            "novelty": "routine",
+                        }
+                    ):
+                        continue
+                    matching_label = routine_label or routine_key
+                    break
+                if not matching_label:
+                    continue
+                confirmations.append((child_id, child_end_ms, matching_label))
+                confirmations = list(
+                    {
+                        source_id: (source_id, timestamp_ms, label)
+                        for source_id, timestamp_ms, label in confirmations
+                    }.values()
+                )
+                if len(confirmations) < confirmations_needed:
+                    continue
+                selected = confirmations[-confirmations_needed:]
+                boundary_ms = max(item[1] for item in selected)
+                digest = hashlib.sha256(
+                    (
+                        f"{channel_id}\x1f{semantic_key}\x1f"
+                        + "\x1f".join(item[0] for item in selected)
+                    ).encode("utf-8")
+                ).hexdigest()[:32]
+                observation = make_temporal_observation(
+                    channel_id=channel_id,
+                    source_batch_id=f"inferred-routine-{digest}",
+                    ordinal=ordinal,
+                    kind=TemporalObservationKind.ROUTINE_GAP,
+                    semantic_key=entity,
+                    label=f"Confirmed return to routine: {selected[-1][2]}",
+                    applies_to=[semantic_key],
+                    start_ms=boundary_ms,
+                    end_ms=boundary_ms,
+                    evidence_refs=[item[0] for item in selected],
+                ).to_dict()
+                observation["boundary_inference"] = "two_covered_l0_routines"
+                inferred.append(observation)
+                break
+        return inferred
 
     @staticmethod
     def _compose_temporal_incident_candidates(
