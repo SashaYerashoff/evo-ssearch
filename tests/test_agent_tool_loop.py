@@ -699,6 +699,61 @@ class AgentToolLoopTests(unittest.TestCase):
             )
         )
 
+    def test_video_final_uses_server_owned_coverage_percentage(self):
+        ledger = agent._new_turn_signal_ledger(
+            "Summarize channel 118 for the last hour"
+        )
+        agent._record_turn_signal_ledger(
+            ledger,
+            "get_video_summaries",
+            {
+                "channel_id": 118,
+                "depth": "L1",
+                "count": 2,
+                "total_in_window": 2,
+                "semantic_status": "ready",
+                "coverage": {
+                    "status": "partial",
+                    "returned": {
+                        "coverage_ratio": 0.32,
+                        "first_time": "2026-08-13 22:55",
+                        "last_time": "2026-08-13 23:15",
+                        "trailing_gap_sec": 2448.0,
+                    },
+                    "note": (
+                        "returned_entries covers 2026-08-13 22:55 to "
+                        "2026-08-13 23:15 inside requested 2026-08-13 "
+                        "22:55 to 2026-08-13 23:55."
+                    ),
+                },
+                "entries": [],
+            },
+        )
+
+        corrected, changed = agent._correct_single_video_coverage_percentage(
+            (
+                "The review covers only 20% of the requested hour "
+                "(22:55–23:15 UTC)."
+            ),
+            ledger,
+        )
+
+        self.assertTrue(changed)
+        self.assertIn("covers only 32%", corrected)
+        self.assertNotIn("20%", corrected)
+        coverage = ledger["coverage"][0]
+        self.assertEqual(coverage["returned_coverage_ratio"], 0.32)
+        self.assertEqual(coverage["returned_first_time"], "2026-08-13 22:55")
+
+        already_correct, changed = (
+            agent._correct_single_video_coverage_percentage(
+                "Coverage is 32% of the requested hour.",
+                ledger,
+            )
+        )
+        self.assertFalse(changed)
+        self.assertEqual(already_correct, "Coverage is 32% of the requested hour.")
+
     def test_protocol_deploy_rehydrates_scope_selection_from_tool_history(self):
         start_result = {
             "deployment_id": "deploy-home-1",

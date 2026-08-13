@@ -13129,6 +13129,11 @@ def _record_turn_signal_ledger(
 
     if tool_name == "get_video_summaries":
         coverage = result.get("coverage") if isinstance(result.get("coverage"), Mapping) else {}
+        returned_coverage = (
+            coverage.get("returned")
+            if isinstance(coverage.get("returned"), Mapping)
+            else {}
+        )
         evidence_frames = result.get("evidence_frames") if isinstance(result.get("evidence_frames"), list) else []
         entries = result.get("entries") if isinstance(result.get("entries"), list) else []
         _signal_ledger_append(
@@ -13143,6 +13148,10 @@ def _record_turn_signal_ledger(
                 "status": coverage.get("status"),
                 "truncated": result.get("truncated") or result.get("backend_truncated") or coverage.get("truncated"),
                 "coverage_note": _compact_signal_value(coverage.get("operator_note") or coverage.get("note"), 220),
+                "returned_coverage_ratio": returned_coverage.get("coverage_ratio"),
+                "returned_first_time": returned_coverage.get("first_time"),
+                "returned_last_time": returned_coverage.get("last_time"),
+                "returned_trailing_gap_sec": returned_coverage.get("trailing_gap_sec"),
                 "provenance_totals": result.get("provenance_totals"),
                 "returned_provenance_totals": result.get("returned_provenance_totals"),
                 "alert_episode_summary": result.get("alert_episode_summary"),
@@ -13457,6 +13466,9 @@ def _format_turn_signal_ledger_message(ledger: Mapping[str, Any]) -> Optional[st
         "Answer discipline: report coverage/truncation/errors when present; separate visual evidence from summary text and CLIP candidates; cite docs for help answers; ask to narrow/continue when scope or tool budget is incomplete."
     )
     lines.append(
+        "Coverage ratios and formatted coverage bounds are server-owned: copy them verbatim when present and never recompute a percentage from rounded display times."
+    )
+    lines.append(
         "Final synthesis style: lead with the finding in natural prose; usually use one short paragraph, optional compact bullets, and one final coverage caveat. Do not reproduce ledger headings or field labels, use a table unless the operator asked for one, add a generic follow-up menu, infer zero source hits from a source missing in sampled rows, or convert timestamp_ms yourself; copy only server-formatted timestamps verbatim."
     )
     message = "\n".join(lines)
@@ -13722,6 +13734,70 @@ def _video_response_grounding_issues(value: Any, ledger: Mapping[str, Any]) -> L
             if alert_count not in trusted_counts.get(channel_id, set()):
                 issues.append(f"unsupported_alert_count:{channel_id}:{alert_count}")
     return sorted(set(issues))
+
+
+def _correct_single_video_coverage_percentage(
+    value: Any,
+    ledger: Mapping[str, Any],
+) -> Tuple[str, bool]:
+    """Correct one-channel coverage arithmetic from the trusted server receipt.
+
+    Small local models occasionally copy the exact returned time bounds but
+    divide their rounded minute labels themselves.  This narrowly rewrites only
+    a percentage explicitly attached to coverage/review scope, and only when a
+    single ``get_video_summaries`` receipt makes the mapping unambiguous.
+    """
+
+    text = str(value or "")
+    rows = [
+        row
+        for row in (ledger.get("coverage") or [])
+        if isinstance(row, Mapping)
+        and str(row.get("tool") or "") == "get_video_summaries"
+        and _opt_float(row.get("returned_coverage_ratio")) is not None
+    ]
+    if len(rows) != 1:
+        return text, False
+    ratio = _opt_float(rows[0].get("returned_coverage_ratio"))
+    if ratio is None or not np.isfinite(ratio):
+        return text, False
+    expected = max(0.0, min(100.0, float(ratio) * 100.0))
+    expected_text = (
+        str(int(round(expected)))
+        if abs(expected - round(expected)) < 0.05
+        else f"{expected:.1f}".rstrip("0").rstrip(".")
+    )
+    changed = False
+
+    def replace_claim(match: re.Match[str]) -> str:
+        nonlocal changed
+        claimed = _opt_float(match.group("number"))
+        if claimed is None or abs(float(claimed) - expected) <= 0.51:
+            return match.group(0)
+        changed = True
+        start, end = match.span("number")
+        relative_start = start - match.start()
+        relative_end = end - match.start()
+        matched = match.group(0)
+        return matched[:relative_start] + expected_text + matched[relative_end:]
+
+    patterns = (
+        re.compile(
+            r"(?:\bcoverage\b|\b(?:review|result|scope|returned entries|summary data)\b"
+            r"[^.\n%]{0,48}\b(?:covers?|covered|reviewed)\b|\bcovers?\b)"
+            r"[^.\n%]{0,100}?(?P<number>\d+(?:\.\d+)?)\s*%",
+            flags=re.IGNORECASE,
+        ),
+        re.compile(
+            r"(?P<number>\d+(?:\.\d+)?)\s*%[^.\n]{0,100}"
+            r"\b(?:coverage|covered|reviewed|requested (?:hour|period|window))\b",
+            flags=re.IGNORECASE,
+        ),
+    )
+    corrected = text
+    for pattern in patterns:
+        corrected = pattern.sub(replace_claim, corrected)
+    return corrected, changed
 
 
 def _format_video_event_followup_clarification(
@@ -16298,6 +16374,22 @@ class AgentRunner:
                 "type": "completion_recovery",
                 "message": "The local model returned an incomplete final response; using completed tool results.",
             })
+        final_text, coverage_corrected = (
+            _correct_single_video_coverage_percentage(
+                final_text,
+                turn_signal_ledger,
+            )
+        )
+        if coverage_corrected:
+            yield _sse(
+                {
+                    "type": "completion_recovery",
+                    "message": (
+                        "Corrected the final coverage percentage from the "
+                        "server-owned video-summary receipt."
+                    ),
+                }
+            )
         yield _sse({"type": "text", "content": final_text})
 
         # ── persist assistant turn ─────────────────────────────────────────
