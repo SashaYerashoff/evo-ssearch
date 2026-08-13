@@ -2398,6 +2398,44 @@ agent llama.cpp PID:    2916440
 No immutable upgrade archive or Desktop launcher pin was produced in this
 slice.
 
+### Stable operator ranking for semantic presence
+
+Commit `caa22ed` (`fix: stabilize semantic presence ranking`) corrects a UI
+interpretation problem found during live operator review. The compact card had
+sorted every class by the latest absolute z-score on every poll. Routine noise
+therefore reordered rows continuously, while the large raw SigLIP similarity
+looked like an object probability (for example, `vehicle 0.067` in an indoor
+room). Those raw similarities are prompt-specific and cannot be compared
+between labels.
+
+The card now:
+
+- ranks only meaningful responses (roughly 3 sigma from each class's own
+  baseline) above routine rows;
+- holds a recent response for 12 samples so a real pulse stays visible instead
+  of flickering out immediately;
+- preserves configured server order for routine noise and near-equal responses;
+- displays signed baseline delta as the primary value, with raw similarity and
+  baseline demoted to diagnostic labels;
+- labels rows `responding`, `recent response`, or `baseline`, and dims routine
+  rows slightly. This changes presentation only; backend presence math,
+  embeddings, patch affinity, probes, alerts, and archives are untouched.
+
+Focused ranking/probe UI tests passed 8/8, TypeScript passed, and the production
+Vite build completed successfully. Only `react-ui/dist` was replaced; no HUP or
+inference restart was performed. The prior UI is recoverable at
+`react-ui/dist.pre-20260813-stable-presence-caa22ed`. Served assets returned HTTP
+200 and matched the reviewed build:
+
+```text
+index-DclbRjN9.js  SHA-256 c00a653c8a7ec7014a7c2aa2337c7511a268a25466d1d5dbef10cee8daa4590d
+index-BMRlQC2_.css SHA-256 50d8f6dbf060aa81abae1a07def299ecfaa6c9f8955ab3230c36ae03a03d7880
+```
+
+Final live readiness remained 200 with CLIP queue depth 0, semantic archive
+queue depth 0, and no batcher error. The `.env` hash and all Gunicorn/llama.cpp
+PIDs remained unchanged.
+
 ## Rehearsal fixture note: emu1 is intentionally looped
 
 On this rehearsal stand, Luxriot channel 118 (`emu1`) is a roughly 30-second
