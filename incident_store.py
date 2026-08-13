@@ -1677,15 +1677,19 @@ class PostgresIncidentStore:
         if top_level_only:
             # Nested incidents remain first-class rows addressable by id, but
             # they must not consume review-board pagination or totals until an
-            # operator promotes them.  Keep the predicate in PostgreSQL rather
-            # than filtering a bounded page in Python, which could otherwise
-            # return sparse/empty pages on a busy multi-channel deployment.
+            # operator or an independently grounded attention signal promotes
+            # them. Older rows may already carry the grounded priority while
+            # retaining a stale nested marker; include those defensively so a
+            # configured alert cannot disappear from review. Keep the predicate
+            # in PostgreSQL rather than filtering a bounded page in Python.
             clauses.append(
                 "NOT ("
                 "COALESCE(report_json #>> '{presentation,scope}', '') = 'nested' "
                 "AND COALESCE("
                 "report_json #>> '{presentation,parent_incident_id}', ''"
-                ") <> ''"
+                ") <> '' "
+                "AND COALESCE(report_json ->> 'priority', 'context') "
+                "NOT IN ('operator_criterion', 'safety')"
                 ")"
             )
         bounded_limit = max(1, min(500, int(limit or 100)))

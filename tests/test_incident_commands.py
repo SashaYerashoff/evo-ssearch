@@ -722,6 +722,87 @@ def test_episode_event_does_not_refresh_legacy_candidate_but_grounded_signal_upg
     assert store.records[0]["report"]["source"] == "operator_alert_l0"
 
 
+def test_l0_grounded_signal_repairs_stale_nested_attention_row():
+    class _NestedPriorityStore:
+        def __init__(self):
+            self.record = {
+                **_record(state="candidate"),
+                "revision": 4,
+                "case_state": "candidate",
+                "attention_state": "inactive",
+                "possible_start_ms": 1_000,
+                "observed_start_ms": 1_000,
+                "observed_end_ms": 2_000,
+                "possible_end_ms": None,
+                "timeline_refs": [
+                    {
+                        "observation_id": "obs-old",
+                        "semantic_key": "person thumbs_up",
+                        "label": "Thumbs-up gesture detected",
+                    }
+                ],
+                "report": {
+                    "priority": "operator_criterion",
+                    "severity": "info",
+                    "source": "operator_alert_l0",
+                    "presentation": {
+                        "scope": "nested",
+                        "parent_incident_id": "00000000-0000-0000-0000-000000000999",
+                    },
+                },
+            }
+            self.observations = []
+
+        def list_incidents(self, **_kwargs):
+            return [dict(self.record)], 1
+
+        def create_incident(self, *_args, **_kwargs):
+            raise AssertionError("the existing semantic track must be reused")
+
+        def update_incident(self, incident_id, *, expected_revision, changes, **_kwargs):
+            assert incident_id == INCIDENT_ID
+            assert expected_revision == self.record["revision"]
+            self.record.update(dict(changes))
+            self.record["revision"] += 1
+            return dict(self.record)
+
+        def append_observation(self, observation, **_kwargs):
+            self.observations.append(dict(observation))
+            return dict(observation)
+
+    store = _NestedPriorityStore()
+    result = _service(store, _Runtime()).ingest_l0_temporal_observations(
+        112,
+        {
+            "batch_id": "batch-repair-nested",
+            "batch_start_ms": 3_000,
+            "batch_end_ms": 4_000,
+        },
+        [
+            {
+                "observation_id": "obs-new",
+                "kind": "event",
+                "state": "continuing",
+                "semantic_key": "person thumbs_up",
+                "label": "Thumbs-up gesture detected",
+                "start_ms": 3_000,
+                "end_ms": 4_000,
+                "trigger_kind": "operator_alert",
+                "severity": "high",
+                "operator_criterion": "you spot a thumbs-up gesture",
+            }
+        ],
+    )
+
+    assert result["associated"] == 1
+    presentation = store.record["report"]["presentation"]
+    assert presentation["scope"] == "top_level"
+    assert presentation["parent_incident_id"].endswith("0999")
+    assert presentation["promoted_by_signal"] == "operator_alert"
+    assert presentation["promotion_reason"] == "grounded_l0_attention_signal"
+    assert store.record["report"]["severity"] == "high"
+
+
 def test_open_automatic_incident_waits_for_boundary_before_episode_materialization():
     class _ProjectionStore:
         def __init__(self):
@@ -977,6 +1058,80 @@ def test_l2_composition_cannot_promote_context_or_info_operator_case():
         ],
     }
     store = _NoPromotionStore()
+
+    result = _service(store, _Runtime()).ingest_rollup_incident_compositions(
+        112,
+        rollup,
+    )
+
+    assert result["attached"] == 0
+    assert result["skipped"] == 1
+    assert store.episodes == []
+    assert store.observations == []
+
+
+def test_l2_composition_cannot_use_a_nested_incident_as_its_parent():
+    nested_safety = {
+        **_record(state="candidate"),
+        "case_state": "candidate",
+        "possible_start_ms": 10_000,
+        "observed_start_ms": 10_000,
+        "anchor_ref": {"observation_id": "obs-collision"},
+        "timeline_refs": [{"observation_id": "obs-collision"}],
+        "report": {
+            "priority": "safety",
+            "severity": "critical",
+            "presentation": {
+                "scope": "nested",
+                "parent_incident_id": "00000000-0000-0000-0000-000000000999",
+            },
+        },
+    }
+
+    class _NestedParentStore:
+        def __init__(self):
+            self.episodes = []
+            self.observations = []
+
+        def list_incidents(self, **_kwargs):
+            return [dict(nested_safety)], 1
+
+        def append_episode(self, record, **_kwargs):
+            self.episodes.append(dict(record))
+
+        def append_observation(self, record, **_kwargs):
+            self.observations.append(dict(record))
+
+    rollup = {
+        "rollup_id": "l2-ch112-w3600-0",
+        "level": "L2",
+        "incident_ledger": [
+            {
+                "episode_id": "episode-collision",
+                "semantic_key": "vehicle collision",
+                "start_ms": 10_000,
+                "last_observed_ms": 11_000,
+            },
+            {
+                "episode_id": "episode-phone",
+                "semantic_key": "person phone_call",
+                "start_ms": 12_000,
+                "last_observed_ms": 13_000,
+            },
+        ],
+        "incident_compositions": [
+            {
+                "composition_id": "composition-nested-parent",
+                "parent_observation_ids": ["obs-collision"],
+                "nested_episode_ids": ["episode-phone"],
+                "start_ms": 10_000,
+                "end_ms": 13_000,
+                "promotion_policy": "extend_grounded_anchor",
+                "automatic_merge": False,
+            }
+        ],
+    }
+    store = _NestedParentStore()
 
     result = _service(store, _Runtime()).ingest_rollup_incident_compositions(
         112,

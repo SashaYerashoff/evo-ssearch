@@ -833,6 +833,22 @@ class IncidentCommandService:
             offset=0,
         )
         active_by_key: dict[str, dict[str, Any]] = {}
+
+        def active_incident_rank(value: Mapping[str, Any]) -> tuple[int, int, int]:
+            report = value.get("report")
+            report = report if isinstance(report, Mapping) else {}
+            presentation = report.get("presentation")
+            presentation = presentation if isinstance(presentation, Mapping) else {}
+            priority = str(report.get("priority") or "").strip().lower()
+            return (
+                0 if str(presentation.get("scope") or "") == "nested" else 1,
+                {"": 0, "context": 0, "operator_criterion": 1, "safety": 2}.get(
+                    priority,
+                    0,
+                ),
+                int(value.get("revision") or 0),
+            )
+
         for raw in records:
             if not isinstance(raw, Mapping):
                 continue
@@ -841,9 +857,15 @@ class IncidentCommandService:
                 semantic_key
                 and str(raw.get("perception_state") or "unknown") != "ended"
                 and self._optional_int(raw.get("possible_end_ms")) is None
-                and semantic_key not in active_by_key
             ):
-                active_by_key[semantic_key] = dict(raw)
+                current = active_by_key.get(semantic_key)
+                if current is None or active_incident_rank(raw) > active_incident_rank(
+                    current
+                ):
+                    # A first-class grounded incident owns later observations
+                    # for this semantic track. A nested context row must not
+                    # shadow it merely because that row was updated recently.
+                    active_by_key[semantic_key] = dict(raw)
 
         homeostasis = self._heartbeat_homeostasis(heartbeat)
         created = 0
@@ -1102,7 +1124,23 @@ class IncidentCommandService:
         grounded = [
             (dict(item), observation_ids(item), grounded_priority(item))
             for item in incidents
-            if isinstance(item, Mapping) and grounded_priority(item)[0] > 0
+            if (
+                isinstance(item, Mapping)
+                and grounded_priority(item)[0] > 0
+                and str(
+                    (
+                        item.get("report", {}).get("presentation", {})
+                        if isinstance(item.get("report"), Mapping)
+                        and isinstance(
+                            item.get("report", {}).get("presentation"),
+                            Mapping,
+                        )
+                        else {}
+                    ).get("scope")
+                    or ""
+                )
+                != "nested"
+            )
         ]
         attached = 0
         episode_count = 0
@@ -1660,6 +1698,7 @@ class IncidentCommandService:
             if isinstance(incident.get("report"), Mapping)
             else {}
         )
+        report_changed = False
         priority_rank = {"": 0, "context": 0, "safety": 1, "operator_criterion": 2}
         if priority_rank.get(incoming_priority, 0) > priority_rank.get(
             str(report.get("priority") or ""), 0
@@ -1672,21 +1711,45 @@ class IncidentCommandService:
                 if trigger_kind == "safety_alert"
                 else "safety_event_l0"
             )
-            incoming_severity = str(observation.get("severity") or "").strip().lower()
-            severity_rank = {
-                "": 0,
-                "info": 1,
-                "low": 2,
-                "normal": 3,
-                "medium": 3,
-                "high": 4,
-                "critical": 5,
-                "emergency": 5,
-            }
-            if severity_rank.get(incoming_severity, 0) > severity_rank.get(
-                str(report.get("severity") or "").strip().lower(), 0
-            ):
-                report["severity"] = incoming_severity
+            report_changed = True
+        severity_rank = {
+            "": 0,
+            "info": 1,
+            "low": 2,
+            "normal": 3,
+            "medium": 3,
+            "high": 4,
+            "critical": 5,
+            "emergency": 5,
+        }
+        incoming_severity = str(observation.get("severity") or "").strip().lower()
+        if incoming_priority and severity_rank.get(
+            incoming_severity,
+            0,
+        ) > severity_rank.get(str(report.get("severity") or "").strip().lower(), 0):
+            report["severity"] = incoming_severity
+            report_changed = True
+        presentation = (
+            dict(report.get("presentation") or {})
+            if isinstance(report.get("presentation"), Mapping)
+            else {}
+        )
+        if incoming_priority and str(presentation.get("scope") or "") == "nested":
+            # A nested row is context-only until independent attention arrives.
+            # A server-classified saved criterion or safety signal is such an
+            # interrupt and must appear on the top-level review board. Keep the
+            # parent link for navigation and audit; only presentation changes.
+            presentation.update(
+                {
+                    "scope": "top_level",
+                    "promoted_at_ms": int(event_end_ms or self._wall_clock_ms()),
+                    "promoted_by_signal": trigger_kind,
+                    "promotion_reason": "grounded_l0_attention_signal",
+                }
+            )
+            report["presentation"] = presentation
+            report_changed = True
+        if report_changed:
             changes["report"] = report
         if terminal:
             changes["possible_end_ms"] = effective_end_ms

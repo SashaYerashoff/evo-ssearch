@@ -499,6 +499,8 @@ class IncidentPostgresStoreTests(unittest.TestCase):
                 "report_json #>> '{presentation,parent_incident_id}'",
                 sql,
             )
+            self.assertIn("report_json ->> 'priority'", sql)
+            self.assertIn("NOT IN ('operator_criterion', 'safety')", sql)
         self.assertEqual(page_params[-2:], (50, 10))
 
 
