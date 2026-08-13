@@ -6398,6 +6398,7 @@ class LuxriotManager:
             "semantic_guard_failures": 0,
             "semantic_guard_sanitized": 0,
             "cached_semantic_guard_rejections": 0,
+            "source_regressions_preserved": 0,
             "last_error": None,
         }
         try:
@@ -22473,6 +22474,56 @@ class LuxriotManager:
             ]
         )
 
+    def _rollup_source_regressed(
+        self,
+        cached: Mapping[str, Any],
+        candidate: Mapping[str, Any],
+    ) -> bool:
+        """Return whether a rebuild contains less evidence than its durable row.
+
+        The recurring scheduler deliberately reads one overlap window so higher
+        levels have children at their left boundary.  After a process restart,
+        that overlap can contain only the post-restart tail of an already
+        consolidated L1 window.  A source-signature mismatch must not then turn
+        a durable 35-batch summary into a new one-batch summary.
+
+        Closed rollups are monotonic evidence receipts.  Normal background
+        synthesis may extend them, but contraction requires an explicit repair
+        workflow with the complete archived source set.
+        """
+
+        cached_ids = set(self._coerce_str_list(cached.get("source_ids")))
+        candidate_ids = set(self._coerce_str_list(candidate.get("source_ids")))
+        cached_items = max(0, int(_parse_optional_int(cached.get("item_count")) or 0))
+        candidate_items = max(
+            0,
+            int(_parse_optional_int(candidate.get("item_count")) or 0),
+        )
+        cached_frames = max(0, int(_parse_optional_int(cached.get("frame_count")) or 0))
+        candidate_frames = max(
+            0,
+            int(_parse_optional_int(candidate.get("frame_count")) or 0),
+        )
+
+        if cached_ids and candidate_ids:
+            if candidate_ids < cached_ids:
+                return True
+            if len(candidate_ids) <= len(cached_ids) and (
+                candidate_items < cached_items
+                or candidate_frames < cached_frames
+            ):
+                return True
+            return False
+        return bool(
+            (cached_items > 0 or cached_frames > 0)
+            and candidate_items <= cached_items
+            and candidate_frames <= cached_frames
+            and (
+                candidate_items < cached_items
+                or candidate_frames < cached_frames
+            )
+        )
+
     def _apply_rollup_llm_summaries(
         self,
         channel_id: int,
@@ -22581,6 +22632,22 @@ class LuxriotManager:
                     self._increment_rollup_status_counter(
                         "cached_semantic_guard_rejections"
                     )
+                if (
+                    cached_summary
+                    and self._rollup_semantic_ready(cached)
+                    and self._rollup_source_regressed(cached, node)
+                ):
+                    # Keep both the narrative and its complete provenance.
+                    # Merely copying the cached summary would still let the
+                    # later row merge replace item/frame/source counts with the
+                    # partial post-restart candidate.
+                    node.clear()
+                    node.update(dict(cached))
+                    node["source_regression_deferred"] = True
+                    self._increment_rollup_status_counter(
+                        "source_regressions_preserved"
+                    )
+                    continue
                 if (
                     cached_summary
                     and self._rollup_semantic_ready(cached)

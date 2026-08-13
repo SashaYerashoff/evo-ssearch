@@ -7919,6 +7919,83 @@ class LuxriotCaptureDispatchTests(unittest.TestCase):
             self.assertEqual(merged["generation_status"], "refresh_pending")
             self.assertTrue(merged["semantic_refresh_pending"])
 
+    def test_synthesis_preserves_durable_rollup_against_partial_restart_tail(self):
+        with tempfile.TemporaryDirectory() as temp:
+            lm_calls = []
+
+            def lm_callback(_messages, _model):
+                lm_calls.append(True)
+                return operator_rollup_response("Regenerated from a partial tail.")
+
+            manager = build_manager(Path(temp), lm_callback=lm_callback)
+            manager.rollup_llm_levels = {"L1"}
+            manager.rollup_time_only = True
+            rollup_id = "l1-ch7-w900-1781700000"
+            cached = manager._normalize_cached_rollup_entry(
+                {
+                    "rollup_id": rollup_id,
+                    "channel_id": 7,
+                    "level": "L1",
+                    "source_level": "L0",
+                    "window_start": 1_781_700_000.0,
+                    "window_end": 1_781_700_900.0,
+                    "window_sec": 900,
+                    "source_ids": ["l0-old-a", "l0-old-b", "l0-restart-tail"],
+                    "source_signature": "complete-source",
+                    "item_count": 35,
+                    "frame_count": 140,
+                    "source_tokens": 9000,
+                    "summary": operator_rollup_response(
+                        "The complete durable window contains 35 observations."
+                    ),
+                    "summary_kind": "llm",
+                    "generation_status": "ready",
+                    "format_version": 2,
+                }
+            )
+            self.assertIsNotNone(cached)
+            manager.rollup_summary_cache[rollup_id] = cached
+            candidate = {
+                "rollup_id": rollup_id,
+                "channel_id": 7,
+                "level": "L1",
+                "source_level": "L0",
+                "window_start": 1_781_700_000.0,
+                "window_end": 1_781_700_900.0,
+                "window_sec": 900,
+                "source_ids": ["l0-restart-tail"],
+                "source_signature": "partial-source",
+                "item_count": 1,
+                "frame_count": 4,
+                "source_tokens": 400,
+                "summary": operator_rollup_response("Only the restart tail is loaded."),
+                "summary_kind": "queued",
+                "generation_status": "queued",
+                "format_version": 2,
+            }
+
+            manager._apply_rollup_llm_summaries(
+                channel_id=7,
+                level="L1",
+                source_level="L0",
+                node_children_pairs=[(candidate, [])],
+                max_new=1,
+            )
+
+            self.assertEqual(lm_calls, [])
+            self.assertEqual(candidate["item_count"], 35)
+            self.assertEqual(candidate["frame_count"], 140)
+            self.assertEqual(
+                candidate["source_ids"],
+                ["l0-old-a", "l0-old-b", "l0-restart-tail"],
+            )
+            self.assertIn("complete durable window", candidate["summary"])
+            self.assertTrue(candidate["source_regression_deferred"])
+            self.assertEqual(
+                manager._rollup_scheduler_status["source_regressions_preserved"],
+                1,
+            )
+
     def test_readonly_rollup_skips_sources_for_durable_target_buckets(self):
         with tempfile.TemporaryDirectory() as temp:
             manager = build_manager(Path(temp))
