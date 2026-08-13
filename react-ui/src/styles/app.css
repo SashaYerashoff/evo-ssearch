@@ -2156,6 +2156,8 @@
 }
 .presence-class.above_baseline { border-color: color-mix(in srgb, var(--accent) 45%, var(--line)); }
 .presence-class.below_baseline { border-color: color-mix(in srgb, #a991f7 38%, var(--line)); }
+.presence-class.routine { opacity: .82; }
+.presence-class.reacting { opacity: 1; border-color: color-mix(in srgb, var(--accent) 58%, var(--line)); background: color-mix(in srgb, var(--accent-bg) 28%, var(--space-0)); }
 .presence-class.inspectable { width: 100%; color: inherit; font: inherit; text-align: left; cursor: pointer; appearance: none; }
 .presence-class.inspectable:hover, .presence-class.inspectable.active { border-color: var(--accent); box-shadow: 0 0 0 1px var(--accent-line); }
 .presence-class.inspectable:disabled { cursor: wait; opacity: .72; }
@@ -2169,6 +2171,7 @@
 .presence-pulse .empty { stroke: var(--line-2); stroke-width: 1; }
 .presence-class-values { min-width: 0; display: grid; grid-template-columns: 1fr auto; align-items: baseline; gap: 1px 6px; text-align: right; }
 .presence-class-values b { color: var(--text); font: 650 13px/1 var(--mono); }
+.presence-class.reacting .presence-class-values b { color: var(--accent); }
 .presence-class-values span { color: var(--text-mut); font: 8px/1 var(--mono); }
 .presence-class-values em { grid-column: 1 / -1; color: var(--text-2); font: 9px/1 var(--mono); font-style: normal; }
 .presence-card-note, .presence-card-empty { color: var(--text-mut); font-size: 9.5px; line-height: 1.4; }

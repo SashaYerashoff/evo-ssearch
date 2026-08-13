@@ -4,9 +4,20 @@ import type {
   SemanticPresencePoint,
   SemanticPresenceStatus,
 } from '../../api/probes'
+import {
+  presenceClassKey,
+  presenceReaction,
+  rankPresenceClasses,
+} from './semanticPresenceView'
 
 function n3(value?: number | null): string {
   return value == null || !Number.isFinite(Number(value)) ? '—' : Number(value).toFixed(3)
+}
+
+function signed3(value?: number | null): string {
+  if (value == null || !Number.isFinite(Number(value))) return '—'
+  const number = Number(value)
+  return `${number >= 0 ? '+' : ''}${number.toFixed(3)}`
 }
 
 function presencePoints(history?: SemanticPresencePoint[]): string {
@@ -67,8 +78,7 @@ export function SemanticPresenceCard({
   activeKey?: string | null
 }) {
   if (!presence?.enabled) return null
-  const classes = [...(presence.classes || [])]
-    .sort((left, right) => Math.abs(Number(right.z || 0)) - Math.abs(Number(left.z || 0)))
+  const classes = rankPresenceClasses([...(presence.classes || [])])
     .slice(0, maxClasses ?? (compact ? 3 : 10))
   const timestamp = Number(presence.timestamp_ms)
   const ageSeconds = Number.isFinite(timestamp) && timestamp > 0
@@ -79,7 +89,7 @@ export function SemanticPresenceCard({
       <div className="presence-card-head">
         <div>
           <span><IconActivityHeartbeat size={15} /> Semantic presence</span>
-          <b>Pooled embedding pulse · attention only, not object detection</b>
+          <b>Response from each class baseline · attention only, not object detection</b>
         </div>
         <i>{presence.state || 'warming_up'}{ageSeconds != null ? ` · ${ageSeconds.toFixed(ageSeconds < 10 ? 1 : 0)}s` : ''}</i>
       </div>
@@ -88,29 +98,35 @@ export function SemanticPresenceCard({
       )}
       <div className="presence-class-list">
         {classes.map((item) => {
-          const key = item.key || item.label
+          const key = presenceClassKey(item)
+          const reaction = presenceReaction(item)
+          const responseLabel = item.warmup
+            ? `${item.samples || 0} warmup`
+            : reaction.current
+              ? `responding ${reaction.direction === 'down' ? '↓' : '↑'}`
+              : reaction.reacting
+                ? `recent response ${reaction.direction === 'down' ? '↓' : '↑'}`
+                : 'baseline'
           const content = <>
             <div className="presence-class-label">
               <b>{item.label}</b>
               <span>{busyKey === key
                 ? 'mapping exact frame…'
-                : item.warmup
-                  ? `${item.samples || 0} warmup`
-                  : onInspect
-                    ? `${String(item.state || 'routine').replace(/_/g, ' ')} · inspect patches`
-                    : String(item.state || 'routine').replace(/_/g, ' ')}</span>
+                : onInspect
+                  ? `${responseLabel} · inspect patches`
+                  : responseLabel}</span>
             </div>
             <PresencePulse item={item} />
             <div className="presence-class-values">
-              <b>{n3(item.score)}</b>
-              <span>base {n3(item.baseline)}</span>
-              <em>{Number(item.delta) >= 0 ? '+' : ''}{n3(item.delta)}</em>
+              <b>{signed3(item.delta)}</b>
+              <span>raw {n3(item.score)}</span>
+              <em>base {n3(item.baseline)}</em>
             </div>
           </>
           return onInspect ? (
             <button
               type="button"
-              className={`presence-class inspectable ${item.state || 'warming_up'} ${activeKey === key ? 'active' : ''}`}
+              className={`presence-class inspectable ${reaction.reacting ? 'reacting' : 'routine'} ${item.state || 'warming_up'} ${activeKey === key ? 'active' : ''}`}
               key={key}
               disabled={!!busyKey}
               onClick={() => onInspect(item)}
@@ -119,14 +135,14 @@ export function SemanticPresenceCard({
               {content}
             </button>
           ) : (
-            <div className={`presence-class ${item.state || 'warming_up'}`} key={key}>{content}</div>
+            <div className={`presence-class ${reaction.reacting ? 'reacting' : 'routine'} ${item.state || 'warming_up'}`} key={key}>{content}</div>
           )
         })}
         {!classes.length && <div className="presence-card-empty">Waiting for the first archived embedding.</div>}
       </div>
       {!compact && (
         <div className="presence-card-note">
-          Baselines adapt per channel. Scores are semantic similarities, not probabilities or object counts.
+          Responding classes stay on top for about 12 samples; routine rows stay stable. Raw scores are prompt-specific and cannot be compared between labels.
         </div>
       )}
       {onInspect && (
