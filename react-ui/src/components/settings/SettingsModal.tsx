@@ -67,11 +67,15 @@ export function SettingsModal({
   user,
   channels,
   onRefreshChannels,
+  showIncidents,
+  onShowIncidentsChange,
   onClose,
 }: {
   user: AuthUser
   channels: Channel[]
   onRefreshChannels?: () => Promise<void> | void
+  showIncidents: boolean
+  onShowIncidentsChange: (enabled: boolean) => void
   onClose: () => void
 }) {
   const [s, setS] = useState<Settings>({})
@@ -183,7 +187,7 @@ export function SettingsModal({
   const tabHasMatch = (t: (typeof TABS)[number]) => {
     if (!q) return true
     if (t.label.toLowerCase().includes(q)) return true
-    if (t.custom) return t.custom.includes(q)
+    if (t.custom) return `${t.custom} ${t.searchTerms || ''}`.includes(q)
     return !!t.sections?.some((sec) => sec.title.toLowerCase().includes(q) || sec.fields?.some((f) => fieldMatch(f.label)))
   }
   const tabKind = (custom?: string) => custom === 'users'
@@ -196,11 +200,14 @@ export function SettingsModal({
           ? 'diagnostics'
           : 'settings'
   const permittedTabs = TABS.filter((candidate) => (
-    candidate.custom === 'appearance' || canViewSettingsTab(user, tabKind(candidate.custom))
+    candidate.custom === 'appearance'
+    || candidate.custom === 'features'
+    || canViewSettingsTab(user, tabKind(candidate.custom))
   ))
   const visibleTabs = permittedTabs.filter(tabHasMatch)
   const activeId = visibleTabs.some((t) => t.id === tab) ? tab : (visibleTabs[0]?.id ?? tab)
   const activeTab = permittedTabs.find((t) => t.id === activeId) ?? permittedTabs[0]
+  const localPreferenceTab = activeTab?.custom === 'appearance' || activeTab?.custom === 'features'
   const capacitySummary = normalizeArchiveCapacity(capacity)
   const sourceDeclared = s.envPrecedence?.declared_file_matches_project === true
   const sourceWritable = s.envPrecedence?.write_allowed !== false
@@ -212,7 +219,7 @@ export function SettingsModal({
         <div className="modal-head">
           <div>
             <div className="modal-title">Settings</div>
-            <div className="brand-sub">Tune appearance, runtime, ranking, Luxriot integration, and environment.</div>
+            <div className="brand-sub">Tune appearance, feature visibility, runtime, ranking, Luxriot integration, and environment.</div>
           </div>
           <div className="set-actions">
             <a
@@ -252,10 +259,10 @@ export function SettingsModal({
                 </div>
               </div>
             )}
-            {!loading && settingsLoadError && (
+            {!loading && settingsLoadError && !localPreferenceTab && (
               <div className="set-load-error">{settingsLoadError}. Showing safe defaults; saving is disabled until the live configuration can be read.</div>
             )}
-            {!loading && !settingsLoadError && (
+            {!loading && !settingsLoadError && !localPreferenceTab && (
               <div className={`set-source-state ${sourceDeclared ? (pendingSourceKeys.length ? 'pending' : 'aligned') : 'unknown'}`}>
                 {sourceDeclared ? (
                   <>
@@ -285,6 +292,31 @@ export function SettingsModal({
             {!loading && activeTab?.custom === 'audit' && <AuditTab />}
             {!loading && activeTab?.custom === 'diagnostics' && <DiagnosticsTab />}
             {!loading && activeTab?.custom === 'appearance' && <AppearanceModal embedded onClose={() => {}} />}
+            {!loading && activeTab?.custom === 'features' && (
+              <div className="set-section set-feature-section">
+                <h3>
+                  Operator features
+                  <span className={`set-exp ${showIncidents ? 'on' : ''}`}>feature in progress</span>
+                </h3>
+                <p className="set-section-help">
+                  Keep developing operator surfaces visible while validating them, or hide them on this workstation if their output does not match operational expectations.
+                </p>
+                <label className="set-row set-check set-feature-toggle">
+                  <input
+                    type="checkbox"
+                    checked={showIncidents}
+                    onChange={(event) => onShowIncidentsChange(event.target.checked)}
+                  />
+                  <span>
+                    <b>Show incidents (FiP)</b>
+                    <small>Show Incident Review in the Video workspace.</small>
+                  </span>
+                </label>
+                <div className="set-feature-advisory">
+                  This preference applies immediately in this browser. Turning it off hides and stops the Incident Review UI, but does not delete incident history or disable backend incident processing.
+                </div>
+              </div>
+            )}
             {!loading && activeTab?.custom === 'users' && (
               <UsersTab
                 currentUserId={user.id}

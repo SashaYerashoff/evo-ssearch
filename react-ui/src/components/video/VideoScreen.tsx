@@ -28,7 +28,7 @@ import {
   type SummaryEntry,
 } from '../../api/video'
 import { renderMarkdown } from '../agent/markdown'
-import { StreamControl, type VideoWorkspaceTab } from './StreamControl'
+import { resolveVideoWorkspaceTab, StreamControl, type VideoWorkspaceTab } from './StreamControl'
 import { PromptSettingsModal } from './PromptSettingsModal'
 import { IncidentModal } from '../incidents/IncidentModal'
 import { IncidentReview, type IncidentPeriod } from '../incidents/IncidentReview'
@@ -387,6 +387,7 @@ export function VideoScreen({
   canReportIncidents,
   canExport,
   onReviewSummary,
+  showIncidents,
 }: {
   navigation?: ReactNode
   channels: Channel[]
@@ -399,6 +400,7 @@ export function VideoScreen({
   canReportIncidents: boolean
   canExport: boolean
   onReviewSummary?: (entry: SummaryEntry) => void
+  showIncidents: boolean
 }) {
   const { locale, t } = useI18n()
   const [activeTab, setActiveTab] = useState<VideoWorkspaceTab>('review')
@@ -608,6 +610,13 @@ export function VideoScreen({
   useEffect(() => {
     try { window.localStorage.setItem(INCIDENT_PERIOD_STORAGE_KEY, incidentPeriod) } catch { /* optional */ }
   }, [incidentPeriod])
+  useEffect(() => {
+    const nextTab = resolveVideoWorkspaceTab(activeTab, showIncidents)
+    if (nextTab === activeTab) return
+    setIncidentVisited(false)
+    setIncidentLoading(false)
+    setActiveTab(nextTab)
+  }, [activeTab, showIncidents])
   useEffect(() => {
     hydratedSettingsChannelRef.current = null
     setBatch('12')
@@ -985,6 +994,7 @@ export function VideoScreen({
         onIncidentPeriod={setIncidentPeriod}
         incidentLoading={incidentLoading}
         onRefreshIncidents={() => setIncidentRefreshKey((value) => value + 1)}
+        showIncidents={showIncidents}
       />
 
       {activeTab === 'review' ? (
@@ -1096,7 +1106,7 @@ export function VideoScreen({
         </div>
       ) : null}
 
-      {incidentVisited && (
+      {showIncidents && incidentVisited && (
         <div className="vid-incident-main" hidden={activeTab !== 'incidents'}>
           <IncidentReview
             channels={channels}

@@ -16,7 +16,7 @@ export interface FieldDef {
 }
 
 export interface Section { title: string; help?: string; fields?: FieldDef[]; kind?: 'severity' | 'capacity'; experimental?: boolean }
-export interface TabDef { id: string; label: string; custom?: 'env' | 'audit' | 'users' | 'diagnostics' | 'appearance'; sections?: Section[] }
+export interface TabDef { id: string; label: string; custom?: 'env' | 'audit' | 'users' | 'diagnostics' | 'appearance' | 'features'; searchTerms?: string; sections?: Section[] }
 
 const CLIP_MODELS = [
   'google/siglip2-base-patch16-224',
@@ -165,6 +165,7 @@ export const TABS: TabDef[] = [
       { title: 'Estimated capacity', kind: 'capacity' },
     ],
   },
+  { id: 'features', label: 'Features', custom: 'features', searchTerms: 'show hide disable operator incidents incident review feature progress fip' },
   { id: 'appearance', label: 'Appearance', custom: 'appearance' },
   { id: 'diagnostics', label: 'Diagnostics', custom: 'diagnostics' },
   { id: 'users', label: 'Users', custom: 'users' },

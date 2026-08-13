@@ -6,6 +6,12 @@ Format loosely follows Keep a Changelog.
 
 ## Unreleased
 
+- **Incident Review is explicitly feature-in-progress:** its Video workspace tab
+  now carries a visible FiP badge and operator warning. Settings → Features has
+  a workstation-local `Show incidents (FiP)` switch which immediately unmounts
+  and hides the review surface when its output is not operationally useful,
+  without deleting incident history or changing backend processing.
+
 - **Legacy incident noise no longer consumes operator review:** automatic
   pre-admission `vlm_l0_temporal` candidates which were never grounded,
   followed, or acted on remain in the full incident ledger and detail API but

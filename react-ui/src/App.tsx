@@ -29,6 +29,11 @@ import { NeuralBackground } from './components/shell/NeuralBackground'
 import { useAppearance } from './appearance/AppearanceProvider'
 import type { ConsoleUiEffect } from './ui-effects/consoleEffects'
 import { useI18n } from './i18n/I18nProvider'
+import {
+  persistFeaturePreferences,
+  readFeaturePreferences,
+  type FeaturePreferences,
+} from './features/featurePreferences'
 
 export type AgentDrive = AgentAction & { seq: number }
 export interface ConsoleDrive {
@@ -130,12 +135,20 @@ export default function App() {
   const [forbiddenNotice, setForbiddenNotice] = useState('')
   const [appVersion, setAppVersion] = useState('')
   const [serverStartedAtMs, setServerStartedAtMs] = useState<number | null>(null)
+  const [featurePreferences, setFeaturePreferences] = useState<FeaturePreferences>(readFeaturePreferences)
   const seqRef = useRef(0)
   const summaryReviewOriginRef = useRef<HTMLElement | null>(null)
   const appliedEffectIds = useRef(new Set<string>())
   const visibleSections = (['home', 'archive', 'video', 'monitoring'] as SectionId[])
     .filter((candidate) => canViewSection(user, candidate))
   const settingsAllowed = canOpenSettings(user)
+
+  const setShowIncidents = useCallback((showIncidents: boolean) => {
+    setFeaturePreferences((current) => persistFeaturePreferences({
+      ...current,
+      showIncidents,
+    }))
+  }, [])
 
   // Trusted backend effects route completed domain reads/receipts into the console.
   const handleAgentUiEffects = useCallback((effects: ConsoleUiEffect[], result: unknown) => {
@@ -453,6 +466,7 @@ export default function App() {
               canReportIncidents={hasPermission(user, PERMISSION.incidentsManage)}
               canExport={hasPermission(user, PERMISSION.dataExport)}
               onReviewSummary={handleReviewVideoSummary}
+              showIncidents={featurePreferences.showIncidents && hasPermission(user, PERMISSION.reportsView)}
             />
           )}
           {section !== 'home' && section !== 'archive' && section !== 'monitoring' && section !== 'video' && (
@@ -467,6 +481,8 @@ export default function App() {
             user={user}
             channels={channels}
             onRefreshChannels={refreshChannels}
+            showIncidents={featurePreferences.showIncidents}
+            onShowIncidentsChange={setShowIncidents}
             onClose={() => setSettingsOpen(false)}
           />
         )}

@@ -48,6 +48,17 @@ const RESOLUTION_LABEL_KEYS: Record<SummaryResolution, TranslationKey> = {
 
 export type VideoWorkspaceTab = 'review' | 'incidents' | 'settings'
 
+export function visibleVideoWorkspaceTabs(showIncidents: boolean): VideoWorkspaceTab[] {
+  return showIncidents ? ['review', 'incidents', 'settings'] : ['review', 'settings']
+}
+
+export function resolveVideoWorkspaceTab(
+  active: VideoWorkspaceTab,
+  showIncidents: boolean,
+): VideoWorkspaceTab {
+  return visibleVideoWorkspaceTabs(showIncidents).includes(active) ? active : 'review'
+}
+
 export function StreamControl(p: {
   navigation?: ReactNode
   channels: Channel[]
@@ -85,6 +96,7 @@ export function StreamControl(p: {
   onIncidentPeriod: (period: IncidentPeriod) => void
   incidentLoading: boolean
   onRefreshIncidents: () => void
+  showIncidents: boolean
 }) {
   const { t } = useI18n()
   const periods = PERIODS.map((item) => ({ ...item, label: t(PERIOD_LABEL_KEYS[item.v]) }))
@@ -103,7 +115,13 @@ export function StreamControl(p: {
     <ToolTabs
       tabs={[
         { id: 'review', icon: <IconFileDescription size={13} />, label: t('video.review'), summary: reviewSummary },
-        { id: 'incidents', icon: <IconAlertTriangle size={13} />, label: t('incident.review'), summary: t('incident.tabSummary') },
+        ...(visibleVideoWorkspaceTabs(p.showIncidents).includes('incidents') ? [{
+          id: 'incidents',
+          icon: <IconAlertTriangle size={13} />,
+          label: t('incident.review'),
+          badge: 'FiP',
+          summary: `Feature in progress · ${t('incident.tabSummary')}`,
+        }] : []),
         { id: 'settings', icon: <IconVideo size={13} />, label: t('video.settings'), summary: settingsSummary },
       ]}
       active={p.activeTab}
@@ -150,6 +168,10 @@ export function StreamControl(p: {
         </div>
       ) : p.activeTab === 'incidents' ? (
         <div className="vid-incident-toolbar incident-review-filters">
+          <div className="vid-incident-tab-note">
+            <IconAlertTriangle size={16} />
+            <span><b>Feature in progress.</b> Disable “Show incidents (FiP)” in Settings → Features if the result is not operationally useful.</span>
+          </div>
           <label>
             {t('video.channel')}
             <Dropdown
