@@ -444,7 +444,10 @@ DEFAULT_BATCH_STATE_JSON_PROMPT = (
     '"scene":{"status":"matched","summary":"short current scene"},'
     '"routines":[{"key":"routine-key","label":"recurring activity","state":"continuing",'
     '"snapshot_indices":[1],"applies_to_event_keys": []}],"memory_pass":[]}\n'
-    "Never copy schema examples into output, emit prose-only alerts, or use a prior alert to suppress a currently visible match."
+    "CRITICAL: the four Markdown sections are not a complete response. After ### Worth to remember, always write the "
+    "literal BATCH_STATE_JSON: marker and one complete JSON object, including empty arrays when nothing changed. Never "
+    "stop before this block. Reuse the schema field names, replace example values with current evidence, and never use "
+    "a prior alert to suppress a currently visible match."
 )
 
 # Compatibility name retained for persisted settings and public API fields.
@@ -504,6 +507,7 @@ _OUTDATED_ALERT_PROMPT_MARKERS = (
     "\"kind\": \"event|transition|routine|coverage_issue\"",
     "\"confidence\": \"high|medium|low\"",
     "also emit operator-defined low/normal test triggers when the stream prompt explicitly asks",
+    "never copy schema examples into output, emit prose-only alerts",
 )
 
 ALERT_SEVERITY_ORDER = ("critical", "high", "normal", "low", "info")
