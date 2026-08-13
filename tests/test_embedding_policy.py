@@ -38,6 +38,21 @@ class EmbeddingPolicyTests(unittest.TestCase):
             "CLIP_DEVICE": getattr(config, "CLIP_DEVICE", "auto"),
             "CLIP_MODEL": config.CLIP_MODEL,
             "CLIP_MODEL_REVISION": getattr(config, "CLIP_MODEL_REVISION", ""),
+            "CLIP_RUNTIME_AUTO_RECOVERY_ENABLED": getattr(
+                config,
+                "CLIP_RUNTIME_AUTO_RECOVERY_ENABLED",
+                True,
+            ),
+            "CLIP_RUNTIME_RECOVERY_COOLDOWN_SEC": getattr(
+                config,
+                "CLIP_RUNTIME_RECOVERY_COOLDOWN_SEC",
+                300.0,
+            ),
+            "CLIP_RUNTIME_RECOVERY_MAX_PER_HOUR": getattr(
+                config,
+                "CLIP_RUNTIME_RECOVERY_MAX_PER_HOUR",
+                2,
+            ),
             "INDEX_MODE": config.INDEX_MODE,
             "FUSION_ENABLED": config.FUSION_ENABLED,
             "DINO_SEGMENTS_ENABLED": config.DINO_SEGMENTS_ENABLED,
@@ -326,8 +341,66 @@ class EmbeddingPolicyTests(unittest.TestCase):
             self.assertEqual(status["status"], "runtime_drift")
             self.assertEqual(status["image_cosine"], 0.0)
             self.assertEqual(status["text_cosine"], 1.0)
+            self.assertNotEqual(
+                status["image_fingerprint"],
+                status["baseline_image_fingerprint"],
+            )
 
         oldapp._clear_clip_runtime_generation()
+
+    def test_image_drift_schedules_bounded_runtime_recovery(self) -> None:
+        with (
+            patch(
+                "oldapp._clip_image_batch_with_space_locked",
+                side_effect=oldapp.ClipRuntimeDriftError("drift"),
+            ),
+            patch("oldapp._schedule_clip_runtime_recovery") as schedule,
+        ):
+            with self.assertRaises(oldapp.ClipRuntimeDriftError):
+                oldapp._clip_image_batch_with_space(
+                    [Image.new("RGB", (8, 8), color=(0, 0, 0))]
+                )
+
+        schedule.assert_called_once_with()
+
+    def test_runtime_recovery_reloads_and_warms_off_worker(self) -> None:
+        class ImmediateThread:
+            def __init__(self, *, target, **_kwargs):
+                self.target = target
+
+            def start(self):
+                self.target()
+
+        config.CLIP_RUNTIME_AUTO_RECOVERY_ENABLED = True
+        config.CLIP_RUNTIME_RECOVERY_COOLDOWN_SEC = 30.0
+        config.CLIP_RUNTIME_RECOVERY_MAX_PER_HOUR = 2
+        with oldapp._clip_runtime_recovery_lock:
+            oldapp._clip_runtime_recovery_attempts.clear()
+            oldapp._clip_runtime_recovery_state.update(
+                {
+                    "in_progress": False,
+                    "attempts_total": 0,
+                    "recoveries_total": 0,
+                    "last_error": None,
+                }
+            )
+
+        with (
+            patch("oldapp.threading.Thread", ImmediateThread),
+            patch("oldapp.reset_embedder_runtime_state") as reset_runtime,
+            patch(
+                "oldapp._warm_live_embedding_runtime",
+                return_value={"status": "ready"},
+            ) as warm_runtime,
+        ):
+            self.assertTrue(oldapp._schedule_clip_runtime_recovery())
+
+        reset_runtime.assert_called_once_with()
+        warm_runtime.assert_called_once_with()
+        status = oldapp._clip_runtime_recovery_status()
+        self.assertFalse(status["in_progress"])
+        self.assertEqual(status["recoveries_total"], 1)
+        self.assertIsNone(status["last_error"])
 
 
 class ProbeVectorGuardTests(unittest.TestCase):

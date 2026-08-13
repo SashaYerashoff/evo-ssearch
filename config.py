@@ -237,6 +237,40 @@ class Config:
         'EVOSSEARCH_CLIP_MODEL_REVISION',
         '75de2d55ec2d0b4efc50b3e9ad70dba96a7b2fa2',
     ).strip()
+    try:
+        CLIP_RUNTIME_CANARY_INTERVAL_SEC = float(
+            os.getenv('EVOSSEARCH_CLIP_RUNTIME_CANARY_INTERVAL_SEC', '120')
+        )
+    except (TypeError, ValueError):
+        CLIP_RUNTIME_CANARY_INTERVAL_SEC = 120.0
+    CLIP_RUNTIME_CANARY_INTERVAL_SEC = max(
+        15.0,
+        min(900.0, CLIP_RUNTIME_CANARY_INTERVAL_SEC),
+    )
+    CLIP_RUNTIME_AUTO_RECOVERY_ENABLED = _get_bool_env(
+        'EVOSSEARCH_CLIP_RUNTIME_AUTO_RECOVERY_ENABLED',
+        'True',
+    )
+    try:
+        CLIP_RUNTIME_RECOVERY_COOLDOWN_SEC = float(
+            os.getenv('EVOSSEARCH_CLIP_RUNTIME_RECOVERY_COOLDOWN_SEC', '300')
+        )
+    except (TypeError, ValueError):
+        CLIP_RUNTIME_RECOVERY_COOLDOWN_SEC = 300.0
+    CLIP_RUNTIME_RECOVERY_COOLDOWN_SEC = max(
+        30.0,
+        min(3600.0, CLIP_RUNTIME_RECOVERY_COOLDOWN_SEC),
+    )
+    try:
+        CLIP_RUNTIME_RECOVERY_MAX_PER_HOUR = int(
+            os.getenv('EVOSSEARCH_CLIP_RUNTIME_RECOVERY_MAX_PER_HOUR', '2')
+        )
+    except (TypeError, ValueError):
+        CLIP_RUNTIME_RECOVERY_MAX_PER_HOUR = 2
+    CLIP_RUNTIME_RECOVERY_MAX_PER_HOUR = max(
+        1,
+        min(6, CLIP_RUNTIME_RECOVERY_MAX_PER_HOUR),
+    )
     if not EXPERIMENTAL_EMBEDDERS_ENABLED:
         EMBEDDER = 'clip'
         CLIP_MODEL = PRODUCTION_CLIP_MODEL

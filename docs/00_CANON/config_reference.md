@@ -343,6 +343,9 @@ links, P/N/M semantics, and the deployed office profile.
 | `EVOSSEARCH_PRODUCTION_CLIP_MODEL` / `EVOSSEARCH_CLIP_MODEL` (`google/siglip2-base-patch16-224`) | CLIP-like semantic model; OpenAI CLIP remains a selectable legacy/A-B backend |
 | `EVOSSEARCH_CLIP_MODEL_REVISION` (`75de2d55...`) | Immutable Hugging Face revision included in the embedding-space fingerprint and offline bundle |
 | `EVOSSEARCH_CLIP_DEVICE` (`auto`; appliance `cuda`) | Device for the CLIP-like attention embedder. SigLIP2 base on CPU does not sustain the eight-channel 1 Hz target; the single-4070S appliance reserves GPU headroom for it |
+| `EVOSSEARCH_CLIP_RUNTIME_CANARY_INTERVAL_SEC` (`120`) | Re-encode fixed image/text controls inside one loaded generation; content drift fails closed before probe or archive vectors are accepted |
+| `EVOSSEARCH_CLIP_RUNTIME_AUTO_RECOVERY_ENABLED` (`true`) | After persistent image-space drift, replace the generation off the embedding worker and warm the exact pinned local image/text path; L0 and the UI remain available while semantic scoring recovers |
+| `EVOSSEARCH_CLIP_RUNTIME_RECOVERY_COOLDOWN_SEC` (`300`) / `_MAX_PER_HOUR` (`2`) | Circuit breaker for automatic SigLIP generation replacement; repeated failure stays visible and unready instead of entering an infinite reload loop |
 | `EVOSSEARCH_EMBEDDER_FALLBACK_ENABLED` (`false`) | Allows an explicit fallback to a different embedding model after load failure. Keep `false` in production: model changes invalidate archive vectors and probe thresholds |
 | `EVOSSEARCH_OFFLINE_MODE` (`true`) | Blocks Hugging Face/Transformers and OpenAI CLIP downloads; missing artifacts fail closed |
 | `EVOSSEARCH_MODEL_CACHE_DIR` (`~/.cache/eva-ai/models`) | Local Hugging Face/Transformers model cache |

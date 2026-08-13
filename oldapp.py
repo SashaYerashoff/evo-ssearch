@@ -213,9 +213,23 @@ _clip_runtime_canary_lock = Lock()
 _clip_runtime_canary_image_baseline: Optional[np.ndarray] = None
 _clip_runtime_canary_text_baseline: Optional[np.ndarray] = None
 _clip_runtime_canary_last_check = 0.0
+_clip_runtime_canary_vision_signature = ""
 _clip_runtime_canary_state: Dict[str, Any] = {
     "ok": True,
     "status": "not_initialized",
+}
+_clip_runtime_recovery_lock = Lock()
+_clip_runtime_recovery_attempts: List[float] = []
+_clip_runtime_recovery_state: Dict[str, Any] = {
+    "enabled": bool(
+        getattr(config, "CLIP_RUNTIME_AUTO_RECOVERY_ENABLED", True)
+    ),
+    "in_progress": False,
+    "attempts_total": 0,
+    "recoveries_total": 0,
+    "last_started_at_ms": None,
+    "last_completed_at_ms": None,
+    "last_error": None,
 }
 _live_clip_batcher: Optional[ImageEmbeddingBatcher] = None
 _live_clip_batcher_lock = Lock()
@@ -1662,11 +1676,13 @@ def _begin_clip_runtime_generation() -> None:
     global _clip_runtime_canary_image_baseline
     global _clip_runtime_canary_text_baseline
     global _clip_runtime_canary_last_check
+    global _clip_runtime_canary_vision_signature
     clip_runtime_generation = secrets.token_hex(8)
     with _clip_runtime_canary_lock:
         _clip_runtime_canary_image_baseline = None
         _clip_runtime_canary_text_baseline = None
         _clip_runtime_canary_last_check = 0.0
+        _clip_runtime_canary_vision_signature = ""
         _clip_runtime_canary_state.clear()
         _clip_runtime_canary_state.update(
             {
@@ -1684,11 +1700,13 @@ def _clear_clip_runtime_generation() -> None:
     global _clip_runtime_canary_image_baseline
     global _clip_runtime_canary_text_baseline
     global _clip_runtime_canary_last_check
+    global _clip_runtime_canary_vision_signature
     clip_runtime_generation = ""
     with _clip_runtime_canary_lock:
         _clip_runtime_canary_image_baseline = None
         _clip_runtime_canary_text_baseline = None
         _clip_runtime_canary_last_check = 0.0
+        _clip_runtime_canary_vision_signature = ""
         _clip_runtime_canary_state.clear()
         _clip_runtime_canary_state.update(
             {
@@ -2149,12 +2167,61 @@ def _siglip_runtime_canary_vectors_locked() -> Tuple[np.ndarray, np.ndarray]:
     )
 
 
+def _siglip_vision_signature_locked() -> str:
+    """Fingerprint sparse immutable vision weights for drift diagnostics.
+
+    The signature is not an artifact checksum. It samples a bounded spread of
+    tensors so a canary failure can distinguish an altered module from a
+    stable module producing different CUDA results without copying the full
+    vision tower off the GPU.
+    """
+
+    if clip_model is None:
+        return ""
+    vision_model = getattr(clip_model, "vision_model", None)
+    named_parameters = getattr(vision_model, "named_parameters", None)
+    if not callable(named_parameters):
+        return ""
+    parameters = list(named_parameters())
+    if not parameters:
+        return ""
+    selected_count = min(16, len(parameters))
+    selected_indices = sorted(
+        {
+            round(index * (len(parameters) - 1) / max(1, selected_count - 1))
+            for index in range(selected_count)
+        }
+    )
+    digest = hashlib.sha256()
+    with torch.inference_mode():
+        for parameter_index in selected_indices:
+            name, parameter = parameters[parameter_index]
+            flat = parameter.detach().reshape(-1)
+            if flat.numel() == 0:
+                continue
+            sample_indices = sorted(
+                {0, int(flat.numel() // 2), int(flat.numel() - 1)}
+            )
+            sample = (
+                flat[sample_indices]
+                .float()
+                .cpu()
+                .numpy()
+                .astype(np.float32, copy=False)
+            )
+            digest.update(str(name).encode("utf-8", errors="replace"))
+            digest.update(str(tuple(parameter.shape)).encode("ascii"))
+            digest.update(sample.tobytes())
+    return digest.hexdigest()[:16]
+
+
 def _check_clip_runtime_canary_locked(*, force: bool = False) -> None:
     """Fail closed when image or text output drifts inside one model load."""
 
     global _clip_runtime_canary_image_baseline
     global _clip_runtime_canary_text_baseline
     global _clip_runtime_canary_last_check
+    global _clip_runtime_canary_vision_signature
     if clip_backend_kind != "siglip2":
         with _clip_runtime_canary_lock:
             _clip_runtime_canary_state.clear()
@@ -2222,10 +2289,12 @@ def _check_clip_runtime_canary_locked(*, force: bool = False) -> None:
         raise RuntimeError("SigLIP runtime canary could not be evaluated") from exc
     elapsed_ms = (time.perf_counter() - started) * 1000.0
     if baseline_image is None or baseline_text is None:
+        vision_signature = _siglip_vision_signature_locked()
         with _clip_runtime_canary_lock:
             _clip_runtime_canary_image_baseline = current_image.copy()
             _clip_runtime_canary_text_baseline = current_text.copy()
             _clip_runtime_canary_last_check = now
+            _clip_runtime_canary_vision_signature = vision_signature
             _clip_runtime_canary_state.clear()
             _clip_runtime_canary_state.update(
                 {
@@ -2234,6 +2303,14 @@ def _check_clip_runtime_canary_locked(*, force: bool = False) -> None:
                     "generation": clip_runtime_generation,
                     "image_cosine": 1.0,
                     "text_cosine": 1.0,
+                    "image_fingerprint": hashlib.sha256(
+                        current_image.tobytes()
+                    ).hexdigest()[:16],
+                    "vision_signature": vision_signature or None,
+                    "model_training": bool(getattr(clip_model, "training", False)),
+                    "vision_training": bool(
+                        getattr(getattr(clip_model, "vision_model", None), "training", False)
+                    ),
                     "last_check_ms": round(elapsed_ms, 3),
                 }
             )
@@ -2245,6 +2322,11 @@ def _check_clip_runtime_canary_locked(*, force: bool = False) -> None:
         image_cosine = float(np.min(np.sum(baseline_image * current_image, axis=1)))
         text_cosine = float(np.min(np.sum(baseline_text * current_text, axis=1)))
     healthy = image_cosine >= 0.999 and text_cosine >= 0.999
+    current_vision_signature = (
+        _clip_runtime_canary_vision_signature
+        if healthy
+        else _siglip_vision_signature_locked()
+    )
     with _clip_runtime_canary_lock:
         _clip_runtime_canary_last_check = now
         _clip_runtime_canary_state.clear()
@@ -2255,6 +2337,26 @@ def _check_clip_runtime_canary_locked(*, force: bool = False) -> None:
                 "generation": clip_runtime_generation,
                 "image_cosine": round(image_cosine, 6),
                 "text_cosine": round(text_cosine, 6),
+                "image_fingerprint": hashlib.sha256(
+                    current_image.tobytes()
+                ).hexdigest()[:16],
+                "baseline_image_fingerprint": hashlib.sha256(
+                    baseline_image.tobytes()
+                ).hexdigest()[:16],
+                "vision_signature": current_vision_signature or None,
+                "baseline_vision_signature": (
+                    _clip_runtime_canary_vision_signature or None
+                ),
+                "vision_signature_changed": bool(
+                    current_vision_signature
+                    and _clip_runtime_canary_vision_signature
+                    and current_vision_signature
+                    != _clip_runtime_canary_vision_signature
+                ),
+                "model_training": bool(getattr(clip_model, "training", False)),
+                "vision_training": bool(
+                    getattr(getattr(clip_model, "vision_model", None), "training", False)
+                ),
                 "last_check_ms": round(elapsed_ms, 3),
             }
         )
@@ -2302,17 +2404,23 @@ def _clip_image_batch_with_space(
     """Encode a whole microbatch under one immutable model-generation lock."""
 
     requested_at = time.perf_counter()
-    with _clip_init_lock:
-        acquired_at = time.perf_counter()
-        try:
-            return _clip_image_batch_with_space_locked(images)
-        finally:
-            finished_at = time.perf_counter()
-            _record_clip_runtime_timing(
-                "image",
-                wait_ms=(acquired_at - requested_at) * 1000.0,
-                work_ms=(finished_at - acquired_at) * 1000.0,
-            )
+    try:
+        with _clip_init_lock:
+            acquired_at = time.perf_counter()
+            try:
+                return _clip_image_batch_with_space_locked(images)
+            finally:
+                finished_at = time.perf_counter()
+                _record_clip_runtime_timing(
+                    "image",
+                    wait_ms=(acquired_at - requested_at) * 1000.0,
+                    work_ms=(finished_at - acquired_at) * 1000.0,
+                )
+    except ClipRuntimeDriftError:
+        scheduler = globals().get("_schedule_clip_runtime_recovery")
+        if callable(scheduler):
+            scheduler()
+        raise
 
 
 def _record_clip_runtime_timing(
@@ -2677,6 +2785,118 @@ def reset_embedder_runtime_state() -> None:
         finally:
             with _live_clip_batcher_lock:
                 _clip_resetting = False
+
+
+def _clip_runtime_recovery_status() -> Dict[str, Any]:
+    with _clip_runtime_recovery_lock:
+        status = copy.deepcopy(_clip_runtime_recovery_state)
+        now = time.monotonic()
+        status["attempts_last_hour"] = sum(
+            1
+            for attempted_at in _clip_runtime_recovery_attempts
+            if now - attempted_at < 3600.0
+        )
+        return status
+
+
+def _schedule_clip_runtime_recovery() -> bool:
+    """Recover a persistently drifted SigLIP generation off the batch worker.
+
+    The canary continues to fail closed. Recovery stops the old microbatcher,
+    clears generation-bound caches, reloads the pinned local artifact and warms
+    the exact image/text path. A small hourly circuit breaker prevents a broken
+    GPU or artifact from turning into an infinite reload loop.
+    """
+
+    enabled = bool(
+        getattr(config, "CLIP_RUNTIME_AUTO_RECOVERY_ENABLED", True)
+    )
+    now = time.monotonic()
+    cooldown = max(
+        30.0,
+        float(
+            getattr(config, "CLIP_RUNTIME_RECOVERY_COOLDOWN_SEC", 300.0)
+            or 300.0
+        ),
+    )
+    max_per_hour = max(
+        1,
+        int(
+            getattr(config, "CLIP_RUNTIME_RECOVERY_MAX_PER_HOUR", 2)
+            or 2
+        ),
+    )
+    with _clip_runtime_recovery_lock:
+        _clip_runtime_recovery_state["enabled"] = enabled
+        if not enabled:
+            _clip_runtime_recovery_state["last_skip_reason"] = "disabled"
+            return False
+        if bool(_clip_runtime_recovery_state.get("in_progress")):
+            _clip_runtime_recovery_state["last_skip_reason"] = "already_in_progress"
+            return False
+        _clip_runtime_recovery_attempts[:] = [
+            attempted_at
+            for attempted_at in _clip_runtime_recovery_attempts
+            if now - attempted_at < 3600.0
+        ]
+        if (
+            _clip_runtime_recovery_attempts
+            and now - _clip_runtime_recovery_attempts[-1] < cooldown
+        ):
+            _clip_runtime_recovery_state["last_skip_reason"] = "cooldown"
+            return False
+        if len(_clip_runtime_recovery_attempts) >= max_per_hour:
+            _clip_runtime_recovery_state["last_skip_reason"] = "hourly_limit"
+            return False
+        _clip_runtime_recovery_attempts.append(now)
+        _clip_runtime_recovery_state.update(
+            {
+                "in_progress": True,
+                "attempts_total": int(
+                    _clip_runtime_recovery_state.get("attempts_total") or 0
+                )
+                + 1,
+                "last_started_at_ms": int(time.time() * 1000.0),
+                "last_completed_at_ms": None,
+                "last_error": None,
+                "last_skip_reason": None,
+            }
+        )
+
+    def recover() -> None:
+        error: Optional[str] = None
+        warmup: Optional[Dict[str, Any]] = None
+        try:
+            reset_embedder_runtime_state()
+            warmup_fn = globals().get("_warm_live_embedding_runtime")
+            if not callable(warmup_fn):
+                raise RuntimeError("live embedding warmup is unavailable")
+            raw_warmup = warmup_fn()
+            if isinstance(raw_warmup, Mapping):
+                warmup = dict(raw_warmup)
+        except BaseException as exc:
+            error = f"{type(exc).__name__}: {exc}"[:500]
+        with _clip_runtime_recovery_lock:
+            _clip_runtime_recovery_state.update(
+                {
+                    "in_progress": False,
+                    "last_completed_at_ms": int(time.time() * 1000.0),
+                    "last_error": error,
+                    "last_warmup": warmup,
+                }
+            )
+            if error is None:
+                _clip_runtime_recovery_state["recoveries_total"] = int(
+                    _clip_runtime_recovery_state.get("recoveries_total") or 0
+                ) + 1
+
+    thread = threading.Thread(
+        target=recover,
+        name="eva-clip-runtime-recovery",
+        daemon=True,
+    )
+    thread.start()
+    return True
 
 
 def warm_start_embedder() -> Optional[str]:
@@ -7332,6 +7552,7 @@ def _embedder_loaded_state() -> Dict[str, Any]:
         opencv_threads=int(cv2.getNumThreads()),
         embedding_space=embedding_space or None,
         runtime_canary=canary,
+        runtime_recovery=_clip_runtime_recovery_status(),
     )
 
 
