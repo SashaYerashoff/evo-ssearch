@@ -9035,6 +9035,40 @@ class LuxriotCaptureDispatchTests(unittest.TestCase):
             [],
         )
 
+        for claim in (
+            "One sub-episode remaining open at the end of the window.",
+            "This was an open safety episode requiring attention.",
+            "The drifting vehicle remains an unresolved safety priority.",
+        ):
+            variant = operator_rollup_response(
+                "Drift was visible in the sampled frames.",
+                takeaway=claim,
+            )
+            variant_issues = LuxriotManager._rollup_grounding_guard_issues(
+                variant,
+                operator_node,
+            )
+            variant_sanitized = (
+                LuxriotManager._sanitize_rollup_operator_overclaims(
+                    variant,
+                    operator_node,
+                )
+            )
+            self.assertIn(
+                "temporal_episode_as_case_state",
+                variant_issues,
+                claim,
+            )
+            self.assertEqual(
+                LuxriotManager._rollup_grounding_guard_issues(
+                    variant_sanitized,
+                    operator_node,
+                ),
+                [],
+                claim,
+            )
+            self.assertIn("review its grounded alert", variant_sanitized)
+
         active_watchlist_summary = operator_rollup_response(
             "A configured watch remains pending.",
             takeaway=(

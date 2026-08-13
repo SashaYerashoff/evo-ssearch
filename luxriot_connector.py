@@ -19087,10 +19087,11 @@ class LuxriotManager:
         text = " ".join(str(value or "").split())
         patterns = (
             r"\b(?:incident|case|episode|event(?:\s+track)?)s?\s+"
-            r"(?:remain(?:s|ed)?|is|are|stay(?:s|ed)?)\s+"
-            r"(?:active|open|unresolved)\b",
-            r"\b(?:active|open|unresolved)\s+(?:operator\s+)?"
-            r"(?:incident|case|episode|event(?:\s+track)?)s?\b",
+            r"(?:remain(?:s|ed|ing)?|is|are|stay(?:s|ed|ing)?)\s+"
+            r"(?:an?\s+)?(?:active|open|unresolved)\b",
+            r"\b(?:an?\s+)?(?:active|open|unresolved)\s+"
+            r"(?:(?:operator|safety|security)[ -]+)?"
+            r"(?:incident|case|episode|event(?:\s+track)?|priority)s?\b",
             r"\b(?:incident|case|episode|event(?:\s+track)?)s?\b[^.!?]{0,160}"
             r"\b(?:marked|classified|flagged|treated|listed|recorded)\s+as\s+"
             r"(?:an?\s+)?(?:active|open|unresolved)\s+"
