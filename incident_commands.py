@@ -889,6 +889,11 @@ class IncidentCommandService:
             if isinstance(item, Mapping)
             and str(item.get("kind") or "") == "routine_gap"
         ][:16]
+        observed_event_keys = {
+            str(item.get("semantic_key") or "").strip().lower()[:160]
+            for item in event_rows
+            if str(item.get("semantic_key") or "").strip()
+        }
 
         for observation in event_rows:
             semantic_key = str(observation.get("semantic_key") or "").strip().lower()[:160]
@@ -975,6 +980,7 @@ class IncidentCommandService:
                     incident = self._extend_l0_incident(
                         incident,
                         observation,
+                        heartbeat=heartbeat,
                         actor_id=actor_id,
                     )
                     active_by_key[semantic_key] = incident
@@ -1016,6 +1022,52 @@ class IncidentCommandService:
                     ended += 1
                 except Exception as exc:
                     failures.append(f"{semantic_key}:routine:{type(exc).__name__}")
+
+        # A short operator/safety signal must not remain perceptually observed
+        # forever merely because the model did not emit an explicit
+        # ``routine returned`` record.  Covered silence is meaningful only
+        # inside the same capture run: a restart or disconnected camera is an
+        # evidence gap, not proof that the event ended.
+        heartbeat_run_id = str(heartbeat.get("run_id") or "").strip()
+        if heartbeat_run_id and not bool(heartbeat.get("coverage_gap")):
+            for semantic_key, incident in list(active_by_key.items()):
+                if semantic_key in observed_event_keys:
+                    continue
+                coverage = (
+                    incident.get("coverage")
+                    if isinstance(incident.get("coverage"), Mapping)
+                    else {}
+                )
+                source_run_id = str(coverage.get("source_run_id") or "").strip()
+                if source_run_id != heartbeat_run_id:
+                    continue
+                prior_observed_end_ms = (
+                    self._optional_int(incident.get("observed_end_ms"))
+                    or self._optional_int(incident.get("observed_start_ms"))
+                    or self._optional_int(incident.get("possible_start_ms"))
+                )
+                if (
+                    prior_observed_end_ms is None
+                    or batch_start_ms - prior_observed_end_ms
+                    <= normalized_observed_gap_ms
+                ):
+                    continue
+                try:
+                    self._end_l0_incident_at_observed_gap(
+                        incident,
+                        boundary_ms=batch_start_ms,
+                        source_batch_id=batch_id,
+                        semantic_key=semantic_key,
+                        max_observed_gap_ms=normalized_observed_gap_ms,
+                        actor_id=actor_id,
+                        boundary_basis="covered_absence_same_run",
+                    )
+                    active_by_key.pop(semantic_key, None)
+                    ended += 1
+                except Exception as exc:
+                    failures.append(
+                        f"{semantic_key}:covered_absence:{type(exc).__name__}"
+                    )
 
         return {
             "supported": True,
@@ -1765,6 +1817,8 @@ class IncidentCommandService:
             "coverage": {
                 "status": "covered",
                 "source_batch_id": str(heartbeat.get("batch_id") or ""),
+                "source_run_id": str(heartbeat.get("run_id") or "").strip()
+                or None,
             },
             "uncertainties": [
                 (
@@ -1819,6 +1873,7 @@ class IncidentCommandService:
         incident: Mapping[str, Any],
         observation: Mapping[str, Any],
         *,
+        heartbeat: Mapping[str, Any],
         actor_id: str | None,
     ) -> dict[str, Any]:
         observation_id = str(observation.get("observation_id") or "").strip()
@@ -1856,6 +1911,21 @@ class IncidentCommandService:
             "observed_end_ms": effective_end_ms,
             "perception_state": "ended" if terminal else "observed",
         }
+        coverage = (
+            dict(incident.get("coverage") or {})
+            if isinstance(incident.get("coverage"), Mapping)
+            else {}
+        )
+        coverage.update(
+            {
+                "status": "covered",
+                "source_batch_id": str(heartbeat.get("batch_id") or ""),
+            }
+        )
+        heartbeat_run_id = str(heartbeat.get("run_id") or "").strip()
+        if heartbeat_run_id:
+            coverage["source_run_id"] = heartbeat_run_id
+        changes["coverage"] = coverage
         trigger_kind = str(observation.get("trigger_kind") or "").strip().lower()
         incoming_priority = (
             "operator_criterion"
@@ -1985,6 +2055,7 @@ class IncidentCommandService:
         semantic_key: str,
         max_observed_gap_ms: int,
         actor_id: str | None,
+        boundary_basis: str = "later_same_key_observation",
     ) -> dict[str, Any]:
         """End perception before a later same-key episode is associated.
 
@@ -2010,6 +2081,8 @@ class IncidentCommandService:
         }
         if current_legacy in {"candidate", "draft"}:
             changes["state"] = "ended"
+        normalized_basis = str(boundary_basis or "").strip().lower()
+        covered_absence = normalized_basis == "covered_absence_same_run"
         return self.incident_store.update_incident(
             str(incident.get("id") or ""),
             expected_revision=int(incident.get("revision") or 0),
@@ -2017,7 +2090,11 @@ class IncidentCommandService:
             actor_id=actor_id,
             transition={
                 "transitioned_at_ms": normalized_boundary_ms,
-                "reason": "later same-key observation exceeded the bounded perceptual episode gap",
+                "reason": (
+                    "same-run covered absence exceeded the bounded perceptual episode gap"
+                    if covered_absence
+                    else "later same-key observation exceeded the bounded perceptual episode gap"
+                ),
                 "source_kind": "observed_gap_boundary",
                 "source_ref": {
                     "batch_id": str(source_batch_id or "")[:160],
@@ -2025,6 +2102,11 @@ class IncidentCommandService:
                 },
                 "payload": {
                     "max_observed_gap_ms": max(1_000, int(max_observed_gap_ms)),
+                    "boundary_basis": (
+                        "covered_absence_same_run"
+                        if covered_absence
+                        else "later_same_key_observation"
+                    ),
                     "case_closed": False,
                 },
             },

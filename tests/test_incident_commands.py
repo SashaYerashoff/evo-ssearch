@@ -527,6 +527,7 @@ def test_l0_temporal_ingestion_creates_continues_and_ends_candidate_at_routine()
     service = _service(store, _Runtime())
     base_heartbeat = {
         "batch_id": "batch-1",
+        "run_id": "run-1",
         "batch_start_ms": 1_000,
         "batch_end_ms": 2_000,
         "vector_signal": {
@@ -593,6 +594,8 @@ def test_l0_temporal_ingestion_creates_continues_and_ends_candidate_at_routine()
     assert len(store.records[0]["timeline_refs"]) == 2
     assert len(store.observations) == 3
     assert store.records[0]["qualia_refs"][0]["activity_x_max"] == 4.5
+    assert store.records[0]["coverage"]["source_run_id"] == "run-1"
+    assert store.records[0]["coverage"]["source_batch_id"] == "batch-2"
 
     held_for_rollup = service.ingest_l0_temporal_observations(
         112,
@@ -625,6 +628,7 @@ def test_l0_operator_alert_candidate_preserves_admission_priority():
         112,
         {
             "batch_id": "batch-alert-1",
+            "run_id": "run-alert-1",
             "batch_start_ms": 1_000,
             "batch_end_ms": 2_000,
         },
@@ -648,6 +652,7 @@ def test_l0_operator_alert_candidate_preserves_admission_priority():
     assert record["report"]["priority"] == "operator_criterion"
     assert record["timeline_refs"][0]["trigger_kind"] == "operator_alert"
     assert record["timeline_refs"][0]["operator_criterion"] == "you spot a thumbs-up gesture"
+    assert record["coverage"]["source_run_id"] == "run-alert-1"
 
 
 def test_episode_event_does_not_refresh_legacy_candidate_but_grounded_signal_upgrades_it():
@@ -904,6 +909,100 @@ def test_l0_same_key_after_observed_gap_starts_a_new_grounded_incident():
     assert store.records[1]["perception_state"] == "observed"
     assert store.transitions[0]["source_kind"] == "observed_gap_boundary"
     assert store.transitions[0]["payload"]["case_closed"] is False
+
+
+@pytest.mark.parametrize(
+    ("heartbeat_run_id", "expected_ended"),
+    (("run-1", 1), ("run-2", 0), ("", 0)),
+)
+def test_l0_covered_absence_ends_only_inside_the_same_capture_run(
+    heartbeat_run_id,
+    expected_ended,
+):
+    class _CoveredAbsenceStore:
+        def __init__(self):
+            self.record = {
+                **_record(state="candidate"),
+                "revision": 3,
+                "case_state": "candidate",
+                "possible_start_ms": 1_000,
+                "observed_start_ms": 1_000,
+                "observed_end_ms": 2_000,
+                "possible_end_ms": None,
+                "timeline_refs": [
+                    {
+                        "observation_id": "obs-old",
+                        "semantic_key": "person thumbs_up",
+                        "label": "Thumbs-up gesture detected",
+                    }
+                ],
+                "coverage": {
+                    "status": "covered",
+                    "source_batch_id": "batch-old",
+                    "source_run_id": "run-1",
+                },
+                "report": {
+                    "priority": "operator_criterion",
+                    "source": "operator_alert_l0",
+                },
+            }
+            self.transitions = []
+
+        def list_incidents(self, **_kwargs):
+            return [dict(self.record)], 1
+
+        def create_incident(self, *_args, **_kwargs):
+            raise AssertionError("covered absence must not create an incident")
+
+        def update_incident(
+            self,
+            incident_id,
+            *,
+            expected_revision,
+            changes,
+            transition=None,
+            **_kwargs,
+        ):
+            assert incident_id == INCIDENT_ID
+            assert expected_revision == self.record["revision"]
+            self.record.update(dict(changes))
+            self.record["revision"] += 1
+            if transition:
+                self.transitions.append(dict(transition))
+            return dict(self.record)
+
+        def append_observation(self, observation, **_kwargs):
+            return dict(observation)
+
+    store = _CoveredAbsenceStore()
+    result = _service(store, _Runtime()).ingest_l0_temporal_observations(
+        112,
+        {
+            "batch_id": "batch-silence",
+            "run_id": heartbeat_run_id,
+            "batch_start_ms": 4_001,
+            "batch_end_ms": 5_000,
+        },
+        [],
+        max_observed_gap_ms=1_000,
+    )
+
+    assert result["ended"] == expected_ended
+    assert store.record["perception_state"] == (
+        "ended" if expected_ended else "observed"
+    )
+    if expected_ended:
+        assert store.record["state"] == "ended"
+        assert store.record["case_state"] == "candidate"
+        assert store.record["possible_end_ms"] == 4_001
+        assert store.transitions[0]["source_kind"] == "observed_gap_boundary"
+        assert (
+            store.transitions[0]["payload"]["boundary_basis"]
+            == "covered_absence_same_run"
+        )
+        assert store.transitions[0]["payload"]["case_closed"] is False
+    else:
+        assert store.transitions == []
 
 
 def test_open_automatic_incident_waits_for_boundary_before_episode_materialization():
