@@ -2300,6 +2300,104 @@ agent llama.cpp PID:    2916440
 No new immutable upgrade archive or Desktop launcher pin was produced in this
 slice.
 
+## 2026-08-13 semantic probe pulses, presence, and gated patch affinity
+
+Recovery commit `a8f6daf` (`feat: add semantic probe presence pulses`) is the
+deliberate boundary before the experimental patch-localization pass. It ships
+two independently useful probe improvements:
+
+- every probe card and live inspector plots continuous pre-threshold positive
+  and negative scores against the configured floor; a thumbnail no longer
+  hides the pulse;
+- per-channel semantic presence tracks a bounded default bank (`person`,
+  `vehicle`, `animal`, `smoke`, `fire`) from the pooled SigLIP2 image vector
+  already produced at archive cadence. Text prototypes are prewarmed
+  asynchronously; no second image forward is added to the continuous path;
+- presence maintains a 60-point adaptive baseline per class and is explicitly
+  labelled as an attention signal, not a probability, object count, detector,
+  or alert source;
+- compact presence snapshots may accompany archived vector signals, but the
+  signal is not injected into VLM prompts, attention admission, probes,
+  bookmarks, or incidents. A bounded dynamic-class seam exists but is not yet
+  connected to L1 proposals.
+
+Commit `4d444a1` (`feat: add on-demand SigLIP patch affinity`) is the separately
+recoverable third pass. It exposes a SigLIP2 final-patch/text cosine map only
+when an authenticated operator clicks a registered presence class for one exact
+scored frame. The endpoint requires `streams:view` plus channel scope, is
+per-channel serialized/rate-limited, returns only a 14x14 relative heatmap and
+an optional ROI hint, and sets `Cache-Control: no-store`. Patch tokens are never
+returned, cached, persisted, archived, or fed back into probe/attention/alert
+logic. The suggested ROI changes only the unsaved UI draft after an explicit
+**Use suggested ROI** click. The UI calls this an experimental affinity hint,
+not a detector or segmentation mask.
+
+Verification before the live patch rollout:
+
+```text
+semantic-presence focused tests:                         6 passed
+API/RBAC/dataflow smoke:                                67 passed, 129 subtests
+expanded probe/Luxriot/API regression:                 323 passed, 129 subtests
+focused React tests:                                     7 passed
+TypeScript + Vite production build:                      passed
+```
+
+Live acceptance on channel 112 used no database write or synthetic evidence.
+Presence reached `ready`; each five-second observation added exactly five
+samples to every class and histories remained capped at 60. One explicit
+`person` patch request against timestamp `1786616235681` returned HTTP 200:
+
+```text
+grid / values:            14 x 14 / 196
+request wall time:        527.07 ms
+encoder lock wait / work: 7.70 ms / 336.43 ms
+relative raw contrast:    0.033936
+suggested ROI:            x .678571, y 0, w .321429, h .464286
+post-request pulse:       ready, four new samples after roughly four seconds
+microbatch queue depth:   0
+```
+
+The ROI was geometrically plausible for the person on the right of the current
+webcam frame, but this single observation is not a localization-quality claim.
+Keep the feature operator-gated until it has been checked against animals,
+vehicles, partial objects, empty scenes, and distractors. A patch pass is an
+additional image forward and measured hundreds, not single-digit, milliseconds;
+it is deliberately absent from the one-Hz automatic path.
+
+The first deployment replaced worker `978514` with `1098257`; the patch
+deployment replaced `1098257` with `1136017`. Health remained HTTP 200 while
+each replacement cold-loaded SigLIP2, but handoff still took roughly 4.5
+minutes. The recurring Python 3.14 resource-tracker warning reports one leaked
+semaphore when the old worker exits. Both are separate reload-stabilization
+debts; neither blocked the live stream.
+
+Rollback layers are intentionally nested:
+
+```text
+pre-20260813-semantic-presence-a8f6daf  -> state before pulse/presence
+pre-20260813-patch-affinity             -> accepted pulse/presence, before patch pass
+```
+
+Backend copies are beside the live files and both matching `react-ui/dist.*`
+directories are preserved. Current served assets are:
+
+```text
+index-aNO4qB70.js  SHA-256 304b8a0b1069dbc11148e234d564e5a83b75e376a2840f833e219678bef36c10
+index-DIGtm4wT.css SHA-256 6a9b7df53cb4d9a7caa32de62e0939beb81351c678356cf1db313b3d15b4e701
+```
+
+Deployment invariants remained unchanged:
+
+```text
+rehearsal .env SHA-256: 2c254527143f62bbdbcf7a14914872e2a6f1e0f4f776ef02024c0f27aac76325
+Gunicorn master/worker: 2014970 / 1136017
+VLM llama.cpp PID:      1499650
+agent llama.cpp PID:    2916440
+```
+
+No immutable upgrade archive or Desktop launcher pin was produced in this
+slice.
+
 ## Rehearsal fixture note: emu1 is intentionally looped
 
 On this rehearsal stand, Luxriot channel 118 (`emu1`) is a roughly 30-second
