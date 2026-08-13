@@ -6,6 +6,7 @@ import type {
 } from '../../api/probes'
 import {
   presenceClassKey,
+  presenceMatchesContext,
   presenceReaction,
   rankPresenceClasses,
 } from './semanticPresenceView'
@@ -69,6 +70,7 @@ export function SemanticPresenceCard({
   onInspect,
   busyKey,
   activeKey,
+  contextTexts = [],
 }: {
   presence?: SemanticPresenceStatus | null
   compact?: boolean
@@ -76,9 +78,10 @@ export function SemanticPresenceCard({
   onInspect?: (item: SemanticPresenceClass) => void
   busyKey?: string | null
   activeKey?: string | null
+  contextTexts?: string[]
 }) {
   if (!presence?.enabled) return null
-  const classes = rankPresenceClasses([...(presence.classes || [])])
+  const classes = rankPresenceClasses([...(presence.classes || [])], contextTexts)
     .slice(0, maxClasses ?? (compact ? 3 : 10))
   const timestamp = Number(presence.timestamp_ms)
   const ageSeconds = Number.isFinite(timestamp) && timestamp > 0
@@ -100,13 +103,16 @@ export function SemanticPresenceCard({
         {classes.map((item) => {
           const key = presenceClassKey(item)
           const reaction = presenceReaction(item)
+          const relevant = presenceMatchesContext(item, contextTexts)
           const responseLabel = item.warmup
             ? `${item.samples || 0} warmup`
             : reaction.current
               ? `responding ${reaction.direction === 'down' ? '↓' : '↑'}`
               : reaction.reacting
                 ? `recent response ${reaction.direction === 'down' ? '↓' : '↑'}`
-                : 'baseline'
+                : relevant
+                  ? 'probe context · baseline'
+                  : 'baseline'
           const content = <>
             <div className="presence-class-label">
               <b>{item.label}</b>

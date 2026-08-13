@@ -85,7 +85,11 @@ export function ProbeInspector({ probe, status, runtime, busy, settingsBlockedRe
             ? 'Waiting for indexed frames.'
             : 'No score has been computed yet.'}
       </div>
-      <SemanticPresenceCard presence={runtime?.semantic_presence} compact />
+      <SemanticPresenceCard
+        presence={runtime?.semantic_presence}
+        compact
+        contextTexts={[probe.name || '', ...(probe.positives || [])]}
+      />
 
       {/* how it's set up: one quiet scannable list */}
       <div className="pi-sec">Configuration</div>

@@ -565,6 +565,7 @@ export function ProbeSettingsModal({ probe, channels, busy, canControlCapture, c
             presence={st.semantic_presence}
             compact
             maxClasses={10}
+            contextTexts={[d.name, ...d.pairs.map((pair) => pair.pos)]}
             onInspect={inspectPresenceClass}
             busyKey={patchBusyKey}
             activeKey={patchAttention?.class_key}

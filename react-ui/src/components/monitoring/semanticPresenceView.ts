@@ -12,6 +12,34 @@ export interface PresenceReaction {
   peakTimestampMs: number | null
 }
 
+const PRESENCE_CONTEXT_ALIASES: Record<string, string[]> = {
+  person: ['person', 'people', 'human', 'hand', 'finger', 'thumb', 'gesture', 'face', 'head', 'headphone', 'worker', 'pedestrian'],
+  vehicle: ['vehicle', 'car', 'truck', 'bus', 'van', 'motorcycle', 'road', 'driver', 'drift', 'donut', 'skid', 'tire'],
+  animal: ['animal', 'cat', 'dog', 'bird', 'pet'],
+  smoke: ['smoke', 'smoky', 'haze', 'exhaust'],
+  fire: ['fire', 'flame', 'burn', 'blaze'],
+}
+
+function contextTokens(texts: string[]): string[] {
+  return texts
+    .join(' ')
+    .toLocaleLowerCase()
+    .split(/[^\p{L}\p{N}]+/u)
+    .filter(Boolean)
+}
+
+export function presenceMatchesContext(
+  item: SemanticPresenceClass,
+  texts: string[] = [],
+): boolean {
+  const key = presenceClassKey(item).toLocaleLowerCase()
+  const aliases = PRESENCE_CONTEXT_ALIASES[key] || [key]
+  const tokens = contextTokens(texts)
+  return aliases.some((alias) => tokens.some((token) => (
+    token === alias || (alias.length >= 4 && token.startsWith(alias))
+  )))
+}
+
 function finite(value: unknown): number | null {
   const number = Number(value)
   return Number.isFinite(number) ? number : null
@@ -76,21 +104,31 @@ export function presenceReaction(
 
 export function rankPresenceClasses(
   values: SemanticPresenceClass[],
+  contextTexts: string[] = [],
 ): SemanticPresenceClass[] {
   return values
-    .map((item, index) => ({ item, index, reaction: presenceReaction(item) }))
+    .map((item, index) => ({
+      item,
+      index,
+      reaction: presenceReaction(item),
+      relevant: presenceMatchesContext(item, contextTexts),
+    }))
     .sort((left, right) => {
       if (left.reaction.reacting !== right.reaction.reacting) {
         return left.reaction.reacting ? -1 : 1
       }
       if (left.reaction.reacting && right.reaction.reacting) {
+        if (left.relevant !== right.relevant) return left.relevant ? -1 : 1
         const strengthDifference = right.reaction.strength - left.reaction.strength
         if (Math.abs(strengthDifference) >= 0.25) return strengthDifference
       }
+      if (!left.reaction.reacting && left.relevant !== right.relevant) {
+        return left.relevant ? -1 : 1
+      }
       // Routine noise and near-equal responses preserve the server's bounded
-      // configured order instead of swapping rows on every poll.
+      // configured order instead of swapping rows on every poll. Classes named
+      // by the selected probe remain visible, but are not called detections.
       return left.index - right.index
     })
     .map(({ item }) => item)
 }
-

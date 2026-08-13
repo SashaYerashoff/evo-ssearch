@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest'
 import type { SemanticPresenceClass } from '../../api/probes'
-import { presenceReaction, rankPresenceClasses } from './semanticPresenceView'
+import { presenceMatchesContext, presenceReaction, rankPresenceClasses } from './semanticPresenceView'
 
 function semanticClass(
   key: string,
@@ -64,5 +64,37 @@ describe('semantic presence operator ranking', () => {
     )
 
     expect(presenceReaction(oldResponse).reacting).toBe(false)
+  })
+
+  it('keeps drift probe concepts visible above unrelated routine noise', () => {
+    const values = ['person', 'vehicle', 'animal', 'smoke', 'fire']
+      .map((key) => semanticClass(key, 0.001, [0.001, 0.002]))
+    const context = ['a vehicle drifting sideways with visible tire smoke']
+
+    expect(rankPresenceClasses(values, context).map((item) => item.key)).toEqual([
+      'vehicle',
+      'smoke',
+      'person',
+      'animal',
+      'fire',
+    ])
+  })
+
+  it('maps gesture vocabulary to the person presence class', () => {
+    expect(presenceMatchesContext(
+      semanticClass('person', 0, [0]),
+      ['thumbs up gesture'],
+    )).toBe(true)
+  })
+
+  it('keeps a real unexpected response above contextual routine classes', () => {
+    const vehicle = semanticClass('vehicle', 0.001, [0.001])
+    const smoke = semanticClass('smoke', 0.001, [0.001])
+    const fire = semanticClass('fire', 0.04, [0.04], 'above_baseline')
+
+    expect(rankPresenceClasses(
+      [vehicle, smoke, fire],
+      ['vehicle drifting through tire smoke'],
+    ).map((item) => item.key)).toEqual(['fire', 'vehicle', 'smoke'])
   })
 })
