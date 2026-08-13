@@ -450,6 +450,45 @@ DEFAULT_BATCH_STATE_JSON_PROMPT = (
     "a prior alert to suppress a currently visible match."
 )
 
+# Exact shipped compact v2 contract. Persisted infrastructure defaults are
+# migrated to the current contract, while operator-authored/custom contracts
+# remain untouched.
+PREVIOUS_COMPACT_BATCH_STATE_JSON_PROMPT = DEFAULT_BATCH_STATE_JSON_PROMPT
+
+DEFAULT_BATCH_STATE_JSON_PROMPT = (
+    "Machine-readable current-batch state for EVA memory, navigation, and alert actions:\n"
+    "Use CURRENT snapshots as evidence. Memory, CV, probes, P/N/M, and vector signals direct attention only.\n"
+    "Before the JSON write no more than 36 words total under exactly these headings: "
+    "### Scene description, ### Episode update, ### Routine and deviations, ### Worth to remember. "
+    "Use one short sentence or None per heading. Do not repeat JSON detail.\n"
+    "Then always finish with literal BATCH_STATE_JSON: and one COMPLETE, compact JSON object. "
+    "Emit JSON on one line without Markdown fences or indentation. Never copy instruction placeholders.\n"
+    "Required top-level key order: version, alerts, events, observed_states, cover, scene, routines, memory_pass. "
+    "Use version 2 and include every top-level key, including empty arrays.\n"
+    "Evidence rules:\n"
+    "- Snapshot indices are 1-based and list only CURRENT snapshots visibly supporting a claim. Use unknown when "
+    "the sample cannot prove presence, absence, identity, intent, or transition.\n"
+    "- alerts (max 8): title, description, severity, snapshot_indices. Emit one per distinct current visible "
+    "operator criterion or immediate hazard; [] when none. Hazards include violence, fall/collapse/distress, "
+    "dangerous vehicle behavior, forced entry, damage/tampering/theft, weapon, fire/smoke, critical obstruction, "
+    "or crowd escalation. Do not infer illegality. Routine walking, parking, delivery, loitering, littering, or "
+    "casual gestures are not alerts unless explicitly requested. Ambiguous evidence for an explicit criterion is "
+    "low/info with uncertainty. Memory and vector signals never create an alert.\n"
+    "- events (max 3): event_id, label, state=new|continuing|resolved|uncertain, snapshot_indices, summary, "
+    "novelty=routine|expected_variation|novel|unknown, pass_up. Include only observable actions/transitions. "
+    "Every action in Episode update must appear here. pass_up is true only for a deviation, transition, alert-linked "
+    "episode, or unresolved item needed by the next window.\n"
+    "- observed_states (max 4): key, label, state=present|absent|unknown, snapshot_indices, evidence. "
+    "Absent requires the relevant area to be clearly visible.\n"
+    "- cover: snapshot_index, kind=event|transition|routine|coverage_issue, reason, confidence=high|medium|low. "
+    "scene: status=matched|mismatch|uncertain|unavailable and summary.\n"
+    "- routines (max 2): key, label, state=continuing|returned|uncertain, snapshot_indices, "
+    "applies_to_event_keys. returned requires visible ordinary activity after an event. memory_pass is max 2.\n"
+    "Minimal empty shape: "
+    '{"version":2,"alerts":[],"events":[],"observed_states":[],"cover":{},'
+    '"scene":{},"routines":[],"memory_pass":[]}'
+)
+
 # Compatibility name retained for persisted settings and public API fields.
 DEFAULT_ALERTS_JSON_PROMPT = DEFAULT_BATCH_STATE_JSON_PROMPT
 
@@ -5477,6 +5516,8 @@ class LuxriotManager:
         if not text:
             return DEFAULT_ALERTS_JSON_PROMPT
         if text == PREVIOUS_VERBOSE_BATCH_STATE_JSON_PROMPT.strip():
+            return DEFAULT_ALERTS_JSON_PROMPT
+        if text == PREVIOUS_COMPACT_BATCH_STATE_JSON_PROMPT.strip():
             return DEFAULT_ALERTS_JSON_PROMPT
         lowered = text.lower()
         if "batch_state_json:" not in lowered:

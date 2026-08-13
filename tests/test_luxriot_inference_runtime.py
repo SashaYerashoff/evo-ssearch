@@ -29,6 +29,7 @@ from incident_attention import PromptBudgetError
 from luxriot_connector import (
     DEFAULT_ALERTS_JSON_PROMPT,
     PREVIOUS_VERBOSE_BATCH_STATE_JSON_PROMPT,
+    PREVIOUS_COMPACT_BATCH_STATE_JSON_PROMPT,
     LuxriotCaptureSession,
     LuxriotManager,
     _intel_hwaccel_for_config,
@@ -2548,6 +2549,24 @@ class LuxriotCaptureDispatchTests(unittest.TestCase):
                 migrated["prompt_settings"]["json_alert_prompt"],
                 DEFAULT_ALERTS_JSON_PROMPT,
             )
+
+    def test_compact_shipped_contract_migrates_without_overriding_custom_contracts(self):
+        self.assertEqual(
+            LuxriotManager._normalize_json_alert_prompt(
+                PREVIOUS_COMPACT_BATCH_STATE_JSON_PROMPT
+            ),
+            DEFAULT_ALERTS_JSON_PROMPT,
+        )
+        custom = (
+            "Custom current evidence contract.\n"
+            "BATCH_STATE_JSON:\n"
+            '{"version":2,"alerts":[],"events":[],"observed_states":[],'
+            '"cover":{},"scene":{},"routines":[],"memory_pass":[]}'
+        )
+        self.assertEqual(
+            LuxriotManager._normalize_json_alert_prompt(custom),
+            custom,
+        )
 
     def test_dedicated_prompt_state_survives_stale_high_revision_summary_write(self):
         with tempfile.TemporaryDirectory() as temp:
