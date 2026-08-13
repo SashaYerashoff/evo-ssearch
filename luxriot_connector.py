@@ -3416,6 +3416,9 @@ class LuxriotCaptureSession:
             semantic_archive = embedding.get("semantic_archive")
             if isinstance(semantic_archive, Mapping):
                 frame["semantic_archive"] = dict(semantic_archive)
+            semantic_presence = embedding.get("semantic_presence")
+            if isinstance(semantic_presence, Mapping):
+                frame["semantic_presence"] = dict(semantic_presence)
             self.manager.link_attention_snapshot(
                 channel_id=self.channel_id,
                 timestamp_ms=selected_timestamp,
@@ -13583,6 +13586,49 @@ class LuxriotManager:
         if frame_score_items:
             out["clip_frame_scores"] = frame_score_items
 
+        raw_presence = value.get("semantic_presence")
+        if isinstance(raw_presence, Mapping):
+            presence_out: Dict[str, Any] = {
+                "enabled": bool(raw_presence.get("enabled", True)),
+                "shadow": True,
+                "state": str(raw_presence.get("state") or "warming_up").strip().lower()[:24],
+                "semantics": "pooled_embedding_attention_signal_not_object_detection",
+            }
+            presence_timestamp = _parse_optional_int(raw_presence.get("timestamp_ms"))
+            if presence_timestamp is not None:
+                presence_out["timestamp_ms"] = int(presence_timestamp)
+            presence_classes: List[Dict[str, Any]] = []
+            raw_presence_classes = raw_presence.get("classes")
+            if isinstance(raw_presence_classes, Sequence) and not isinstance(
+                raw_presence_classes,
+                (str, bytes, bytearray),
+            ):
+                for raw in raw_presence_classes[:10]:
+                    if not isinstance(raw, Mapping):
+                        continue
+                    label = str(raw.get("label") or raw.get("key") or "").strip().lower()[:48]
+                    if not label:
+                        continue
+                    item: Dict[str, Any] = {
+                        "label": label,
+                        "state": str(raw.get("state") or "warming_up").strip().lower()[:24],
+                        "warmup": bool(raw.get("warmup")),
+                    }
+                    for score_key in ("score", "baseline", "deviation", "delta", "z"):
+                        score = cls._finite_float(raw.get(score_key))
+                        if score is not None:
+                            item[score_key] = round(float(score), 6)
+                    samples = _parse_optional_int(raw.get("samples"))
+                    if samples is not None:
+                        item["samples"] = max(0, int(samples))
+                    timestamp_ms = _parse_optional_int(raw.get("timestamp_ms"))
+                    if timestamp_ms is not None:
+                        item["timestamp_ms"] = int(timestamp_ms)
+                    presence_classes.append(item)
+            if presence_classes:
+                presence_out["classes"] = presence_classes
+            out["semantic_presence"] = presence_out
+
         interval_items: List[Dict[str, Any]] = []
         raw_intervals = value.get("motion_intervals")
         if isinstance(raw_intervals, Sequence) and not isinstance(
@@ -13840,6 +13886,7 @@ class LuxriotManager:
             for key in (
                 "clip_probe_signals",
                 "clip_frame_scores",
+                "semantic_presence",
                 "motion_intervals",
                 "road_cv_cues",
                 "road_cv_frame_scores",
@@ -19013,6 +19060,14 @@ class LuxriotManager:
                 motion_intervals.append(dict(interval))
         if clip_frame_scores:
             bundle["clip_frame_scores"] = clip_frame_scores
+        presence_samples = [
+            dict(frame.get("semantic_presence") or {})
+            for frame in frames
+            if isinstance(frame, Mapping)
+            and isinstance(frame.get("semantic_presence"), Mapping)
+        ]
+        if presence_samples:
+            bundle["semantic_presence"] = presence_samples[-1]
         if motion_intervals:
             bundle["motion_intervals"] = motion_intervals
         if road_cues:

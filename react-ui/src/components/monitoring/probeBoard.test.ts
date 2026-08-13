@@ -1,6 +1,8 @@
 import { describe, expect, it } from 'vitest'
 import {
   buildProbeBoardTree,
+  probeHitSeries,
+  probeLiveSeries,
   probeMatchesFilters,
   probeOrigin,
   probeTemporaryTtl,
@@ -47,5 +49,27 @@ describe('probe board', () => {
       'running',
       'North gate',
     )).toBe(true)
+  })
+
+  it('keeps positive and negative values in event history', () => {
+    const series = probeHitSeries({
+      id: 'p1',
+      recent_hits: [
+        { timestamp_ms: 2_000, pos_score: 0.12, neg_score: 0.07, margin: 0.05 },
+        { timestamp_ms: 1_000, pos_score: 0.03, neg_score: 0.08, margin: -0.05 },
+      ],
+    })
+    expect(series.map((point) => point.timestampMs)).toEqual([1_000, 2_000])
+    expect(series[0]).toMatchObject({ posScore: 0.03, negScore: 0.08, margin: -0.05 })
+  })
+
+  it('normalizes continuous pre-threshold samples independently from hits', () => {
+    const series = probeLiveSeries([
+      { timestamp_ms: 1_000, pos_score: 0.02, neg_score: 0.09, margin: -0.07, threshold_state: 'below_both' },
+      { timestamp_ms: 2_000, pos_score: 0.14, neg_score: 0.08, margin: 0.06, threshold_state: 'hit' },
+    ])
+    expect(series).toHaveLength(2)
+    expect(series[0].thresholdState).toBe('below_both')
+    expect(series[1]).toMatchObject({ posScore: 0.14, negScore: 0.08, margin: 0.06 })
   })
 })

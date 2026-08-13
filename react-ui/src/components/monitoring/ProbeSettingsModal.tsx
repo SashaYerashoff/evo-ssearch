@@ -18,6 +18,8 @@ import {
 } from '../../api/probes'
 import { recentFrameUrl } from '../../api/video'
 import { Dropdown } from '../shell/Dropdown'
+import { ProbeSparkline } from './ProbeCard'
+import { SemanticPresenceCard } from './SemanticPresenceCard'
 
 const SEVERITIES = ['info', 'low', 'normal', 'high', 'critical']
 
@@ -516,6 +518,11 @@ export function ProbeSettingsModal({ probe, channels, busy, canControlCapture, c
                 </div>
               </div>
             )}
+            {probe && !st.semantic_error && (
+              <div className="probe-live-pulse">
+                <ProbeSparkline probe={probe} history={st.signal_history} />
+              </div>
+            )}
             {!st.semantic_error && signalFrameError && (
               <div className="probe-live-warning"><IconAlertTriangle size={15} /> Waiting for the next complete scored frame. The last matched image and values are retained.</div>
             )}
@@ -524,6 +531,8 @@ export function ProbeSettingsModal({ probe, channels, busy, canControlCapture, c
             )}
             <div className="probe-live-note">P/N/M belongs only to the scored frame above. The large preview at left stays live for operator framing and ROI.</div>
           </div>
+
+          <SemanticPresenceCard presence={st.semantic_presence} compact />
 
           {advOpen && (
             <div className="probe-panel">

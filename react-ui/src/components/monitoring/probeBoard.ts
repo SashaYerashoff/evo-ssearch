@@ -2,6 +2,7 @@ import type {
   Probe,
   ProbeChannelGroup,
   ProbeHit,
+  ProbeLiveSignal,
   ProbeOrigin,
 } from '../../api/probes'
 import type { Channel } from '../../api/types'
@@ -38,11 +39,36 @@ export function probeOrigin(probe: Probe): ProbeOrigin {
   return 'operator'
 }
 
-export function probeHitSeries(probe: Probe): Array<{
-  score: number
-  margin: number | null
+export interface ProbeSignalPoint {
+  posScore: number
+  negScore: number
+  margin: number
   timestampMs: number
-}> {
+  thresholdState?: string
+}
+
+function normalizeProbeSignal(
+  sample: ProbeHit | ProbeLiveSignal,
+): ProbeSignalPoint | null {
+  const posScore = Number(sample?.pos_score)
+  const negScore = Number(sample?.neg_score)
+  const margin = Number(sample?.margin)
+  if (!Number.isFinite(posScore)) return null
+  const timestampMs = Number(sample.timestamp_ms ?? sample.recorded_at_ms ?? 0)
+  return {
+    posScore,
+    negScore: Number.isFinite(negScore) ? negScore : 0,
+    margin: Number.isFinite(margin)
+      ? margin
+      : posScore - (Number.isFinite(negScore) ? negScore : 0),
+    timestampMs: Number.isFinite(timestampMs) ? timestampMs : 0,
+    ...('threshold_state' in sample && sample.threshold_state
+      ? { thresholdState: String(sample.threshold_state) }
+      : {}),
+  }
+}
+
+export function probeHitSeries(probe: Probe): ProbeSignalPoint[] {
   const hits: ProbeHit[] = probe.recent_hits?.length
     ? probe.recent_hits
     : probe.last_hit
@@ -50,18 +76,24 @@ export function probeHitSeries(probe: Probe): Array<{
       : []
   return hits
     .flatMap((hit) => {
-      const score = Number(hit?.pos_score)
-      if (!Number.isFinite(score)) return []
-      const timestampMs = Number(hit.timestamp_ms ?? hit.recorded_at_ms ?? 0)
-      const margin = Number(hit.margin)
-      return [{
-        score,
-        margin: Number.isFinite(margin) ? margin : null,
-        timestampMs: Number.isFinite(timestampMs) ? timestampMs : 0,
-      }]
+      const point = normalizeProbeSignal(hit)
+      return point ? [point] : []
     })
     .sort((left, right) => left.timestampMs - right.timestampMs)
     .slice(-24)
+}
+
+export function probeLiveSeries(
+  history?: ProbeLiveSignal[] | null,
+): ProbeSignalPoint[] {
+  if (!Array.isArray(history)) return []
+  return history
+    .flatMap((sample) => {
+      const point = normalizeProbeSignal(sample)
+      return point ? [point] : []
+    })
+    .sort((left, right) => left.timestampMs - right.timestampMs)
+    .slice(-60)
 }
 
 export function probeTemporaryTtl(

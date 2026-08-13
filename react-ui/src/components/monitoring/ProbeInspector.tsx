@@ -17,6 +17,7 @@ import {
   type ProbeStatus,
 } from './ProbeCard'
 import { probeOrigin, probeTemporaryTtl } from './probeBoard'
+import { SemanticPresenceCard } from './SemanticPresenceCard'
 
 const n3 = (v?: number | null) => (v == null ? '—' : Number(v).toFixed(3))
 function fmtDateTime(ms?: number | null): string {
@@ -61,7 +62,7 @@ export function ProbeInspector({ probe, status, runtime, busy, settingsBlockedRe
 
       {/* what matters: the last signal, front and centre */}
       <div className="pi-sec">Last signal</div>
-      <ProbeSparkline probe={probe} />
+      <ProbeSparkline probe={probe} history={runtime?.signal_history} />
       {runtime?.semantic_error && (
         <div className="probe-live-error pi-live-error">
           Embedding/scoring unavailable: {runtime.semantic_error}
@@ -84,6 +85,7 @@ export function ProbeInspector({ probe, status, runtime, busy, settingsBlockedRe
             ? 'Waiting for indexed frames.'
             : 'No score has been computed yet.'}
       </div>
+      <SemanticPresenceCard presence={runtime?.semantic_presence} compact />
 
       {/* how it's set up: one quiet scannable list */}
       <div className="pi-sec">Configuration</div>

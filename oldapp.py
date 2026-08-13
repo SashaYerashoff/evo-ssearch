@@ -6191,6 +6191,14 @@ probe_manager = ProbeManager(
     jpeg_encoder=_encode_jpeg,
     embed_image_with_metadata_fn=get_probe_image_embedding_with_space,
     embedding_space_fn=get_probe_embedding_space,
+    semantic_presence_enabled=bool(
+        getattr(config, "SEMANTIC_PRESENCE_ENABLED", True)
+    ),
+    semantic_presence_classes=getattr(
+        config,
+        "SEMANTIC_PRESENCE_CLASSES",
+        ("person", "vehicle", "animal", "smoke", "fire"),
+    ),
 )
 luxriot_manager.probe_manager = probe_manager
 probe_daemon_thread: Optional[threading.Thread] = None

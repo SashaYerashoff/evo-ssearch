@@ -10,6 +10,7 @@ from PIL import Image
 
 from config import config
 from embedding_space import embedding_space_fingerprint
+from semantic_presence import SemanticPresenceTracker
 
 
 class _FaissTypingStub:
@@ -519,6 +520,8 @@ class ProbeManager:
         ] = None,
         embedding_space_fn: Optional[Callable[[], Mapping[str, Any]]] = None,
         embed_texts_fn: Optional[Callable[[Sequence[str]], np.ndarray]] = None,
+        semantic_presence_enabled: bool = False,
+        semantic_presence_classes: Optional[Sequence[str]] = None,
     ) -> None:
         self.buffers: Dict[int, ProbeBuffer] = {}
         self.lock = threading.Lock()
@@ -541,6 +544,16 @@ class ProbeManager:
         self._text_prewarm_lock = threading.Lock()
         self._text_prewarm_pending: Dict[str, str] = {}
         self._text_prewarm_worker_active = False
+        self.semantic_presence_enabled = bool(semantic_presence_enabled)
+        self.semantic_presence_tracker = SemanticPresenceTracker(
+            semantic_presence_classes or (),
+            maximum_classes=int(
+                getattr(config, "SEMANTIC_PRESENCE_MAX_CLASSES", 10)
+            ),
+            warmup_samples=int(
+                getattr(config, "SEMANTIC_PRESENCE_WARMUP_SAMPLES", 30)
+            ),
+        )
         try:
             roi_query_budget = int(
                 getattr(config, "PROBE_ROI_QUERY_EMBED_BUDGET", 2)
@@ -631,6 +644,7 @@ class ProbeManager:
         frame_fingerprint = self._space_fingerprint(embedding_space)
         self._remember_space_fingerprint(frame_fingerprint)
         thumb = self.jpeg_encoder(pil_image, max_edge=self.thumb_edge, quality=70)
+        reset_presence = False
         with self.lock:
             previous_fingerprint = self._buffer_embedding_fingerprints.get(
                 int(channel_id)
@@ -642,6 +656,7 @@ class ProbeManager:
             ):
                 self.buffers.pop(int(channel_id), None)
                 self._buffer_embedding_spaces.pop(int(channel_id), None)
+                reset_presence = True
             buf = self._buffer(channel_id)
             if frame_fingerprint:
                 self._buffer_embedding_fingerprints[int(channel_id)] = (
@@ -658,7 +673,14 @@ class ProbeManager:
                 thumb,
                 provenance=provenance,
             )
-        return {
+        if reset_presence:
+            self.semantic_presence_tracker.clear_channel(int(channel_id))
+        presence = self._observe_semantic_presence(
+            int(channel_id),
+            int(ts_ms),
+            np.asarray(emb, dtype=np.float32),
+        )
+        result = {
             "channel_id": int(channel_id),
             "frame_uid": int(frame_uid),
             "timestamp_ms": int(ts_ms),
@@ -667,6 +689,69 @@ class ProbeManager:
             "embedding_space": embedding_space,
             "thumbnail": thumb,
         }
+        if presence:
+            result["semantic_presence"] = presence
+        return result
+
+    def _observe_semantic_presence(
+        self,
+        channel_id: int,
+        timestamp_ms: int,
+        embedding: np.ndarray,
+    ) -> Dict[str, Any]:
+        if not self.semantic_presence_enabled:
+            return {}
+        plan = self.semantic_presence_tracker.prompt_plan(channel_id)
+        phrases = [prompt for _label, prompts in plan for prompt in prompts]
+        if not phrases:
+            return self.semantic_presence_tracker.status(
+                channel_id,
+                now_ms=timestamp_ms,
+            )
+        try:
+            if not self.texts_cached(phrases):
+                self.prewarm_texts_async(phrases)
+                return self.semantic_presence_tracker.status(
+                    channel_id,
+                    now_ms=timestamp_ms,
+                )
+            text_matrix = self._embed_texts(phrases)
+            image_vector = ProbeBuffer._normalize_vec(
+                np.asarray(embedding, dtype=np.float32).flatten()
+            )
+            if (
+                text_matrix.ndim != 2
+                or not text_matrix.size
+                or int(text_matrix.shape[1]) != int(image_vector.shape[0])
+            ):
+                raise ValueError("Semantic presence vector dimension mismatch")
+            prompt_scores = text_matrix @ image_vector
+            offset = 0
+            scores: Dict[str, float] = {}
+            for label, prompts in plan:
+                width = len(prompts)
+                scores[label] = float(prompt_scores[offset : offset + width].max())
+                offset += width
+            return self.semantic_presence_tracker.update(
+                channel_id,
+                timestamp_ms,
+                scores,
+            )
+        except Exception as exc:
+            self.semantic_presence_tracker.note_error(channel_id, exc)
+            return self.semantic_presence_tracker.status(
+                channel_id,
+                now_ms=timestamp_ms,
+            )
+
+    def set_semantic_presence_classes(
+        self,
+        channel_id: int,
+        labels: Sequence[str],
+    ) -> Tuple[str, ...]:
+        """Bounded seam for future evidence-backed L1 class proposals."""
+
+        return self.semantic_presence_tracker.set_channel_labels(channel_id, labels)
 
     @staticmethod
     def _prepare_texts(texts: Sequence[str]) -> List[str]:
@@ -1107,8 +1192,14 @@ class ProbeManager:
         with self.lock:
             buf = self.buffers.get(channel_id)
             if not buf:
-                return {"frames": 0, "time_range_ms": None}
-            return buf.status()
+                result = {"frames": 0, "time_range_ms": None}
+            else:
+                result = buf.status()
+        if self.semantic_presence_enabled:
+            result["semantic_presence"] = self.semantic_presence_tracker.status(
+                channel_id
+            )
+        return result
 
     def frame_thumbnail(self, channel_id: int, timestamp_ms: int) -> Optional[str]:
         """Return the JPEG belonging to one exact scored semantic frame.
@@ -1171,6 +1262,7 @@ class ProbeManager:
             self.buffers.pop(channel_id, None)
             self._buffer_embedding_fingerprints.pop(channel_id, None)
             self._buffer_embedding_spaces.pop(channel_id, None)
+        self.semantic_presence_tracker.clear_channel(channel_id)
 
     def clear_all(self) -> None:
         with self.lock:
@@ -1181,3 +1273,4 @@ class ProbeManager:
             self._text_embedding_cache.clear()
         with self._embedding_space_fingerprint_lock:
             self._embedding_space_fingerprint = ""
+        self.semantic_presence_tracker.clear()

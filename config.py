@@ -1792,6 +1792,43 @@ class Config:
         16,
         max(0, PROBE_ROI_QUERY_EMBED_BUDGET),
     )
+    # Shadow-only class presence over the pooled embedding already produced at
+    # archive cadence. It cannot create alerts, regulate attention, or claim
+    # object detection. Disable independently without changing probe behavior.
+    SEMANTIC_PRESENCE_ENABLED = _get_bool_env(
+        'EVOSSEARCH_SEMANTIC_PRESENCE_ENABLED',
+        'True',
+    )
+    try:
+        SEMANTIC_PRESENCE_MAX_CLASSES = int(
+            os.getenv('EVOSSEARCH_SEMANTIC_PRESENCE_MAX_CLASSES', '10')
+        )
+    except (TypeError, ValueError):
+        SEMANTIC_PRESENCE_MAX_CLASSES = 10
+    SEMANTIC_PRESENCE_MAX_CLASSES = min(
+        16,
+        max(1, SEMANTIC_PRESENCE_MAX_CLASSES),
+    )
+    SEMANTIC_PRESENCE_CLASSES = tuple(
+        dict.fromkeys(
+            value.strip().lower()
+            for value in os.getenv(
+                'EVOSSEARCH_SEMANTIC_PRESENCE_CLASSES',
+                'person,vehicle,animal,smoke,fire',
+            ).split(',')
+            if value.strip()
+        )
+    )[:SEMANTIC_PRESENCE_MAX_CLASSES]
+    try:
+        SEMANTIC_PRESENCE_WARMUP_SAMPLES = int(
+            os.getenv('EVOSSEARCH_SEMANTIC_PRESENCE_WARMUP_SAMPLES', '30')
+        )
+    except (TypeError, ValueError):
+        SEMANTIC_PRESENCE_WARMUP_SAMPLES = 30
+    SEMANTIC_PRESENCE_WARMUP_SAMPLES = min(
+        600,
+        max(3, SEMANTIC_PRESENCE_WARMUP_SAMPLES),
+    )
     try:
         PROBE_BOOKMARK_COOLDOWN_SEC = float(os.getenv('EVOSSEARCH_PROBE_BOOKMARK_COOLDOWN_SEC', '8.0'))
     except (TypeError, ValueError):

@@ -113,6 +113,37 @@ export interface ProbeLiveSignal extends ProbeHit {
   stale?: boolean
   frame_url?: string
 }
+export interface SemanticPresencePoint {
+  timestamp_ms: number
+  score: number
+  baseline: number
+}
+export interface SemanticPresenceClass {
+  key: string
+  label: string
+  prompts?: string[]
+  score?: number | null
+  baseline?: number | null
+  deviation?: number | null
+  delta?: number | null
+  z?: number | null
+  state?: 'warming_up' | 'routine' | 'above_baseline' | 'below_baseline' | string
+  warmup?: boolean
+  samples?: number
+  timestamp_ms?: number | null
+  history?: SemanticPresencePoint[]
+}
+export interface SemanticPresenceStatus {
+  enabled: boolean
+  shadow?: boolean
+  state?: 'warming_up' | 'ready' | 'degraded' | string
+  channel_id?: number
+  timestamp_ms?: number | null
+  age_ms?: number | null
+  semantics?: string
+  error?: string | null
+  classes?: SemanticPresenceClass[]
+}
 export interface ChannelStatus {
   channel_id: number
   runtime_state?: 'running' | 'paused' | 'idle' | string
@@ -130,6 +161,7 @@ export interface ChannelStatus {
   last_timestamp_ms?: number | null
   live_signal?: ProbeLiveSignal | null
   signal_history?: ProbeLiveSignal[]
+  semantic_presence?: SemanticPresenceStatus | null
   embedding_backend?: string
   embedding_model?: string
   embedding_revision?: string

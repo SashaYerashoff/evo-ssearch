@@ -47,6 +47,8 @@ import {
   type SummaryResolution,
 } from './summaryView'
 import { useI18n } from '../../i18n/I18nProvider'
+import { probesApi, type SemanticPresenceStatus } from '../../api/probes'
+import { SemanticPresenceCard } from '../monitoring/SemanticPresenceCard'
 
 function asTimestampMs(value: unknown): number | null {
   const number = Number(value)
@@ -437,6 +439,7 @@ export function VideoScreen({
   const [promptOpen, setPromptOpen] = useState(false)
   const [reviewPreviewOpen, setReviewPreviewOpen] = useState(false)
   const [settingsDirty, setSettingsDirty] = useState(false)
+  const [settingsPresence, setSettingsPresence] = useState<SemanticPresenceStatus | null>(null)
   const [pendingSettingsSwitch, setPendingSettingsSwitch] = useState<{ channelId: number; openSettings: boolean } | null>(null)
   const [collapsedSummaries, setCollapsedSummaries] = useState<Set<string>>(new Set())
   const [summaryImage, setSummaryImage] = useState<{ src: string; title: string } | null>(null)
@@ -500,6 +503,27 @@ export function VideoScreen({
   const loadStreams = useCallback(async () => {
     try { setStreams(await videoApi.streams()) } catch (e: any) { setError(e?.message || 'Streams failed') }
   }, [])
+
+  useEffect(() => {
+    let alive = true
+    let timer: number | null = null
+    if (activeTab !== 'settings' || settingsChannelId == null) {
+      setSettingsPresence(null)
+      return () => { alive = false }
+    }
+    setSettingsPresence(null)
+    const tick = async () => {
+      const status = await probesApi.status(settingsChannelId).catch(() => null)
+      if (!alive) return
+      if (status) setSettingsPresence(status.semantic_presence || null)
+      timer = window.setTimeout(tick, 2_000)
+    }
+    void tick()
+    return () => {
+      alive = false
+      if (timer != null) window.clearTimeout(timer)
+    }
+  }, [activeTab, settingsChannelId])
 
   const loadFeed = useCallback(async () => {
     if (reviewChannelId == null) return
@@ -1051,6 +1075,7 @@ export function VideoScreen({
             {previewCard}
             <p>Model view shows EVA-selected input without opening another recorder stream. Full live is intended for short source verification.</p>
           </section>
+          <div className="vid-settings-stack">
           <section className="vid-selected-card vid-settings-status">
             <div className="vid-settings-status-head">
               <div>
@@ -1103,6 +1128,8 @@ export function VideoScreen({
               </div>
             </div>
           </section>
+          <SemanticPresenceCard presence={settingsPresence} />
+          </div>
         </div>
       ) : null}
 

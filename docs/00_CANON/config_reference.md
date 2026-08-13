@@ -241,6 +241,10 @@ thresholds, alert policy, live sampling, or the live routine context.
 | `EVOSSEARCH_PROBE_MAX_FRAMES` (`2000`) | Per-channel probe buffer |
 | `EVOSSEARCH_PROBE_THUMB_MAX_EDGE` (`256`) | Probe thumbnail size |
 | `EVOSSEARCH_PROBE_ROI_QUERY_EMBED_BUDGET` (`2`) | Maximum previously uncached ROI thumbnails encoded by one retrospective probe query. Realtime operator ROI results seed the same cache; bounded cold backfill prevents the 5-second daemon from flooding the shared SigLIP batcher |
+| `EVOSSEARCH_SEMANTIC_PRESENCE_ENABLED` (`True`) | Enables shadow-only per-channel semantic-presence pulses over the pooled embedding already produced at archive cadence. It does not run another image encoder, create alerts, regulate attention, or claim object detection |
+| `EVOSSEARCH_SEMANTIC_PRESENCE_CLASSES` (`person,vehicle,animal,smoke,fire`) | Comma-separated bounded core class bank for semantic-presence baselines. Unknown labels use a generic `a visible …` text prototype; configured order is preserved |
+| `EVOSSEARCH_SEMANTIC_PRESENCE_MAX_CLASSES` (`10`) | Hard upper bound for core plus future evidence-backed dynamic presence labels (1–16) |
+| `EVOSSEARCH_SEMANTIC_PRESENCE_WARMUP_SAMPLES` (`30`) | Per-channel samples required before a presence trace is classified relative to its adaptive baseline |
 | `EVOSSEARCH_PROBE_POS_FLOOR_DEFAULT` (`0.05` for SigLIP2; `0.28` for OpenAI CLIP) | Backend-sensitive raw-cosine floor for newly created and ad-hoc probes. Scores are not transferable between embedding spaces; existing saved probes stay shadowed until their fingerprint matches and thresholds are recalibrated |
 | `EVOSSEARCH_PROBE_MARGIN_DEFAULT` (`0.02` for SigLIP2; `0.08` for OpenAI CLIP) | Backend-sensitive positive-minus-negative margin for newly created and ad-hoc probes |
 | `EVOSSEARCH_PROBE_CAPTURE_WARMUP_SEC` (`2.5`) | Maximum first-frame wait before an empty manual probe query returns an explicit capture-warming state |

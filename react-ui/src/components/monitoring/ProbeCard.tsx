@@ -1,8 +1,9 @@
 import { IconTrash, IconPlayerPlay, IconPlayerStop, IconMaximize, IconRadar2 } from '@tabler/icons-react'
-import type { Probe } from '../../api/probes'
+import type { Probe, ProbeLiveSignal } from '../../api/probes'
 import { hitImageSrc } from '../../api/probes'
 import {
   probeHitSeries,
+  probeLiveSeries,
   probeOrigin,
   probeTemporaryTtl,
 } from './probeBoard'
@@ -46,47 +47,66 @@ export function ProbeOriginBadge({ probe }: { probe: Probe }) {
 
 export function ProbeSparkline({
   probe,
+  history,
   compact = false,
 }: {
   probe: Probe
+  history?: ProbeLiveSignal[] | null
   compact?: boolean
 }) {
-  const series = probeHitSeries(probe)
+  const liveSeries = probeLiveSeries(history)
+  const series = liveSeries.length ? liveSeries : probeHitSeries(probe)
+  const sourceLabel = liveSeries.length ? 'samples' : 'events'
   const width = compact ? 96 : 180
   const height = compact ? 22 : 42
   if (!series.length) {
     return (
-      <div className={`probe-spark empty ${compact ? 'compact' : ''}`} title="No probe hits recorded yet">
+      <div className={`probe-spark empty ${compact ? 'compact' : ''}`} title="No semantic samples recorded yet">
         <svg viewBox={`0 0 ${width} ${height}`} preserveAspectRatio="none" aria-hidden="true">
           <line x1="0" y1={height - 2} x2={width} y2={height - 2} />
         </svg>
-        {!compact && <span>no hits yet</span>}
+        {!compact && <span className="probe-spark-empty">no signal yet</span>}
       </div>
     )
   }
   const floor = Number(probe.pos_floor)
   const hasFloor = Number.isFinite(floor)
-  const values = series.map((point) => point.score)
+  const values = series.flatMap((point) => [point.posScore, point.negScore])
   const scale = hasFloor ? [...values, floor] : values
   const min = Math.min(...scale)
   const max = Math.max(...scale)
-  const span = max - min > 1e-6 ? max - min : 1
+  const pad = Math.max(0.004, (max - min) * 0.1)
+  const scaleMin = min - pad
+  const scaleMax = max + pad
+  const span = Math.max(0.008, scaleMax - scaleMin)
   const stepX = series.length > 1 ? width / (series.length - 1) : width
-  const toY = (value: number) => height - 2 - ((value - min) / span) * (height - 4)
-  const points = series
-    .map((point, index) => `${(index * stepX).toFixed(1)},${toY(point.score).toFixed(1)}`)
+  const toY = (value: number) => height - 2 - ((value - scaleMin) / span) * (height - 4)
+  const positivePoints = series
+    .map((point, index) => `${(index * stepX).toFixed(1)},${toY(point.posScore).toFixed(1)}`)
+    .join(' ')
+  const negativePoints = series
+    .map((point, index) => `${(index * stepX).toFixed(1)},${toY(point.negScore).toFixed(1)}`)
     .join(' ')
   const last = series[series.length - 1]
   return (
     <div
-      className={`probe-spark ${hasFloor && last.score >= floor ? 'over' : ''} ${compact ? 'compact' : ''}`}
-      title={`${series.length} hit${series.length === 1 ? '' : 's'} · last P ${last.score.toFixed(3)}${hasFloor ? ` · floor ${floor.toFixed(3)}` : ''}`}
+      className={`probe-spark ${hasFloor && last.posScore >= floor ? 'over' : ''} ${compact ? 'compact' : ''}`}
+      title={`${series.length} ${sourceLabel} · P ${last.posScore.toFixed(3)} · N ${last.negScore.toFixed(3)} · M ${last.margin.toFixed(3)}${hasFloor ? ` · P floor ${floor.toFixed(3)}` : ''}`}
     >
       <svg viewBox={`0 0 ${width} ${height}`} preserveAspectRatio="none" aria-hidden="true">
         {hasFloor && <line className="floor" x1="0" y1={toY(floor)} x2={width} y2={toY(floor)} />}
-        <polyline className="signal" points={points} />
-        <circle className="head" cx={(series.length - 1) * stepX} cy={toY(last.score)} r="2" />
+        <polyline className="signal negative" points={negativePoints} />
+        <polyline className="signal positive" points={positivePoints} />
+        <circle className="head negative" cx={(series.length - 1) * stepX} cy={toY(last.negScore)} r="2" />
+        <circle className="head positive" cx={(series.length - 1) * stepX} cy={toY(last.posScore)} r="2" />
       </svg>
+      {!compact && (
+        <div className="probe-spark-legend">
+          <span className="positive">P</span>
+          <span className="negative">N</span>
+          <i>{liveSeries.length ? 'live' : 'events'}</i>
+        </div>
+      )}
     </div>
   )
 }
@@ -120,8 +140,9 @@ export function ProbeCard({ probe, status, selected, onSelect, onRun, onDelete }
       <div className="pc-thumb">
         {src
           ? <img src={src} alt={probe.name || 'probe'} loading="lazy" />
-          : <><IconRadar2 className="pc-radar" size={20} /><ProbeSparkline probe={probe} /></>}
+          : <IconRadar2 className="pc-radar" size={20} />}
       </div>
+      <div className="pc-pulse"><ProbeSparkline probe={probe} compact /></div>
       <div className="pc-name">{probe.name || 'Untitled probe'}</div>
       <div className="pc-meta">Ch {probe.channel_id ?? '—'} · Last {fmtTime(hit?.timestamp_ms ?? hit?.recorded_at_ms)}</div>
       <div className="pc-scores">P: {n3(hit?.pos_score)} · N: {n3(hit?.neg_score)} · M: {n3(hit?.margin)}</div>
