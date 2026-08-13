@@ -10370,7 +10370,8 @@ def _classify_tool_intents(user_text: Any, context: Mapping[str, Any]) -> List[s
     if (
         context.get("focus_video_summaries")
         or re.search(
-            r"\b(?:vlm|video|camera|webcam|stream|alert|alerts|summary|summaries|notable|coverage|went quiet|what happened|report|incidents?|event|events)\b"
+            r"\b(?:vlm|video|camera|webcam|stream|alert|alerts|summary|summaries|summari[sz](?:e|ed|ing)|notable|coverage|went quiet|what happened|report|incidents?|event|events)\b"
+            r"|\bget_video_summaries\b"
             r"|видео|камер|алерт|суммар|описан|событи|инцидент|что\s+произош|отч[её]т|покрыти|замолчал",
             text,
         )
@@ -10613,7 +10614,8 @@ def _seed_turn_tool_context(user_text: Any) -> Dict[str, Any]:
     context["video_overview_request"] = bool(
         re.search(
             r"\b(?:what happened|what went on|alerts?|notable|incidents?|events?|"
-            r"overnight|last night|summary|summaries|report)\b"
+            r"overnight|last night|summary|summaries|summari[sz](?:e|ed|ing)|report)\b"
+            r"|\bget_video_summaries\b"
             r"|что\s+произош|что\s+было|за\s+ночь|алерт|событи|инцидент|сводк|отч[её]т",
             normalized_unicode,
         )

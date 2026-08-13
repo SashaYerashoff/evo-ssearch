@@ -222,6 +222,26 @@ class AgentToolLoopTests(unittest.TestCase):
             names("Show recent VLM alerts and notable video-summary events for the last hour"),
             {"normalize_time_window", "list_video_summary_channels"},
         )
+        for query in (
+            "Summarize channel 118 over the last hour for an operator.",
+            "Summarise channel 118 over the last hour for an operator.",
+            "Use get_video_summaries for channel 118 over the last hour.",
+        ):
+            context = _seed_turn_tool_context(query)
+            self.assertIn("video_research", context["tool_intents"], query)
+            self.assertTrue(context["video_overview_request"], query)
+            context["channel_id"] = 118
+            self.assertIn(
+                "get_video_summaries",
+                {
+                    row["function"]["name"]
+                    for row in _select_relevant_tool_schemas(
+                        agent._TOOL_SCHEMAS,
+                        context,
+                    )
+                },
+                query,
+            )
         detailed = names(
             "Show recent VLM alerts and notable video-summary events for the last hour",
             inventory_complete=True,
