@@ -2378,3 +2378,39 @@ agent llama.cpp PID:    2916440
 
 No new immutable upgrade archive or Desktop launcher pin was produced in this
 slice.
+
+## 2026-08-13 Incident Review FiP visibility gate
+
+Commit `2f1b3b6` (`feat: gate Incident Review as feature in progress`) makes the
+unfinished operator surface explicit and safely optional:
+
+- the Incident Review workspace tab carries a visible `FiP` badge and a
+  `Feature in progress` summary/warning;
+- Settings now contains a local **Features** page with
+  **Show incidents (FiP)** and guidance to disable it when the produced output
+  does not match operational expectations;
+- the preference defaults to enabled to preserve existing workstations and is
+  persisted as browser-local UI state in `eva.ui.features.v1`; it does not
+  compete with or modify server `.env` settings;
+- disabling it while Incident Review is open returns the workspace to Stream
+  Review, unmounts the incident board, and stops further review UI requests;
+- disabling the UI does not delete incident history, stop backend temporal
+  consolidation, suppress safety evidence, or bypass report-view permissions.
+
+React verification completed with 101/101 tests, including explicit default,
+normalization, tab-removal and active-tab fallback cases. TypeScript and the Vite
+production build passed. The deployed assets are:
+
+```text
+index-ChOlFpeW.js  SHA-256 741e936ee94d4b4b2a8f2f5cabe7b09c9b5141410611b9e3b1c6e6983d6142ac
+index-DqyGfKgJ.css SHA-256 a4ac770f57ff3423923a1698c81f11b4ed6900f987b85239f5b42748decf3690
+```
+
+Only `react-ui/dist` was replaced. The prior UI is recoverable at
+`react-ui/dist.pre-20260813-incidents-fip-2f1b3b6`. Both served assets returned
+HTTP 200 and matched the reviewed build hashes; the served JavaScript contains
+the expected `Show incidents (FiP)` and `Feature in progress` copy. No Gunicorn
+HUP, backend restart, inference restart, or `.env` write was performed.
+
+No new immutable upgrade archive or Desktop launcher pin was produced in this
+slice.
