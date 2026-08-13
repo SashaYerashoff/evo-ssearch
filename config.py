@@ -1829,6 +1829,26 @@ class Config:
         600,
         max(3, SEMANTIC_PRESENCE_WARMUP_SAMPLES),
     )
+    # Explicit operator-only inspection of one already-buffered SigLIP2 frame.
+    # Patch tokens are discarded after the response and never enter probe
+    # scoring, attention scheduling, alerts, or durable archive records.
+    PROBE_PATCH_ATTENTION_ENABLED = _get_bool_env(
+        'EVOSSEARCH_PROBE_PATCH_ATTENTION_ENABLED',
+        'True',
+    )
+    try:
+        PROBE_PATCH_ATTENTION_MIN_INTERVAL_SEC = float(
+            os.getenv(
+                'EVOSSEARCH_PROBE_PATCH_ATTENTION_MIN_INTERVAL_SEC',
+                '0.75',
+            )
+        )
+    except (TypeError, ValueError):
+        PROBE_PATCH_ATTENTION_MIN_INTERVAL_SEC = 0.75
+    PROBE_PATCH_ATTENTION_MIN_INTERVAL_SEC = min(
+        10.0,
+        max(0.25, PROBE_PATCH_ATTENTION_MIN_INTERVAL_SEC),
+    )
     try:
         PROBE_BOOKMARK_COOLDOWN_SEC = float(os.getenv('EVOSSEARCH_PROBE_BOOKMARK_COOLDOWN_SEC', '8.0'))
     except (TypeError, ValueError):

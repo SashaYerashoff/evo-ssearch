@@ -522,6 +522,10 @@ class ProbeManager:
         embed_texts_fn: Optional[Callable[[Sequence[str]], np.ndarray]] = None,
         semantic_presence_enabled: bool = False,
         semantic_presence_classes: Optional[Sequence[str]] = None,
+        patch_attention_fn: Optional[
+            Callable[[Image.Image, np.ndarray, str], Mapping[str, Any]]
+        ] = None,
+        patch_attention_enabled: bool = False,
     ) -> None:
         self.buffers: Dict[int, ProbeBuffer] = {}
         self.lock = threading.Lock()
@@ -553,6 +557,21 @@ class ProbeManager:
             warmup_samples=int(
                 getattr(config, "SEMANTIC_PRESENCE_WARMUP_SAMPLES", 30)
             ),
+        )
+        self.patch_attention_fn = patch_attention_fn
+        self.patch_attention_enabled = bool(patch_attention_enabled)
+        self._patch_attention_lock = threading.Lock()
+        self._patch_attention_inflight: set[int] = set()
+        self._patch_attention_last_started: Dict[int, float] = {}
+        try:
+            patch_attention_interval = float(
+                getattr(config, "PROBE_PATCH_ATTENTION_MIN_INTERVAL_SEC", 0.75)
+            )
+        except (TypeError, ValueError):
+            patch_attention_interval = 0.75
+        self.patch_attention_min_interval_sec = max(
+            0.0,
+            min(10.0, patch_attention_interval),
         )
         try:
             roi_query_budget = int(
@@ -752,6 +771,108 @@ class ProbeManager:
         """Bounded seam for future evidence-backed L1 class proposals."""
 
         return self.semantic_presence_tracker.set_channel_labels(channel_id, labels)
+
+    def patch_attention(
+        self,
+        channel_id: int,
+        timestamp_ms: int,
+        class_key: str,
+    ) -> Dict[str, Any]:
+        """Inspect one exact frame; never persist or feed the resulting map."""
+
+        channel = int(channel_id)
+        timestamp = int(timestamp_ms)
+        normalized_key = " ".join(str(class_key or "").lower().split())
+        if not self.patch_attention_enabled or self.patch_attention_fn is None:
+            return {
+                "error": "Patch inspection is unavailable.",
+                "error_code": "patch_attention_unavailable",
+            }
+        prompt_plan = dict(self.semantic_presence_tracker.prompt_plan(channel))
+        prompts = tuple(prompt_plan.get(normalized_key) or ())
+        if not prompts:
+            return {
+                "error": "Choose a class from this channel's semantic presence bank.",
+                "error_code": "patch_attention_class_invalid",
+                "allowed_classes": list(prompt_plan),
+            }
+        thumbnail = self.frame_thumbnail(channel, timestamp)
+        frame_vector, _embedding_space = self.frame_embedding(channel, timestamp)
+        if not thumbnail or frame_vector is None:
+            return {
+                "error": "The exact scored frame is no longer buffered.",
+                "error_code": "patch_attention_frame_unavailable",
+            }
+        try:
+            raw = base64.b64decode(thumbnail)
+            with Image.open(BytesIO(raw)) as opened:
+                image = opened.convert("RGB")
+        except Exception:
+            return {
+                "error": "The exact scored frame could not be decoded.",
+                "error_code": "patch_attention_frame_invalid",
+            }
+
+        now = time.monotonic()
+        with self._patch_attention_lock:
+            previous = float(self._patch_attention_last_started.get(channel) or 0.0)
+            if channel in self._patch_attention_inflight:
+                return {
+                    "error": "A patch inspection is already running for this channel.",
+                    "error_code": "patch_attention_busy",
+                    "retry_after_ms": 250,
+                }
+            remaining = self.patch_attention_min_interval_sec - (now - previous)
+            if remaining > 0:
+                return {
+                    "error": "Patch inspection is rate limited.",
+                    "error_code": "patch_attention_rate_limited",
+                    "retry_after_ms": int(round(remaining * 1000.0)),
+                }
+            self._patch_attention_inflight.add(channel)
+            self._patch_attention_last_started[channel] = now
+
+        try:
+            text_matrix = self._embed_texts(prompts)
+            image_vector = ProbeBuffer._normalize_vec(
+                np.asarray(frame_vector, dtype=np.float32)
+            )
+            if (
+                text_matrix.ndim != 2
+                or not text_matrix.size
+                or int(text_matrix.shape[1]) != int(image_vector.shape[0])
+            ):
+                raise ValueError("Patch inspection vector dimension mismatch")
+            prompt_index = int(np.argmax(text_matrix @ image_vector))
+            selected_prompt = prompts[prompt_index]
+            payload = dict(
+                self.patch_attention_fn(
+                    image,
+                    np.asarray(text_matrix[prompt_index], dtype=np.float32),
+                    selected_prompt,
+                )
+            )
+            payload.update(
+                {
+                    "channel_id": channel,
+                    "timestamp_ms": timestamp,
+                    "class_key": normalized_key,
+                    "label": normalized_key,
+                    "prompt": selected_prompt,
+                    "frame_url": f"/probes/signal_frame/{channel}/{timestamp}",
+                    "ephemeral": True,
+                    "shadow": True,
+                }
+            )
+            return payload
+        except Exception as exc:
+            return {
+                "error": f"Patch inspection failed: {type(exc).__name__}",
+                "error_code": "patch_attention_failed",
+            }
+        finally:
+            with self._patch_attention_lock:
+                self._patch_attention_inflight.discard(channel)
 
     @staticmethod
     def _prepare_texts(texts: Sequence[str]) -> List[str]:

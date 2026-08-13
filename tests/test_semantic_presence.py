@@ -1,12 +1,15 @@
 from __future__ import annotations
 
 from unittest.mock import patch
+import base64
+from io import BytesIO
 
 import numpy as np
 from PIL import Image
 
 from probe_manager import ProbeBuffer, ProbeManager
 from semantic_presence import SemanticPresenceTracker, normalize_presence_labels
+from semantic_patch_attention import build_patch_affinity_payload
 from luxriot_connector import LuxriotManager
 
 
@@ -136,3 +139,89 @@ def test_presence_is_archived_compactly_but_not_injected_into_vlm_prompt():
     assert compact["semantic_presence"]["classes"][0]["label"] == "person"
     assert "history" not in compact["semantic_presence"]["classes"][0]
     assert "semantic_presence" not in prompt
+
+
+def test_patch_affinity_is_relative_bounded_and_returns_only_a_roi_hint():
+    patches = np.asarray(
+        [
+            [1.0, 0.0],
+            [0.9, 0.1],
+            [0.0, 1.0],
+            [0.1, 0.9],
+        ],
+        dtype=np.float32,
+    )
+    payload = build_patch_affinity_payload(
+        patches,
+        np.asarray([1.0, 0.0], dtype=np.float32),
+        rows=2,
+        cols=2,
+        minimum_contrast=0.0,
+    )
+
+    assert payload["grid"] == {"rows": 2, "cols": 2}
+    assert len(payload["heatmap"]) == 4
+    assert all(0.0 <= value <= 1.0 for value in payload["heatmap"])
+    assert payload["semantics"].endswith("not_detection")
+    assert payload["suggested_roi"] is not None
+    assert "patch_embeddings" not in payload
+
+
+def test_patch_attention_runs_only_on_explicit_exact_frame_request():
+    image_calls = []
+    patch_calls = []
+
+    def encode_jpeg(image, **_kwargs):
+        stream = BytesIO()
+        image.save(stream, format="JPEG")
+        return base64.b64encode(stream.getvalue()).decode("ascii")
+
+    def embed_image(_image):
+        image_calls.append(True)
+        return np.asarray([1.0, 0.0], dtype=np.float32)
+
+    def embed_texts(texts):
+        return np.asarray(
+            [
+                [1.0, 0.0] if text == "a person" else [0.0, 1.0]
+                for text in texts
+            ],
+            dtype=np.float32,
+        )
+
+    def inspect(image, text_vector, prompt):
+        patch_calls.append((image.size, text_vector.copy(), prompt))
+        return {
+            "semantics": "experimental_relative_patch_text_affinity_not_detection",
+            "grid": {"rows": 1, "cols": 1},
+            "heatmap": [1.0],
+            "suggested_roi": {"x": 0.0, "y": 0.0, "w": 1.0, "h": 1.0},
+        }
+
+    manager = ProbeManager(
+        embed_image_fn=embed_image,
+        embed_text_fn=lambda _text: np.asarray([0.0, 1.0], dtype=np.float32),
+        embed_texts_fn=embed_texts,
+        jpeg_encoder=encode_jpeg,
+        semantic_presence_classes=("person",),
+        patch_attention_fn=inspect,
+        patch_attention_enabled=True,
+    )
+    manager.patch_attention_min_interval_sec = 0.0
+    frame = Image.new("RGB", (8, 6), color=(240, 240, 240))
+    added = manager.add_frame(7, frame, 1_000)
+
+    assert len(image_calls) == 1
+    assert patch_calls == []
+    result = manager.patch_attention(7, 1_000, "person")
+
+    assert len(image_calls) == 1
+    assert len(patch_calls) == 1
+    assert patch_calls[0][0] == (8, 6)
+    assert patch_calls[0][2] == "a person"
+    assert result["frame_url"] == "/probes/signal_frame/7/1000"
+    assert result["ephemeral"] is True
+    assert result["class_key"] == "person"
+    assert manager.patch_attention(7, 1_000, "not-registered")["error_code"] == (
+        "patch_attention_class_invalid"
+    )

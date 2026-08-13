@@ -10,11 +10,13 @@ import {
   probeRangeDurationMs,
   probesApi,
   type ChannelStatus,
+  type PatchAttentionResult,
   type Probe,
   type ProbeInput,
   type ProbeLiveSignal,
   type ProbeThresholdDefaults,
   type RoiNorm,
+  type SemanticPresenceClass,
 } from '../../api/probes'
 import { recentFrameUrl } from '../../api/video'
 import { Dropdown } from '../shell/Dropdown'
@@ -116,6 +118,9 @@ export function ProbeSettingsModal({ probe, channels, busy, canControlCapture, c
   const [displayedSignal, setDisplayedSignal] = useState<ProbeLiveSignal | null>(null)
   const [signalFrameError, setSignalFrameError] = useState(false)
   const [applyMessage, setApplyMessage] = useState<string | null>(null)
+  const [patchAttention, setPatchAttention] = useState<PatchAttentionResult | null>(null)
+  const [patchBusyKey, setPatchBusyKey] = useState<string | null>(null)
+  const [patchError, setPatchError] = useState<string | null>(null)
   const previewBlobUrlRef = useRef<string | null>(null)
   const scoredFrameBlobUrlRef = useRef<string | null>(null)
   useEffect(() => {
@@ -140,6 +145,9 @@ export function ProbeSettingsModal({ probe, channels, busy, canControlCapture, c
     setSt({ channel_id: d.channel_id ?? 0 })
     setDisplayedSignal(null)
     setSignalFrameError(false)
+    setPatchAttention(null)
+    setPatchBusyKey(null)
+    setPatchError(null)
 
     const schedulePreview = (delayMs: number) => {
       if (previewTimer != null) window.clearTimeout(previewTimer)
@@ -388,6 +396,27 @@ export function ProbeSettingsModal({ probe, channels, busy, canControlCapture, c
     ? null
     : Math.max(0, Number(signal.age_ms) / 1000)
 
+  async function inspectPresenceClass(item: SemanticPresenceClass) {
+    const channelId = Number(d.channel_id)
+    const timestampMs = Number(signal?.timestamp_ms)
+    const classKey = String(item.key || item.label || '').trim()
+    if (!Number.isFinite(channelId) || channelId <= 0 || !Number.isFinite(timestampMs) || timestampMs <= 0) {
+      setPatchError('Wait for an exact scored frame before inspecting patches.')
+      return
+    }
+    if (!classKey || patchBusyKey) return
+    setPatchBusyKey(classKey)
+    setPatchError(null)
+    try {
+      const result = await probesApi.patchAttention(channelId, timestampMs, classKey)
+      setPatchAttention(result)
+    } catch (error: any) {
+      setPatchError(error?.message || 'Patch inspection failed.')
+    } finally {
+      setPatchBusyKey(null)
+    }
+  }
+
   async function applyProbe() {
     setApplyMessage(null)
     const saved = await onSave(buildInput())
@@ -532,7 +561,80 @@ export function ProbeSettingsModal({ probe, channels, busy, canControlCapture, c
             <div className="probe-live-note">P/N/M belongs only to the scored frame above. The large preview at left stays live for operator framing and ROI.</div>
           </div>
 
-          <SemanticPresenceCard presence={st.semantic_presence} compact />
+          <SemanticPresenceCard
+            presence={st.semantic_presence}
+            compact
+            maxClasses={10}
+            onInspect={inspectPresenceClass}
+            busyKey={patchBusyKey}
+            activeKey={patchAttention?.class_key}
+          />
+
+          {(patchAttention || patchError) && (
+            <section className="probe-patch-card" aria-label="Experimental patch affinity">
+              <div className="probe-patch-head">
+                <div>
+                  <span>Experimental patch affinity</span>
+                  <b>{patchAttention
+                    ? `${patchAttention.label} · exact frame ${new Date(patchAttention.timestamp_ms).toLocaleTimeString()}`
+                    : 'Inspection unavailable'}</b>
+                </div>
+                {patchAttention && <i>{patchAttention.grid.rows} × {patchAttention.grid.cols} · ephemeral</i>}
+              </div>
+              {patchError && <div className="probe-live-error"><IconAlertTriangle size={15} /> {patchError}</div>}
+              {patchAttention && (
+                <>
+                  <div
+                    className="probe-patch-frame"
+                    style={{ aspectRatio: `${patchAttention.image?.width || 16} / ${patchAttention.image?.height || 9}` }}
+                  >
+                    <img src={patchAttention.frame_url} alt={`exact frame patch affinity for ${patchAttention.label}`} />
+                    <div
+                      className="probe-patch-grid"
+                      style={{ gridTemplateColumns: `repeat(${patchAttention.grid.cols}, minmax(0, 1fr))` }}
+                      aria-hidden="true"
+                    >
+                      {patchAttention.heatmap.map((value, index) => (
+                        <i
+                          key={index}
+                          style={{ opacity: Math.max(0, Math.min(0.78, Number(value) * 0.78)) }}
+                        />
+                      ))}
+                    </div>
+                    {patchAttention.suggested_roi && (
+                      <div
+                        className="probe-patch-roi"
+                        style={{
+                          left: pct(patchAttention.suggested_roi.x),
+                          top: pct(patchAttention.suggested_roi.y),
+                          width: pct(patchAttention.suggested_roi.w),
+                          height: pct(patchAttention.suggested_roi.h),
+                        }}
+                      />
+                    )}
+                  </div>
+                  <div className="probe-patch-actions">
+                    <span>
+                      Relative contrast {Number(patchAttention.raw_range?.contrast || 0).toFixed(4)}.
+                      This is a localization hint, not an object box.
+                    </span>
+                    <button
+                      type="button"
+                      className="mon-btn sm"
+                      disabled={!patchAttention.suggested_roi}
+                      onClick={() => {
+                        if (patchAttention.suggested_roi) {
+                          set({ roiOn: true, roi: patchAttention.suggested_roi })
+                        }
+                      }}
+                    >
+                      Use suggested ROI
+                    </button>
+                  </div>
+                </>
+              )}
+            </section>
+          )}
 
           {advOpen && (
             <div className="probe-panel">

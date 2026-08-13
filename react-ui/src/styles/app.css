@@ -2156,6 +2156,9 @@
 }
 .presence-class.above_baseline { border-color: color-mix(in srgb, var(--accent) 45%, var(--line)); }
 .presence-class.below_baseline { border-color: color-mix(in srgb, #a991f7 38%, var(--line)); }
+.presence-class.inspectable { width: 100%; color: inherit; font: inherit; text-align: left; cursor: pointer; appearance: none; }
+.presence-class.inspectable:hover, .presence-class.inspectable.active { border-color: var(--accent); box-shadow: 0 0 0 1px var(--accent-line); }
+.presence-class.inspectable:disabled { cursor: wait; opacity: .72; }
 .presence-class-label { min-width: 0; display: flex; flex-direction: column; gap: 2px; }
 .presence-class-label b { overflow: hidden; color: var(--text); font-size: 11.5px; text-overflow: ellipsis; white-space: nowrap; text-transform: capitalize; }
 .presence-class-label span { overflow: hidden; color: var(--text-mut); font-size: 8.5px; text-overflow: ellipsis; white-space: nowrap; }
@@ -2172,6 +2175,21 @@
 .presence-card-error { display: flex; align-items: flex-start; gap: 6px; color: var(--danger); font-size: 10px; }
 .semantic-presence-card.compact { padding: 10px; }
 .semantic-presence-card.compact .presence-class { grid-template-columns: minmax(90px, .75fr) minmax(100px, 1fr) minmax(92px, .7fr); padding: 6px 8px; }
+
+.probe-patch-card { display: flex; flex-direction: column; gap: 9px; padding: 10px; border: 1px solid color-mix(in srgb, var(--accent) 44%, var(--line)); border-radius: 12px; background: var(--space-0); }
+.probe-patch-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 10px; }
+.probe-patch-head > div { display: flex; min-width: 0; flex-direction: column; gap: 3px; }
+.probe-patch-head span { color: var(--text); font-size: 10.5px; font-weight: 750; text-transform: uppercase; letter-spacing: .06em; }
+.probe-patch-head b { overflow: hidden; color: var(--text-mut); font-size: 9.5px; font-weight: 500; text-overflow: ellipsis; white-space: nowrap; }
+.probe-patch-head i { flex: 0 0 auto; color: var(--accent); font: 600 9px/1.4 var(--mono); font-style: normal; }
+.probe-patch-frame { position: relative; width: min(100%, 520px); overflow: hidden; border: 1px solid var(--line-2); border-radius: 10px; background: #080c16; }
+.probe-patch-frame > img { display: block; width: 100%; height: 100%; object-fit: fill; }
+.probe-patch-grid { position: absolute; inset: 0; display: grid; pointer-events: none; mix-blend-mode: screen; }
+.probe-patch-grid > i { min-width: 0; min-height: 0; background: var(--accent); box-shadow: inset 0 0 4px rgba(255,255,255,.2); }
+.probe-patch-roi { position: absolute; z-index: 2; border: 2px dashed var(--warning); background: color-mix(in srgb, var(--warning) 8%, transparent); box-shadow: 0 0 0 1px rgba(0,0,0,.55); pointer-events: none; }
+.probe-patch-actions { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
+.probe-patch-actions span { color: var(--text-mut); font-size: 9.5px; line-height: 1.4; }
+.probe-patch-actions .mon-btn { flex: 0 0 auto; }
 
 /* Operator-owned channel grouping */
 .probe-group-modal { width: min(620px, 94vw); max-width: 620px; }

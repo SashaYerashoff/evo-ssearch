@@ -245,6 +245,8 @@ thresholds, alert policy, live sampling, or the live routine context.
 | `EVOSSEARCH_SEMANTIC_PRESENCE_CLASSES` (`person,vehicle,animal,smoke,fire`) | Comma-separated bounded core class bank for semantic-presence baselines. Unknown labels use a generic `a visible …` text prototype; configured order is preserved |
 | `EVOSSEARCH_SEMANTIC_PRESENCE_MAX_CLASSES` (`10`) | Hard upper bound for core plus future evidence-backed dynamic presence labels (1–16) |
 | `EVOSSEARCH_SEMANTIC_PRESENCE_WARMUP_SAMPLES` (`30`) | Per-channel samples required before a presence trace is classified relative to its adaptive baseline |
+| `EVOSSEARCH_PROBE_PATCH_ATTENTION_ENABLED` (`True`) | Enables explicit operator-requested SigLIP2 patch/text affinity for one exact buffered frame. Maps are ephemeral, are not object detections, and never enter alerting, attention scheduling, or archive records |
+| `EVOSSEARCH_PROBE_PATCH_ATTENTION_MIN_INTERVAL_SEC` (`0.75`) | Per-channel lower bound between on-demand patch inspections (clamped to 0.25–10 seconds) |
 | `EVOSSEARCH_PROBE_POS_FLOOR_DEFAULT` (`0.05` for SigLIP2; `0.28` for OpenAI CLIP) | Backend-sensitive raw-cosine floor for newly created and ad-hoc probes. Scores are not transferable between embedding spaces; existing saved probes stay shadowed until their fingerprint matches and thresholds are recalibrated |
 | `EVOSSEARCH_PROBE_MARGIN_DEFAULT` (`0.02` for SigLIP2; `0.08` for OpenAI CLIP) | Backend-sensitive positive-minus-negative margin for newly created and ad-hoc probes |
 | `EVOSSEARCH_PROBE_CAPTURE_WARMUP_SEC` (`2.5`) | Maximum first-frame wait before an empty manual probe query returns an explicit capture-warming state |

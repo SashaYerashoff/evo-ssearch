@@ -54,14 +54,22 @@ function PresencePulse({ item }: { item: SemanticPresenceClass }) {
 export function SemanticPresenceCard({
   presence,
   compact = false,
+  maxClasses,
+  onInspect,
+  busyKey,
+  activeKey,
 }: {
   presence?: SemanticPresenceStatus | null
   compact?: boolean
+  maxClasses?: number
+  onInspect?: (item: SemanticPresenceClass) => void
+  busyKey?: string | null
+  activeKey?: string | null
 }) {
   if (!presence?.enabled) return null
   const classes = [...(presence.classes || [])]
     .sort((left, right) => Math.abs(Number(right.z || 0)) - Math.abs(Number(left.z || 0)))
-    .slice(0, compact ? 3 : 10)
+    .slice(0, maxClasses ?? (compact ? 3 : 10))
   const timestamp = Number(presence.timestamp_ms)
   const ageSeconds = Number.isFinite(timestamp) && timestamp > 0
     ? Math.max(0, (Date.now() - timestamp) / 1000)
@@ -79,11 +87,18 @@ export function SemanticPresenceCard({
         <div className="presence-card-error"><IconAlertTriangle size={14} /> {presence.error}</div>
       )}
       <div className="presence-class-list">
-        {classes.map((item) => (
-          <div className={`presence-class ${item.state || 'warming_up'}`} key={item.key || item.label}>
+        {classes.map((item) => {
+          const key = item.key || item.label
+          const content = <>
             <div className="presence-class-label">
               <b>{item.label}</b>
-              <span>{item.warmup ? `${item.samples || 0} warmup` : String(item.state || 'routine').replace(/_/g, ' ')}</span>
+              <span>{busyKey === key
+                ? 'mapping exact frame…'
+                : item.warmup
+                  ? `${item.samples || 0} warmup`
+                  : onInspect
+                    ? `${String(item.state || 'routine').replace(/_/g, ' ')} · inspect patches`
+                    : String(item.state || 'routine').replace(/_/g, ' ')}</span>
             </div>
             <PresencePulse item={item} />
             <div className="presence-class-values">
@@ -91,13 +106,32 @@ export function SemanticPresenceCard({
               <span>base {n3(item.baseline)}</span>
               <em>{Number(item.delta) >= 0 ? '+' : ''}{n3(item.delta)}</em>
             </div>
-          </div>
-        ))}
+          </>
+          return onInspect ? (
+            <button
+              type="button"
+              className={`presence-class inspectable ${item.state || 'warming_up'} ${activeKey === key ? 'active' : ''}`}
+              key={key}
+              disabled={!!busyKey}
+              onClick={() => onInspect(item)}
+              title={`Inspect relative ${item.label} patch affinity on the exact scored frame`}
+            >
+              {content}
+            </button>
+          ) : (
+            <div className={`presence-class ${item.state || 'warming_up'}`} key={key}>{content}</div>
+          )
+        })}
         {!classes.length && <div className="presence-card-empty">Waiting for the first archived embedding.</div>}
       </div>
       {!compact && (
         <div className="presence-card-note">
           Baselines adapt per channel. Scores are semantic similarities, not probabilities or object counts.
+        </div>
+      )}
+      {onInspect && (
+        <div className="presence-card-note">
+          Click a class for an on-demand patch hint. It is relative affinity, not a box detector.
         </div>
       )}
     </section>

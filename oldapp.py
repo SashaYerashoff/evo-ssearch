@@ -138,6 +138,7 @@ from incident_store import (
     PostgresIncidentStore,
 )
 from embedding_batcher import EmbeddingBatchOutput, ImageEmbeddingBatcher
+from semantic_patch_attention import build_patch_affinity_payload
 from embedding_space import (
     embedding_space_fingerprint,
     embedding_space_requires_identity,
@@ -438,6 +439,7 @@ _SENSITIVE_ENDPOINT_PERMISSIONS: Dict[str, Permission] = {
     "luxriot_streams_status": Permission.STREAMS_VIEW,
     "probes_status": Permission.STREAMS_VIEW,
     "probes_signal_frame": Permission.STREAMS_VIEW,
+    "probes_patch_attention": Permission.STREAMS_VIEW,
     "probes_list": Permission.REPORTS_VIEW,
     "probes_channel_groups_list": Permission.REPORTS_VIEW,
     "probes_bench": Permission.DIAGNOSTICS_VIEW,
@@ -485,6 +487,7 @@ _DEFAULT_CHANNEL_ENDPOINTS = frozenset(
         "probes_save",
         "probes_start_capture",
         "probes_status",
+        "probes_patch_attention",
         "probes_stop_capture",
     }
 )
@@ -2702,6 +2705,89 @@ def get_probe_embedding_space() -> Dict[str, Any]:
     with _clip_init_lock:
         ensure_embedder_loaded("clip")
         return _current_clip_embedding_space_locked()
+
+
+def get_siglip_patch_attention_from_pil(
+    pil_image: Image.Image,
+    text_embedding: np.ndarray,
+    prompt: str,
+) -> Dict[str, Any]:
+    """Build one ephemeral relative patch/text map on explicit operator demand."""
+
+    requested_at = time.perf_counter()
+    with _clip_init_lock:
+        acquired_at = time.perf_counter()
+        try:
+            ensure_embedder_loaded("clip")
+            if clip_backend_kind != "siglip2":
+                raise RuntimeError("patch inspection requires the SigLIP2 backend")
+            if clip_processor is None or clip_model is None:
+                raise RuntimeError("SigLIP2 backend is not initialized")
+            rgb = pil_image.convert("RGB")
+            image_width, image_height = rgb.size
+            processor_inputs = cast(Any, clip_processor)(
+                images=[rgb],
+                return_tensors="pt",
+            )
+            model_inputs = _processor_to_device(
+                cast(Mapping[str, Any], processor_inputs),
+                clip_runtime_device,
+            )
+            vision_inputs = {
+                key: model_inputs[key]
+                for key in (
+                    "pixel_values",
+                    "pixel_attention_mask",
+                    "spatial_shapes",
+                )
+                if key in model_inputs
+            }
+            with torch.inference_mode():
+                vision_outputs = cast(Any, clip_model).vision_model(
+                    **vision_inputs,
+                    return_dict=True,
+                )
+                patch_tensor = getattr(vision_outputs, "last_hidden_state", None)
+                if not isinstance(patch_tensor, torch.Tensor) or patch_tensor.ndim != 3:
+                    raise RuntimeError("SigLIP2 returned no patch tensor")
+                patch_matrix = (
+                    patch_tensor[0].float().cpu().numpy().astype(np.float32, copy=False)
+                )
+            spatial_shapes = model_inputs.get("spatial_shapes")
+            if isinstance(spatial_shapes, torch.Tensor) and spatial_shapes.numel() >= 2:
+                rows = int(spatial_shapes[0, 0].item())
+                cols = int(spatial_shapes[0, 1].item())
+            else:
+                side = int(round(math.sqrt(int(patch_matrix.shape[0]))))
+                if side * side != int(patch_matrix.shape[0]):
+                    raise RuntimeError("SigLIP2 returned no usable spatial patch shape")
+                rows = cols = side
+            payload = build_patch_affinity_payload(
+                patch_matrix,
+                np.asarray(text_embedding, dtype=np.float32),
+                rows=rows,
+                cols=cols,
+            )
+            payload.update(
+                {
+                    "image": {
+                        "width": int(image_width),
+                        "height": int(image_height),
+                    },
+                    "backend": "siglip2",
+                    "model": str(clip_runtime_model or config.CLIP_MODEL or ""),
+                    "method": "direct_final_patch_text_cosine_v1",
+                    "prompt_length": len(str(prompt or "")),
+                }
+            )
+            return payload
+        finally:
+            finished_at = time.perf_counter()
+            _record_clip_runtime_timing(
+                "patch_attention",
+                wait_ms=(acquired_at - requested_at) * 1000.0,
+                work_ms=(finished_at - acquired_at) * 1000.0,
+            )
 
 
 def _probe_embedding_calibration_state(probe: Mapping[str, Any]) -> str:
@@ -6198,6 +6284,10 @@ probe_manager = ProbeManager(
         config,
         "SEMANTIC_PRESENCE_CLASSES",
         ("person", "vehicle", "animal", "smoke", "fire"),
+    ),
+    patch_attention_fn=get_siglip_patch_attention_from_pil,
+    patch_attention_enabled=bool(
+        getattr(config, "PROBE_PATCH_ATTENTION_ENABLED", True)
     ),
 )
 luxriot_manager.probe_manager = probe_manager
@@ -18100,6 +18190,53 @@ def probes_signal_frame(channel_id: int, timestamp_ms: int):
     response.headers['X-Content-Type-Options'] = 'nosniff'
     response.headers['X-EVA-Frame-Timestamp-Ms'] = str(int(timestamp_ms))
     response.headers['X-EVA-Media-Source'] = 'semantic_probe_buffer'
+    return response
+
+
+@app.route('/probes/patch_attention', methods=['GET'])
+def probes_patch_attention():
+    """Return one bounded, ephemeral patch map for an exact scored frame."""
+
+    if not bool(getattr(config, 'PROBE_PATCH_ATTENTION_ENABLED', False)):
+        return jsonify({'error': 'patch_attention_disabled'}), 404
+    channel_id = request.args.get('channel_id', type=int)
+    timestamp_ms = request.args.get('timestamp_ms', type=int)
+    class_key = ' '.join(
+        str(request.args.get('class_key') or '').lower().split()
+    )
+    if not channel_id or not timestamp_ms or not class_key:
+        return jsonify(
+            {
+                'error': 'channel_id, timestamp_ms, and class_key are required',
+                'error_code': 'patch_attention_invalid_request',
+            }
+        ), 400
+    context = _current_auth_context()
+    if (
+        _auth_enabled()
+        and context is not None
+        and not _can_access_context_channel(context, int(channel_id))
+    ):
+        return jsonify({'error': 'Access denied'}), 403
+    result = probe_manager.patch_attention(
+        int(channel_id),
+        int(timestamp_ms),
+        class_key,
+    )
+    error_code = str(result.get('error_code') or '')
+    status_code = {
+        'patch_attention_class_invalid': 400,
+        'patch_attention_frame_unavailable': 404,
+        'patch_attention_frame_invalid': 422,
+        'patch_attention_busy': 429,
+        'patch_attention_rate_limited': 429,
+        'patch_attention_unavailable': 409,
+        'patch_attention_failed': 503,
+    }.get(error_code, 200)
+    response = jsonify(result)
+    response.status_code = status_code
+    response.headers['Cache-Control'] = 'no-store, private, max-age=0'
+    response.headers['Pragma'] = 'no-cache'
     return response
 
 

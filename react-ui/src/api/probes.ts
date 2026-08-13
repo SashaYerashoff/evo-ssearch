@@ -144,6 +144,29 @@ export interface SemanticPresenceStatus {
   error?: string | null
   classes?: SemanticPresenceClass[]
 }
+export interface PatchAttentionResult {
+  channel_id: number
+  timestamp_ms: number
+  class_key: string
+  label: string
+  prompt?: string
+  frame_url: string
+  semantics: string
+  backend?: string
+  model?: string
+  method?: string
+  ephemeral?: boolean
+  shadow?: boolean
+  grid: { rows: number; cols: number }
+  heatmap: number[]
+  image?: { width: number; height: number }
+  raw_range?: { p10?: number; p90?: number; contrast?: number }
+  peak_cell?: { row: number; col: number }
+  suggested_roi?: RoiNorm | null
+  error?: string
+  error_code?: string
+  retry_after_ms?: number
+}
 export interface ChannelStatus {
   channel_id: number
   runtime_state?: 'running' | 'paused' | 'idle' | string
@@ -280,6 +303,15 @@ export const probesApi = {
   status: (channelId: number, probeId?: string): Promise<ChannelStatus> => api.get('/probes/status', {
     channel_id: String(channelId),
     ...(probeId ? { probe_id: probeId } : {}),
+  }),
+  patchAttention: (
+    channelId: number,
+    timestampMs: number,
+    classKey: string,
+  ): Promise<PatchAttentionResult> => api.get('/probes/patch_attention', {
+    channel_id: String(channelId),
+    timestamp_ms: String(timestampMs),
+    class_key: classKey,
   }),
   cast: (payload: CastInput): Promise<CastResult> => api.postJson('/probes/cast', payload),
   startCapture: (channelId: number, fps?: number): Promise<any> => api.postJson('/probes/start_capture', { channel_id: channelId, fps }),

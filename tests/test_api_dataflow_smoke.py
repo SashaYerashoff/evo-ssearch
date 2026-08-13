@@ -545,6 +545,10 @@ class ApiDataflowSmokeTests(unittest.TestCase):
             # semantic-signal payload, so the static frontend path collector
             # cannot recover its Flask route template.
             "/probes/signal_frame/<int:channel_id>/<int:timestamp_ms>",
+            # The production React client calls this through probesApi; this
+            # legacy bundle inventory intentionally scans only shipped static
+            # sources and therefore cannot see the typed source module.
+            "/probes/patch_attention",
             "/ready",
             "/reports/false-positives",
             "/reports/false-positives/export",
@@ -2060,6 +2064,34 @@ class ApiDataflowSmokeTests(unittest.TestCase):
 
         self.assertEqual(response.status_code, 404)
         self.assertEqual(response.get_json()["error"], "semantic_frame_unavailable")
+
+    def test_probe_patch_attention_is_exact_ephemeral_and_not_cached(self) -> None:
+        result = {
+            "channel_id": 7,
+            "timestamp_ms": 2000,
+            "class_key": "person",
+            "frame_url": "/probes/signal_frame/7/2000",
+            "semantics": "experimental_relative_patch_text_affinity_not_detection",
+            "grid": {"rows": 2, "cols": 2},
+            "heatmap": [0.0, 1.0, 0.2, 0.1],
+            "ephemeral": True,
+        }
+        with (
+            patch.object(oldapp.config, "PROBE_PATCH_ATTENTION_ENABLED", True),
+            patch.object(
+                oldapp.probe_manager,
+                "patch_attention",
+                return_value=result,
+            ) as inspect,
+        ):
+            response = self.client.get(
+                "/probes/patch_attention?channel_id=7&timestamp_ms=2000&class_key=person"
+            )
+
+        self.assertEqual(response.status_code, 200, response.get_json())
+        self.assertEqual(response.get_json()["heatmap"], result["heatmap"])
+        self.assertIn("no-store", response.headers["Cache-Control"])
+        inspect.assert_called_once_with(7, 2000, "person")
 
     def test_probe_status_exposes_embedder_failure_instead_of_false_running(self) -> None:
         class Session:
