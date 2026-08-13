@@ -2299,3 +2299,68 @@ agent llama.cpp PID:    2916440
 
 No new immutable upgrade archive or Desktop launcher pin was produced in this
 slice.
+
+## 2026-08-13 legacy Incident Review backlog isolation
+
+Commit `5aeff4c` (`fix: hide ungrounded legacy incident noise`) removes the
+remaining pre-admission backlog from the operator review projection without
+deleting or rewriting an incident. A read-only 30-day audit found one exact
+legacy class:
+
+```text
+channel 112: 85 automatic vlm_l0_temporal candidates
+channel 118: 48 automatic vlm_l0_temporal candidates
+```
+
+All 133 rows had no saved-policy/safety priority, `case_state=candidate`,
+`attention_state=inactive`, and `risk_state=unknown`. None had been confirmed,
+followed, dismissed, or otherwise acted on by an operator. Channel 112 also had
+one separate manual draft with no source; it was deliberately preserved.
+
+The new PostgreSQL predicate runs before review `COUNT/LIMIT/OFFSET` and excludes
+only that exact untouched automatic legacy class. The full incident ledger,
+direct detail lookup, immutable observations, and temporal history are
+unchanged. A manual draft, saved operator/safety priority, active Follow lease,
+or explicit lifecycle decision falls outside the predicate and remains visible.
+This makes review admission reflect the already-deployed grounded L0 boundary
+without a destructive historical migration.
+
+Source verification completed with 30 focused store/API tests and 292 expanded
+incident command/store/API/Luxriot runtime tests. Python compilation and
+`git diff --check` also passed. Read-only replay predicted:
+
+```text
+channel 112: review 94 -> 9  (8 operator criteria + 1 manual draft)
+channel 118: review 82 -> 34 (34 safety incidents)
+```
+
+The two backend files were installed with rollback suffix
+`pre-20260813-legacy-review-5aeff4c`. One HUP was sent only to Gunicorn master
+`2014970`; worker `950798` served throughout replacement worker `978514` startup
+and then retired normally. Live authenticated acceptance matched the prediction:
+
+```text
+channel 112 / 30 days: full 97, review 9
+  review: 7 operator needs-review, 1 operator history, 1 manual needs-review
+channel 118 / 30 days: full 121, review 34
+  review: 23 safety-alert needs-review, 11 safety-event needs-review
+```
+
+No database write or synthetic incident was used for this acceptance. A single
+channel-118 Luxriot snapshot timeout was visible immediately after cold start;
+the next successful capture cleared `capture_last_error`. The channel remained
+running on live-segment capture, its summary queue stayed bounded at 0--1, and
+`probe_last_error` remained empty. Final `/health` and `/ready` are 200,
+PostgreSQL and Luxriot are reachable, both channels are running, and the CUDA
+SigLIP2 canary is healthy at image/text cosine 1.0.
+
+Deployment invariants remained unchanged:
+
+```text
+rehearsal .env SHA-256: 2c254527143f62bbdbcf7a14914872e2a6f1e0f4f776ef02024c0f27aac76325
+VLM llama.cpp PID:      1499650
+agent llama.cpp PID:    2916440
+```
+
+No new immutable upgrade archive or Desktop launcher pin was produced in this
+slice.
