@@ -753,6 +753,50 @@ class OutputByteBudgetTests(unittest.TestCase):
         self.assertEqual(EvaAgentToolAdapter._max_output_bytes("get_detections"), 2_000_000)
         self.assertEqual(EvaAgentToolAdapter._max_output_items("get_detections"), 50_000)
 
+    def test_video_summaries_preserve_realistic_evidence_before_compaction(self) -> None:
+        result = {
+            "channel_id": 118,
+            "depth": "L1",
+            "coverage": {"status": "complete", "truncated": False},
+            "count": 1,
+            "entries": [
+                {
+                    "level": "L1",
+                    "summary": "Night drift fixture remained visible.",
+                }
+            ],
+            # Live vlm_summary/vlm_alert payloads measured about 20 KB each.
+            # Eight evidence frames are the normal tool default, not an
+            # exceptional max-page request.
+            "evidence_frames": [
+                {
+                    "id": index,
+                    "source": "vlm_summary",
+                    "payload": {"summary": "x" * 20_000},
+                }
+                for index in range(8)
+            ],
+        }
+        raw_bytes = len(json.dumps(result, default=str).encode("utf-8"))
+        self.assertGreater(raw_bytes, 96_000)
+        policy = ToolPolicy(
+            required_permission="streams.view",
+            max_output_bytes=EvaAgentToolAdapter._max_output_bytes(
+                "get_video_summaries"
+            ),
+            max_output_items=EvaAgentToolAdapter._max_output_items(
+                "get_video_summaries"
+            ),
+            max_output_string_chars=24_000,
+        )
+
+        sanitized = sanitize_output(result, policy)
+
+        self.assertNotIn("_truncated", sanitized)
+        self.assertEqual(sanitized["channel_id"], 118)
+        self.assertEqual(sanitized["coverage"]["status"], "complete")
+        self.assertEqual(len(sanitized["evidence_frames"]), 8)
+
     def test_unlisted_tools_keep_the_conservative_default(self) -> None:
         self.assertEqual(EvaAgentToolAdapter._max_output_bytes("some_other_tool"), 96_000)
         self.assertEqual(EvaAgentToolAdapter._max_output_items("some_other_tool"), 500)

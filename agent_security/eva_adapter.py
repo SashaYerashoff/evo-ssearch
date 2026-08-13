@@ -356,6 +356,14 @@ class EvaAgentToolAdapter:
         return {
             "search_archive": 2_000_000,
             "get_detections": 2_000_000,
+            # Eight ordinary live VLM evidence rows currently carry roughly
+            # 160 KB of structured payload before the stable model/UI
+            # compactor runs.  The generic 96 KB gateway cap replaced that
+            # whole successful read with a preview envelope, which the next
+            # compaction pass interpreted as an empty summary result.  Keep
+            # the bounded raw receipt intact until get_video_summaries applies
+            # its existing compact contract.
+            "get_video_summaries": 2_000_000,
             "get_incident": 32_000,
             "draft_incident": 32_000,
             "follow_incident": 8_000,
