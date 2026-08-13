@@ -553,7 +553,18 @@ class ProbeManager:
     def _space_fingerprint(value: Any) -> str:
         if not isinstance(value, Mapping) or not value:
             return ""
-        return embedding_space_fingerprint(value)
+        durable = embedding_space_fingerprint(value)
+        runtime_generation = str(value.get("runtime_generation") or "").strip()
+        # The durable fingerprint intentionally remains model/revision based so
+        # archive vectors survive a healthy process restart. In-memory frame
+        # and text caches are stricter: a partial model reload must never leave
+        # vectors from two loaded instances comparable merely because their
+        # metadata is identical.
+        return (
+            f"{durable}@{runtime_generation}"
+            if runtime_generation
+            else durable
+        )
 
     def _current_space_fingerprint(self) -> str:
         # A cache hit must not wait for the image encoder. SigLIP image and text

@@ -200,12 +200,21 @@ clip_backend_kind = "openai_clip"
 clip_runtime_model = ""
 clip_runtime_revision = ""
 clip_runtime_device = device
+clip_runtime_generation = ""
 _clip_module: Optional[Any] = None
 _clip_init_lock = RLock()
 _clip_reset_lock = Lock()
 _clip_resetting = False
 _clip_runtime_timing_lock = Lock()
 _clip_runtime_timing: Dict[str, Dict[str, float]] = {}
+_clip_runtime_canary_lock = Lock()
+_clip_runtime_canary_image_baseline: Optional[np.ndarray] = None
+_clip_runtime_canary_text_baseline: Optional[np.ndarray] = None
+_clip_runtime_canary_last_check = 0.0
+_clip_runtime_canary_state: Dict[str, Any] = {
+    "ok": True,
+    "status": "not_initialized",
+}
 _live_clip_batcher: Optional[ImageEmbeddingBatcher] = None
 _live_clip_batcher_lock = Lock()
 dino_encoder: Optional[DINOEncoder] = None
@@ -1633,6 +1642,58 @@ def payload_too_large(_: Exception):
     return jsonify({"error": f"Payload too large (max {config.MAX_FILE_SIZE_MB} MB)."}), 413
 
 
+class ClipRuntimeDriftError(RuntimeError):
+    """Raised when one loaded encoder stops reproducing its startup space."""
+
+
+def _begin_clip_runtime_generation() -> None:
+    """Start one in-memory encoder generation and clear its canary baseline."""
+
+    global clip_runtime_generation
+    global _clip_runtime_canary_image_baseline
+    global _clip_runtime_canary_text_baseline
+    global _clip_runtime_canary_last_check
+    clip_runtime_generation = secrets.token_hex(8)
+    with _clip_runtime_canary_lock:
+        _clip_runtime_canary_image_baseline = None
+        _clip_runtime_canary_text_baseline = None
+        _clip_runtime_canary_last_check = 0.0
+        _clip_runtime_canary_state.clear()
+        _clip_runtime_canary_state.update(
+            {
+                "ok": True,
+                "status": "pending",
+                "generation": clip_runtime_generation,
+            }
+        )
+
+
+def _clear_clip_runtime_generation() -> None:
+    """Forget content identity when the loaded encoder is explicitly reset."""
+
+    global clip_runtime_generation
+    global _clip_runtime_canary_image_baseline
+    global _clip_runtime_canary_text_baseline
+    global _clip_runtime_canary_last_check
+    clip_runtime_generation = ""
+    with _clip_runtime_canary_lock:
+        _clip_runtime_canary_image_baseline = None
+        _clip_runtime_canary_text_baseline = None
+        _clip_runtime_canary_last_check = 0.0
+        _clip_runtime_canary_state.clear()
+        _clip_runtime_canary_state.update(
+            {
+                "ok": True,
+                "status": "not_initialized",
+            }
+        )
+
+
+def _clip_runtime_canary_status() -> Dict[str, Any]:
+    with _clip_runtime_canary_lock:
+        return copy.deepcopy(_clip_runtime_canary_state)
+
+
 def init_clip() -> None:
     """Single-flight initialization for concurrent channel cold starts."""
 
@@ -1669,6 +1730,7 @@ def _init_clip_locked() -> None:
                 or ""
             ).strip()
             clip_runtime_device = preferred_device
+            _begin_clip_runtime_generation()
             return
         except Exception as exc:
             if not bool(getattr(config, "EMBEDDER_FALLBACK_ENABLED", False)):
@@ -1706,6 +1768,7 @@ def _init_clip_locked() -> None:
             clip_runtime_model = fallback_model
             clip_runtime_revision = ""
             clip_runtime_device = fallback_device
+            _begin_clip_runtime_generation()
             if fallback_error is not None:
                 print(f"CLIP fallback recovered on {fallback_device} after initial failure: {fallback_error}")
             return
@@ -1729,6 +1792,7 @@ def _init_clip_locked() -> None:
     clip_runtime_model = requested_model
     clip_runtime_revision = ""
     clip_runtime_device = fallback_device
+    _begin_clip_runtime_generation()
     if initial_error is not None:
         print(f"CLIP model '{requested_model}' loaded on {fallback_device} after retry: {initial_error}")
 
@@ -1904,6 +1968,185 @@ def _processor_to_device(batch: Mapping[str, Any], target_device: str) -> Dict[s
     return moved
 
 
+def _siglip_runtime_canary_vectors_locked() -> Tuple[np.ndarray, np.ndarray]:
+    """Encode fixed image/text controls with the currently loaded SigLIP.
+
+    Metadata identifies model files, but it cannot prove that one long-lived
+    CUDA process still emits vectors in that space.  These controls stay in
+    memory and contain no customer image or prompt data.
+    """
+
+    if clip_backend_kind != "siglip2" or clip_model is None or clip_processor is None:
+        raise RuntimeError("SigLIP runtime canary requires a loaded SigLIP backend")
+    height = width = 224
+    yy, xx = np.mgrid[:height, :width]
+    pixels = np.stack(
+        (
+            (xx * 3 + yy) % 256,
+            (yy * 5 + xx // 2) % 256,
+            ((xx // 16 + yy // 16) % 2) * 190 + 30,
+        ),
+        axis=-1,
+    ).astype(np.uint8)
+    canary_image = Image.fromarray(pixels, mode="RGB")
+    canary_texts = [
+        "eva semantic encoder runtime control",
+        "person wearing headphones",
+    ]
+    with torch.inference_mode():
+        image_inputs = cast(Any, clip_processor)(
+            images=[canary_image],
+            return_tensors="pt",
+        )
+        image_inputs = _processor_to_device(
+            cast(Mapping[str, Any], image_inputs),
+            clip_runtime_device,
+        )
+        image_features = _siglip_feature_tensor(
+            cast(Any, clip_model).get_image_features(**image_inputs)
+        )
+        text_inputs = cast(Any, clip_processor)(
+            text=[text.lower() for text in canary_texts],
+            padding="max_length",
+            truncation=True,
+            max_length=64,
+            return_tensors="pt",
+        )
+        text_inputs = _processor_to_device(
+            cast(Mapping[str, Any], text_inputs),
+            clip_runtime_device,
+        )
+        text_features = _siglip_feature_tensor(
+            cast(Any, clip_model).get_text_features(**text_inputs)
+        )
+        image_features = _normalize_l2_embeddings(
+            cast(torch.Tensor, image_features).float()
+        )
+        text_features = _normalize_l2_embeddings(
+            cast(torch.Tensor, text_features).float()
+        )
+    return (
+        image_features.cpu().numpy().astype(np.float32, copy=False),
+        text_features.cpu().numpy().astype(np.float32, copy=False),
+    )
+
+
+def _check_clip_runtime_canary_locked(*, force: bool = False) -> None:
+    """Fail closed when image or text output drifts inside one model load."""
+
+    global _clip_runtime_canary_image_baseline
+    global _clip_runtime_canary_text_baseline
+    global _clip_runtime_canary_last_check
+    if clip_backend_kind != "siglip2":
+        with _clip_runtime_canary_lock:
+            _clip_runtime_canary_state.clear()
+            _clip_runtime_canary_state.update(
+                {
+                    "ok": True,
+                    "status": "not_applicable",
+                    "generation": clip_runtime_generation,
+                }
+            )
+        return
+    try:
+        interval_sec = max(
+            15.0,
+            min(
+                900.0,
+                float(
+                    getattr(
+                        config,
+                        "CLIP_RUNTIME_CANARY_INTERVAL_SEC",
+                        120.0,
+                    )
+                ),
+            ),
+        )
+    except (TypeError, ValueError):
+        interval_sec = 120.0
+    now = time.monotonic()
+    with _clip_runtime_canary_lock:
+        if (
+            not force
+            and _clip_runtime_canary_image_baseline is not None
+            and now - _clip_runtime_canary_last_check < interval_sec
+        ):
+            if not bool(_clip_runtime_canary_state.get("ok", True)):
+                raise ClipRuntimeDriftError(
+                    "SigLIP runtime canary previously detected embedding drift"
+                )
+            return
+        baseline_image = (
+            None
+            if _clip_runtime_canary_image_baseline is None
+            else _clip_runtime_canary_image_baseline.copy()
+        )
+        baseline_text = (
+            None
+            if _clip_runtime_canary_text_baseline is None
+            else _clip_runtime_canary_text_baseline.copy()
+        )
+    started = time.perf_counter()
+    try:
+        current_image, current_text = _siglip_runtime_canary_vectors_locked()
+    except Exception as exc:
+        with _clip_runtime_canary_lock:
+            _clip_runtime_canary_last_check = now
+            _clip_runtime_canary_state.clear()
+            _clip_runtime_canary_state.update(
+                {
+                    "ok": False,
+                    "status": "canary_error",
+                    "generation": clip_runtime_generation,
+                    "error": type(exc).__name__,
+                }
+            )
+        raise RuntimeError("SigLIP runtime canary could not be evaluated") from exc
+    elapsed_ms = (time.perf_counter() - started) * 1000.0
+    if baseline_image is None or baseline_text is None:
+        with _clip_runtime_canary_lock:
+            _clip_runtime_canary_image_baseline = current_image.copy()
+            _clip_runtime_canary_text_baseline = current_text.copy()
+            _clip_runtime_canary_last_check = now
+            _clip_runtime_canary_state.clear()
+            _clip_runtime_canary_state.update(
+                {
+                    "ok": True,
+                    "status": "healthy",
+                    "generation": clip_runtime_generation,
+                    "image_cosine": 1.0,
+                    "text_cosine": 1.0,
+                    "last_check_ms": round(elapsed_ms, 3),
+                }
+            )
+        return
+    if baseline_image.shape != current_image.shape or baseline_text.shape != current_text.shape:
+        image_cosine = 0.0
+        text_cosine = 0.0
+    else:
+        image_cosine = float(np.min(np.sum(baseline_image * current_image, axis=1)))
+        text_cosine = float(np.min(np.sum(baseline_text * current_text, axis=1)))
+    healthy = image_cosine >= 0.999 and text_cosine >= 0.999
+    with _clip_runtime_canary_lock:
+        _clip_runtime_canary_last_check = now
+        _clip_runtime_canary_state.clear()
+        _clip_runtime_canary_state.update(
+            {
+                "ok": healthy,
+                "status": "healthy" if healthy else "runtime_drift",
+                "generation": clip_runtime_generation,
+                "image_cosine": round(image_cosine, 6),
+                "text_cosine": round(text_cosine, 6),
+                "last_check_ms": round(elapsed_ms, 3),
+            }
+        )
+    if not healthy:
+        raise ClipRuntimeDriftError(
+            "SigLIP runtime embedding drift detected "
+            f"(image cosine={image_cosine:.6f}, text cosine={text_cosine:.6f})"
+        )
+
+
 def _current_clip_embedding_space_locked() -> Dict[str, Any]:
     dimension: Optional[int] = None
     if clip_backend_kind == "siglip2":
@@ -1925,7 +2168,14 @@ def _current_clip_embedding_space_locked() -> Dict[str, Any]:
         payload["revision"] = clip_runtime_revision
     if dimension is not None:
         payload["dimension"] = dimension
-    return identified_embedding_space(payload)
+    identified = identified_embedding_space(payload)
+    if clip_runtime_generation:
+        # Runtime generation deliberately does not participate in the durable
+        # model/revision fingerprint. ProbeManager does include it in its
+        # in-memory cache identity so text vectors and frames cannot survive a
+        # partial encoder reload and remain silently comparable.
+        identified["runtime_generation"] = clip_runtime_generation
+    return identified
 
 
 def _clip_image_batch_with_space(
@@ -2013,6 +2263,13 @@ def _clip_image_batch_with_space_locked(
     ensure_embedder_loaded("clip")
     _record_clip_runtime_timing(
         "image_init",
+        wait_ms=0.0,
+        work_ms=(time.perf_counter() - stage_started) * 1000.0,
+    )
+    stage_started = time.perf_counter()
+    _check_clip_runtime_canary_locked()
+    _record_clip_runtime_timing(
+        "runtime_canary",
         wait_ms=0.0,
         work_ms=(time.perf_counter() - stage_started) * 1000.0,
     )
@@ -2165,6 +2422,7 @@ def _clip_text_embeddings(texts: Sequence[str]) -> np.ndarray:
         acquired_at = time.perf_counter()
         try:
             ensure_embedder_loaded("clip")
+            _check_clip_runtime_canary_locked()
             with torch.inference_mode():
                 if clip_backend_kind == "siglip2":
                     if clip_processor is None or clip_model is None:
@@ -2268,6 +2526,7 @@ def reset_embedder_runtime_state() -> None:
                 clip_runtime_model = ""
                 clip_runtime_revision = ""
                 clip_runtime_device = device
+                _clear_clip_runtime_generation()
                 dino_encoder = None
                 manager = globals().get("probe_manager")
                 clear_all = getattr(manager, "clear_all", None)
@@ -6809,9 +7068,22 @@ def _embedder_loaded_state() -> Dict[str, Any]:
             embedding_space = get_probe_embedding_space()
         except Exception:
             embedding_space = {}
+    canary = (
+        _clip_runtime_canary_status()
+        if active_embedder in {"clip", "fusion"} and clip_backend_kind == "siglip2"
+        else {"ok": True, "status": "not_applicable"}
+    )
+    runtime_ok = bool(loaded and canary.get("ok", True))
+    runtime_status = (
+        str(canary.get("status") or "runtime_drift")
+        if loaded and not bool(canary.get("ok", True))
+        else "loaded"
+        if loaded
+        else "not_loaded"
+    )
     return _component_result(
-        loaded,
-        "loaded" if loaded else "not_loaded",
+        runtime_ok,
+        runtime_status,
         embedder=active_embedder,
         clip_model=clip_runtime_model or None,
         backend=clip_backend_kind if clip_model is not None else None,
@@ -6821,6 +7093,7 @@ def _embedder_loaded_state() -> Dict[str, Any]:
         torch_interop_threads=int(torch.get_num_interop_threads()),
         opencv_threads=int(cv2.getNumThreads()),
         embedding_space=embedding_space or None,
+        runtime_canary=canary,
     )
 
 

@@ -296,8 +296,60 @@ class EmbeddingPolicyTests(unittest.TestCase):
         self.assertEqual(oldapp.clip_backend_kind, "openai_clip")
         self.assertEqual(oldapp.clip_runtime_model, "ViT-B/32")
 
+    def test_siglip_runtime_canary_fails_closed_on_content_drift(self) -> None:
+        image_baseline = np.asarray([[1.0, 0.0, 0.0]], dtype=np.float32)
+        text_baseline = np.asarray(
+            [[0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
+            dtype=np.float32,
+        )
+        image_drifted = np.asarray([[0.0, 1.0, 0.0]], dtype=np.float32)
+
+        with (
+            patch.object(oldapp, "clip_backend_kind", "siglip2"),
+            patch(
+                "oldapp._siglip_runtime_canary_vectors_locked",
+                side_effect=[
+                    (image_baseline, text_baseline),
+                    (image_baseline, text_baseline),
+                    (image_drifted, text_baseline),
+                ],
+            ),
+        ):
+            oldapp._begin_clip_runtime_generation()
+            oldapp._check_clip_runtime_canary_locked(force=True)
+            oldapp._check_clip_runtime_canary_locked(force=True)
+            with self.assertRaises(oldapp.ClipRuntimeDriftError):
+                oldapp._check_clip_runtime_canary_locked(force=True)
+
+            status = oldapp._clip_runtime_canary_status()
+            self.assertFalse(status["ok"])
+            self.assertEqual(status["status"], "runtime_drift")
+            self.assertEqual(status["image_cosine"], 0.0)
+            self.assertEqual(status["text_cosine"], 1.0)
+
+        oldapp._clear_clip_runtime_generation()
+
 
 class ProbeVectorGuardTests(unittest.TestCase):
+    def test_runtime_generation_partitions_in_memory_vector_caches(self) -> None:
+        base = {
+            "backend": "siglip2",
+            "model": "google/siglip2-base-patch16-224",
+            "revision": "revision",
+            "dimension": 768,
+            "contract": "siglip2-torchvision-lower64-v1",
+        }
+
+        first = ProbeManager._space_fingerprint(
+            {**base, "runtime_generation": "generation-a"}
+        )
+        second = ProbeManager._space_fingerprint(
+            {**base, "runtime_generation": "generation-b"}
+        )
+
+        self.assertNotEqual(first, second)
+        self.assertEqual(first.split("@", 1)[0], second.split("@", 1)[0])
+
     def test_live_buffer_preserves_capture_apex_provenance(self) -> None:
         manager = ProbeManager(
             embed_image_fn=lambda _img: np.ones(4, dtype=np.float32),
