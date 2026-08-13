@@ -3533,6 +3533,7 @@ def incident_list():
                 since_ms=since_ms,
                 until_ms=until_ms,
                 top_level_only=view == "review",
+                operator_review_only=view == "review",
                 limit=limit,
                 offset=offset,
             )

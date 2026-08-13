@@ -81,6 +81,12 @@ first production slice of the third gate is also implemented at L2:
   query also includes older nested-marked rows which already carry direct
   `operator_criterion` or `safety` provenance, so stale presentation metadata
   cannot hide an alert while it waits for the next grounded observation.
+- automatic `vlm_l0_temporal` candidates created by builds predating the
+  grounded admission boundary stay in the full durable ledger but do not enter
+  review count/pagination while they remain unprioritized, `case=candidate`,
+  `attention=inactive/unknown`, and `risk=unknown`. A manual draft, saved-policy
+  or safety priority, Follow lease, or explicit operator lifecycle action keeps
+  or restores review visibility without deleting or rewriting history.
 
 The next bounded slice extends composition across L2 window boundaries at L3:
 

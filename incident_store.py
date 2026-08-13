@@ -1632,6 +1632,7 @@ class PostgresIncidentStore:
         since_ms: int | None = None,
         until_ms: int | None = None,
         top_level_only: bool = False,
+        operator_review_only: bool = False,
         limit: int = 100,
         offset: int = 0,
     ) -> tuple[list[dict[str, Any]], int]:
@@ -1690,6 +1691,23 @@ class PostgresIncidentStore:
                 ") <> '' "
                 "AND COALESCE(report_json ->> 'priority', 'context') "
                 "NOT IN ('operator_criterion', 'safety')"
+                ")"
+            )
+        if operator_review_only:
+            # Builds before the grounded L0 admission boundary created a durable
+            # candidate for every ordinary temporal event. Keep those records in
+            # the full ledger and directly addressable by ID, but do not make an
+            # operator dismiss generic movement/gesture narration one card at a
+            # time. Any saved-policy/safety priority, manual draft, Follow lease,
+            # or explicit lifecycle decision falls outside this exact predicate
+            # and therefore remains in Incident Review.
+            clauses.append(
+                "NOT ("
+                "COALESCE(report_json ->> 'source', '') = 'vlm_l0_temporal' "
+                "AND COALESCE(report_json ->> 'priority', '') = '' "
+                "AND case_state = 'candidate' "
+                "AND attention_state IN ('unknown', 'inactive') "
+                "AND risk_state = 'unknown'"
                 ")"
             )
         bounded_limit = max(1, min(500, int(limit or 100)))

@@ -248,6 +248,7 @@ def test_incident_draft_follow_stop_and_export_contracts():
             assert "timeline" not in review
             assert "evidence" not in review
             assert store.list_calls[-1]["top_level_only"] is True
+            assert store.list_calls[-1]["operator_review_only"] is True
 
             response = client.get(f"/incidents/{INCIDENT_ID}/observations")
             assert response.status_code == 200, response.get_json()

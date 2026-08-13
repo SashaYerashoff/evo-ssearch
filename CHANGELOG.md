@@ -6,6 +6,13 @@ Format loosely follows Keep a Changelog.
 
 ## Unreleased
 
+- **Legacy incident noise no longer consumes operator review:** automatic
+  pre-admission `vlm_l0_temporal` candidates which were never grounded,
+  followed, or acted on remain in the full incident ledger and detail API but
+  are excluded in PostgreSQL before Incident Review count and pagination.
+  Manual drafts, operator lifecycle history, Follow cases, and every saved
+  operator/safety signal remain visible.
+
 - **Grounded cross-window incident hierarchy:** L3 may now attach bounded
   context across adjacent L2 windows only when an existing top-level safety or
   high-priority operator incident anchors the scene. Existing L2 children are

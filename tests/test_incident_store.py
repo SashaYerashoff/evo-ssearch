@@ -503,6 +503,23 @@ class IncidentPostgresStoreTests(unittest.TestCase):
             self.assertIn("NOT IN ('operator_criterion', 'safety')", sql)
         self.assertEqual(page_params[-2:], (50, 10))
 
+    def test_review_list_hides_only_untouched_legacy_temporal_candidates(self):
+        connection = FakeConnection(results=[[(1,)], [incident_row()]])
+        store = PostgresIncidentStore(FakePool(connection), TENANT_ID)
+
+        store.list_incidents(operator_review_only=True, limit=50, offset=10)
+
+        count_sql, _count_params = connection.calls[0]
+        page_sql, page_params = connection.calls[1]
+        for sql in (count_sql, page_sql):
+            self.assertIn("report_json ->> 'source'", sql)
+            self.assertIn("= 'vlm_l0_temporal'", sql)
+            self.assertIn("report_json ->> 'priority'", sql)
+            self.assertIn("case_state = 'candidate'", sql)
+            self.assertIn("attention_state IN ('unknown', 'inactive')", sql)
+            self.assertIn("risk_state = 'unknown'", sql)
+        self.assertEqual(page_params[-2:], (50, 10))
+
 
 class IncidentObservationStoreTests(unittest.TestCase):
     def test_append_observation_is_tenant_scoped_and_returns_immutable_record(self):
