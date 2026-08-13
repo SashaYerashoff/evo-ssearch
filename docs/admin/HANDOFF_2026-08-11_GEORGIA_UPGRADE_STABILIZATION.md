@@ -1861,6 +1861,75 @@ weekday/time-of-day baselines remain the next incident-logic layers. The
 architecture contract and research basis are recorded in
 `docs/architecture/incident_temporal_memory.md`.
 
+## 2026-08-13 natural episode replay and SigLIP runtime identity
+
+Three additional backend commits are deployed to the rehearsal:
+
+```text
+2603969 fix: preserve grounded incident transitions
+95b3dff fix: detect live embedding space drift
+13d2c21 fix: infer grounded returns to routine
+```
+
+The natural channel-112 sequence included drinking, phone use, head resting on
+the desk, return to typing, exit/return and a later hand-to-face action. The old
+L0 prose saw most of this, but its structured contract omitted the phone action,
+misclassified the continuing head-on-desk posture as routine and never emitted
+an explicit return boundary. It also allowed a later `info` duplicate to lower a
+saved `high` alert and matched a cat criterion to a person interacting with a cat
+statue.
+
+The fixed contract requires every grounded action in the prose episode update to
+exist in structured events and requires explicit `returned` routine evidence.
+Phone use is retained as a distinct context episode, head-on-desk/slumped posture
+enters the safety path, alert dedupe preserves the highest severity, and operator
+policy matching rejects mismatched primary entities. As a conservative fallback,
+L1 now infers `ended_by_routine` only after two later covered L0 children show
+ordinary activity for the same entity. An abnormal routine label that independently
+passes the incident gate does not count; coverage gaps reset confirmation.
+
+A read-only replay of the preserved 08:15-08:30 EEST L0 records produced a
+`person fall` safety episode ending at the two later `person seated at desk`
+windows. The intermediate `Person slumped over desk` was not accepted as recovery.
+The replay was not written back to PostgreSQL. The historical phone call cannot be
+reconstructed deterministically because it exists only in prose; the stronger
+structured-output prompt applies to future batches.
+
+The overnight headphones probe regression was not a threshold-editing problem.
+The saved probe remains the intended contrastive pair `Person in headphones`
+versus `Person`. Its model, revision, processor contract and 768-dimensional
+fingerprint had not changed, but historical one-Hz vectors formed incompatible
+clusters under that same metadata identity. A clean CPU encoding matched an old
+stored vector at cosine 0.994, while a fresh encoding of a current frame and its
+nearest live vector were only about 0.447. A separate deterministic control then
+proved that the pinned CPU and RTX 5060 Ti FP16 model agree at cosine 0.999999 and
+that GPU batch sizes 1/2/3/8, including mixed aspect ratios, are stable. Do not
+change the probe phrases, thresholds or SigLIP dtype on the basis of this incident.
+
+The runtime now has a stricter in-memory identity than the durable model identity.
+Every model load receives a `runtime_generation`; ProbeManager includes it in frame
+and text-cache keys but the durable model/revision fingerprint remains unchanged.
+A deterministic image and two deterministic text controls are re-encoded every
+120 seconds and compared with the startup generation. Drift fails readiness as
+`runtime_drift` instead of persisting misleading scores. After both readiness-gated
+HUPs the repeated live canary remained healthy at image/text cosine 1.0. The
+rehearsal has one worker (`855105`), both channels restored, and no probe/capture
+errors. The VLM and agent llama.cpp PIDs remained `1499650` and `2916440`.
+
+The rehearsal `.env` was not changed and still hashes to:
+
+```text
+2c254527143f62bbdbcf7a14914872e2a6f1e0f4f776ef02024c0f27aac76325
+```
+
+Recoverable live copies use suffixes
+`pre-20260813-siglip-incident-95b3dff` and
+`pre-20260813-routine-boundary-13d2c21`. Verification completed with 174/174
+Luxriot capture/temporal tests, 21/21 embedding/space/batcher tests, Python
+compilation and `git diff --check`. Manual post-reload acceptance of the same
+headphones probe is still required; compare a short no-headphones / headphones /
+no-headphones cycle and do not infer acceptance from the canary alone.
+
 ## Next work
 
 ### 1. Confirm the committed baseline
