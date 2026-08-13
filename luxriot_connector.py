@@ -19009,6 +19009,10 @@ class LuxriotManager:
                 r"\b(?:confirm|determine|verify|establish)\s+(?:the\s+)?(?:person(?:'s)?\s+)?intent\b",
             ),
             (
+                "intent_speculation",
+                r"\b(?:potential|possible|likely|apparent|suspected)\s+(?:[a-z]+\s+){0,3}intent\b",
+            ),
+            (
                 "complete_coverage_claim",
                 r"\b(?:no\s+blind\s+spots?|no\s+missing\s+coverage|complete\s+(?:visual\s+)?coverage|coverage\s+(?:was|is)\s+complete)\b",
             ),
@@ -19081,8 +19085,10 @@ class LuxriotManager:
 
         text = " ".join(str(value or "").split())
         patterns = (
-            r"\b(?:incident|case)s?\s+(?:remains?|is|are|stays?)\s+(?:active|open|unresolved)\b",
-            r"\b(?:active|open|unresolved)\s+(?:operator\s+)?(?:incident|case)s?\b",
+            r"\b(?:incident|case|episode|event(?:\s+track)?)s?\s+"
+            r"(?:remains?|is|are|stays?)\s+(?:active|open|unresolved)\b",
+            r"\b(?:active|open|unresolved)\s+(?:operator\s+)?"
+            r"(?:incident|case|episode|event(?:\s+track)?)s?\b",
         )
         for pattern in patterns:
             for match in re.finditer(pattern, text, flags=re.IGNORECASE):
@@ -19100,8 +19106,9 @@ class LuxriotManager:
     def _rollup_incident_followup_claim(value: object) -> bool:
         text = " ".join(str(value or "").split())
         pattern = re.compile(
-            r"\b(?:incident|case)s?\b[^.!?]{0,160}\b(?:requires?|needs?|warrants?)\s+"
-            r"(?:(?:operator|visual|manual)\s+)?(?:follow[- ]?up|verification|review|attention)\b",
+            r"\b(?:incident|case|episode|event(?:\s+track)?)s?\b[^.!?]{0,160}"
+            r"\b(?:requires?|needs?|warrants?)\s+(?:(?:operator|visual|manual|continued)\s+)?"
+            r"(?:follow[- ]?up|verification|review|attention|observation|monitoring)\b",
             flags=re.IGNORECASE,
         )
         return any(
@@ -19334,6 +19341,11 @@ class LuxriotManager:
                     "review the observable sequence and context",
                     line,
                     flags=re.IGNORECASE,
+                )
+            if "intent_speculation" in issues:
+                line = (
+                    prefix
+                    + "Review the observable sequence only; the sampled frames do not establish intent."
                 )
             output.append(line)
         return "\n".join(output).strip()

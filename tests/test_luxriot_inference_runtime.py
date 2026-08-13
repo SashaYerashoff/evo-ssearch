@@ -8757,6 +8757,72 @@ class LuxriotCaptureDispatchTests(unittest.TestCase):
             ),
             [],
         )
+
+        open_episode_summary = operator_rollup_response(
+            "A brief head turn was sampled.",
+            takeaway=(
+                "The open episode requires continued observation."
+            ),
+        )
+        episode_issues = LuxriotManager._rollup_grounding_guard_issues(
+            open_episode_summary,
+            context_node,
+        )
+        episode_sanitized = LuxriotManager._sanitize_rollup_operator_overclaims(
+            open_episode_summary,
+            context_node,
+        )
+        self.assertIn("temporal_episode_as_case_state", episode_issues)
+        self.assertIn("unsupported_incident_escalation", episode_issues)
+        self.assertEqual(
+            LuxriotManager._rollup_grounding_guard_issues(
+                episode_sanitized,
+                context_node,
+            ),
+            [],
+        )
+
+        speculative_summary = operator_rollup_response(
+            "A brief head turn was sampled.",
+            takeaway=(
+                "The head-turn event remains open and requires monitoring "
+                "for potential exit intent."
+            ),
+        )
+        speculative_issues = LuxriotManager._rollup_grounding_guard_issues(
+            speculative_summary,
+            context_node,
+        )
+        speculative_sanitized = (
+            LuxriotManager._sanitize_rollup_operator_overclaims(
+                speculative_summary,
+                context_node,
+            )
+        )
+        self.assertIn("temporal_episode_as_case_state", speculative_issues)
+        self.assertIn("unsupported_incident_escalation", speculative_issues)
+        self.assertIn("intent_speculation", speculative_issues)
+        self.assertEqual(
+            LuxriotManager._rollup_grounding_guard_issues(
+                speculative_sanitized,
+                context_node,
+            ),
+            [],
+        )
+
+        active_watchlist_summary = operator_rollup_response(
+            "A configured watch remains pending.",
+            takeaway=(
+                "The active watchlist item remains open for future verification."
+            ),
+        )
+        self.assertNotIn(
+            "temporal_episode_as_case_state",
+            LuxriotManager._rollup_grounding_guard_issues(
+                active_watchlist_summary,
+                context_node,
+            ),
+        )
         self.assertEqual(
             LuxriotManager._rollup_grounding_guard_issues(
                 operator_rollup_response(
