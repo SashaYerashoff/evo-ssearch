@@ -759,12 +759,6 @@ class OutputByteBudgetTests(unittest.TestCase):
             "depth": "L1",
             "coverage": {"status": "complete", "truncated": False},
             "count": 1,
-            "entries": [
-                {
-                    "level": "L1",
-                    "summary": "Night drift fixture remained visible.",
-                }
-            ],
             # Live vlm_summary/vlm_alert payloads measured about 20 KB each.
             # Eight evidence frames are the normal tool default, not an
             # exceptional max-page request.
@@ -772,9 +766,28 @@ class OutputByteBudgetTests(unittest.TestCase):
                 {
                     "id": index,
                     "source": "vlm_summary",
-                    "payload": {"summary": "x" * 20_000},
+                    "payload": {
+                        "summary": "x" * 20_000,
+                        "state_observations": [
+                            {
+                                "ordinal": observation,
+                                "state": "continuing",
+                                "label": "vehicle maneuver",
+                                "evidence_refs": [f"frame:{observation}"],
+                            }
+                            for observation in range(150)
+                        ],
+                    },
                 }
                 for index in range(8)
+            ],
+            # This is deliberately after evidence_frames, matching the real
+            # AgentTools receipt and reproducing the field that disappeared.
+            "entries": [
+                {
+                    "level": "L1",
+                    "summary": "Night drift fixture remained visible.",
+                }
             ],
         }
         raw_bytes = len(json.dumps(result, default=str).encode("utf-8"))
@@ -796,6 +809,7 @@ class OutputByteBudgetTests(unittest.TestCase):
         self.assertEqual(sanitized["channel_id"], 118)
         self.assertEqual(sanitized["coverage"]["status"], "complete")
         self.assertEqual(len(sanitized["evidence_frames"]), 8)
+        self.assertEqual(sanitized["entries"][0]["level"], "L1")
 
     def test_unlisted_tools_keep_the_conservative_default(self) -> None:
         self.assertEqual(EvaAgentToolAdapter._max_output_bytes("some_other_tool"), 96_000)

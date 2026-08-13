@@ -330,7 +330,12 @@ class EvaAgentToolAdapter:
         # ~18,000 items; measured lossless only above 30,000). Both set to
         # 50,000 for shared headroom against future payload growth.
         return {
-            "get_video_summaries": 4_000,
+            # The bounded receipt puts evidence_frames before entries. Eight
+            # live VLM evidence payloads can exceed 4,000 nested sanitizer
+            # items, silently dropping the trailing semantic rollup entries
+            # even after the byte cap is large enough. The stable compactor
+            # still exposes at most eight evidence rows and five entries.
+            "get_video_summaries": 50_000,
             "list_video_summary_channels": 2_000,
             "search_archive": 50_000,
             "get_detections": 50_000,
