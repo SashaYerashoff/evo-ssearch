@@ -350,6 +350,12 @@ DEFAULT_BATCH_STATE_JSON_PROMPT = (
     "show a return after one or more listed event keys; state=uncertain means coverage cannot prove a return. Only "
     "returned with current snapshot evidence is an episode boundary. Set pass_up=true only for "
     "a real deviation, meaningful transition, alert-linked episode, or unresolved item needed by the next window.\n"
+    "- Every distinct observable action or transition stated in the human Episode update must also appear once in "
+    "events with its supporting snapshot indices. This includes phone calls/phone use and a person changing from "
+    "ordinary work to a visibly slumped or head-on-desk posture. Do not leave a grounded episode only in prose.\n"
+    "- When later snapshots visibly show ordinary activity resuming after a listed event, emit a routine item with "
+    "state=returned and put the matching event_id in applies_to_event_keys. Do not relabel the unusual posture or "
+    "action itself as a new routine merely because it persists for the rest of one short batch.\n"
     "- For observed_states, present means directly visible in every listed snapshot. Absent is allowed only when "
     "the relevant scene area is clearly observable in the listed snapshots; otherwise use unknown. A name, breed, "
     "ownership, or identity supplied by memory/policy is only a watch label and must remain unknown unless current "
@@ -531,6 +537,27 @@ _ALERT_POLICY_ACTION_STEMS = {
     "take",
     "tamper",
     "wave",
+}
+_ALERT_POLICY_ENTITY_STEMS = {
+    "animal": "animal",
+    "boat": "vessel",
+    "car": "vehicle",
+    "cat": "cat",
+    "dog": "dog",
+    "human": "person",
+    "individual": "person",
+    "man": "person",
+    "motorcycle": "vehicle",
+    "pedestrian": "person",
+    "people": "person",
+    "person": "person",
+    "ship": "vessel",
+    "subject": "person",
+    "truck": "vehicle",
+    "van": "vehicle",
+    "vehicle": "vehicle",
+    "vessel": "vessel",
+    "woman": "person",
 }
 _GENERAL_HAZARD_EVENT_RULES: Tuple[
     Tuple[str, str, str, Tuple[frozenset[str], ...]],
@@ -11083,6 +11110,10 @@ class LuxriotManager:
                 r"carry(?:ies|ing|ied)?|take(?:s|n|ing)?|took|theft|steal(?:s|ing)?|stole|"
                 r"grab(?:s|bed|bing)?|drift(?:s|ed|ing)?|turn(?:s|ed|ing)?|"
                 r"cross(?:es|ed|ing)?|climb(?:s|ed|ing)?|rest(?:s|ed)?\s+down|"
+                r"slump(?:s|ed|ing)?\s+(?:over|onto|at)\s+(?:a\s+|the\s+)?(?:desk|table)|"
+                r"head\s+(?:rest(?:s|ed|ing)?|laid|lying)\s+(?:on|onto)\s+(?:a\s+|the\s+)?(?:desk|table)|"
+                r"(?:phone\s+call|speak(?:s|ing)?|talk(?:s|ed|ing)?)\s+(?:on|by|with)\s+(?:a\s+)?phone|"
+                r"hold(?:s|ing)?\s+(?:a\s+)?phone\s+to\s+(?:the\s+)?ear|"
                 r"motion|movement|displacement|intrusion|collision|fire|smoke|"
                 r"weapon|obstruction|damage|flood|leak|collapse"
                 r")\b",
@@ -11165,6 +11196,8 @@ class LuxriotManager:
             r"exit(?:s|ed|ing)?|leave(?:s|ing)?|depart(?:s|ed|ing|ure)?|"
             r"appear(?:s|ed|ing|ance)?|disappear(?:s|ed|ing|ance)?|"
             r"fall(?:s|en|ing)?|fell|collaps(?:e|es|ed|ing)|faint(?:s|ed|ing)?|"
+            r"slump(?:s|ed|ing)?\s+(?:over|onto|at)\s+(?:a\s+|the\s+)?(?:desk|table)|"
+            r"head\s+(?:rest(?:s|ed|ing)?|laid|lying)\s+(?:on|onto)\s+(?:a\s+|the\s+)?(?:desk|table)|"
             r"run(?:s|ning)?|sprint(?:s|ed|ing)?|chas(?:e|es|ed|ing)?|"
             r"jump(?:s|ed|ing)?|leap(?:s|ed|ing)?|crawl(?:s|ed|ing)?|climb(?:s|ed|ing)?|"
             r"fight(?:s|ing)?|assault(?:s|ed|ing)?|attack(?:s|ed|ing)?|"
@@ -11241,6 +11274,8 @@ class LuxriotManager:
         if re.search(
             r"\b(?:"
             r"fall(?:s|en|ing)?|fell|collaps(?:e|es|ed|ing)|faint(?:s|ed|ing)?|"
+            r"slump(?:s|ed|ing)?\s+(?:over|onto|at)\s+(?:a\s+|the\s+)?(?:desk|table)|"
+            r"head\s+(?:rest(?:s|ed|ing)?|laid|lying)\s+(?:on|onto)\s+(?:a\s+|the\s+)?(?:desk|table)|"
             r"fight(?:s|ing)?|assault(?:s|ed|ing)?|attack(?:s|ed|ing)?|"
             r"hit(?:s|ting)?|strik(?:e|es|ing)|violent|violence|"
             r"snatch(?:es|ed|ing)?|steal(?:s|ing)?|stole|theft|robbery|"
@@ -11289,14 +11324,14 @@ class LuxriotManager:
         action_patterns = (
             ("thumbs_up", r"\bthumbs?\s*[- ]?\s*up\b"),
             ("victory_gesture", r"\b(?:victory|peace|v\s*[- ]?\s*sign|two\s+finger)\b"),
-            ("phone_call", r"\b(?:phone\s+call|call(?:s|ed|ing)?\s+(?:on|by|with)\s+(?:a\s+)?phone|talk(?:s|ed|ing)?\s+on\s+(?:a\s+)?phone)\b"),
+            ("phone_call", r"\b(?:phone\s+call|call(?:s|ed|ing)?\s+(?:on|by|with)\s+(?:a\s+)?phone|(?:talk|speak)(?:s|ed|ing)?\s+(?:on|by|with)\s+(?:a\s+)?phone|hold(?:s|ing)?\s+(?:a\s+)?phone\s+to\s+(?:the\s+)?ear)\b"),
             ("enter", r"\b(?:enter|entry|arriv|appear)"),
             (
                 "exit",
                 r"\b(?:exit|leave|depart|disappear)|"
                 r"\bleft\s+(?:the\s+)?(?:camera\s+)?(?:scene|frame|room|area|view)\b",
             ),
-            ("fall", r"\b(?:fall|fell|collapse|faint)"),
+            ("fall", r"\b(?:fall|fell|collapse|faint|slump)|\bhead\s+(?:rest|laid|lying)\w*\s+(?:on|onto)\s+(?:a\s+|the\s+)?(?:desk|table)"),
             ("collision", r"\b(?:collision|collid|crash|impact|near\s+miss)"),
             ("fire_smoke", r"\b(?:fire|flame|smoke|explosion)\b"),
             ("take_object", r"\b(?:grab|snatch|steal|stole|theft|pick\w*\s+up|take|took|carry)"),
@@ -12359,7 +12394,24 @@ class LuxriotManager:
             existing = event_rows_by_key.get(semantic_key)
             if existing is not None:
                 existing["trigger_kind"] = trigger_kind
-                existing["severity"] = str(raw.get("severity") or "info").strip().lower()[:32]
+                incoming_severity = str(
+                    raw.get("severity") or "info"
+                ).strip().lower()[:32]
+                current_severity = str(
+                    existing.get("severity") or ""
+                ).strip().lower()[:32]
+                severity_rank = {
+                    severity: rank
+                    for rank, severity in enumerate(
+                        reversed(ALERT_SEVERITY_ORDER),
+                        1,
+                    )
+                }
+                if severity_rank.get(incoming_severity, 0) >= severity_rank.get(
+                    current_severity,
+                    0,
+                ):
+                    existing["severity"] = incoming_severity
                 if matched_criterion:
                     existing["operator_criterion"] = matched_criterion
                 existing_refs = list(existing.get("evidence_refs") or [])
@@ -17550,6 +17602,25 @@ class LuxriotManager:
         evidence_text = f"{event.get('label') or ''} {event.get('summary') or ''}"
         evidence_tokens = cls._alert_policy_match_tokens(evidence_text)
         if len(criterion_tokens) < 2 or not evidence_tokens:
+            return None
+        # Action overlap alone is insufficient when the rule and evidence have
+        # different subjects. Without this guard "cat entering or leaving"
+        # matched "person enters, touches a cat statue, then exits" because the
+        # two action stems occupied most of the criterion token set.
+        def primary_entity(value: object) -> str:
+            for stem in cls._alert_policy_match_stems(value):
+                normalized = _ALERT_POLICY_ENTITY_STEMS.get(stem)
+                if normalized:
+                    return normalized
+            return ""
+
+        criterion_entity = primary_entity(criterion)
+        evidence_entity = primary_entity(evidence_text)
+        if (
+            criterion_entity
+            and evidence_entity
+            and criterion_entity != evidence_entity
+        ):
             return None
         overlap = criterion_tokens & evidence_tokens
         if len(overlap) < 2:

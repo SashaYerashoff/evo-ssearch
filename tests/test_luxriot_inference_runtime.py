@@ -8956,6 +8956,56 @@ class LuxriotCaptureDispatchTests(unittest.TestCase):
 
         self.assertEqual(observations, [])
 
+    def test_temporal_memory_keeps_phone_call_as_distinct_context_episode(self):
+        observations = LuxriotManager._l0_temporal_observations(
+            channel_id=112,
+            source_batch_id="vlm-room-phone",
+            batch_state={
+                "events": [
+                    {
+                        "event_id": "person_phone_use",
+                        "label": "Person speaking on a phone",
+                        "summary": "Person holds a phone to the ear and speaks.",
+                        "state": "new",
+                        "novelty": "novel",
+                        "pass_up": True,
+                        "snapshot_indices": [3, 4, 5],
+                    }
+                ]
+            },
+            batch_start_ms=1_000,
+            batch_end_ms=2_000,
+        )
+
+        self.assertEqual(len(observations), 1)
+        self.assertEqual(observations[0]["semantic_key"], "person phone_call")
+        self.assertEqual(observations[0]["trigger_kind"], "episode_event")
+
+    def test_temporal_memory_treats_transition_to_head_on_desk_as_safety(self):
+        observations = LuxriotManager._l0_temporal_observations(
+            channel_id=112,
+            source_batch_id="vlm-room-slumped",
+            batch_state={
+                "events": [
+                    {
+                        "event_id": "person_posture_change",
+                        "label": "Person leaning forward, head resting on desk",
+                        "summary": "Person transitions from typing to resting head on desk.",
+                        "state": "new",
+                        "novelty": "novel",
+                        "pass_up": True,
+                        "snapshot_indices": [4, 5, 6, 7, 8],
+                    }
+                ]
+            },
+            batch_start_ms=1_000,
+            batch_end_ms=2_000,
+        )
+
+        self.assertEqual(len(observations), 1)
+        self.assertEqual(observations[0]["semantic_key"], "person fall")
+        self.assertEqual(observations[0]["trigger_kind"], "safety_event")
+
     def test_temporal_memory_preserves_structured_alert_without_event_duplicate(self):
         observations = LuxriotManager._l0_temporal_observations(
             channel_id=112,
@@ -9082,6 +9132,75 @@ class LuxriotCaptureDispatchTests(unittest.TestCase):
         self.assertEqual(len(observations), 1)
         self.assertEqual(observations[0]["semantic_key"], "person exit")
         self.assertEqual(observations[0]["trigger_kind"], "operator_alert")
+
+    def test_operator_cat_policy_does_not_match_person_using_cat_statue(self):
+        criterion = "cat entering or leaving scene, severity - high"
+
+        self.assertIsNone(
+            LuxriotManager._operator_policy_event_match(
+                criterion,
+                {
+                    "label": "Person interacts with cat statue",
+                    "summary": "Person enters, touches the statue, then exits.",
+                    "state": "new",
+                    "snapshot_indices": [3, 4, 5],
+                },
+            )
+        )
+        self.assertIsNotNone(
+            LuxriotManager._operator_policy_event_match(
+                criterion,
+                {
+                    "label": "Cat enters the scene",
+                    "summary": "Cat walks into view and later leaves.",
+                    "state": "new",
+                    "snapshot_indices": [2, 6],
+                },
+            )
+        )
+
+    def test_temporal_alert_merge_preserves_highest_severity(self):
+        observations = LuxriotManager._l0_temporal_observations(
+            channel_id=112,
+            source_batch_id="vlm-room-duplicate-alert",
+            operator_alert_policy=(
+                "Alert if person entering or leaving scene, severity - high"
+            ),
+            batch_state={
+                "events": [
+                    {
+                        "event_id": "person_exit",
+                        "label": "Person exits the scene",
+                        "summary": "Person leaves the camera view.",
+                        "state": "new",
+                        "novelty": "novel",
+                        "pass_up": True,
+                        "snapshot_indices": [5],
+                    }
+                ],
+                "alerts": [
+                    {
+                        "title": "Person exits the scene",
+                        "description": "Person leaves the camera view.",
+                        "severity": "high",
+                        "state": "new",
+                        "snapshot_indices": [5],
+                    },
+                    {
+                        "title": "Person exits the scene",
+                        "description": "Person leaves the camera view.",
+                        "severity": "info",
+                        "state": "new",
+                        "snapshot_indices": [5],
+                    },
+                ],
+            },
+            batch_start_ms=1_000,
+            batch_end_ms=2_000,
+        )
+
+        self.assertEqual(len(observations), 1)
+        self.assertEqual(observations[0]["severity"], "high")
 
     def test_operator_leave_policy_does_not_treat_left_direction_as_egress(self):
         criterion = "person entering or leaving scene, severity - info"
