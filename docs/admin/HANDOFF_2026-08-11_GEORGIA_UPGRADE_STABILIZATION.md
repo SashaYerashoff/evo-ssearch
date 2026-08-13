@@ -2550,3 +2550,67 @@ HUP, backend restart, inference restart, or `.env` write was performed.
 
 No new immutable upgrade archive or Desktop launcher pin was produced in this
 slice.
+
+## 2026-08-14 VLM alert and temporal-incident stabilization
+
+The current stabilization slice is represented by these source commits:
+
+- `d5fd7ad` splits temporal incidents across observed episode gaps;
+- `8e2e36b` ends stale incidents on covered silence without crossing camera-run
+  boundaries;
+- `5587168` separates the temporal episode ledger from operator case state and
+  sanitizes unsupported open-case language in both new and cached rollups;
+- `d8449d2` reconciles configured VLM alerts from structured event state and
+  deduplicates fast/full-lane descriptions of the same source-time episode;
+- `72e0292` extends the rollup guard to unsupported open episode/event wording,
+  follow-up monitoring, and speculative intent.
+
+Commit `d8449d2` and all commits before it are loaded in the running rehearsal
+worker. Commit `72e0292` is copied into the live tree but intentionally awaits
+the next normal restart: another Gunicorn HUP was avoided after the measured
+4m39s cold candidate load. The handover kept the old worker serving during most
+of the cold load; the final capture ownership transition still produced an
+approximately 9--14 second readiness gap. Zero-gap handover remains a separate
+two-phase capture-ownership design task.
+
+The configured channel 112 VLM rule is currently `Alert when see thumbs up
+gesture, priority low`. The parser now recognizes `priority`, removes the
+imperative `see` token from the criterion, and canonicalizes equivalent
+`thumb/thumbs up gesture` titles. Missing model `alerts[]` entries may be
+reconstructed only from current structured present/event state with snapshot
+evidence. Fast and full lanes now deduplicate by canonical criterion and source
+event time, while a genuinely later gesture remains eligible.
+
+Measured before this change, channel 112 alert delivery was dominated by batch
+collection and inference rather than Evo transport: the fast lane had 14.57s
+median event-to-Evo acknowledgement and the full lane 28.91s; bookmark HTTP
+time was approximately 0.05--0.15s. Channel 118 after reload showed 29.05s
+median event-to-Evo acknowledgement with 0.054s median bookmark HTTP time. The
+30-second emu1 drift loop is intentionally treated as test content, so repeated
+dangerous-driving observations there are not globally suppressed.
+
+A requested live thumbs-up validation could not be completed because the
+channel 112 Luxriot snapshot itself was nearly black (mean luma 17/255, p95
+20.7/255). Channel 118 remained normally exposed. This establishes the current
+block below EVA UI, SigLIP, and VLM processing: restore the Zenbook camera image
+and repeat one short gesture to verify the new single-alert reconciliation and
+dedup contract end to end.
+
+The reload was otherwise healthy: channels 112 and 118 are running, capture,
+probe and summary errors are null, semantic archive and VLM queues are empty,
+SigLIP2 reports a healthy CUDA runtime canary, and both llama.cpp profiles are
+reachable. At the final check the archive volume had 25.8 GB free (5.27%), only
+slightly above its configured 5% health floor, so disk reclamation remains an
+immediate operational follow-up.
+
+Regression coverage completed in this slice includes 101 quick command/store
+tests, 37 VLM alert contract tests, the neighboring alert/dedup set, and the
+targeted temporal rollup/cache guard tests. The rehearsal `.env` was not
+modified and its SHA-256 remains:
+
+```text
+2c254527143f62bbdbcf7a14914872e2a6f1e0f4f776ef02024c0f27aac76325
+```
+
+No new immutable upgrade archive or Desktop launcher pin was produced in this
+slice.
