@@ -2614,3 +2614,60 @@ modified and its SHA-256 remains:
 
 No new immutable upgrade archive or Desktop launcher pin was produced in this
 slice.
+
+## 2026-08-14 agent rollup receipt and routing stabilization
+
+This note supersedes the preceding statement that `72e0292` awaited a normal
+restart. The rehearsal worker has now loaded `72e0292` and the following fixes:
+
+- `72c6e65` raises the `get_video_summaries` security byte allowance so a
+  legitimate nested evidence envelope is not replaced by a generic truncated
+  preview before agent compaction;
+- `756e5b4` raises that tool's security item allowance so deeply nested evidence
+  cannot consume the generic item budget before the trailing `entries` receipt;
+- `d81725c` routes `summarize`/`summarise` forms and the literal
+  `get_video_summaries` name to the existing video-research intent group;
+- `47c3e05` sanitizes unsupported passive temporal case-state wording such as an
+  episode being "marked as an open safety priority";
+- `686d8e1` extends that guard to past-tense `remained`/`stayed` wording.
+
+The resulting agent receipt remains deliberately compact (at most eight
+evidence items and five entries), but an exact channel-118 last-hour request now
+reliably exposes `get_video_summaries`, normalizes the requested time window,
+and returns four entries with their evidence instead of an all-null envelope.
+Authenticated replay of `l1-ch118-w900-1786660200` reports
+`generation_status=semantic_guard_sanitized`; neither `remained open` nor
+`open safety priority` remains in the returned window.
+
+Because `d81725c` changes progressive tool disclosure, the pinned tuktuk grammar
+was reviewed before implementation. The change stays within the existing
+`AGG`/`DRILL` path, adds no tool or result-envelope schema, and derives arguments
+only from operator text and server results; no grammar conflict or review
+question was introduced.
+
+Verification completed with 152 gateway/adapter/video-summary tests plus three
+subtests, then 215 agent-loop/gateway/adapter/video-summary tests plus sixteen
+subtests. The focused temporal guard/cache set passes 3/3. A broader filtered
+run still contains an older expectation that a cached unsupported coverage
+claim must be regenerated instead of sanitized; that unrelated expectation was
+not rewritten during this focused fix.
+
+During the second handover in this sequence, the external Evo/Luxriot endpoint
+at `192.168.1.100:8080` stopped responding. At 02:29 EEST both HTTP connect and
+ICMP still timed out. EVA itself is serving from the single new Gunicorn worker
+`2148782`; PostgreSQL, authentication, CUDA SigLIP2, and both llama.cpp profiles
+are healthy, and all internal queues are empty. `/ready` correctly remains 503
+because Luxriot is a required dependency. Both desired capture sessions are
+remembered as restored and continue retrying, but no new camera frame, probe,
+VLM alert, or end-to-end thumbs-up measurement is possible until the upstream
+feed returns.
+
+The rehearsal `.env` was not modified and its SHA-256 remains:
+
+```text
+2c254527143f62bbdbcf7a14914872e2a6f1e0f4f776ef02024c0f27aac76325
+```
+
+No inference process was restarted. The running VLM and agent llama.cpp PIDs
+remain `1499650` and `2916440` respectively. No new immutable upgrade archive or
+Desktop launcher pin was produced in this slice.
