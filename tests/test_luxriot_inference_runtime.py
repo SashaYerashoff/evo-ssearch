@@ -26,7 +26,13 @@ from inference_queue import (
 from archive_store import PostgresRuntimeStateStore
 from attention_policy import AttentionMode, CostBudgetState
 from incident_attention import PromptBudgetError
-from luxriot_connector import LuxriotCaptureSession, LuxriotManager, _intel_hwaccel_for_config
+from luxriot_connector import (
+    DEFAULT_ALERTS_JSON_PROMPT,
+    PREVIOUS_VERBOSE_BATCH_STATE_JSON_PROMPT,
+    LuxriotCaptureSession,
+    LuxriotManager,
+    _intel_hwaccel_for_config,
+)
 from temporal_memory import make_observation as make_temporal_observation
 
 
@@ -581,6 +587,9 @@ class LuxriotCaptureApexDeciderTests(unittest.TestCase):
             store.release_first.set()
             writer.join(timeout=2.0)
             self.assertTrue(completed.is_set())
+            deadline = time.monotonic() + 1.0
+            while not getattr(store, "assert_released", False) and time.monotonic() < deadline:
+                time.sleep(0.01)
             self.assertTrue(getattr(store, "assert_released", False))
             persisted = store.load_state(manager.PROMPT_SETTINGS_STATE_KEY)
             self.assertEqual(
@@ -2470,6 +2479,67 @@ class LuxriotCaptureDispatchTests(unittest.TestCase):
                 "channel_override",
             )
             self.assertIn("alert_policy_prompt", restored_settings["override_fields"])
+
+            batch = restored.create_summary_batch(
+                channel_id=7,
+                run_id="prompt-audit",
+                batch_size=2,
+                prompt="",
+                model_hint=None,
+                interval_sec=1.0,
+                frames=sample_frames(),
+            )
+            input_stats = batch["llm_input_stats"]
+            self.assertEqual(
+                input_stats["operator_alert_policy_chars"], len(criteria)
+            )
+            self.assertEqual(
+                len(input_stats["operator_alert_policy_fingerprint"]), 16
+            )
+            self.assertIn(criteria, batch["system_prompt"])
+
+    def test_dedicated_prompt_state_migrates_verbose_contract_without_losing_alerts(self):
+        with tempfile.TemporaryDirectory() as temp:
+            state_store = MemoryRuntimeStateStore()
+            criteria = "Alert when a person raises a thumb."
+            state_store.save_state(
+                LuxriotManager.PROMPT_SETTINGS_STATE_KEY,
+                {
+                    "version": 1,
+                    "revision": 7,
+                    "updated_at": 1_786_633_000.0,
+                    "prompt_settings": {
+                        "stream_system_prompt": "Describe the stream.",
+                        "alert_policy_prompt": "",
+                        "rollup_prompts": {},
+                        "bookmark_enabled": False,
+                        "bookmark_cooldown_sec": 60.0,
+                        "capture_selector_enabled": True,
+                        "capture_selector_bias": "auto",
+                        "json_alert_prompt": PREVIOUS_VERBOSE_BATCH_STATE_JSON_PROMPT,
+                        "channel_overrides": {
+                            "7": {"alert_policy_prompt": criteria}
+                        },
+                    },
+                },
+            )
+
+            restored = build_manager(Path(temp), runtime_state_store=state_store)
+            settings = restored.get_prompt_settings(channel_id=7)
+            self.assertEqual(settings["alert_policy_prompt"], criteria)
+            self.assertEqual(settings["json_alert_prompt"], DEFAULT_ALERTS_JSON_PROMPT)
+            migrated = state_store.load_state(restored.PROMPT_SETTINGS_STATE_KEY)
+            self.assertEqual(migrated["revision"], 8)
+            self.assertEqual(
+                migrated["prompt_settings"]["channel_overrides"]["7"][
+                    "alert_policy_prompt"
+                ],
+                criteria,
+            )
+            self.assertEqual(
+                migrated["prompt_settings"]["json_alert_prompt"],
+                DEFAULT_ALERTS_JSON_PROMPT,
+            )
 
     def test_dedicated_prompt_state_survives_stale_high_revision_summary_write(self):
         with tempfile.TemporaryDirectory() as temp:

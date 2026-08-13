@@ -122,7 +122,7 @@ class VlmAlertPromptContractTests(unittest.TestCase):
 
         self.assertLess(schema.index('"alerts"'), schema.index('"events"'))
         self.assertLess(schema.index('"alerts"'), schema.index('"memory_pass"'))
-        self.assertIn("at most 80 words", DEFAULT_ALERTS_JSON_PROMPT)
+        self.assertIn("at most 50 words", DEFAULT_ALERTS_JSON_PROMPT)
         self.assertIn("Keep the JSON compact", DEFAULT_ALERTS_JSON_PROMPT)
 
     def test_batch_state_recovers_complete_alert_from_truncated_json_prefix(self):

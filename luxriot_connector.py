@@ -403,74 +403,89 @@ DEFAULT_BATCH_STATE_JSON_PROMPT = (
     "do not select a cover, event, observed state, or alert from prior memory or a vector signal alone; "
     "never copy field-description or schema-example text into the output."
 )
+# Preserve the verbose v2 contract only so persisted shipped defaults can be
+# migrated exactly.  Repeating its prose and expanded schema cost roughly half
+# of the text tokens in every realtime request and encouraged 300+ token
+# completions on small VLMs.
+PREVIOUS_VERBOSE_BATCH_STATE_JSON_PROMPT = DEFAULT_BATCH_STATE_JSON_PROMPT
+
+DEFAULT_BATCH_STATE_JSON_PROMPT = (
+    "Machine-readable current-batch state for EVA memory, navigation, and alert actions:\n"
+    "Use CURRENT snapshots as evidence. Memory, CV, probes, P/N/M, and vector signals only direct attention. "
+    "Before the JSON, write at most 50 words total under exactly these headings: "
+    "### Scene description, ### Episode update, ### Routine and deviations, ### Worth to remember. "
+    "Use one short sentence per heading; write None when empty.\n"
+    "BATCH_STATE_JSON rules:\n"
+    "- Always finish with exactly one BATCH_STATE_JSON block. Keep the JSON compact. The first two members MUST be "
+    "version and alerts, in that order. Finish alerts, events, and observed_states before the remaining members.\n"
+    "- Snapshot indices are 1-based and list only snapshots that visibly support the claim. Use unknown when the "
+    "sample cannot prove presence, absence, identity, intent, or a transition.\n"
+    "- alerts: one object per distinct current visible operator criterion or immediate safety/security hazard; [] when "
+    "none. General hazards include violence, fall/collapse/distress, dangerous vehicle behavior, forced entry, "
+    "damage/tampering/theft, weapon, fire/smoke, critical obstruction, or crowd escalation. Do not infer illegality. "
+    "Do not alert on routine walking, parking, delivery, loitering, littering, or casual gestures unless explicitly requested.\n"
+    "- evaluate every operator-defined trigger independently. If relevant evidence is ambiguous, use a low/info alert "
+    "with uncertainty. Never create an alert from memory or a vector signal alone.\n"
+    "- events contain only observable actions/transitions (new|continuing|resolved|uncertain), max 4. Every action or "
+    "transition mentioned in Episode update must appear here, including phone use or a posture change. pass_up is true "
+    "only for a deviation, transition, alert-linked episode, or unresolved item needed by the next window.\n"
+    "- observed_states tracks current watched entities/triggers (present|absent|unknown), max 6. routines contains "
+    "grounded recurring context, max 2; state=returned requires visible ordinary activity after an event and links its event key. "
+    "memory_pass is max 2. Select one grounded cover. Cover kind must be exactly one of event, transition, routine, "
+    "or coverage_issue; scene status is matched|mismatch|uncertain|unavailable.\n"
+    "BATCH_STATE_JSON:\n"
+    '{"version": 2,"alerts":[{"title":"short title","description":"visible evidence <=160 chars",'
+    '"severity":"low","state":"new","channel_id":{channel_id},"timestamp_ms":0,"snapshot_indices":[1]}],'
+    '"events":[{"event_id":"short-key","label":"visible event","state":"new","snapshot_indices":[1],'
+    '"summary":"short update","novelty":"novel","pass_up":true}],'
+    '"observed_states":[{"key":"watch-key","label":"watched state","state":"present",'
+    '"snapshot_indices":[1],"evidence":"visible evidence"}],'
+    '"cover":{"snapshot_index":1,"kind":"event","reason":"visible reason","confidence":"high"},'
+    '"scene":{"status":"matched","summary":"short current scene"},'
+    '"routines":[{"key":"routine-key","label":"recurring activity","state":"continuing",'
+    '"snapshot_indices":[1],"applies_to_event_keys": []}],"memory_pass":[]}\n'
+    "Never copy schema examples into output, emit prose-only alerts, or use a prior alert to suppress a currently visible match."
+)
+
 # Compatibility name retained for persisted settings and public API fields.
 DEFAULT_ALERTS_JSON_PROMPT = DEFAULT_BATCH_STATE_JSON_PROMPT
 
 DEFAULT_ALERT_POLICY_PROMPT = (
     "Alert review policy:\n"
-    "- Evaluate general safety/security hazards even if the operator did not list them explicitly. "
-    "Use severity high/critical only for immediate visible danger; use low/normal for review-worthy but non-urgent events.\n"
-    "- Evaluate channel-specific operator criteria as first-class alert triggers. Operator criteria may describe "
-    "non-security review signals, vulnerable-person monitoring, site-specific rules, or temporary watch items.\n"
-    "- If operator criteria mention health, age, impairment, intent, legality, or identity, do not diagnose or accuse. "
-    "Alert only on visible facts such as falling, collapse, distress, immobility, unsafe movement, obstruction, "
-    "or a requested visible object/action.\n"
-    "- If evidence is ambiguous but relevant to an explicit operator criterion, emit a low/info alert with uncertainty "
-    "instead of silently dropping it.\n"
+    "- Current snapshots are the only evidence. Review visible general hazards and every channel-specific criterion; "
+    "criteria may be non-security/site-specific signals.\n"
+    "- Use high/critical only for immediate visible danger. For ambiguous evidence relevant to an explicit criterion, "
+    "emit low/info with uncertainty instead of diagnosing health, identity, intent, or legality.\n"
     "Channel-specific operator alert criteria:\n"
     "{operator_alert_policy}"
 )
 
 LIVE_ALERT_RECONCILIATION_PROMPT = (
     "Mandatory current-batch alert reconciliation:\n"
-    "Channel-specific criteria repeated at the final decision point:\n"
+    "Final channel-specific criteria:\n"
     "{operator_alert_policy}\n"
-    "- Immediately before writing BATCH_STATE_JSON, compare every channel-specific criterion above with the visible "
-    "events, observed states, and operator-facing narrative you just produced.\n"
-    "- If any current-batch event or narrative explicitly says that a criterion happened, alerts must contain the "
-    "corresponding object. Routine status, low novelty, continuing/resolved episode state, or a previous alert never "
-    "turns a currently visible criterion match into alerts: [].\n"
-    "- This reconciliation uses current snapshots only; do not recover a match from memory or vector signals alone."
+    "Compare each criterion with current visible events/states immediately before JSON. If the narrative or structured "
+    "state says it happened, alerts must contain the corresponding object; routine status, novelty, or a prior alert never suppresses a current "
+    "match. Never recover a match from memory/vector signals alone."
 )
 
 LIVE_OBSERVATION_STATE_PROMPT = (
     "Current-batch observation contract:\n"
-    "- Treat prior channel memory as context only, never as visual evidence for the current batch.\n"
-    "- Evaluate every watched entity and operator-defined trigger independently against the CURRENT snapshots.\n"
-    "- Put watched-entity/trigger states in BATCH_STATE_JSON.observed_states: present|absent|unknown with current "
-    "snapshot indices and concise evidence. Prose may explain them but is not the machine state contract.\n"
-    "- Snapshot indices identify only frames that independently support the claim; do not emit the full 1..N range "
-    "unless every supplied snapshot was actually checked and visibly supports it. Use unknown when the sampled view "
-    "cannot establish absence or distinguish a policy-supplied name, breed, ownership, or identity.\n"
-    "- If two distinct triggers are visible in the same batch, report both and emit two alert objects.\n"
-    "- Claim enter/leave only when the current snapshots show a before/after transition; otherwise report the "
-    "current state and let backend continuity tools compare adjacent batches.\n"
-    "- Never assert intent or skill: words like 'intentional', 'controlled', 'stunt', 'deliberate', 'showing off' "
-    "are conclusions cameras cannot prove. Describe the visible dynamics (speed, trajectory, smoke, proximity to "
-    "people/objects) and let severity reflect the visible risk.\n"
+    "- Memory is context, never current evidence. Evaluate watched entities and triggers independently against CURRENT "
+    "snapshots; observed_states uses present|absent|unknown plus only supporting snapshot indices.\n"
+    "- Claim enter/leave only from a visible before/after transition. Report every distinct visible trigger separately. "
+    "Never assert intent or skill, identity, or legality; describe visible dynamics.\n"
     "- Never declare 'no safety hazard' or 'no danger': absence of visible harm in sampled snapshots is not proof "
-    "of safety. Say what is visible and what remains uncertain.\n"
-    "- A vector/attention cue never confirms an event by itself; only current snapshots confirm. If the images do "
-    "not support the cue, say the cue is visually unconfirmed.\n"
-    "- Your BATCH_STATE_JSON output enters EVA memory and may influence later attention, continuity tracking, "
-    "frame selection, and alert actions. Preserve uncertainty and use only grounded current-batch updates."
+    "of safety. A vector cue never confirms an event; without image support mark it visually unconfirmed. Preserve "
+    "uncertainty because this state feeds EVA memory."
 )
 
 VECTOR_SIGNAL_PROMPT_PREFIX = (
     "Current vector/homeostasis signal contract:\n"
-    "- VECTOR_SIGNALS_JSON is a secondary attention/arousal signal from CLIP probes and lightweight CV, not visual proof.\n"
-    "- A CLIP signal with attention_authority=shadow is an unconfirmed follow-up cue. It may direct visual scrutiny, "
-    "but it must not change the current state, create an alert, or confirm another cue without direct snapshot evidence.\n"
-    "- Use it to decide which current snapshots deserve extra scrutiny; verify any candidate directly in the current images.\n"
-    "- camera_scene reports camera-global PTZ motion, a scene epoch, and recurring-view coverage. During pan, tilt, "
-    "zoom, preset_cut, settling, or an unconfirmed view, do not infer that an object/zone is absent and do not treat "
-    "camera-global motion as object motion. Report the relevant area as not observed when coverage is unavailable.\n"
-    "- capture_attention marks snapshots whose motion is far above this channel's measured norm (activity_x = times above "
-    "typical). Motion blur on burst snapshots is expected physics of fast events - describe the action itself; use sharper "
-    "neighboring snapshots (or a provided sharper companion frame) for identity details.\n"
-    "- If a vector cue and the current snapshots support an Alert review policy trigger, emit the normal "
-    "BATCH_STATE_JSON alert.\n"
-    "- If the cue is not visually supported, mention uncertainty briefly and do not create an alert from the vector cue alone.\n"
+    "VECTOR_SIGNALS_JSON is a secondary attention/arousal signal, not visual proof. attention_authority=shadow can direct scrutiny but cannot "
+    "change state or create an alert without snapshot evidence. PTZ/preset/unknown-view camera motion makes absence "
+    "unknown. capture_attention marks snapshots with above-baseline motion; prefer a sharper companion for detail. "
+    "Verify every cue in current images and leave unsupported cues visually unconfirmed.\n"
 )
 
 INCIDENT_FOCUS_PROMPT_PREFIX = (
@@ -5457,6 +5472,8 @@ class LuxriotManager:
         text = str(prompt_text or "").strip()
         if not text:
             return DEFAULT_ALERTS_JSON_PROMPT
+        if text == PREVIOUS_VERBOSE_BATCH_STATE_JSON_PROMPT.strip():
+            return DEFAULT_ALERTS_JSON_PROMPT
         lowered = text.lower()
         if "batch_state_json:" not in lowered:
             return DEFAULT_ALERTS_JSON_PROMPT
@@ -6099,7 +6116,7 @@ class LuxriotManager:
                     getattr(
                         config,
                         "LUXRIOT_L0_HEARTBEAT_OUTPUT_TOKENS",
-                        384,
+                        320,
                     )
                 ),
             ),
@@ -6112,7 +6129,7 @@ class LuxriotManager:
                     getattr(
                         config,
                         "LUXRIOT_L0_EVENT_OUTPUT_TOKENS",
-                        512,
+                        384,
                     )
                 ),
             ),
@@ -16629,6 +16646,7 @@ class LuxriotManager:
         loaded_default_capture_selector_bias: Optional[str] = None
         loaded_default_json_alert_prompt: Optional[str] = None
         loaded_prompt_default_fields: Set[str] = set()
+        prompt_settings_migrated = False
         if isinstance(prompt_settings_raw, Mapping):
             if "stream_system_prompt" in prompt_settings_raw:
                 loaded_stream_system_prompt = str(prompt_settings_raw.get("stream_system_prompt") or "")
@@ -16658,9 +16676,17 @@ class LuxriotManager:
                 if loaded_default_capture_selector_bias is not None:
                     loaded_prompt_default_fields.add("capture_selector_bias")
             if "json_alert_prompt" in prompt_settings_raw:
+                raw_default_json_prompt = str(
+                    prompt_settings_raw.get("json_alert_prompt") or ""
+                ).strip()
                 loaded_default_json_alert_prompt = self._normalize_json_alert_prompt(
                     prompt_settings_raw.get("json_alert_prompt")
                 )
+                if (
+                    raw_default_json_prompt
+                    and loaded_default_json_alert_prompt != raw_default_json_prompt
+                ):
+                    prompt_settings_migrated = True
                 loaded_prompt_default_fields.add("json_alert_prompt")
             rollup_prompts_raw = prompt_settings_raw.get("rollup_prompts")
             if isinstance(rollup_prompts_raw, Mapping):
@@ -16716,9 +16742,18 @@ class LuxriotManager:
                         if channel_selector_bias is not None:
                             parsed_channel_payload["capture_selector_bias"] = channel_selector_bias
                     if "json_alert_prompt" in channel_payload:
+                        raw_channel_json_prompt = str(
+                            channel_payload.get("json_alert_prompt") or ""
+                        ).strip()
                         parsed_channel_payload["json_alert_prompt"] = self._normalize_json_alert_prompt(
                             channel_payload.get("json_alert_prompt")
                         )
+                        if (
+                            raw_channel_json_prompt
+                            and parsed_channel_payload["json_alert_prompt"]
+                            != raw_channel_json_prompt
+                        ):
+                            prompt_settings_migrated = True
                     channel_rollup_prompts_raw = channel_payload.get("rollup_prompts")
                     if isinstance(channel_rollup_prompts_raw, Mapping):
                         parsed_rollup_prompts: Dict[str, str] = {}
@@ -16786,10 +16821,8 @@ class LuxriotManager:
         # prompt, create the dedicated authority immediately.  Future L0 saves
         # (including saves from an overlapping old worker) can then change the
         # summary document without touching operator policy.
-        if (
-            state_store is not None
-            and prompt_state_payload is None
-            and isinstance(prompt_settings_raw, Mapping)
+        if state_store is not None and isinstance(prompt_settings_raw, Mapping) and (
+            prompt_state_payload is None or prompt_settings_migrated
         ):
             with self.cache_lock:
                 self._persist_prompt_settings_state_locked(mirror_summary=False)
@@ -23704,6 +23737,7 @@ class LuxriotManager:
         )
         prompt_started = time.perf_counter()
         base_system_prompt = self.get_effective_stream_system_prompt(channel_id)
+        raw_operator_alert_policy = self.get_alert_policy_prompt(channel_id)
         prompt_vector_signal = self._vector_signal_prompt_view(
             vector_signal,
             cast(Sequence[Mapping[str, Any]], frame_items),
@@ -23731,6 +23765,11 @@ class LuxriotManager:
             "selected_frame_count": len(frame_items),
             "batch_size": int(batch_size),
             "system_prompt_chars": len(system_prompt),
+            "operator_alert_policy_chars": len(raw_operator_alert_policy),
+            "operator_alert_policy_fingerprint": self._text_hash(
+                raw_operator_alert_policy,
+                length=16,
+            ),
             "task_prompt_chars": len(str(prompt or "")),
             "vector_signal_chars": (
                 len(

@@ -187,7 +187,7 @@ thresholds, alert policy, live sampling, or the live routine context.
 | `EVOSSEARCH_INCIDENT_MAINTENANCE_INTERVAL_SEC` (`15`) | Bounded background reconciliation interval, clamped to 1–300 seconds |
 | `EVOSSEARCH_LUXRIOT_L0_CONTEXT_WINDOW_TOKENS` (`16384`) | Measurable L0 context envelope used by the prompt planner |
 | `EVOSSEARCH_LUXRIOT_L0_TEXT_BUDGET_TOKENS` / `_VISION_BUDGET_TOKENS` / `_OUTPUT_BUDGET_TOKENS` (`5000/5500/512`) | Separate L0 envelope ceilings. Alert criteria and `BATCH_STATE_JSON` are protected atomic blocks; incident context is semantically compacted first |
-| `EVOSSEARCH_LUXRIOT_L0_HEARTBEAT_OUTPUT_TOKENS` / `_EVENT_OUTPUT_TOKENS` (`384/512`) | Per-request generation caps below the L0 envelope ceiling. Routine batches stay short enough to preserve freshness; event/manual descriptions retain room for distinct alerts and episode state |
+| `EVOSSEARCH_LUXRIOT_L0_HEARTBEAT_OUTPUT_TOKENS` / `_EVENT_OUTPUT_TOKENS` (`320/384`) | Per-request generation caps below the L0 envelope ceiling. The compact state contract keeps routine batches fresh while event/manual descriptions retain room for distinct alerts and episode state |
 | `EVOSSEARCH_LUXRIOT_L0_INCIDENT_BUDGET_TOKENS` (`900`) | Sub-budget shared by at most four incident contexts in an L0 request; incidents 5–8 remain scheduler state only |
 | `EVOSSEARCH_LUXRIOT_L0_VISION_TOKENS_PER_IMAGE_ESTIMATE` (`300`) | Conservative accounting estimate per selected frame for telemetry and fail-before-send budget checks |
 | `EVOSSEARCH_LM_VLM_BALANCER_ENABLED` | Static channel→profile routing across multiple VLM hosts |
