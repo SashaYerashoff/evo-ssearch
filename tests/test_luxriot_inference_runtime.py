@@ -1567,8 +1567,8 @@ class LuxriotSummaryBackpressureTests(unittest.TestCase):
             event["lm_workload_class"] = "alert"
             event_entry = manager.run_summary_batch(event)
 
-        self.assertEqual(calls[0]["max_tokens_override"], 384)
-        self.assertEqual(calls[1]["max_tokens_override"], 512)
+        self.assertEqual(calls[0]["max_tokens_override"], 320)
+        self.assertEqual(calls[1]["max_tokens_override"], 384)
         self.assertEqual(
             heartbeat_entry["llm_input_stats"]["generation_output_mode"],
             "heartbeat",
@@ -3751,9 +3751,11 @@ class LuxriotCaptureDispatchTests(unittest.TestCase):
                 [call["timestamp_ms"] for call in probe_calls],
                 [source_anchor_ms + 333 + second * 1000 for second in range(15)],
             )
-            self.assertEqual(len(vlm_frames), 12)
+            self.assertEqual(len(vlm_frames), 4)
             self.assertTrue(all(frame["thumbnail"] in {"level-0", "level-240"} for frame in vlm_frames))
             self.assertEqual(len(archive_entries), 1)
+            self.assertEqual(archive_entries[0]["source_frame_count"], 12)
+            self.assertEqual(archive_entries[0]["selected_frame_count"], 4)
             self.assertTrue(
                 all(
                     frame["thumbnail"] in {"level-0", "level-240"}
@@ -3904,6 +3906,8 @@ class LuxriotCaptureDispatchTests(unittest.TestCase):
                     {
                         "workload": workload,
                         "thumbnails": [frame["thumbnail"] for frame in batch["frames"]],
+                        "source_frame_count": batch["source_frame_count"],
+                        "selected_frame_count": batch["selected_frame_count"],
                     }
                 )
                 or {"queued": False, "accepted": True}
@@ -3929,9 +3933,23 @@ class LuxriotCaptureDispatchTests(unittest.TestCase):
 
             session._summarize_if_ready()
 
-            self.assertEqual([len(item["thumbnails"]) for item in dispatched], [12, 12])
-            self.assertEqual(dispatched[0]["thumbnails"], [f"frame-{index}" for index in range(12)])
-            self.assertEqual(dispatched[1]["thumbnails"], [f"frame-{index}" for index in range(12, 24)])
+            self.assertEqual([len(item["thumbnails"]) for item in dispatched], [4, 4])
+            self.assertEqual(
+                dispatched[0]["thumbnails"],
+                ["frame-0", "frame-1", "frame-6", "frame-11"],
+            )
+            self.assertEqual(
+                dispatched[1]["thumbnails"],
+                ["frame-12", "frame-13", "frame-18", "frame-23"],
+            )
+            self.assertEqual(
+                [item["source_frame_count"] for item in dispatched],
+                [12, 12],
+            )
+            self.assertEqual(
+                [item["selected_frame_count"] for item in dispatched],
+                [4, 4],
+            )
             self.assertEqual([frame["thumbnail"] for frame in session.frames], ["frame-24"])
 
     def test_summary_deadline_dispatches_without_a_followup_capture_frame(self):
@@ -5188,17 +5206,21 @@ class LuxriotCaptureDispatchTests(unittest.TestCase):
 
             self.assertFalse(outcome["queued"])
             saved = archived[0]["archive_frames"]
-            self.assertEqual([frame["frame_index"] for frame in saved], [0, 1, 2, 3, 4])
+            self.assertEqual([frame["frame_index"] for frame in saved], [0, 1, 2, 3])
+            self.assertEqual(
+                [frame["source_frame_index"] for frame in saved],
+                [1, 2, 3, 5],
+            )
             self.assertEqual(
                 [frame["anchor_role"] for frame in saved],
-                ["first", "sample", "sample", "sample", "last"],
+                ["first", "sample", "sample", "last"],
             )
             self.assertEqual(
                 [frame["timestamp_ms"] for frame in saved],
-                [100000, 101000, 102000, 103000, 104000],
+                [100000, 101000, 102000, 104000],
             )
-            self.assertTrue(saved[2]["is_cover"])
-            self.assertEqual(saved[2]["cover_source"], "backend_fallback")
+            self.assertTrue(saved[1]["is_cover"])
+            self.assertEqual(saved[1]["cover_source"], "backend_fallback")
 
     def test_summary_alert_counts_roll_up_by_severity(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -8547,6 +8569,63 @@ class LuxriotCaptureDispatchTests(unittest.TestCase):
         )
         self.assertEqual(memory["routine_baseline"], "domestic activity")
         self.assertEqual(memory["ignore_as_routine"], ["cat sleeping on the shelf"])
+
+    def test_rollup_temporal_scope_is_guarded_and_sanitized(self):
+        short_node = {
+            "window_start": 1_000.0,
+            "window_end": 1_900.0,
+        }
+        short_summary = operator_rollup_response(
+            "The room was static for the first 23 minutes before a person entered."
+        )
+
+        short_issues = LuxriotManager._rollup_grounding_guard_issues(
+            short_summary,
+            short_node,
+        )
+        short_sanitized = LuxriotManager._sanitize_rollup_operator_overclaims(
+            short_summary,
+            short_node,
+        )
+
+        self.assertIn("temporal_duration_overrun", short_issues)
+        self.assertNotIn("first 23 minutes", short_sanitized)
+        self.assertIn("during the early part of the window", short_sanitized)
+        self.assertNotIn(
+            "temporal_duration_overrun",
+            LuxriotManager._rollup_grounding_guard_issues(
+                short_sanitized,
+                short_node,
+            ),
+        )
+
+        long_node = {
+            "window_start": 10_000.0,
+            "window_end": 38_800.0,
+        }
+        long_summary = operator_rollup_response(
+            "A person remained seated for the majority of the hour."
+        )
+        long_sanitized = LuxriotManager._sanitize_rollup_operator_overclaims(
+            long_summary,
+            long_node,
+        )
+
+        self.assertIn(
+            "temporal_window_unit_mismatch",
+            LuxriotManager._rollup_grounding_guard_issues(
+                long_summary,
+                long_node,
+            ),
+        )
+        self.assertIn("for most of the window", long_sanitized)
+        self.assertNotIn(
+            "temporal_window_unit_mismatch",
+            LuxriotManager._rollup_grounding_guard_issues(
+                long_sanitized,
+                long_node,
+            ),
+        )
 
     def test_rollup_contract_gets_one_corrective_retry(self):
         with tempfile.TemporaryDirectory() as temp:

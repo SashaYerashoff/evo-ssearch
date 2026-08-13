@@ -10005,6 +10005,7 @@ class LuxriotManager:
             "- The watched-state ledger counts sampled present/absent/unknown observations once per batch. "
             "Zero present observations means no confirmed occurrence in available samples, not proof that an entity never appeared.",
             "- Keep numeric facts aligned with metadata above (item_count/frame_count/window).",
+            "- Keep every duration and period noun aligned with the exact target window: never describe a 15-minute window as longer than 15 minutes, and never call an eight-hour window an hour.",
             "- Never compress alerts, deviations, coverage gaps, or operator-review incidents into routine.",
             "- Do not classify behavior as illegal/unlawful; describe observable security/safety facts.",
             "- Never infer intent, motive, identity, skill, or blame, and never ask the operator to confirm intent.",
@@ -19022,6 +19023,39 @@ class LuxriotManager:
                 for pattern in dismissal_patterns
             ):
                 issues.append("unreviewed_alert_dismissal")
+        window_start = (
+            cls._coerce_float(node.get("window_start"))
+            if isinstance(node, Mapping)
+            else None
+        )
+        window_end = (
+            cls._coerce_float(node.get("window_end"))
+            if isinstance(node, Mapping)
+            else None
+        )
+        if (
+            window_start is not None
+            and window_end is not None
+            and window_end > window_start
+        ):
+            duration_sec = float(window_end) - float(window_start)
+            duration_minutes = duration_sec / 60.0
+            normalized_text = " ".join(str(value or "").split())
+            for match in re.finditer(
+                r"\b(?:for\s+)?(?:the\s+)?(?:first|last)\s+(\d{1,4})\s+minutes?\b",
+                normalized_text,
+                flags=re.IGNORECASE,
+            ):
+                if int(match.group(1)) > int(math.ceil(duration_minutes)):
+                    issues.append("temporal_duration_overrun")
+                    break
+            if duration_sec >= 7200.0 and re.search(
+                r"\b(?:(?:the\s+)?(?:majority|remainder)\s+of\s+the\s+hour|"
+                r"throughout\s+the\s+hour|during\s+this\s+hour)\b",
+                normalized_text,
+                flags=re.IGNORECASE,
+            ):
+                issues.append("temporal_window_unit_mismatch")
         return list(dict.fromkeys(issues))
 
     @classmethod
@@ -19033,6 +19067,23 @@ class LuxriotManager:
         """Replace a narrow set of unsafe sampled-evidence overclaims."""
 
         node_issues = set(cls._rollup_grounding_guard_issues(value, node))
+        window_start = (
+            cls._coerce_float(node.get("window_start"))
+            if isinstance(node, Mapping)
+            else None
+        )
+        window_end = (
+            cls._coerce_float(node.get("window_end"))
+            if isinstance(node, Mapping)
+            else None
+        )
+        duration_minutes = (
+            (float(window_end) - float(window_start)) / 60.0
+            if window_start is not None
+            and window_end is not None
+            and window_end > window_start
+            else None
+        )
         output: List[str] = []
         for raw_line in str(value or "").splitlines():
             line = raw_line
@@ -19055,6 +19106,52 @@ class LuxriotManager:
                 )
                 output.append(line)
                 continue
+            if (
+                "temporal_duration_overrun" in node_issues
+                and duration_minutes is not None
+            ):
+                def replace_impossible_duration(match: re.Match[str]) -> str:
+                    phase = str(match.group(1) or "").lower()
+                    amount = int(match.group(2))
+                    if amount <= int(math.ceil(duration_minutes)):
+                        return match.group(0)
+                    return (
+                        "during the early part of the window"
+                        if phase == "first"
+                        else "during the late part of the window"
+                    )
+
+                line = re.sub(
+                    r"\b(?:for\s+)?(?:the\s+)?(first|last)\s+(\d{1,4})\s+minutes?\b",
+                    replace_impossible_duration,
+                    line,
+                    flags=re.IGNORECASE,
+                )
+            if "temporal_window_unit_mismatch" in node_issues:
+                line = re.sub(
+                    r"\b(?:for\s+)?(?:the\s+)?majority\s+of\s+the\s+hour\b",
+                    "for most of the window",
+                    line,
+                    flags=re.IGNORECASE,
+                )
+                line = re.sub(
+                    r"\b(?:the\s+)?remainder\s+of\s+the\s+hour\b",
+                    "the remainder of the window",
+                    line,
+                    flags=re.IGNORECASE,
+                )
+                line = re.sub(
+                    r"\bthroughout\s+the\s+hour\b",
+                    "throughout the window",
+                    line,
+                    flags=re.IGNORECASE,
+                )
+                line = re.sub(
+                    r"\bduring\s+this\s+hour\b",
+                    "during this window",
+                    line,
+                    flags=re.IGNORECASE,
+                )
             if "complete_coverage_claim" in issues:
                 line = (
                     prefix
