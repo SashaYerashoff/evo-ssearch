@@ -2228,3 +2228,74 @@ at SHA-256:
 Recoverable backend copies are beside the live files with suffix
 `pre-20260813-incident-top-level-181c4f8`. No new immutable upgrade archive or
 Desktop launcher pin was produced in this slice.
+
+## 2026-08-13 cross-window L3 incident composition
+
+Commit `19fcf5e` (`feat: compose grounded incidents across L2 windows`) adds the
+next conservative temporal-memory slice without changing the operator review
+admission invariant:
+
+- an L3 candidate must contain episodes sourced from at least two distinct L2
+  rollup windows;
+- L3 uses a parent-centred 15-minute proximity bound; L2 keeps its existing
+  5-minute bound;
+- only a top-level safety incident, or a saved high/critical operator criterion,
+  may ground the composition. Operator criteria remain entity-bound; safety may
+  cross entities;
+- an existing L2 child is reused by its server-owned episode ID even if a later
+  direct observation promoted it. Only genuinely new cross-window context gets
+  a deterministic L3 child;
+- the only automatic relation is candidate `concurrent_with`; L3 does not infer
+  causality and does not merge incidents;
+- the command boundary defensively rejects an L3 payload with fewer than two
+  source L2 windows, independently of the upstream candidate builder.
+
+The implementation also repairs a temporal-boundary defect found by replay:
+`ended_by_observed_gap` had been using the later possible boundary as if the
+event were observed until that time. Proximity now ends at `last_observed_ms`;
+the later `boundary_at_ms` remains only `possible_end_ms`. This prevents a short
+observed episode from being stretched into an artificial multi-hour incident.
+
+Read-only replay over the live channel-112 24-hour history initially exposed
+that false roughly 11-hour candidate. After the boundary fix, the same replay
+found exactly one natural eligible cross-window candidate: `cat enter` plus
+`cat motion`, spanning about 6.5 minutes across adjacent source windows
+`l2-ch112-w3600-1786554000` and `l2-ch112-w3600-1786557600`. Its live grounding
+parent is the saved high-severity operator incident
+`8c564fa2-92eb-4304-87b5-234addfd8725` (`Cat enters scene`). Replay performed no
+database writes.
+
+Verification after the final dispatch test:
+
+```text
+incident command/store/Luxriot runtime tests: 288 passed
+focused L3 selection/dispatch tests:          91 passed, 206 deselected
+source commit:                                19fcf5e
+```
+
+The two changed backend files were deployed with recoverable suffix
+`pre-20260813-l3-cross-window-19fcf5e`. One HUP was sent only to Gunicorn master
+`2014970`. Worker `913845` kept serving health/readiness while replacement
+`950798` completed the roughly four-minute CUDA/SigLIP cold start, then retired
+normally. Post-handover `/health=200` and `/ready=200`; PostgreSQL and Luxriot are
+reachable, channels 112 and 118 are running, the semantic archive/probe paths
+report no capture or probe errors, and the CUDA embedder canary remains healthy.
+
+The comparable live acceptance query for channel 112 over four hours remains
+exactly eight full incidents and seven review incidents. All seven review rows
+are grounded `operator_criterion` cases; context-only children remain absent.
+The grounded cat parent currently reports no nested L3 child because the natural
+background close/dispatch has not yet reached that historical window. No
+synthetic dispatch was forced and no test incident was inserted into the live
+operator queue.
+
+Deployment invariants remained unchanged:
+
+```text
+rehearsal .env SHA-256: 2c254527143f62bbdbcf7a14914872e2a6f1e0f4f776ef02024c0f27aac76325
+VLM llama.cpp PID:      1499650
+agent llama.cpp PID:    2916440
+```
+
+No new immutable upgrade archive or Desktop launcher pin was produced in this
+slice.
