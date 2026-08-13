@@ -2168,3 +2168,63 @@ exact manifest commit; `bash -n` and a final outer checksum check pass. The prio
 `b18876b` archive remains immutable as the previous recovery artifact. No
 destructive RECOVER or interactive upgrade rehearsal was run while producing
 this archive.
+
+## 2026-08-13 grounded incident hierarchy invariant
+
+Commit `181c4f8` (`fix: keep grounded incidents in top-level review`) repairs a
+live hierarchy defect found while resuming incident work. The read-only channel
+112 audit contained this chain:
+
+- top-level grounded `cat exit` operator incident;
+- `cat enter`, originally nested under it, later upgraded by direct saved-policy
+  L0 observations to `priority=operator_criterion` but still carrying the stale
+  `presentation.scope=nested` marker;
+- a new context-only `cat movement` child nested below that stale nested row.
+
+This made a configured alert disappear from the top-level review board and
+allowed a nested incident to become the parent of another automatic composition.
+The fixed invariant is:
+
+- active semantic-track selection prefers an existing top-level incident over a
+  recently updated nested context row;
+- L2 composition rejects every nested-marked candidate as an automatic parent;
+- a later server-classified `operator_alert`, `safety_alert`, or `safety_event`
+  promotes a matching nested row to `top_level`, retains its old parent link for
+  audit/navigation, and preserves the highest grounded severity;
+- PostgreSQL review filtering defensively includes older nested-marked rows that
+  already carry direct `operator_criterion` or `safety` priority. Context-only
+  children remain excluded before `COUNT/LIMIT/OFFSET`.
+
+No historical row was rewritten or bulk-reclassified. After the live rollout,
+the four-hour channel-112 query returned eight full records and seven review
+records: the stale direct `cat enter` alert is visible in review, while the new
+context-only `cat movement` child remains hidden and directly addressable. A
+future grounded observation will persist the repaired `top_level` presentation
+on the old row; visibility no longer depends on waiting for it.
+
+Verification and rollout controls:
+
+```text
+focused incident command/store tests:             50 passed
+expanded API/maintenance/temporal/admission tests: 84 passed
+source commit:                                     181c4f8
+live Gunicorn master / worker:                     2014970 / 913845
+VLM llama.cpp PID:                                 1499650
+agent llama.cpp PID:                               2916440
+```
+
+One readiness-gated HUP replaced worker `855105` with `913845`. The old worker
+served `/health=200` throughout the roughly 3 minute 46 second cold SigLIP load;
+after ownership transfer `/ready` returned from 503 to 200 in about four seconds.
+Both channels restored, PostgreSQL and Luxriot are reachable, the CUDA SigLIP2
+canary reports image/text cosine 1.0, and there are no capture/probe errors. The
+inference processes were not restarted. The rehearsal `.env` remains unchanged
+at SHA-256:
+
+```text
+2c254527143f62bbdbcf7a14914872e2a6f1e0f4f776ef02024c0f27aac76325
+```
+
+Recoverable backend copies are beside the live files with suffix
+`pre-20260813-incident-top-level-181c4f8`. No new immutable upgrade archive or
+Desktop launcher pin was produced in this slice.

@@ -72,9 +72,15 @@ first production slice of the third gate is also implemented at L2:
   PostgreSQL before review-board `COUNT/LIMIT/OFFSET`. They remain directly
   addressable by ID and navigable from the parent report, so nested context
   cannot flood or sparsify the top-level operator queue;
-- an explicit operator `confirm`, `reopen`, or `follow` action promotes the
-  child to `presentation.scope=top_level`. Model output and ordinary rollup
-  replay cannot promote it.
+- a nested row cannot itself become the automatic parent of another composition;
+  only a first-class top-level grounded incident may anchor nested context;
+- an explicit operator `confirm`, `reopen`, or `follow` action, or a later
+  server-admitted saved operator criterion / independent safety interrupt,
+  promotes the child to `presentation.scope=top_level`. Raw model output,
+  ordinary episode evidence and rollup replay cannot promote it. The review
+  query also includes older nested-marked rows which already carry direct
+  `operator_criterion` or `safety` provenance, so stale presentation metadata
+  cannot hide an alert while it waits for the next grounded observation.
 
 This is conservative durable enrichment, not complete scene understanding.
 Operator-reviewed causal relations, L3 cross-window composition, and a learned
