@@ -21442,6 +21442,39 @@ class LuxriotManager:
         store_key = str(normalized_payload.get("rollup_id") or "").strip()
         if not store_key:
             return
+        # The hot cache can race with a scheduler/query rebuild, especially
+        # during post-restart overlap processing. Consult the durable row
+        # directly before replacing it so a transient one-batch hot entry can
+        # never authorize contraction of a complete closed-window receipt.
+        state_store = getattr(self, "runtime_state_store", None)
+        durable_loader = getattr(state_store, "load_rollup", None)
+        durable_existing: Optional[Dict[str, Any]] = None
+        if callable(durable_loader):
+            try:
+                raw_existing = durable_loader(store_key)
+                if isinstance(raw_existing, Mapping):
+                    durable_existing = self._normalize_cached_rollup_entry(
+                        raw_existing
+                    )
+            except Exception as exc:
+                with self.cache_lock:
+                    self._rollup_scheduler_status["durable_store_last_error"] = (
+                        _safe_error_text(exc, 240) or exc.__class__.__name__
+                    )
+        if (
+            durable_existing is not None
+            and self._rollup_semantic_ready(durable_existing)
+            and self._rollup_source_regressed(
+                durable_existing,
+                normalized_payload,
+            )
+        ):
+            with self.cache_lock:
+                self.rollup_summary_cache[store_key] = durable_existing
+            self._increment_rollup_status_counter(
+                "source_regressions_preserved"
+            )
+            return
         durable_saved = self._save_durable_rollup(normalized_payload)
         with self.cache_lock:
             self.rollup_summary_cache[store_key] = normalized_payload
@@ -21587,13 +21620,22 @@ class LuxriotManager:
             if row_id:
                 current = merged_by_id.get(row_id)
                 if current:
+                    current_semantic_valid = self._rollup_semantic_ready(current)
+                    if (
+                        current_semantic_valid
+                        and self._rollup_source_regressed(current, row_dict)
+                    ):
+                        preserved = dict(current)
+                        preserved["rollup_id"] = row_id
+                        preserved["source_regression_deferred"] = True
+                        merged_by_id[row_id] = preserved
+                        continue
                     merged = dict(current)
                     merged.update(row_dict)
                     generated_kind = str(row_dict.get("summary_kind") or "").strip().lower()
                     current_kind = str(current.get("summary_kind") or "").strip().lower()
                     generated_signature = str(row_dict.get("source_signature") or "").strip()
                     current_signature = str(current.get("source_signature") or "").strip()
-                    current_semantic_valid = self._rollup_semantic_ready(current)
                     if (
                         current_semantic_valid
                         and generated_kind not in {"llm", "llm_cached"}
