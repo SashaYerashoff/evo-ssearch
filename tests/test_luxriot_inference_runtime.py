@@ -531,6 +531,104 @@ class LuxriotCaptureApexDeciderTests(unittest.TestCase):
                 time.sleep(0.01)
             self.assertEqual(manager.summary_state_revision, 1)
 
+    def test_new_prompt_revision_cannot_be_overwritten_by_older_async_history(self):
+        class ReorderingStore(MemoryRuntimeStateStore):
+            backend = "postgres"
+
+            def __init__(self):
+                super().__init__()
+                self.first_started = threading.Event()
+                self.release_first = threading.Event()
+                self.calls = 0
+
+            def save_state(self, key, payload):
+                self.calls += 1
+                if self.calls == 1:
+                    self.first_started.set()
+                    self.assert_released = self.release_first.wait(timeout=2.0)
+                super().save_state(key, payload)
+
+        with tempfile.TemporaryDirectory() as temp:
+            store = ReorderingStore()
+            manager = build_manager(Path(temp), runtime_state_store=store)
+            manager.record_summary_log(
+                7,
+                {
+                    "channel_id": 7,
+                    "run_id": "run-7",
+                    "batch_id": "batch-old",
+                    "summary": "Routine room.",
+                    "frame_count": 1,
+                    "created_at": 1_781_700_000.0,
+                },
+            )
+            self.assertTrue(store.first_started.wait(timeout=1.0))
+
+            completed = threading.Event()
+
+            def save_prompt():
+                manager.update_prompt_settings(
+                    channel_id=7,
+                    alert_policy_prompt="Alert when a person falls.",
+                )
+                completed.set()
+
+            writer = threading.Thread(target=save_prompt)
+            writer.start()
+            time.sleep(0.05)
+            self.assertFalse(completed.is_set())
+            store.release_first.set()
+            writer.join(timeout=2.0)
+            self.assertTrue(completed.is_set())
+            self.assertTrue(getattr(store, "assert_released", False))
+            persisted = store.load_state("luxriot_summary_state")
+            self.assertEqual(
+                persisted["prompt_settings"]["channel_overrides"]["7"][
+                    "alert_policy_prompt"
+                ],
+                "Alert when a person falls.",
+            )
+
+    def test_l0_frame_budget_keeps_endpoints_apex_and_temporal_coverage(self):
+        frames = [
+            {
+                "timestamp_ms": 100_000 + index * 1_000,
+                "selection_score": 9.0 if index == 5 else 0.1,
+            }
+            for index in range(8)
+        ]
+        selection = {
+            "version": 1,
+            "policy": "per_second_attention_apex_v1",
+            "source_frame_count": 8,
+            "selected_frame_count": 8,
+            "groups": [
+                {
+                    "selected_timestamp_ms": frame["timestamp_ms"],
+                    "selected_source_frame_index": index + 1,
+                    "selection_source": "capture_cv_apex",
+                    "apex_available": True,
+                    "source_frame_indices": [index + 1],
+                }
+                for index, frame in enumerate(frames)
+            ],
+        }
+
+        limited, metadata = LuxriotManager._limit_attention_frames(
+            frames,
+            selection,
+            4,
+        )
+
+        timestamps = [frame["timestamp_ms"] for frame in limited]
+        self.assertEqual(len(limited), 4)
+        self.assertEqual(timestamps[0], 100_000)
+        self.assertEqual(timestamps[-1], 107_000)
+        self.assertIn(105_000, timestamps)
+        self.assertEqual(metadata["pre_budget_selected_frame_count"], 8)
+        self.assertEqual(metadata["selected_frame_count"], 4)
+        self.assertEqual(metadata["omitted_selected_frames"], 4)
+
     def test_postgres_history_persistence_writes_only_new_l0_items(self):
         class CapturingPostgresRuntimeStateStore(MemoryRuntimeStateStore):
             backend = "postgres"
@@ -2360,6 +2458,30 @@ class LuxriotCaptureDispatchTests(unittest.TestCase):
                 "channel_override",
             )
             self.assertIn("alert_policy_prompt", restored_settings["override_fields"])
+
+    def test_full_form_echo_does_not_pin_inherited_channel_settings(self):
+        with tempfile.TemporaryDirectory() as temp:
+            state_store = MemoryRuntimeStateStore()
+            manager = build_manager(Path(temp), runtime_state_store=state_store)
+            inherited = manager.get_prompt_settings(channel_id=7)
+
+            saved = manager.update_prompt_settings(
+                channel_id=7,
+                stream_system_prompt=inherited["stream_system_prompt"],
+                alert_policy_prompt="Alert when a person falls.",
+                rollup_prompts=inherited["rollup_prompts"],
+                json_alert_prompt=inherited["json_alert_prompt"],
+                bookmark_enabled=inherited["bookmark_enabled"],
+                bookmark_cooldown_sec=inherited["bookmark_cooldown_sec"],
+                capture_selector_enabled=inherited["capture_selector_enabled"],
+                capture_selector_bias=inherited["capture_selector_bias"],
+            )
+
+            self.assertEqual(saved["override_fields"], ["alert_policy_prompt"])
+            self.assertEqual(
+                manager.channel_prompt_overrides[7],
+                {"alert_policy_prompt": "Alert when a person falls."},
+            )
 
     def test_prompt_update_rejects_setting_and_clearing_the_same_override(self):
         with tempfile.TemporaryDirectory() as temp:

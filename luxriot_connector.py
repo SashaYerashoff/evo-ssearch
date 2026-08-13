@@ -5859,6 +5859,10 @@ class LuxriotManager:
         self._summary_persist_condition = threading.Condition()
         self._summary_persist_pending: Optional[Dict[str, Any]] = None
         self._summary_persist_thread: Optional[threading.Thread] = None
+        # Prompt settings and asynchronous L0 history share one versioned
+        # runtime-state document. Serialize its final write boundary so a
+        # stale history snapshot cannot land after a newer operator save.
+        self._summary_state_write_lock = threading.Lock()
         self.summary_state_backend = "runtime_state" if runtime_state_store is not None else "file"
         self._persisted_prompt_default_fields: Set[str] = set()
         try:
@@ -6103,6 +6107,22 @@ class LuxriotManager:
                 ),
             ),
         )
+        try:
+            self.l0_max_selected_frames = max(
+                2,
+                min(
+                    16,
+                    int(
+                        getattr(
+                            config,
+                            "LUXRIOT_L0_MAX_SELECTED_FRAMES",
+                            4,
+                        )
+                    ),
+                ),
+            )
+        except (TypeError, ValueError):
+            self.l0_max_selected_frames = 4
         self.incident_prompt_planner = IncidentPromptEnvelopePlanner(
             self.incident_attention_policy,
             token_estimator=estimate_text_tokens,
@@ -13142,7 +13162,10 @@ class LuxriotManager:
         }
         for key in (
             "source_frame_count",
+            "pre_budget_selected_frame_count",
             "selected_frame_count",
+            "frame_budget",
+            "omitted_selected_frames",
             "apex_selected_count",
             "fallback_count",
             "single_frame_count",
@@ -13151,6 +13174,11 @@ class LuxriotManager:
             parsed = _parse_optional_int(value.get(key))
             if parsed is not None:
                 out[key] = max(0, int(parsed))
+        frame_budget_policy = str(
+            value.get("frame_budget_policy") or ""
+        ).strip()[:120]
+        if frame_budget_policy:
+            out["frame_budget_policy"] = frame_budget_policy
         selection_sources = cls._compact_count_breakdown(value.get("selection_sources"))
         if selection_sources:
             out["selection_sources"] = selection_sources
@@ -13475,6 +13503,118 @@ class LuxriotManager:
             }
         )
         return [frame for _index, frame in selected_rows], selection
+
+    @classmethod
+    def _limit_attention_frames(
+        cls,
+        frames: Sequence[Mapping[str, Any]],
+        selection: Mapping[str, Any],
+        max_frames: int,
+    ) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
+        """Bound image encodes while preserving temporal and attention evidence.
+
+        Per-second apex selection intentionally runs first so the source window
+        and its provenance remain intact. This second stage keeps the first and
+        last observations, the strongest activity/attention apex, then fills
+        the widest remaining temporal gaps. It therefore reduces VLM vision
+        work without merely taking the first N frames or hiding coalescing.
+        """
+
+        source = [dict(frame) for frame in frames if isinstance(frame, Mapping)]
+        budget = max(2, int(max_frames))
+        if len(source) <= budget:
+            return source, dict(selection)
+
+        def frame_strength(index: int) -> Tuple[int, float]:
+            frame = source[index]
+            capture = frame.get("capture_selection")
+            capture_map = capture if isinstance(capture, Mapping) else {}
+            mode = str(capture_map.get("selection_mode") or "").strip().lower()
+            score = cls._finite_float(frame.get("selection_score"))
+            if score is None:
+                score = cls._finite_float(capture_map.get("activity_x"))
+            return (1 if mode == "burst" else 0, float(score or 0.0))
+
+        timestamps = [
+            int(cls._batch_frame_timestamp_ms(frame) or index * 1000)
+            for index, frame in enumerate(source)
+        ]
+        chosen: Set[int] = {0, len(source) - 1}
+        remaining = set(range(1, len(source) - 1))
+        if remaining and len(chosen) < budget:
+            strongest = max(
+                remaining,
+                key=lambda index: (frame_strength(index), -index),
+            )
+            chosen.add(strongest)
+            remaining.discard(strongest)
+        while remaining and len(chosen) < budget:
+            next_index = max(
+                remaining,
+                key=lambda index: (
+                    min(
+                        abs(timestamps[index] - timestamps[selected])
+                        for selected in chosen
+                    ),
+                    frame_strength(index),
+                    -index,
+                ),
+            )
+            chosen.add(next_index)
+            remaining.discard(next_index)
+
+        chosen_indices = sorted(chosen)
+        limited = [source[index] for index in chosen_indices]
+        chosen_timestamps = {
+            int(timestamp)
+            for timestamp in (
+                cls._batch_frame_timestamp_ms(frame) for frame in limited
+            )
+            if timestamp is not None
+        }
+        compact = dict(selection)
+        raw_groups = compact.get("groups")
+        groups: List[Dict[str, Any]] = []
+        if isinstance(raw_groups, Sequence) and not isinstance(
+            raw_groups,
+            (str, bytes, bytearray),
+        ):
+            for raw_group in raw_groups:
+                if not isinstance(raw_group, Mapping):
+                    continue
+                selected_timestamp = _parse_optional_int(
+                    raw_group.get("selected_timestamp_ms")
+                )
+                if selected_timestamp is not None and selected_timestamp in chosen_timestamps:
+                    groups.append(dict(raw_group))
+        compact.update(
+            {
+                "pre_budget_selected_frame_count": len(source),
+                "selected_frame_count": len(limited),
+                "frame_budget": budget,
+                "frame_budget_policy": "endpoints_attention_apex_temporal_diversity_v1",
+                "omitted_selected_frames": len(source) - len(limited),
+            }
+        )
+        if groups:
+            compact["groups"] = groups
+            sources: Dict[str, int] = {}
+            for group in groups:
+                source_name = str(group.get("selection_source") or "unknown")
+                sources[source_name] = sources.get(source_name, 0) + 1
+            compact["selection_sources"] = sources
+            compact["apex_selected_count"] = sum(
+                1 for group in groups if bool(group.get("apex_available"))
+            )
+            compact["fallback_count"] = sum(
+                1 for group in groups if bool(group.get("fallback_reason"))
+            )
+            compact["single_frame_count"] = sum(
+                1
+                for group in groups
+                if len(group.get("source_frame_indices") or []) == 1
+            )
+        return limited, cls._compact_frame_selection(compact)
 
     @classmethod
     def _compact_vector_signal(cls, value: object) -> Dict[str, Any]:
@@ -14176,7 +14316,11 @@ class LuxriotManager:
                     "policy",
                     "time_bucket_ms",
                     "source_frame_count",
+                    "pre_budget_selected_frame_count",
                     "selected_frame_count",
+                    "frame_budget",
+                    "frame_budget_policy",
+                    "omitted_selected_frames",
                     "apex_selected_count",
                     "fallback_count",
                     "single_frame_count",
@@ -16083,21 +16227,27 @@ class LuxriotManager:
         return payload
 
     def _write_summary_state_payload(self, payload: Mapping[str, Any]) -> Optional[str]:
-        state_store = getattr(self, "runtime_state_store", None)
-        if state_store is not None:
-            try:
-                state_store.save_state("luxriot_summary_state", payload)
-            except Exception as exc:
-                return _safe_error_text(exc, 500) or exc.__class__.__name__
-        else:
-            path = self.summary_state_file
-            try:
-                path.parent.mkdir(parents=True, exist_ok=True)
-                tmp_file = path.with_suffix(f"{path.suffix}.tmp")
-                tmp_file.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-                tmp_file.replace(path)
-            except Exception as exc:
-                return _safe_error_text(exc, 500) or exc.__class__.__name__
+        with self._summary_state_write_lock:
+            revision = int(_parse_optional_int(payload.get("revision")) or 0)
+            # Read this atomic integer inside the write lock and deliberately
+            # avoid cache_lock: synchronous prompt saves already own it.
+            if revision and revision < int(self._summary_state_revision_issued):
+                return None
+            state_store = getattr(self, "runtime_state_store", None)
+            if state_store is not None:
+                try:
+                    state_store.save_state("luxriot_summary_state", payload)
+                except Exception as exc:
+                    return _safe_error_text(exc, 500) or exc.__class__.__name__
+            else:
+                path = self.summary_state_file
+                try:
+                    path.parent.mkdir(parents=True, exist_ok=True)
+                    tmp_file = path.with_suffix(f"{path.suffix}.tmp")
+                    tmp_file.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+                    tmp_file.replace(path)
+                except Exception as exc:
+                    return _safe_error_text(exc, 500) or exc.__class__.__name__
         return None
 
     def _mark_summary_state_write_result_locked(
@@ -19972,6 +20122,25 @@ class LuxriotManager:
             else:
                 current_overrides_raw = self.channel_prompt_overrides.get(target_channel_id)
                 channel_overrides = dict(current_overrides_raw) if isinstance(current_overrides_raw, Mapping) else {}
+
+                def set_channel_override(
+                    field: str,
+                    value: Any,
+                    inherited: Any,
+                ) -> None:
+                    nonlocal changed
+                    # Full-form clients may echo every effective value while
+                    # editing one field. Do not turn an inherited value into a
+                    # pinned channel override merely because it was echoed.
+                    if field not in channel_overrides and value == inherited:
+                        return
+                    if (
+                        field not in channel_overrides
+                        or value != channel_overrides.get(field)
+                    ):
+                        channel_overrides[field] = value
+                        changed = True
+
                 for field in sorted(clear_fields):
                     if field.startswith("rollup_prompts."):
                         level = field.rsplit(".", 1)[-1]
@@ -19993,59 +20162,52 @@ class LuxriotManager:
                         changed = True
                 if stream_system_prompt is not None:
                     next_stream_prompt = str(stream_system_prompt)
-                    if (
-                        "stream_system_prompt" not in channel_overrides
-                        or next_stream_prompt != str(channel_overrides.get("stream_system_prompt") or "")
-                    ):
-                        channel_overrides["stream_system_prompt"] = next_stream_prompt
-                        changed = True
+                    set_channel_override(
+                        "stream_system_prompt",
+                        next_stream_prompt,
+                        str(self.system_prompt or ""),
+                    )
                 if alert_policy_prompt is not None:
                     next_alert_policy_prompt = str(alert_policy_prompt)
-                    if (
-                        "alert_policy_prompt" not in channel_overrides
-                        or next_alert_policy_prompt != str(channel_overrides.get("alert_policy_prompt") or "")
-                    ):
-                        channel_overrides["alert_policy_prompt"] = next_alert_policy_prompt
-                        changed = True
+                    set_channel_override(
+                        "alert_policy_prompt",
+                        next_alert_policy_prompt,
+                        str(self.alert_policy_prompt or ""),
+                    )
                 if json_alert_prompt is not None:
                     next_json_prompt = self._normalize_json_alert_prompt(json_alert_prompt)
-                    if (
-                        "json_alert_prompt" not in channel_overrides
-                        or next_json_prompt != str(channel_overrides.get("json_alert_prompt") or "")
-                    ):
-                        channel_overrides["json_alert_prompt"] = next_json_prompt
-                        changed = True
+                    set_channel_override(
+                        "json_alert_prompt",
+                        next_json_prompt,
+                        str(self.default_json_alert_prompt),
+                    )
                 if bookmark_enabled is not None:
                     next_enabled = bool(bookmark_enabled)
-                    if (
-                        "bookmark_enabled" not in channel_overrides
-                        or next_enabled != bool(channel_overrides.get("bookmark_enabled"))
-                    ):
-                        channel_overrides["bookmark_enabled"] = next_enabled
-                        changed = True
+                    set_channel_override(
+                        "bookmark_enabled",
+                        next_enabled,
+                        bool(self.default_bookmark_enabled),
+                    )
                 if bookmark_cooldown_sec is not None:
                     next_cooldown = max(0.0, float(bookmark_cooldown_sec))
-                    if (
-                        "bookmark_cooldown_sec" not in channel_overrides
-                        or next_cooldown != float(channel_overrides.get("bookmark_cooldown_sec") or 0.0)
-                    ):
-                        channel_overrides["bookmark_cooldown_sec"] = next_cooldown
-                        changed = True
+                    set_channel_override(
+                        "bookmark_cooldown_sec",
+                        next_cooldown,
+                        float(self.default_bookmark_cooldown_sec),
+                    )
                 if capture_selector_enabled is not None:
                     next_selector_enabled = bool(capture_selector_enabled)
-                    if (
-                        "capture_selector_enabled" not in channel_overrides
-                        or next_selector_enabled != bool(channel_overrides.get("capture_selector_enabled"))
-                    ):
-                        channel_overrides["capture_selector_enabled"] = next_selector_enabled
-                        changed = True
+                    set_channel_override(
+                        "capture_selector_enabled",
+                        next_selector_enabled,
+                        bool(self.default_capture_selector_enabled),
+                    )
                 if normalized_selector_bias is not None:
-                    if (
-                        "capture_selector_bias" not in channel_overrides
-                        or normalized_selector_bias != str(channel_overrides.get("capture_selector_bias") or "")
-                    ):
-                        channel_overrides["capture_selector_bias"] = normalized_selector_bias
-                        changed = True
+                    set_channel_override(
+                        "capture_selector_bias",
+                        normalized_selector_bias,
+                        str(self.default_capture_selector_bias or "auto"),
+                    )
             if isinstance(rollup_prompts, Mapping):
                 for raw_level, raw_prompt in rollup_prompts.items():
                     level = self._normalize_rollup_level(raw_level)
@@ -20059,6 +20221,11 @@ class LuxriotManager:
                     else:
                         existing_rollups_raw = channel_overrides.get("rollup_prompts")
                         channel_rollups = dict(existing_rollups_raw) if isinstance(existing_rollups_raw, Mapping) else {}
+                        inherited_prompt = str(
+                            self.rollup_llm_system_prompts.get(level) or ""
+                        )
+                        if level not in channel_rollups and next_prompt == inherited_prompt:
+                            continue
                         if level not in channel_rollups or next_prompt != str(channel_rollups.get(level) or ""):
                             channel_rollups[level] = next_prompt
                             channel_overrides["rollup_prompts"] = channel_rollups
@@ -23380,6 +23547,11 @@ class LuxriotManager:
         frame_items, frame_selection = self._select_attention_frames(
             cast(Sequence[Mapping[str, Any]], source_frame_items),
             raw_vector_signal,
+        )
+        frame_items, frame_selection = self._limit_attention_frames(
+            cast(Sequence[Mapping[str, Any]], frame_items),
+            frame_selection,
+            self.l0_max_selected_frames,
         )
         frame_selection_ms = max(
             0.0,

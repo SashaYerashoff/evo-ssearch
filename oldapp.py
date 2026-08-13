@@ -10766,6 +10766,13 @@ class _FastVlmAlertRuntime:
 
     def __init__(self) -> None:
         self.enabled = bool(getattr(config, "VLM_FAST_ALERT_ENABLED", True))
+        self.require_operator_policy = bool(
+            getattr(
+                config,
+                "VLM_FAST_ALERT_REQUIRE_OPERATOR_POLICY",
+                True,
+            )
+        )
         self.post_roll_ms = int(
             max(0.0, float(getattr(config, "VLM_FAST_ALERT_POST_ROLL_SEC", 1.0) or 1.0))
             * 1000.0
@@ -10810,6 +10817,7 @@ class _FastVlmAlertRuntime:
             "alert_batches_total": 0,
             "bookmarks_sent_total": 0,
             "rejected_total": 0,
+            "suppressed_without_operator_policy_total": 0,
             "pending_channels": 0,
             "last_latency_ms": None,
             "last_trigger_to_inference_ms": None,
@@ -10834,6 +10842,16 @@ class _FastVlmAlertRuntime:
     def observe(self, channel_id: int, observation: Mapping[str, Any]) -> None:
         if not self.enabled:
             return
+        if self.require_operator_policy:
+            policy = luxriot_manager.get_alert_policy_prompt(int(channel_id))
+            if not str(policy or "").strip():
+                with self._lock:
+                    self._pending.pop(int(channel_id), None)
+                    self._status["pending_channels"] = len(self._pending)
+                    self._status[
+                        "suppressed_without_operator_policy_total"
+                    ] += 1
+                return
         timestamp_ms = _to_optional_int(observation.get("timestamp_ms"))
         if timestamp_ms is None:
             return
@@ -11431,6 +11449,7 @@ class _FastVlmAlertRuntime:
         with self._lock:
             return {
                 **self._status,
+                "require_operator_policy": self.require_operator_policy,
                 "trigger_counts": dict(self._trigger_counts),
                 "last_semantic_delta_by_channel": {
                     str(channel_id): value
@@ -17491,6 +17510,22 @@ def luxriot_prompt_settings():
             details={
                 "stream_system_prompt_updated": stream_system_prompt is not None,
                 "alert_policy_prompt_updated": alert_policy_prompt is not None,
+                "alert_policy_prompt_chars": (
+                    len(str(alert_policy_prompt))
+                    if alert_policy_prompt is not None
+                    else None
+                ),
+                "alert_policy_prompt_fingerprint": (
+                    _audit_fingerprint(alert_policy_prompt)
+                    if alert_policy_prompt is not None
+                    else None
+                ),
+                "resulting_alert_policy_prompt_chars": len(
+                    str(settings.get("alert_policy_prompt") or "")
+                ),
+                "resulting_alert_policy_prompt_fingerprint": _audit_fingerprint(
+                    settings.get("alert_policy_prompt")
+                ),
                 "rollup_prompts_updated": bool(rollup_prompt_updates),
                 "json_alert_prompt_updated": json_alert_prompt is not None,
                 "bookmark_enabled_updated": bookmark_enabled is not None,
@@ -17501,6 +17536,18 @@ def luxriot_prompt_settings():
                 "rollup_levels": sorted(rollup_prompt_updates.keys())
                 if isinstance(rollup_prompt_updates, Mapping)
                 else [],
+                "resulting_override_fields": sorted(
+                    str(field)
+                    for field in (settings.get("override_fields") or [])
+                ),
+                "persistence_revision": int(
+                    _to_optional_int(
+                        (settings.get("persistence") or {}).get("revision")
+                        if isinstance(settings.get("persistence"), Mapping)
+                        else None
+                    )
+                    or 0
+                ),
             },
         )
         if audit_error is not None:

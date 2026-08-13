@@ -631,6 +631,18 @@ class Config:
         min(16, LUXRIOT_SUMMARY_MAX_BATCH_FRAMES),
     )
     try:
+        LUXRIOT_L0_MAX_SELECTED_FRAMES = int(
+            os.getenv('EVOSSEARCH_LUXRIOT_L0_MAX_SELECTED_FRAMES', '4')
+        )
+    except (TypeError, ValueError):
+        LUXRIOT_L0_MAX_SELECTED_FRAMES = 4
+    # Keep the wider capture window as provenance while bounding the number of
+    # image encodes in one realtime VLM request.
+    LUXRIOT_L0_MAX_SELECTED_FRAMES = max(
+        2,
+        min(16, LUXRIOT_L0_MAX_SELECTED_FRAMES),
+    )
+    try:
         LUXRIOT_SUMMARY_MAX_WINDOW_SEC = float(
             os.getenv('EVOSSEARCH_LUXRIOT_SUMMARY_MAX_WINDOW_SEC', '60')
         )
@@ -1942,6 +1954,10 @@ class Config:
         'EVOSSEARCH_VLM_FAST_ALERT_ENABLED',
         'True',
     )
+    VLM_FAST_ALERT_REQUIRE_OPERATOR_POLICY = _get_bool_env(
+        'EVOSSEARCH_VLM_FAST_ALERT_REQUIRE_OPERATOR_POLICY',
+        'True',
+    )
     try:
         VLM_FAST_ALERT_POST_ROLL_SEC = float(
             os.getenv('EVOSSEARCH_VLM_FAST_ALERT_POST_ROLL_SEC', '2.5')
@@ -1958,10 +1974,10 @@ class Config:
     VLM_FAST_ALERT_COOLDOWN_SEC = min(120.0, max(1.0, VLM_FAST_ALERT_COOLDOWN_SEC))
     try:
         VLM_FAST_ALERT_MAX_FRAMES = int(
-            os.getenv('EVOSSEARCH_VLM_FAST_ALERT_MAX_FRAMES', '6')
+            os.getenv('EVOSSEARCH_VLM_FAST_ALERT_MAX_FRAMES', '4')
         )
     except (TypeError, ValueError):
-        VLM_FAST_ALERT_MAX_FRAMES = 6
+        VLM_FAST_ALERT_MAX_FRAMES = 4
     VLM_FAST_ALERT_MAX_FRAMES = min(8, max(4, VLM_FAST_ALERT_MAX_FRAMES))
     try:
         VLM_FAST_ALERT_MAX_TOKENS = int(

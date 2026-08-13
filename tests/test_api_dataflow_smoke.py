@@ -1055,6 +1055,7 @@ class ApiDataflowSmokeTests(unittest.TestCase):
 
     def test_fast_vlm_alert_waits_for_post_roll_after_burst(self) -> None:
         runtime = oldapp._FastVlmAlertRuntime()
+        runtime.require_operator_policy = False
         try:
             trigger_ms = 100_000
             with patch.object(runtime, "_submit") as submit:
@@ -1269,6 +1270,7 @@ class ApiDataflowSmokeTests(unittest.TestCase):
 
     def test_fast_vlm_alert_routes_large_semantic_change_with_cv_motion(self) -> None:
         runtime = oldapp._FastVlmAlertRuntime()
+        runtime.require_operator_policy = False
         try:
             runtime.semantic_delta_threshold = 0.2
             runtime.min_moving_fraction = 0.15
@@ -1305,6 +1307,35 @@ class ApiDataflowSmokeTests(unittest.TestCase):
                 _channel, episode = submit.call_args.args
                 self.assertEqual(episode["reason"], "semantic_motion_change")
                 self.assertGreaterEqual(episode["semantic_delta"], 0.2)
+        finally:
+            runtime.shutdown()
+
+    def test_fast_vlm_alert_skips_channels_without_operator_policy(self) -> None:
+        runtime = oldapp._FastVlmAlertRuntime()
+        runtime.require_operator_policy = True
+        try:
+            with (
+                patch.object(
+                    oldapp.luxriot_manager,
+                    "get_alert_policy_prompt",
+                    return_value="",
+                ),
+                patch.object(runtime, "_submit") as submit,
+            ):
+                runtime.observe(
+                    118,
+                    {
+                        "timestamp_ms": 100_000,
+                        "capture_selection": {"selection_mode": "burst"},
+                    },
+                )
+            submit.assert_not_called()
+            status = runtime.status()
+            self.assertEqual(
+                status["suppressed_without_operator_policy_total"],
+                1,
+            )
+            self.assertTrue(status["require_operator_policy"])
         finally:
             runtime.shutdown()
 
