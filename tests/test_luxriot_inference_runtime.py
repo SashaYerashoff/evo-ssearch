@@ -9092,7 +9092,7 @@ class LuxriotCaptureDispatchTests(unittest.TestCase):
 
         self.assertIn("unreviewed_alert_dismissal", issues)
         self.assertNotIn("unreviewed_alert_dismissal", LuxriotManager._rollup_grounding_guard_issues(sanitized, node))
-        self.assertIn("remain unreviewed and unclassified", sanitized)
+        self.assertIn("3 alert signal emissions remain unreviewed", sanitized)
 
         memory = LuxriotManager._sanitize_rollup_memory_update(
             {
@@ -9106,6 +9106,35 @@ class LuxriotCaptureDispatchTests(unittest.TestCase):
         )
         self.assertEqual(memory["routine_baseline"], "domestic activity")
         self.assertEqual(memory["ignore_as_routine"], ["cat sleeping on the shelf"])
+
+    def test_unreviewed_alerts_cannot_be_closed_by_operator_takeaway(self):
+        summary = operator_rollup_response(
+            "A person and cat were visible in sampled frames.",
+            alerts=(
+                "No operator feedback was supplied for these alerts; they remain "
+                "unreviewed and unclassified."
+            ),
+            takeaway=(
+                "The activity appears routine with no unresolved safety or security "
+                "incidents. No immediate follow-up is required."
+            ),
+        )
+        node = {"alert_total": 5, "operator_feedback": {}}
+
+        issues = LuxriotManager._rollup_grounding_guard_issues(summary, node)
+        sanitized = LuxriotManager._sanitize_rollup_operator_overclaims(
+            summary,
+            node,
+        )
+
+        self.assertIn("unreviewed_alert_dismissal", issues)
+        self.assertNotIn("no unresolved safety", sanitized.lower())
+        self.assertNotIn("no immediate follow-up", sanitized.lower())
+        self.assertIn("5 alert signal emissions remain unreviewed", sanitized)
+        self.assertNotIn(
+            "unreviewed_alert_dismissal",
+            LuxriotManager._rollup_grounding_guard_issues(sanitized, node),
+        )
 
     def test_repeated_alert_total_is_presented_as_sampled_emissions(self):
         summary = operator_rollup_response(
@@ -9591,6 +9620,7 @@ class LuxriotCaptureDispatchTests(unittest.TestCase):
         self.assertIn("at most 7 items", l3)
         self.assertIn("sampled alert-signal emissions", l1)
         self.assertIn("not distinct incidents", l3)
+        self.assertIn("need no follow-up/action", l3)
 
     def test_rollup_semantic_guard_sanitizes_supported_rewrites_without_retry(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -9657,6 +9687,64 @@ class LuxriotCaptureDispatchTests(unittest.TestCase):
             self.assertNotIn("No blind spots", cached["summary"])
             self.assertIn("sampled frames are partial evidence", cached["summary"])
             self.assertTrue(manager._rollup_semantic_ready(cached))
+
+    def test_synthesis_pass_persists_cached_semantic_guard_repair(self):
+        with tempfile.TemporaryDirectory() as temp:
+            calls = []
+            state_store = DurableRollupMemoryStateStore()
+            manager = build_manager(
+                Path(temp),
+                lm_callback=lambda _messages, _model: calls.append(True) or "unused",
+                runtime_state_store=state_store,
+            )
+            manager.rollup_llm_levels = {"L1"}
+            manager.record_summary_log(
+                7,
+                {
+                    "channel_id": 7,
+                    "run_id": "run-7",
+                    "summary": "A person remained near the desk.",
+                    "frame_count": 12,
+                    "created_at": 1_781_700_000.0,
+                },
+            )
+            candidate = manager.summary_rollups(
+                7,
+                run_selector="all",
+                target_level="L1",
+                synthesize=False,
+            )["levels"]["L1"][0]
+            rollup_id = candidate["rollup_id"]
+            unsafe = dict(candidate)
+            unsafe_summary = operator_rollup_response(
+                "A person remained near the desk.",
+                coverage="No blind spots or missing coverage were found.",
+            )
+            unsafe.update(
+                {
+                    "summary": unsafe_summary,
+                    "operator_summary": unsafe_summary,
+                    "summary_kind": "llm",
+                    "generation_status": "ready",
+                    "format_version": 2,
+                }
+            )
+            state_store.save_rollup(unsafe)
+            manager.rollup_summary_cache.clear()
+
+            row = manager.summary_rollups(
+                7,
+                run_selector="all",
+                target_level="L1",
+                synthesize=True,
+            )["levels"]["L1"][0]
+
+            self.assertEqual(calls, [])
+            self.assertNotIn("No blind spots", row["summary"])
+            durable = state_store.load_rollup(rollup_id)
+            self.assertIsNotNone(durable)
+            self.assertNotIn("No blind spots", durable["summary"])
+            self.assertIn("sampled frames are partial evidence", durable["summary"])
 
     def test_rollup_semantic_guard_sanitizes_persistent_overclaim_without_retry(self):
         with tempfile.TemporaryDirectory() as temp:

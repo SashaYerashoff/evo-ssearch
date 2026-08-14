@@ -10141,6 +10141,8 @@ class LuxriotManager:
             "real-world events or incidents. When citing a numeric total above one, call it sampled signal "
             "emissions, include supplied delivery/deduplication outcomes, and state that repeated emissions are "
             "not distinct incidents.",
+            "- If alert signals have no supplied operator feedback, keep them unreviewed and never conclude that "
+            "they need no follow-up/action or that no related safety/security incident remains.",
             "- Report camera/feed interruptions and missing coverage separately from observed behavior.",
             "- Distinguish 'no interruption recorded in metadata' from a claim that visual coverage was complete.",
             "- Recommend operator follow-up only for a grounded unresolved safety/security issue, not routine presence changes or low-confidence cues.",
@@ -19517,6 +19519,27 @@ class LuxriotManager:
             for match in pattern.finditer(text)
         )
 
+    @staticmethod
+    def _rollup_unreviewed_alert_dismissal_claim(value: object) -> bool:
+        """Detect an operator disposition made without supplied feedback."""
+
+        text = " ".join(str(value or "").split())
+        patterns = (
+            r"\b(?:alerts?|criteria|criterion|triggers?)\b[^.]{0,180}"
+            r"\b(?:benign|non[- ]actionable|false[- ]positive|irrelevant)\b",
+            r"\b(?:benign|non[- ]actionable|false[- ]positive|irrelevant)\b[^.]{0,180}"
+            r"\b(?:alerts?|criteria|criterion|triggers?)\b",
+            r"\bno\s+(?:immediate\s+)?(?:operator\s+)?"
+            r"(?:follow[- ]?up|action|review|attention|monitoring)\s+"
+            r"(?:is\s+)?(?:required|needed|warranted|recommended)\b",
+            r"\b(?:follow[- ]?up|action|review|attention|monitoring)\s+"
+            r"(?:is|are)\s+not\s+(?:required|needed|warranted|recommended)\b",
+            r"\bno\s+(?:unresolved\s+)?(?:safety|security)"
+            r"(?:\s+(?:or|and)\s+(?:safety|security))?\s+"
+            r"(?:incidents?|cases?|events?)\b",
+        )
+        return any(re.search(pattern, text, flags=re.IGNORECASE) for pattern in patterns)
+
     @classmethod
     def _rollup_grounding_guard_issues(
         cls,
@@ -19559,14 +19582,7 @@ class LuxriotManager:
         ) if isinstance(feedback_summary, Mapping) else 0
         operator_text = " ".join(str(value or "").split())
         if alert_total > 0 and reviewed_count <= 0:
-            dismissal_patterns = (
-                r"\b(?:alerts?|criteria|criterion|triggers?)\b[^.]{0,180}\b(?:benign|non[- ]actionable|false[- ]positive|irrelevant)\b",
-                r"\b(?:benign|non[- ]actionable|false[- ]positive|irrelevant)\b[^.]{0,180}\b(?:alerts?|criteria|criterion|triggers?)\b",
-            )
-            if any(
-                re.search(pattern, operator_text, flags=re.IGNORECASE)
-                for pattern in dismissal_patterns
-            ):
+            if cls._rollup_unreviewed_alert_dismissal_claim(operator_text):
                 issues.append("unreviewed_alert_dismissal")
         if alert_total > 1:
             numeric_alert_claim = re.search(
@@ -19663,17 +19679,15 @@ class LuxriotManager:
             prefix = prefix_match.group(1) if prefix_match else ""
             unreviewed_dismissal = (
                 "unreviewed_alert_dismissal" in node_issues
-                and re.search(r"\b(?:alerts?|criteria|criterion|triggers?)\b", line, flags=re.IGNORECASE)
-                and re.search(
-                    r"\b(?:benign|non[- ]actionable|false[- ]positive|irrelevant)\b",
-                    line,
-                    flags=re.IGNORECASE,
-                )
+                and cls._rollup_unreviewed_alert_dismissal_claim(line)
             )
             if unreviewed_dismissal:
                 line = (
                     prefix
-                    + "No operator feedback was supplied for these alerts; they remain unreviewed and unclassified."
+                    + "No operator disposition is inferred; "
+                    + f"{alert_total} alert signal emission"
+                    + ("s" if alert_total != 1 else "")
+                    + " remain unreviewed under the configured policy."
                 )
                 output.append(line)
                 continue
@@ -21998,16 +22012,6 @@ class LuxriotManager:
                         if isinstance(entry, Mapping)
                     ]
                     entries.extend(durable_rows)
-                    # The durable row is authoritative and also warms the small
-                    # in-process cache, avoiding one DB lookup per rollup during
-                    # the synthesis walk that follows this range read.
-                    with self.cache_lock:
-                        for durable_row in durable_rows:
-                            durable_id = self._rollup_identity_key(durable_row)
-                            if durable_id:
-                                self.rollup_summary_cache[durable_id] = durable_row
-                        while len(self.rollup_summary_cache) > self.rollup_summary_cache_limit:
-                            self.rollup_summary_cache.pop(next(iter(self.rollup_summary_cache)), None)
                 with self.cache_lock:
                     self._rollup_scheduler_status["durable_store_last_error"] = None
             except Exception as exc:
@@ -22044,6 +22048,18 @@ class LuxriotManager:
             if identity:
                 seen.add(identity)
             out.append(normalized)
+        # Warm the synthesis cache only after normalization.  Caching the raw
+        # durable row here used to let a later _get_cached_rollup_record call
+        # bypass deterministic semantic repairs that the range response had
+        # already applied, so the UI and the consolidator could see different
+        # versions of the same canonical rollup.
+        with self.cache_lock:
+            for normalized in out:
+                normalized_id = self._rollup_identity_key(normalized)
+                if normalized_id:
+                    self.rollup_summary_cache[normalized_id] = dict(normalized)
+            while len(self.rollup_summary_cache) > self.rollup_summary_cache_limit:
+                self.rollup_summary_cache.pop(next(iter(self.rollup_summary_cache)), None)
         out.sort(key=lambda item: float(self._coerce_float(item.get("window_start")) or 0.0))
         return out
 
@@ -23131,6 +23147,22 @@ class LuxriotManager:
             cached = self._get_cached_rollup_record(rollup_id)
             if cached:
                 cached_summary = str(cached.get("summary") or "").strip()
+                if cached_summary and bool(cached.get("semantic_guard_sanitized")):
+                    # Normal reads stay read-only, but an explicit/background
+                    # synthesis pass may make a deterministic guard repair the
+                    # durable ground truth.  The next normalization sees the
+                    # already-safe prose and will not set this transient flag,
+                    # so this is a one-time write rather than a write-on-read
+                    # loop.
+                    repaired_meta = dict(cached)
+                    repaired_meta.pop("rollup_id", None)
+                    repaired_meta.pop("summary", None)
+                    repaired_meta.pop("semantic_guard_sanitized", None)
+                    self._put_cached_rollup_summary(
+                        rollup_id,
+                        cached_summary,
+                        **repaired_meta,
+                    )
                 cached_signature = str(cached.get("source_signature") or "").strip()
                 cached_format_version = _parse_optional_int(cached.get("format_version")) or 1
                 cached_kind = str(cached.get("summary_kind") or "").strip().lower()
