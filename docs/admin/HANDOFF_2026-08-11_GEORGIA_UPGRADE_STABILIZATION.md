@@ -2788,3 +2788,124 @@ worker `2622003`. The VLM and agent llama.cpp processes were not restarted, and
 the rehearsal `.env` remains unchanged at SHA-256
 `2c254527143f62bbdbcf7a14914872e2a6f1e0f4f776ef02024c0f27aac76325`.
 No new immutable upgrade archive or Desktop launcher pin was produced.
+
+## 2026-08-14 L0 contract, rollup hierarchy, and inference durability
+
+The Georgia rehearsal is again a single EVA instance with two desired camera
+sessions: channel 112 (Zenbook webcam) and channel 118 (`emu1`, the known
+30-second three-scene night-drift loop). The reviewed and pushed source commits
+added in this pass are:
+
+- `9645323` hardens the bounded structured L0 output contract;
+- `4ff5352` migrates the pre-English live prompt default;
+- `a05e37c` makes L1-L3 treat alert totals as sampled signal emissions, not
+  counts of distinct incidents;
+- `2bfbc5b` removes stale `generation_error` values after a successful retry;
+- `5bbd2b3` prevents unreviewed alerts from being dismissed by a rollup and
+  normalizes durable rows before they enter the hot cache;
+- `acff9d9` restricts an explicit target-level synthesis request to that level
+  instead of silently regenerating all lower levels;
+- `5934fe7` excludes an adjacent rollup ending exactly at `from_ts` and
+  compacts repeated unreviewed guidance;
+- `3191f48` recognizes and repairs duplicate unreviewed disclosures already
+  present in otherwise safe cached reports.
+
+Two hundred pre-change L0 records replayed through the new parser as canonical
+structured output. The first nine live batches under the bounded prompt all
+finished normally, used the exact English schema, and had a median output of
+109 tokens. Qwen still omits the literal marker on some valid JSON outputs;
+this is recorded as `parsed_markerless` at input and persisted as
+`parsed_canonical`, without a second vision call.
+
+The agent llama.cpp endpoint on port 1235 had been manually stopped, not
+crashed. The existing Qwen3.5-9B-MTP 65K unit was restored without changing its
+command or model. One closed channel-118 hour was then synthesized from exactly
+four durable L1 rows. The result preserved 149 alert signal emissions as
+repeated signals rather than incidents and used no L0 shortcut. A closed L3
+read on channel 112 was also repaired so five unreviewed alert emissions cannot
+produce `no follow-up required`.
+
+Final live acceptance of the same L3 request reports:
+
+```text
+HTTP/elapsed:             200 / 2.53 s
+returned L3 windows:      1
+source level:             L2
+agent prompt-token delta: 0
+generation error:         none
+unreviewed disclosure:    1
+operator takeaway:        Review the 5 sampled alert signal emissions under the configured policy
+```
+
+The rollup regression subset is 66/66. The targeted route/UI subset is 7/7,
+and the L0 language/contract tests remain green. `main` is clean and matches
+`origin/main`.
+
+Both required llama.cpp user units are now active and enabled (they were active
+but disabled):
+
+```text
+eva-llama-qwen3-vl-4b.service  active/enabled  port 1234  PID 11006
+eva-llama-qwen35-mtp.service  active/enabled  port 1235  PID 114612
+```
+
+Gunicorn master PID 4127 serves from the single final worker PID 218868.
+`/ready` is green, both desired channels are restored, both inference health
+checks return 200, and no inference process was restarted during source
+deployments. The `agent` LM profile is still diagnostic rather than a required
+readiness gate; decide separately whether agent loss should make the entire EVA
+HTTP worker unready or should instead degrade only consolidation features.
+
+The root filesystem had fallen to approximately 24 GiB / 5.08% free. The main
+recoverable waste was the retired July vLLM environment and AWQ model under
+`evo-ssearch/.local/inference` (13.23 GiB). It was moved, not deleted, to:
+
+```text
+/mnt/eva-llamacpp-lab/offloaded/home/sasha/Projects/evo-ssearch/.local/inference-vllm-20260712
+```
+
+The original path is now a symlink, leaving rollback possible. Root free space
+is approximately 37 GiB / 8%; the model/offload NVMe has approximately 98 GiB
+free. Docker volumes and the active EVA archive were not removed.
+
+The current rehearsal `.env` was not modified during this pass and has SHA-256:
+
+```text
+36f1163baeedbde90352d252dedc426978ed5a5d25864606732a7472d720fdde
+```
+
+### Remaining VLM latency decision
+
+Thirty-nine sent channel-118 VLM alert emissions over the preceding three
+hours measured event-to-Luxriot-ack median 27.5 seconds, p90 40.7 seconds, and
+maximum 55.9 seconds. Luxriot delivery itself is not the bottleneck: bookmark
+HTTP/ack median is 60 ms and p90 is 185 ms. On the current two-channel single
+VLM slot, fresh runtime traces show:
+
+```text
+batch span:                 median 15.4 s, p90 20.2 s
+seal + preparation:         about 1.0 s
+complete L0 VLM call:       median 10.7 s, p90 12.7 s
+LM admission wait:          median 1.0 s, p90 3.3 s, max 7.9 s
+alert processing:           median 14 ms
+```
+
+The bounded fast VLM lane is operating for channels with an explicit operator
+alert policy. Its latest channel-112 burst completed in 10.9 seconds: about
+4.1 seconds to obtain post-roll evidence, 3.6 seconds waiting for the occupied
+VLM slot, and 2.7 seconds for its compact 26-token inference. Channel 118 has
+no operator alert policy, so its 257 recent observations were intentionally
+suppressed from that lane; enabling generic fast hazards on the endless drift
+loop would saturate the single slot.
+
+Do not halve the ordinary batch sizes blindly: both channels currently produce
+roughly one 8-11-second VLM job per 16-second collection window, so doubling
+request cadence would accumulate work. The next latency pass should first set
+an explicit SLO, repeat one channel-112 thumbs-up against the fast policy, then
+choose among shorter post-roll/capture cadence, a stricter priority admission
+policy, a more compact fast evidence set, or additional VLM concurrency. The
+2.5-3 minute SigLIP cold start on every Gunicorn worker handover also remains a
+separate operational optimization target.
+
+No new immutable upgrade archive or Desktop launcher pin was produced in this
+pass.
