@@ -19086,13 +19086,16 @@ class LuxriotManager:
 
         text = " ".join(str(value or "").split())
         patterns = (
-            r"\b(?:incident|case|episode|event(?:\s+track)?)s?\s+"
+            r"\b(?:incident|case|episode|track|event(?:\s+track)?)s?\s+"
             r"(?:remain(?:s|ed|ing)?|is|are|stay(?:s|ed|ing)?)\s+"
+            r"(?:an?\s+)?(?:active|open|unresolved)\b",
+            r"\b(?:track|event\s+track)s?\b[^.!?]{0,160}"
+            r"\b(?:remain(?:s|ed|ing)?|stay(?:s|ed|ing)?)\s+"
             r"(?:an?\s+)?(?:active|open|unresolved)\b",
             r"\b(?:an?\s+)?(?:active|open|unresolved)\s+"
             r"(?:(?:operator|safety|security)[ -]+)?"
-            r"(?:incident|case|episode|event(?:\s+track)?|priority)s?\b",
-            r"\b(?:incident|case|episode|event(?:\s+track)?)s?\b[^.!?]{0,160}"
+            r"(?:incident|case|episode|track|event(?:\s+track)?|priority)s?\b",
+            r"\b(?:incident|case|episode|track|event(?:\s+track)?)s?\b[^.!?]{0,160}"
             r"\b(?:marked|classified|flagged|treated|listed|recorded)\s+as\s+"
             r"(?:an?\s+)?(?:active|open|unresolved)\s+"
             r"(?:safety\s+)?(?:priority|incident|case|episode|event)\b",
@@ -19101,7 +19104,11 @@ class LuxriotManager:
             for match in re.finditer(pattern, text, flags=re.IGNORECASE):
                 prefix = text[max(0, match.start() - 64) : match.start()]
                 if re.search(
-                    r"\b(?:no|not|never|neither|without|does\s+not|do\s+not|cannot|can't)\b[^.!?]{0,56}$",
+                    r"(?:\bno\s+(?:(?:evidence|indication|sign|record)\s+of\s+)?"
+                    r"(?:an?\s+)?|\bnot\s+(?:an?\s+)?|\bwithout\s+(?:an?\s+)?|"
+                    r"\bneither\s+(?:an?\s+)?|\b(?:does|do)\s+not\s+"
+                    r"(?:represent|constitute)\s+(?:an?\s+)?|"
+                    r"\b(?:cannot|can't)\s+be\s+(?:considered\s+)?(?:an?\s+)?)$",
                     prefix,
                     flags=re.IGNORECASE,
                 ):

@@ -9039,6 +9039,11 @@ class LuxriotCaptureDispatchTests(unittest.TestCase):
             "One sub-episode remaining open at the end of the window.",
             "This was an open safety episode requiring attention.",
             "The drifting vehicle remains an unresolved safety priority.",
+            "A second track involving smoke and vehicle maneuvering remains open.",
+            (
+                "No immediate resolution was observed for the active incident, "
+                "suggesting a need for continued surveillance."
+            ),
         ):
             variant = operator_rollup_response(
                 "Drift was visible in the sampled frames.",
@@ -9068,6 +9073,23 @@ class LuxriotCaptureDispatchTests(unittest.TestCase):
                 claim,
             )
             self.assertIn("review its grounded alert", variant_sanitized)
+
+        for grounded_negative in (
+            "There was no active incident in the supplied samples.",
+            "There was no evidence of an active incident in the supplied samples.",
+            "The sequence does not represent an active incident.",
+        ):
+            self.assertNotIn(
+                "temporal_episode_as_case_state",
+                LuxriotManager._rollup_grounding_guard_issues(
+                    operator_rollup_response(
+                        "Drift was visible in the sampled frames.",
+                        takeaway=grounded_negative,
+                    ),
+                    operator_node,
+                ),
+                grounded_negative,
+            )
 
         active_watchlist_summary = operator_rollup_response(
             "A configured watch remains pending.",
