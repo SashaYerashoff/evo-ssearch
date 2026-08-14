@@ -2671,3 +2671,74 @@ The rehearsal `.env` was not modified and its SHA-256 remains:
 No inference process was restarted. The running VLM and agent llama.cpp PIDs
 remain `1499650` and `2916440` respectively. No new immutable upgrade archive or
 Desktop launcher pin was produced in this slice.
+
+## 2026-08-14 durable rollup and agent coverage acceptance
+
+This note supersedes the preceding worker identifier and completes the archive
+acceptance that remained possible while the external Evo/Luxriot endpoint was
+offline. The additional source commits are:
+
+- `0246885` prevents a complete closed rollup from being replaced by a newly
+  generated candidate with a smaller source/evidence receipt;
+- `7b865b3` enforces the same monotonicity against the durable PostgreSQL row,
+  including a hot-cache race during process restart;
+- `069f311` recognizes additional unsupported temporal case-state wording;
+- `252b41e` records server-owned video coverage in the agent turn ledger and
+  corrects a local model only when one unambiguous receipt disagrees with its
+  stated percentage;
+- `a60b706` closes two residual temporal forms seen in the real drift rollup:
+  `second track ... remains open` and `no resolution ... active incident`;
+- `ce3fcc7` computes coverage ratio from the union of actually returned
+  intervals instead of the envelope between the first and last interval.
+
+The restart-race repair was performed from durable PostgreSQL L0 evidence, not
+from exported JSON. For channel 118, the adjacent closed L1 windows now retain
+52 items / 208 frames and 50 items / 200 frames. Repeated synthesis did not
+contract either row, and a read-only comparison against the pre-repair control
+snapshot found no additional L1 count regressions on channels 112 or 118.
+
+The real channel-118 L1 that had already been marked
+`semantic_guard_sanitized` contained two remaining case-state sentences in its
+middle and final sections. The updated read path removes those unsupported
+states without regenerating the rollup or discarding its grounded vehicle,
+drift, smoke, frame, and 25-alert evidence. A final authenticated agent request
+for the last hour executed `normalize_time_window` followed by
+`get_video_summaries`, returned two L1 windows, and reported:
+
+```text
+coverage.status:                  partial
+coverage.returned.coverage_ratio: 0.25
+coverage.returned.internal_gap_count: 1
+semantic_status:                  partial (one pending one-frame window)
+agent answer:                     25% coverage
+unsupported open-case wording:    0
+```
+
+This fixes the prior contradictory receipt where an approximately 45-minute
+internal gap still produced `coverage_ratio=1.0`. The agent now keeps the
+grounded drift/alert conclusion separate from the unchecked remainder of the
+requested hour.
+
+Regression coverage completed with 61/61 filtered rollup tests and 217/217
+agent-loop/gateway/adapter/video-summary tests plus sixteen subtests. The pinned
+tuktuk grammar was rechecked for the agent receipt work: it remains inside the
+existing `AGG` result path, changes no tool schema or compact result envelope,
+and introduces no new argument source or grammar review question.
+
+The live tree matches the reviewed source for both `agent.py` and
+`luxriot_connector.py`. Gunicorn completed its final graceful handover and is
+serving from the single worker `2225510`; `/health` is 200. The VLM and agent
+llama.cpp processes were not restarted and remain PIDs `1499650` and `2916440`.
+The rehearsal `.env` was not modified and still has SHA-256:
+
+```text
+2c254527143f62bbdbcf7a14914872e2a6f1e0f4f776ef02024c0f27aac76325
+```
+
+The external endpoint `192.168.1.100:8080` still does not accept TCP
+connections. `/ready` is therefore correctly 503 on the required Luxriot check;
+both desired channels have zero recent frames and empty local queues. A newly
+shown thumbs-up gesture cannot be observed or timed until that upstream service
+returns. Once it is reachable, repeat one short gesture and record source event
+to probe bookmark, VLM alert, and Evo acknowledgement latency. No new immutable
+upgrade archive or Desktop launcher pin was produced in this slice.
