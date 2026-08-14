@@ -29,6 +29,7 @@ from incident_attention import PromptBudgetError
 from luxriot_connector import (
     DEFAULT_ALERTS_JSON_PROMPT,
     PREVIOUS_ENGLISH_BATCH_STATE_JSON_PROMPT,
+    PREVIOUS_PRE_ENGLISH_BATCH_STATE_JSON_PROMPT,
     PREVIOUS_VERBOSE_BATCH_STATE_JSON_PROMPT,
     PREVIOUS_COMPACT_BATCH_STATE_JSON_PROMPT,
     LuxriotCaptureSession,
@@ -2739,6 +2740,18 @@ class LuxriotCaptureDispatchTests(unittest.TestCase):
         self.assertEqual(
             LuxriotManager._normalize_json_alert_prompt(
                 PREVIOUS_ENGLISH_BATCH_STATE_JSON_PROMPT
+            ),
+            DEFAULT_ALERTS_JSON_PROMPT,
+        )
+
+    def test_pre_english_contract_migrates_to_bounded_output_contract(self):
+        self.assertNotIn(
+            "concise English only",
+            PREVIOUS_PRE_ENGLISH_BATCH_STATE_JSON_PROMPT,
+        )
+        self.assertEqual(
+            LuxriotManager._normalize_json_alert_prompt(
+                PREVIOUS_PRE_ENGLISH_BATCH_STATE_JSON_PROMPT
             ),
             DEFAULT_ALERTS_JSON_PROMPT,
         )

@@ -496,6 +496,17 @@ DEFAULT_BATCH_STATE_JSON_PROMPT = (
 # them as operator-authored prompt overrides.
 PREVIOUS_ENGLISH_BATCH_STATE_JSON_PROMPT = DEFAULT_BATCH_STATE_JSON_PROMPT
 
+# Exact compact v2 contract shipped immediately before the English-only
+# output repair.  Some long-lived pilot state still carries this value.
+PREVIOUS_PRE_ENGLISH_BATCH_STATE_JSON_PROMPT = (
+    PREVIOUS_ENGLISH_BATCH_STATE_JSON_PROMPT.replace(
+        "Write all human-readable prose and every free-text JSON string value in concise English only. "
+        "Never switch to Chinese, Japanese, Korean, or another output language.\n",
+        "",
+        1,
+    )
+)
+
 DEFAULT_BATCH_STATE_JSON_PROMPT = (
     PREVIOUS_ENGLISH_BATCH_STATE_JSON_PROMPT.replace(
         "\nMinimal empty shape: ",
@@ -5559,6 +5570,8 @@ class LuxriotManager:
         if text == PREVIOUS_COMPACT_BATCH_STATE_JSON_PROMPT.strip():
             return DEFAULT_ALERTS_JSON_PROMPT
         if text == PREVIOUS_ENGLISH_BATCH_STATE_JSON_PROMPT.strip():
+            return DEFAULT_ALERTS_JSON_PROMPT
+        if text == PREVIOUS_PRE_ENGLISH_BATCH_STATE_JSON_PROMPT.strip():
             return DEFAULT_ALERTS_JSON_PROMPT
         lowered = text.lower()
         if "batch_state_json:" not in lowered:
