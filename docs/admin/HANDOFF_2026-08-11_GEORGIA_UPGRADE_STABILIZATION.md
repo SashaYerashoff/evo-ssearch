@@ -2742,3 +2742,49 @@ shown thumbs-up gesture cannot be observed or timed until that upstream service
 returns. Once it is reachable, repeat one short gesture and record source event
 to probe bookmark, VLM alert, and Evo acknowledgement latency. No new immutable
 upgrade archive or Desktop launcher pin was produced in this slice.
+
+## 2026-08-14 English-only live VLM output contract
+
+Commit `48da08c` (`fix: enforce English VLM batch output`) fixes intermittent
+Qwen3-VL responses whose required English headings were followed by Chinese
+prose. The cause was a weak prompt contract: it constrained the section names
+and JSON schema, but did not constrain the language of section bodies or
+free-text JSON values.
+
+The final protected L0 prompt layer now requires concise English throughout the
+human report and every free-text `BATCH_STATE_JSON` value. The runtime also
+counts CJK/Japanese/Korean code points before parsing or persistence:
+
+- an ordinary English result is accepted in one inference call;
+- a violating result receives one bounded translation-only retry using the
+  same images, evidence, alerts, states, indices, severities, and schema;
+- a second violation is quarantined behind an explicit English degraded
+  summary. Structured severity, state, snapshot references, and alert presence
+  are retained with neutral English labels, while non-English memory text is
+  not propagated upward.
+
+The persisted LM response telemetry exposes `language_contract_status`,
+`language_retry_count`, `initial_east_asian_chars`, and
+`final_east_asian_chars`. Focused recovery/fallback tests pass, including
+preservation of a structured alert, and the neighboring L0 backpressure/VLM
+alert suite passes 47/47. The expanded inference/prompt run completed with 297
+passes and only the previously documented stale test that expects an unsafe
+cached coverage sentence to be regenerated rather than deterministically
+sanitized.
+
+The external Luxriot service recovered before deployment. After the graceful
+handover, `/ready` returned ready and channel 112 produced real L0 batches at
+08:52:03 and 08:52:19 with:
+
+```text
+language_contract_status: passed
+language_retry_count:      0
+CJK characters:            0
+```
+
+Thus compliant batches pay no second-inference latency. The live connector is
+byte-identical to the reviewed source and Gunicorn serves from the single
+worker `2622003`. The VLM and agent llama.cpp processes were not restarted, and
+the rehearsal `.env` remains unchanged at SHA-256
+`2c254527143f62bbdbcf7a14914872e2a6f1e0f4f776ef02024c0f27aac76325`.
+No new immutable upgrade archive or Desktop launcher pin was produced.
