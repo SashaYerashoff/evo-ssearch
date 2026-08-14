@@ -325,6 +325,17 @@ export function ArchiveScreen({
   ])
 
   const refreshFilters = useCallback(async () => {
+    requestSeq.current++
+    probeRequestSeq.current++
+    loadingRef.current = false
+    setLoading(false)
+    setTextSearchPending(false)
+    setSearchCoverage(null)
+    setError(null)
+    setNextOffset(0)
+    setFilters({ ...DEFAULT_FILTERS })
+    setProbeOptions([])
+    setProbesLoading(false)
     await onRefreshChannels?.()
     setFilterRefresh((n) => n + 1)
   }, [onRefreshChannels])

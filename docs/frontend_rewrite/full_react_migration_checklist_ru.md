@@ -552,6 +552,10 @@ Legacy endpoints, вызываемые старым UI, но не вызывае
 - [x] Геометрия `Semantic probe settings` стабилизирована: раскрытие `Technical details` и `Advanced settings` больше не меняет размер модалки или preview; preview имеет неизменяемый слот без `flex-grow`/`flex-shrink`, а содержимое прокручивается внутри заранее зарезервированных колонок без скачка от scrollbar.
 - [x] Анимация светового Bifrost-фона `atp-tabpanel-content` отделена от состояния dropdown: открытие меню больше не меняет `overflow`/`inset` анимированных слоёв и не сбрасывает их геометрию или визуальную фазу.
 - [x] Dropdown фильтров вынесены в отдельный fixed floating-layer: toolbar остаётся постоянным горизонтальным scroll-контейнером, поэтому открытие списка не пересоздаёт его layout/compositing и не сдвигает подписи кнопок.
+- [x] У светового фона `atp-tabpanel-content` убран наклон (`skewX`): левый край панели остаётся вертикальным, с мягким скруглением и без изменения Bifrost-анимации.
+- [x] В `Semantic probe settings` введён переиспользуемый glass-tooltip: постоянные пояснения убраны из-под полей Detection tuning, Positive floor, Margin, Image probe и Prompt pairs и доступны через компактную кнопку `?` по hover, focus и click без изменения layout модалки.
+- [x] Выбор периода и календарь Archive вынесены из горизонтального scroll-контейнера в fixed floating-layer: обе split-кнопки снова открывают видимые меню и сохраняют корректное закрытие по клику снаружи.
+- [x] `Reset filters` в Archive действительно сбрасывает все выбранные значения к дефолту (`All streams`, `All evidence`, `Last 24h`, `Similarity`), включая custom range и probe-фильтр, и параллельно обновляет справочники без автоматического тяжёлого поиска.
 - [x] Есть L0 feed и L1/L2/L3 rollups.
 - [x] Есть manual refresh, live polling и history range для L1/L2/L3.
 - [x] L0 History передаёт `from_ts` в `/luxriot/session`.

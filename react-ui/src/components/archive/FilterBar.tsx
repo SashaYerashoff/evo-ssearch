@@ -158,6 +158,8 @@ export function FilterBar({
   const [timeOpen, setTimeOpen] = useState(false)
   const [rangeOpen, setRangeOpen] = useState(false)
   const menuRef = useRef<HTMLDivElement>(null)
+  const timePopRef = useRef<HTMLDivElement>(null)
+  const rangeButtonRef = useRef<HTMLButtonElement>(null)
   const custom = !!(filters.sinceMs || filters.untilMs)
   const timeLabel = custom ? rangeLabel(filters) : (TIMES.find((t) => t.v === (filters.hours || '24'))?.label || 'Last 24h')
   const selectedChannels = filters.channelIds?.length
@@ -166,7 +168,10 @@ export function FilterBar({
 
   useEffect(() => {
     if (!timeOpen) return
-    const onDown = (e: MouseEvent) => { if (!menuRef.current?.contains(e.target as Node)) setTimeOpen(false) }
+    const onDown = (e: MouseEvent) => {
+      const target = e.target as Node
+      if (!menuRef.current?.contains(target) && !timePopRef.current?.contains(target)) setTimeOpen(false)
+    }
     document.addEventListener('mousedown', onDown)
     return () => document.removeEventListener('mousedown', onDown)
   }, [timeOpen])
@@ -207,7 +212,7 @@ export function FilterBar({
             <IconClock size={15} /> {timeLabel} <IconChevronDown size={13} />
           </button>
           {timeOpen && (
-            <div className="qf-pop">
+            <FloatingPopover anchorRef={menuRef} popoverRef={timePopRef} className="qf-pop floating-popover" offset={6} matchAnchorWidth>
               {TIMES.map((t) => (
                 <button key={t.v} type="button" className={`qf-opt ${!custom && (filters.hours || '24') === t.v ? 'on' : ''}`}
                   onClick={() => { onChange({ hours: t.v, sinceMs: undefined, untilMs: undefined }); setTimeOpen(false) }}>{t.label}</button>
@@ -219,15 +224,16 @@ export function FilterBar({
               }}>
                 <IconCalendarEvent size={14} /> Custom range…
               </button>
-            </div>
+            </FloatingPopover>
           )}
         </div>
         <span className="qf-divider" />
-        <button type="button" className={`qf-seg qf-icon ${custom ? 'on' : ''}`} onClick={() => setRangeOpen((v) => !v)} title="Pick date range">
+        <button ref={rangeButtonRef} type="button" className={`qf-seg qf-icon ${custom ? 'on' : ''}`} onClick={() => setRangeOpen((v) => !v)} title="Pick date range">
           <IconCalendarEvent size={15} />
         </button>
         {rangeOpen && (
           <DateRangeModal
+            anchorRef={rangeButtonRef}
             sinceMs={filters.sinceMs} untilMs={filters.untilMs}
             onApply={(since, until) => onChange({ sinceMs: since, untilMs: until })}
             onClear={() => onChange({ sinceMs: undefined, untilMs: undefined })}
@@ -242,8 +248,8 @@ export function FilterBar({
 
       <div className="filter-bar-actions">
         <ToolbarActionMenu actions={[{
-          id: 'refresh',
-          label: 'Refresh filters',
+          id: 'reset',
+          label: 'Reset filters',
           icon: <IconRefresh className={loading || probesLoading ? 'spin' : ''} size={15} />,
           onSelect: onRefresh,
           disabled: loading || probesLoading,

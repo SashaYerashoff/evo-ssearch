@@ -553,7 +553,7 @@
     transparent 0, rgba(0,0,0,.68) 5px, #000 12px, #000 calc(100% - 9%), transparent 100%);
   mask-image: linear-gradient(90deg,
     transparent 0, rgba(0,0,0,.68) 5px, #000 12px, #000 calc(100% - 9%), transparent 100%);
-  transform: translateZ(0) skewX(-6deg);
+  transform: translateZ(0);
   clip-path: inset(25.5% 2.85% round 18px);
   will-change: background-position;
   animation: atp-bifrost-aura 22s linear infinite;
@@ -580,7 +580,7 @@
     transparent 0, rgba(0,0,0,.62) 6px, #000 14px, #000 calc(100% - 11%), transparent 100%);
   mask-image: linear-gradient(90deg,
     transparent 0, rgba(0,0,0,.62) 6px, #000 14px, #000 calc(100% - 11%), transparent 100%);
-  transform: translateZ(0) skewX(-5deg);
+  transform: translateZ(0);
   clip-path: inset(0 2.85% round 18px);
   will-change: background-position;
   animation: atp-bifrost-braid 18s linear infinite;
@@ -713,7 +713,7 @@
 .daterange-pop {
   --mon-accent: var(--accent); --mon-line: var(--accent-line);
   position: absolute; top: calc(100% + 8px); left: 0; z-index: 60;
-  width: min(600px, 92cqw);
+  width: min(600px, calc(100vw - 24px));
   background: var(--panel-solid); border: 1px solid var(--line-2); border-radius: 14px;
   box-shadow: 0 26px 60px -18px rgba(0,0,0,0.75); padding: 16px;
 }
@@ -1143,7 +1143,7 @@
 /* window form bits */
 .wform { display: flex; flex-direction: column; gap: 13px; }
 .wfield { display: flex; flex-direction: column; gap: 6px; }
-.wfield > label { font-size: 12px; color: var(--text-mut); }
+.wfield > label, .wfield > .wfield-label { font-size: 12px; color: var(--text-mut); }
 .wfield select, .wfield input {
   background: var(--void-tile); border: 1px solid var(--line-2); border-radius: 10px;
   color: var(--text); padding: 10px 12px; font-size: 14px; outline: none; width: 100%;
@@ -1920,6 +1920,27 @@
 
 /* sub-sections inside Advanced settings — divided, labelled, no nested collapses */
 .probe-block-head { color: var(--accent); font-size: 10px; font-weight: 700; letter-spacing: .08em; text-transform: uppercase; }
+.with-info { display: inline-flex; align-items: center; gap: 5px; width: fit-content; }
+.info-tooltip-anchor { display: inline-flex; flex: 0 0 auto; vertical-align: middle; }
+.info-tooltip-trigger {
+  display: inline-grid; place-items: center; width: 16px; height: 16px; padding: 0; border-radius: 50%;
+  border: 1px solid color-mix(in srgb, var(--text-mut) 58%, transparent); background: color-mix(in srgb, var(--control) 22%, transparent);
+  color: var(--text-mut); cursor: help; transition: color .14s ease, border-color .14s ease, background-color .14s ease, box-shadow .14s ease;
+}
+.info-tooltip-trigger:hover, .info-tooltip-trigger:focus-visible, .info-tooltip-trigger.is-open {
+  color: var(--accent); border-color: color-mix(in srgb, var(--accent) 72%, transparent);
+  background: color-mix(in srgb, var(--accent) 10%, transparent); box-shadow: 0 0 14px color-mix(in srgb, var(--accent) 18%, transparent);
+  outline: none;
+}
+.info-tooltip {
+  z-index: 10020; width: min(290px, calc(100vw - 24px)); padding: 10px 12px; border-radius: 10px;
+  border: 1px solid color-mix(in srgb, var(--accent) 36%, var(--line));
+  background: linear-gradient(145deg, color-mix(in srgb, var(--surface-raised) 94%, transparent), color-mix(in srgb, var(--space-0) 96%, transparent));
+  box-shadow: 0 16px 38px rgb(0 0 0 / 42%), inset 0 1px 0 color-mix(in srgb, var(--text) 7%, transparent);
+  backdrop-filter: blur(18px) saturate(125%); pointer-events: none;
+}
+.info-tooltip-title { color: var(--accent); font-size: 10px; font-weight: 750; letter-spacing: .075em; text-transform: uppercase; }
+.info-tooltip-copy { margin-top: 5px; color: var(--text-2); font-size: 12px; line-height: 1.45; letter-spacing: normal; text-transform: none; font-weight: 450; }
 .probe-sub { display: flex; flex-direction: column; gap: 10px; }
 .probe-panel .probe-sub + .probe-sub { border-top: 1px solid color-mix(in srgb, var(--line) 46%, transparent); padding-top: 12px; }
 .mon-help { font-size: 11.5px; color: var(--text-mut); line-height: 1.45; margin-top: -4px; }
