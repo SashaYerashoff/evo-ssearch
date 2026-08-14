@@ -20,6 +20,7 @@ from agent import (
     _seed_turn_tool_context,
     _safe_detection,
     _strip_thumbnails,
+    _summary_coverage_from_nodes,
     _summary_node_alert_score,
     _tool_result_for_ui,
     _validate_archive_vision_contract,
@@ -410,6 +411,23 @@ class TurnSignalLedgerTests(unittest.TestCase):
 
 
 class AgentVideoSummaryToolTests(unittest.TestCase):
+    def test_summary_coverage_ratio_counts_union_not_interval_envelope(self):
+        coverage = _summary_coverage_from_nodes(
+            [
+                {"window_start": 0.0, "window_end": 900.0},
+                {"window_start": 3600.0, "window_end": 4500.0},
+            ],
+            600.0,
+            4200.0,
+            label="returned_entries",
+        )
+
+        self.assertEqual(coverage["status"], "partial")
+        self.assertEqual(coverage["observed_span_sec"], 3600.0)
+        self.assertEqual(coverage["covered_span_sec"], 900.0)
+        self.assertEqual(coverage["coverage_ratio"], 0.25)
+        self.assertEqual(coverage["internal_gap_count"], 1)
+
     def test_repeated_vlm_alerts_are_grouped_as_candidate_episodes(self):
         result = _aggregate_vlm_alert_episodes(
             [

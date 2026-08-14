@@ -17320,6 +17320,7 @@ def _summary_coverage_from_nodes(
             merged.append([start, end])
         else:
             merged[-1][1] = max(merged[-1][1], end)
+    covered_span = sum(max(0.0, end - start) for start, end in merged)
 
     large_gaps: List[Dict[str, Any]] = []
     for prev, nxt in zip(merged, merged[1:]):
@@ -17341,7 +17342,7 @@ def _summary_coverage_from_nodes(
         status = "partial"
     else:
         status = "covered"
-    coverage_ratio = 1.0 if requested_span <= 0 else max(0.0, min(1.0, observed_span / requested_span))
+    coverage_ratio = 1.0 if requested_span <= 0 else max(0.0, min(1.0, covered_span / requested_span))
     note = (
         f"{label} covers {_format_epoch_minute(first_ts)} to {_format_epoch_minute(last_ts)} "
         f"inside requested {_format_epoch_minute(requested_start)} to {_format_epoch_minute(requested_end)}."
@@ -17357,6 +17358,7 @@ def _summary_coverage_from_nodes(
         "first_time": _format_epoch_minute(first_ts),
         "last_time": _format_epoch_minute(last_ts),
         "observed_span_sec": observed_span,
+        "covered_span_sec": covered_span,
         "coverage_ratio": coverage_ratio,
         "leading_gap_sec": leading_gap,
         "trailing_gap_sec": trailing_gap,
