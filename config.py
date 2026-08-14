@@ -2000,6 +2000,19 @@ class Config:
         VLM_FAST_ALERT_POST_ROLL_SEC = 2.5
     VLM_FAST_ALERT_POST_ROLL_SEC = min(3.0, max(0.0, VLM_FAST_ALERT_POST_ROLL_SEC))
     try:
+        VLM_FAST_ALERT_OPERATOR_PROBE_POST_ROLL_SEC = float(
+            os.getenv(
+                'EVOSSEARCH_VLM_FAST_ALERT_OPERATOR_PROBE_POST_ROLL_SEC',
+                '1.0',
+            )
+        )
+    except (TypeError, ValueError):
+        VLM_FAST_ALERT_OPERATOR_PROBE_POST_ROLL_SEC = 1.0
+    VLM_FAST_ALERT_OPERATOR_PROBE_POST_ROLL_SEC = min(
+        VLM_FAST_ALERT_POST_ROLL_SEC,
+        max(0.0, VLM_FAST_ALERT_OPERATOR_PROBE_POST_ROLL_SEC),
+    )
+    try:
         VLM_FAST_ALERT_COOLDOWN_SEC = float(
             os.getenv('EVOSSEARCH_VLM_FAST_ALERT_COOLDOWN_SEC', '12.0')
         )

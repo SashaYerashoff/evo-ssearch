@@ -1119,7 +1119,23 @@ class ApiDataflowSmokeTests(unittest.TestCase):
                 runtime.observe(
                     112,
                     {
-                        "timestamp_ms": trigger_ms + runtime.post_roll_ms,
+                        "timestamp_ms": (
+                            trigger_ms
+                            + runtime.operator_probe_post_roll_ms
+                            - 1
+                        ),
+                        "thumbnail": "early-post-roll-frame",
+                        "capture_selection": {"selection_mode": "normal"},
+                    },
+                )
+                submit.assert_not_called()
+                runtime.observe(
+                    112,
+                    {
+                        "timestamp_ms": (
+                            trigger_ms
+                            + runtime.operator_probe_post_roll_ms
+                        ),
                         "thumbnail": "post-roll-frame",
                         "capture_selection": {"selection_mode": "normal"},
                     },
@@ -1140,6 +1156,10 @@ class ApiDataflowSmokeTests(unittest.TestCase):
             self.assertEqual(
                 runtime.status()["trigger_counts"]["operator_probe_match"],
                 1,
+            )
+            self.assertLess(
+                runtime.operator_probe_post_roll_ms,
+                runtime.post_roll_ms,
             )
         finally:
             runtime.shutdown()
@@ -1221,10 +1241,23 @@ class ApiDataflowSmokeTests(unittest.TestCase):
                     probe,
                     score,
                 )
+                runtime.observe_operator_probe_match(
+                    112,
+                    {
+                        **observation,
+                        "timestamp_ms": trigger_ms + 500,
+                        "thumbnail": "same-held-gesture-later-frame",
+                    },
+                    probe,
+                    score,
+                )
                 runtime.observe(
                     112,
                     {
-                        "timestamp_ms": trigger_ms + runtime.post_roll_ms,
+                        "timestamp_ms": (
+                            trigger_ms
+                            + runtime.operator_probe_post_roll_ms
+                        ),
                         "thumbnail": "post-roll-during-inflight",
                         "capture_selection": {"selection_mode": "normal"},
                     },
@@ -1236,7 +1269,11 @@ class ApiDataflowSmokeTests(unittest.TestCase):
                 runtime.observe(
                     112,
                     {
-                        "timestamp_ms": trigger_ms + runtime.post_roll_ms + 1_000,
+                        "timestamp_ms": (
+                            trigger_ms
+                            + runtime.operator_probe_post_roll_ms
+                            + 1_000
+                        ),
                         "thumbnail": "post-roll-after-inflight",
                         "capture_selection": {"selection_mode": "normal"},
                     },
@@ -1251,6 +1288,10 @@ class ApiDataflowSmokeTests(unittest.TestCase):
             )
             status = runtime.status()
             self.assertEqual(status["deferred_probe_matches_total"], 1)
+            self.assertEqual(
+                status["suppressed_duplicate_probe_matches_total"],
+                1,
+            )
             self.assertEqual(
                 status["trigger_counts"]["operator_probe_match"],
                 1,

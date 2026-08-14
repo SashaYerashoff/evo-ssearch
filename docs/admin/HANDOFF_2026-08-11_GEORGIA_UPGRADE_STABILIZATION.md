@@ -2946,3 +2946,58 @@ Qwen edge case observed live as string `"1"` and a timestamp placed in the
 version field. The original 12 related fast/probe checks, the new inflight race
 test, and the focused fast contract/timing test pass. The rehearsal `.env` and
 both llama.cpp processes remained unchanged.
+
+## 2026-08-14 exact-probe fast post-roll and held-gesture debounce
+
+Fast-alert LM admission was already strict: `alert` overtakes queued full L0,
+but the capacity-one llama.cpp endpoint cannot pre-empt an L0 request already
+executing. The avoidable latency was instead the shared 2.5-second fast
+post-roll. With channel 112's two-second snapshot cadence it was normally
+observed after about four seconds.
+
+An exact `operator_probe_match` now has its own one-second requested post-roll,
+which resolves on the next saved frame (about two seconds on channel 112).
+Ungrounded CV and semantic-motion bursts retain the 2.5-second trajectory
+requirement. Both paths still use the bounded four-frame evidence selection;
+the operator path keeps control, the exact scored frame, motion apex, and a
+fresh post frame. `/ready` reports both requested windows separately.
+
+The first live thumbs-up after this change used four frames and produced a
+visually grounded `Thumbs Up Gesture Detected` alert. The exact scored frame at
+21:28:22.653 reached Luxriot acknowledgement in **6.859 seconds**, compared
+with 15.433 seconds in the previous clean sample. Its measured components were
+2.005 seconds source post-roll, 0.447 seconds LM admission wait, 3.887 seconds
+HTTP inference, and 67 ms bookmark delivery. The parsed contract remained
+numeric version 2 and explicitly grounded the gesture in snapshot 3.
+
+A longer subsequent thumbs-up exposed a separate inflight race: consecutive
+positive scored frames from one held action could create another deferred
+operator pass while the first pass was running. The fast runtime now debounces
+operator matches by `(channel, probe)` for the existing 12-second fast
+cooldown. The first exact frame is retained; later frames from the same held
+action increment `suppressed_duplicate_probe_matches_total` without scheduling
+another operator episode. A distinct gesture after the window remains
+eligible. The ordinary fast/full-L0 content dedupe was verified rather than
+changed: two externally sent thumbs-up bookmarks in the exploratory run were
+140 seconds apart and therefore legitimately outside the configured 60-second
+cooldown, while same-action variants were marked `deduplicated`.
+
+Eight focused fast/probe tests pass after both changes, including unchanged CV
+post-roll, exact-frame retention, inflight deferral, held-action suppression,
+single-channel inflight bounds, timing telemetry, semantic-motion routing, and
+operator-policy gating. The rehearsal `.env` SHA-256 remains
+`36f1163baeedbde90352d252dedc426978ed5a5d25864606732a7472d720fdde`;
+the VLM and agent llama.cpp processes remain PID 11006 and 114612.
+
+After the final worker handover, the negative/victory motion interval produced
+two ordinary CV checks, both with `alert_count=0`, and no operator-probe match.
+A later thumbs-up produced one above-threshold scored frame. It coalesced into
+an already-pending CV episode, retained the exact frame with
+`apex,operator_probe_match,post` roles, and produced one grounded alert without
+an extra deferred operator pass. The scored frame received a fresh post frame
+2.040 seconds later. End-to-end time was 13.728 seconds from that exact frame,
+dominated by 7.268 seconds waiting for the capacity-one VLM endpoint; the VLM
+HTTP call was 3.641 seconds and Luxriot delivery 65 ms. Only one scored sample
+crossed the tuned floor during this live gesture, so the new held-frame
+suppression counter correctly remained zero; the repeated-match branch is
+covered by its focused race test rather than claimed as a live observation.

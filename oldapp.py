@@ -10998,6 +10998,23 @@ class _FastVlmAlertRuntime:
             max(0.0, float(getattr(config, "VLM_FAST_ALERT_POST_ROLL_SEC", 1.0) or 1.0))
             * 1000.0
         )
+        self.operator_probe_post_roll_ms = int(
+            min(
+                float(self.post_roll_ms),
+                max(
+                    0.0,
+                    float(
+                        getattr(
+                            config,
+                            "VLM_FAST_ALERT_OPERATOR_PROBE_POST_ROLL_SEC",
+                            1.0,
+                        )
+                        or 1.0
+                    )
+                    * 1000.0,
+                ),
+            )
+        )
         self.cooldown_ms = int(
             max(1.0, float(getattr(config, "VLM_FAST_ALERT_COOLDOWN_SEC", 12.0) or 12.0))
             * 1000.0
@@ -11022,6 +11039,7 @@ class _FastVlmAlertRuntime:
         self._pending: Dict[int, Dict[str, Any]] = {}
         self._inflight_channels: Set[int] = set()
         self._last_dispatched_ms: Dict[int, int] = {}
+        self._last_operator_probe_match_ms: Dict[Tuple[int, str], int] = {}
         self._previous_embeddings: Dict[int, np.ndarray] = {}
         self._trigger_counts: Dict[str, int] = {
             "cv_burst": 0,
@@ -11037,6 +11055,7 @@ class _FastVlmAlertRuntime:
             "completed_total": 0,
             "suppressed_while_inflight_total": 0,
             "deferred_probe_matches_total": 0,
+            "suppressed_duplicate_probe_matches_total": 0,
             "alert_batches_total": 0,
             "bookmarks_sent_total": 0,
             "rejected_total": 0,
@@ -11159,7 +11178,11 @@ class _FastVlmAlertRuntime:
                 )
             if pending is not None and channel not in self._inflight_channels:
                 trigger_ms = int(pending["trigger_timestamp_ms"])
-                if int(timestamp_ms) >= trigger_ms + self.post_roll_ms:
+                required_post_roll_ms = max(
+                    0,
+                    _to_int(pending.get("post_roll_ms"), self.post_roll_ms),
+                )
+                if int(timestamp_ms) >= trigger_ms + required_post_roll_ms:
                     dispatch = dict(pending)
                     dispatch["observed_post_timestamp_ms"] = int(timestamp_ms)
                     dispatch["submitted_at_ms"] = int(time.time() * 1000.0)
@@ -11217,6 +11240,7 @@ class _FastVlmAlertRuntime:
             "neg_score": _to_float(score.get("neg_score"), 0.0),
             "margin": _to_float(score.get("margin"), 0.0),
         }
+        probe_key = _probe_bookmark_identity(probe)
         trigger_frame = {
             key: observation.get(key)
             for key in (
@@ -11241,8 +11265,17 @@ class _FastVlmAlertRuntime:
             ),
             "probe_attention": probe_attention,
             "trigger_frame": trigger_frame,
+            "post_roll_ms": self.operator_probe_post_roll_ms,
         }
         with self._lock:
+            match_key = (channel, probe_key)
+            previous_match_ms = self._last_operator_probe_match_ms.get(match_key)
+            if (
+                previous_match_ms is not None
+                and int(timestamp_ms) - int(previous_match_ms) < self.cooldown_ms
+            ):
+                self._status["suppressed_duplicate_probe_matches_total"] += 1
+                return
             pending = self._pending.get(channel)
             last_dispatched = int(self._last_dispatched_ms.get(channel, 0))
             if pending is not None:
@@ -11252,7 +11285,15 @@ class _FastVlmAlertRuntime:
                 newly_routed = "probe_attention" not in pending
                 pending.setdefault("probe_attention", probe_attention)
                 pending.setdefault("trigger_frame", trigger_frame)
+                pending["post_roll_ms"] = min(
+                    max(
+                        0,
+                        _to_int(pending.get("post_roll_ms"), self.post_roll_ms),
+                    ),
+                    self.operator_probe_post_roll_ms,
+                )
                 if newly_routed:
+                    self._last_operator_probe_match_ms[match_key] = int(timestamp_ms)
                     self._trigger_counts["operator_probe_match"] = (
                         self._trigger_counts.get("operator_probe_match", 0) + 1
                     )
@@ -11264,6 +11305,7 @@ class _FastVlmAlertRuntime:
                 # ordinary observations will dispatch it after the current
                 # episode closes instead of losing it to inflight/cooldown.
                 self._pending[channel] = probe_episode
+                self._last_operator_probe_match_ms[match_key] = int(timestamp_ms)
                 self._trigger_counts["operator_probe_match"] = (
                     self._trigger_counts.get("operator_probe_match", 0) + 1
                 )
@@ -11273,6 +11315,7 @@ class _FastVlmAlertRuntime:
             if int(timestamp_ms) - last_dispatched < self.cooldown_ms:
                 return
             self._pending[channel] = probe_episode
+            self._last_operator_probe_match_ms[match_key] = int(timestamp_ms)
             self._trigger_counts["operator_probe_match"] = (
                 self._trigger_counts.get("operator_probe_match", 0) + 1
             )
@@ -11862,6 +11905,8 @@ class _FastVlmAlertRuntime:
             return {
                 **self._status,
                 "require_operator_policy": self.require_operator_policy,
+                "post_roll_ms": self.post_roll_ms,
+                "operator_probe_post_roll_ms": self.operator_probe_post_roll_ms,
                 "trigger_counts": dict(self._trigger_counts),
                 "last_semantic_delta_by_channel": {
                     str(channel_id): value
