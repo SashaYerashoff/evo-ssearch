@@ -137,18 +137,22 @@ class EmbeddingPolicyTests(unittest.TestCase):
         config.PRODUCTION_CLIP_MODEL = "ViT-B/32"
         config.CLIP_MODEL = "ViT-B/32"
 
-        self.assertTrue(
-            oldapp._index_metadata_compatible(
-                "clip",
-                {"model": "ViT-B/32", "backend": "openai_clip"},
+        with patch(
+            "oldapp.get_probe_embedding_space",
+            return_value={"model": "ViT-B/32", "backend": "openai_clip"},
+        ):
+            self.assertTrue(
+                oldapp._index_metadata_compatible(
+                    "clip",
+                    {"model": "ViT-B/32", "backend": "openai_clip"},
+                )
             )
-        )
-        self.assertFalse(
-            oldapp._index_metadata_compatible(
-                "clip",
-                {"model": "google/siglip2-base-patch16-224", "backend": "siglip2"},
+            self.assertFalse(
+                oldapp._index_metadata_compatible(
+                    "clip",
+                    {"model": "google/siglip2-base-patch16-224", "backend": "siglip2"},
+                )
             )
-        )
 
     def test_openai_clip_fails_closed_when_offline_artifact_is_missing(self) -> None:
         config.OFFLINE_MODE = True

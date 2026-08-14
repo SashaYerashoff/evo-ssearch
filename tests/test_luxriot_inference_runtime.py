@@ -9417,7 +9417,7 @@ class LuxriotCaptureDispatchTests(unittest.TestCase):
             self.assertEqual(manager._rollup_scheduler_status["semantic_guard_retries"], 0)
             self.assertEqual(manager._rollup_scheduler_status["semantic_guard_sanitized"], 1)
 
-    def test_cached_rollup_with_unsupported_claim_is_rejected_for_regeneration(self):
+    def test_cached_rollup_with_supported_overclaim_is_sanitized_without_regeneration(self):
         with tempfile.TemporaryDirectory() as temp:
             manager = build_manager(Path(temp))
             unsafe_summary = operator_rollup_response(
@@ -9442,8 +9442,12 @@ class LuxriotCaptureDispatchTests(unittest.TestCase):
 
             cached = manager._get_cached_rollup_record("l1-ch7-w900-1781700000")
             self.assertIsNotNone(cached)
-            self.assertEqual(cached["summary_kind"], "degraded")
-            self.assertEqual(cached["generation_status"], "semantic_guard_rejected")
+            self.assertEqual(cached["summary_kind"], "llm")
+            self.assertEqual(cached["generation_status"], "semantic_guard_sanitized")
+            self.assertTrue(cached["semantic_guard_sanitized"])
+            self.assertNotIn("No blind spots", cached["summary"])
+            self.assertIn("sampled frames are partial evidence", cached["summary"])
+            self.assertTrue(manager._rollup_semantic_ready(cached))
 
     def test_rollup_semantic_guard_sanitizes_persistent_overclaim_without_retry(self):
         with tempfile.TemporaryDirectory() as temp:
