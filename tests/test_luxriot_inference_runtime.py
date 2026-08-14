@@ -9037,6 +9037,53 @@ class LuxriotCaptureDispatchTests(unittest.TestCase):
         self.assertEqual(memory["routine_baseline"], "domestic activity")
         self.assertEqual(memory["ignore_as_routine"], ["cat sleeping on the shelf"])
 
+    def test_repeated_alert_total_is_presented_as_sampled_emissions(self):
+        summary = operator_rollup_response(
+            "Vehicle drifting remained visible in sampled frames.",
+            alerts=(
+                'The system flagged 53 normal-severity alerts for "Dangerous vehicle behavior".'
+            ),
+        )
+        node = {
+            "alert_total": 53,
+            "alert_delivery_breakdown": {
+                "total": 53,
+                "sent": 14,
+                "deduplicated": 39,
+            },
+        }
+
+        issues = LuxriotManager._rollup_grounding_guard_issues(summary, node)
+        sanitized = LuxriotManager._sanitize_rollup_operator_overclaims(
+            summary,
+            node,
+        )
+
+        self.assertIn("alert_emission_count_unqualified", issues)
+        self.assertIn("53 alert signal emissions", sanitized)
+        self.assertIn("14 sent", sanitized)
+        self.assertIn("39 deduplicated", sanitized)
+        self.assertIn("not distinct real-world incidents", sanitized)
+        self.assertNotIn(
+            "alert_emission_count_unqualified",
+            LuxriotManager._rollup_grounding_guard_issues(sanitized, node),
+        )
+
+    def test_qualified_sampled_alert_emission_count_passes_guard(self):
+        summary = operator_rollup_response(
+            "Vehicle drifting remained visible in sampled frames.",
+            alerts=(
+                "EVA recorded 53 sampled alert signal emissions; repeated emissions "
+                "are not distinct real-world incidents."
+            ),
+        )
+        node = {"alert_total": 53}
+
+        self.assertNotIn(
+            "alert_emission_count_unqualified",
+            LuxriotManager._rollup_grounding_guard_issues(summary, node),
+        )
+
     def test_temporal_episode_open_status_is_not_operator_case_state(self):
         summary = operator_rollup_response(
             "A person briefly moved near the monitor.",
@@ -9472,6 +9519,8 @@ class LuxriotCaptureDispatchTests(unittest.TestCase):
         self.assertIn("at most 5 items", l2)
         self.assertIn("within 420 words", l3)
         self.assertIn("at most 7 items", l3)
+        self.assertIn("sampled alert-signal emissions", l1)
+        self.assertIn("not distinct incidents", l3)
 
     def test_rollup_semantic_guard_sanitizes_supported_rewrites_without_retry(self):
         with tempfile.TemporaryDirectory() as temp:

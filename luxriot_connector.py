@@ -10137,6 +10137,10 @@ class LuxriotManager:
             "- Use prose for the period narrative. Use bullets only for distinct observations, alerts, interruptions, or follow-up items.",
             "- Deduplicate repeated scene descriptions, names, boilerplate, and unchanged background.",
             "- Explain each alert's observable meaning and outcome; do not merely repeat severity counters.",
+            "- Source alert totals count sampled alert-signal emissions from lower-level windows, not distinct "
+            "real-world events or incidents. When citing a numeric total above one, call it sampled signal "
+            "emissions, include supplied delivery/deduplication outcomes, and state that repeated emissions are "
+            "not distinct incidents.",
             "- Report camera/feed interruptions and missing coverage separately from observed behavior.",
             "- Distinguish 'no interruption recorded in metadata' from a claim that visual coverage was complete.",
             "- Recommend operator follow-up only for a grounded unresolved safety/security issue, not routine presence changes or low-confidence cues.",
@@ -19553,17 +19557,34 @@ class LuxriotManager:
         reviewed_count = int(
             _parse_optional_int(feedback_summary.get("annotation_count")) or 0
         ) if isinstance(feedback_summary, Mapping) else 0
+        operator_text = " ".join(str(value or "").split())
         if alert_total > 0 and reviewed_count <= 0:
-            text = " ".join(str(value or "").split())
             dismissal_patterns = (
                 r"\b(?:alerts?|criteria|criterion|triggers?)\b[^.]{0,180}\b(?:benign|non[- ]actionable|false[- ]positive|irrelevant)\b",
                 r"\b(?:benign|non[- ]actionable|false[- ]positive|irrelevant)\b[^.]{0,180}\b(?:alerts?|criteria|criterion|triggers?)\b",
             )
             if any(
-                re.search(pattern, text, flags=re.IGNORECASE)
+                re.search(pattern, operator_text, flags=re.IGNORECASE)
                 for pattern in dismissal_patterns
             ):
                 issues.append("unreviewed_alert_dismissal")
+        if alert_total > 1:
+            numeric_alert_claim = re.search(
+                rf"\b{alert_total}\s+(?:[\w-]+\s+){{0,3}}alerts?\b",
+                operator_text,
+                flags=re.IGNORECASE,
+            )
+            if numeric_alert_claim is not None:
+                claim_context = operator_text[
+                    max(0, numeric_alert_claim.start() - 80) :
+                    min(len(operator_text), numeric_alert_claim.end() + 100)
+                ]
+                if not re.search(
+                    r"\b(?:sampled|signals?|emissions?|observations?)\b",
+                    claim_context,
+                    flags=re.IGNORECASE,
+                ):
+                    issues.append("alert_emission_count_unqualified")
         window_start = (
             cls._coerce_float(node.get("window_start"))
             if isinstance(node, Mapping)
@@ -19627,6 +19648,14 @@ class LuxriotManager:
         )
         output: List[str] = []
         has_operator_incident_basis = cls._rollup_has_operator_incident_basis(node)
+        alert_total = int(
+            _parse_optional_int(node.get("alert_total")) or 0
+        ) if isinstance(node, Mapping) else 0
+        delivery_breakdown = cls._compact_count_breakdown(
+            node.get("alert_delivery_breakdown")
+            if isinstance(node, Mapping)
+            else None
+        )
         for raw_line in str(value or "").splitlines():
             line = raw_line
             issues = set(cls._rollup_operator_semantic_guard_issues(line))
@@ -19645,6 +19674,34 @@ class LuxriotManager:
                 line = (
                     prefix
                     + "No operator feedback was supplied for these alerts; they remain unreviewed and unclassified."
+                )
+                output.append(line)
+                continue
+            unqualified_alert_count = (
+                "alert_emission_count_unqualified" in node_issues
+                and alert_total > 1
+                and re.search(
+                    rf"\b{alert_total}\s+(?:[\w-]+\s+){{0,3}}alerts?\b",
+                    line,
+                    flags=re.IGNORECASE,
+                )
+            )
+            if unqualified_alert_count:
+                delivery_parts = [
+                    f"{int(count)} {str(status).replace('_', ' ')}"
+                    for status, count in sorted(delivery_breakdown.items())
+                    if status != "total" and int(count) > 0
+                ]
+                delivery_suffix = (
+                    f" ({', '.join(delivery_parts)})"
+                    if delivery_parts
+                    else ""
+                )
+                line = (
+                    prefix
+                    + f"Across sampled L0 windows, EVA recorded {alert_total} alert signal emissions"
+                    + delivery_suffix
+                    + "; repeated emissions are not distinct real-world incidents."
                 )
                 output.append(line)
                 continue
