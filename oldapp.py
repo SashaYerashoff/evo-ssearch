@@ -17942,6 +17942,11 @@ def luxriot_summary_rollups():
             level_limit=level_limit,
             target_level=target_level,
             synthesize=synthesize,
+            # A targeted operator request must not silently regenerate every
+            # lower level in the selected archive range.  Existing durable
+            # lower-level receipts remain available as sources; generating a
+            # missing prerequisite is a separate, explicit action.
+            synthesize_levels=force_levels,
             force_synthesis_levels=force_levels,
         )
         levels = rollups.get('levels') if isinstance(rollups, Mapping) else None

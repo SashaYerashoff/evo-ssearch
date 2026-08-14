@@ -1463,6 +1463,26 @@ class ApiDataflowSmokeTests(unittest.TestCase):
         self.assertNotIn("highlights", row)
         self.assertNotIn("llm_input_stats", row)
 
+    def test_targeted_rollup_generation_does_not_cascade_to_lower_levels(self) -> None:
+        rollup_payload = {
+            "channel_id": 7,
+            "levels": {"L1": [], "L2": [], "L3": []},
+        }
+        with patch(
+            "oldapp.luxriot_manager.summary_rollups",
+            return_value=rollup_payload,
+        ) as summary_rollups:
+            response = self.client.get(
+                "/luxriot/rollups?channel_id=7&target_level=L2&synthesize=1"
+            )
+
+        self.assertEqual(response.status_code, 200, response.get_json())
+        self.assertEqual(summary_rollups.call_args.kwargs["synthesize_levels"], {"L2"})
+        self.assertEqual(
+            summary_rollups.call_args.kwargs["force_synthesis_levels"],
+            {"L2"},
+        )
+
     def test_detections_list_normalizes_probe_source_aliases(self) -> None:
         captured: Dict[str, Any] = {}
 
