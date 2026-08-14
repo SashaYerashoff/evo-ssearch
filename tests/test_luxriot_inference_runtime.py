@@ -9233,6 +9233,10 @@ class LuxriotCaptureDispatchTests(unittest.TestCase):
         )
         node = {"alert_total": 5, "operator_feedback": {}}
 
+        self.assertIn(
+            "duplicate_unreviewed_disclosure",
+            LuxriotManager._rollup_grounding_guard_issues(summary, node),
+        )
         sanitized = LuxriotManager._sanitize_rollup_operator_overclaims(
             summary,
             node,
@@ -9244,6 +9248,10 @@ class LuxriotCaptureDispatchTests(unittest.TestCase):
                 "Review the 5 sampled alert signal emissions under the configured policy"
             ),
             1,
+        )
+        self.assertNotIn(
+            "duplicate_unreviewed_disclosure",
+            LuxriotManager._rollup_grounding_guard_issues(sanitized, node),
         )
 
     def test_repeated_alert_total_is_presented_as_sampled_emissions(self):

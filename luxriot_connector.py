@@ -19584,6 +19584,14 @@ class LuxriotManager:
         if alert_total > 0 and reviewed_count <= 0:
             if cls._rollup_unreviewed_alert_dismissal_claim(operator_text):
                 issues.append("unreviewed_alert_dismissal")
+            if len(
+                re.findall(
+                    r"\bremain(?:s)?\s+unreviewed\b",
+                    operator_text,
+                    flags=re.IGNORECASE,
+                )
+            ) > 1:
+                issues.append("duplicate_unreviewed_disclosure")
         if alert_total > 1:
             numeric_alert_claim = re.search(
                 rf"\b{alert_total}\s+(?:[\w-]+\s+){{0,3}}alerts?\b",
@@ -19832,8 +19840,18 @@ class LuxriotManager:
             )
             if is_unreviewed_disclosure:
                 if unreviewed_disclosure_emitted:
-                    continue
-                unreviewed_disclosure_emitted = True
+                    if current_section == "operator takeaway":
+                        line = (
+                            prefix
+                            + f"Review the {alert_total} sampled alert signal emission"
+                            + ("s" if alert_total != 1 else "")
+                            + " under the configured policy; no operator disposition is inferred."
+                        )
+                        normalized_line = " ".join(line.split()).casefold()
+                    else:
+                        continue
+                else:
+                    unreviewed_disclosure_emitted = True
             if (
                 normalized_line
                 and output
