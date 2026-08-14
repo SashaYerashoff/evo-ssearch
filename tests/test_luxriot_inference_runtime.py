@@ -28,6 +28,7 @@ from attention_policy import AttentionMode, CostBudgetState
 from incident_attention import PromptBudgetError
 from luxriot_connector import (
     DEFAULT_ALERTS_JSON_PROMPT,
+    PREVIOUS_ENGLISH_BATCH_STATE_JSON_PROMPT,
     PREVIOUS_VERBOSE_BATCH_STATE_JSON_PROMPT,
     PREVIOUS_COMPACT_BATCH_STATE_JSON_PROMPT,
     LuxriotCaptureSession,
@@ -1533,6 +1534,74 @@ class LuxriotSummaryBackpressureTests(unittest.TestCase):
         self.assertEqual(stats["http_ms"], 91.25)
         self.assertNotIn("endpoint", stats)
 
+    def test_truncated_markerless_l0_is_persisted_as_closed_schema_only_state(self):
+        class TruncatedSummary(str):
+            def __new__(cls, value):
+                result = super().__new__(cls, value)
+                result.eva_response_meta = {
+                    "attempt_count": 1,
+                    "finish_reason": "length",
+                    "completion_tokens": 320,
+                }
+                return result
+
+        response = TruncatedSummary(
+            "### Scene description\n"
+            "A person gives a thumbs-up. Coverage is complete.\n\n"
+            "### Episode update\nThumbs-up remains visible.\n\n"
+            '{"version":2,"alerts":[{"title":"Thumbs up",'
+            '"description":"Visible thumbs-up gesture","severity":"info",'
+            '"snapshot_indices":[2]}],"events":[],"observed_states":[],'
+            '"cover":{"snapshot_index":2,"kind":"event"},'
+            '"scene":{"status":"matched","summary":"Person at desk"},'
+            '"routines":[],"memory_pass":[],"batch_end_ms":101000,'
+            '"clip_probe_legend":['
+        )
+        with tempfile.TemporaryDirectory() as temp:
+            manager = build_manager(
+                Path(temp),
+                lm_callback=lambda _messages, _hint: response,
+            )
+            batch = manager.create_summary_batch(
+                channel_id=7,
+                run_id="run-7",
+                batch_size=2,
+                prompt="Describe.",
+                model_hint=None,
+                interval_sec=1.0,
+                frames=self._frames(100.0, 2),
+            )
+            entry = manager.run_summary_batch(batch)
+
+        self.assertNotIn("clip_probe_legend", entry["summary"])
+        self.assertNotIn("batch_end_ms", entry["summary"])
+        self.assertNotIn("Coverage is complete", entry["summary"])
+        payload = json.loads(entry["summary"].split("BATCH_STATE_JSON:\n", 1)[1])
+        self.assertEqual(
+            list(payload),
+            [
+                "version",
+                "alerts",
+                "events",
+                "observed_states",
+                "cover",
+                "scene",
+                "routines",
+                "memory_pass",
+            ],
+        )
+        self.assertEqual(payload["alerts"][0]["title"], "Thumbs up")
+        stats = entry["lm_response_stats"]
+        self.assertEqual(
+            stats["batch_state_input_contract_status"],
+            "partial_prefix_markerless",
+        )
+        self.assertEqual(
+            stats["batch_state_output_contract_status"],
+            "parsed_canonical",
+        )
+        self.assertTrue(stats["batch_state_canonicalized"])
+
     def test_l0_retries_cjk_output_once_and_keeps_english_result(self):
         calls = []
         responses = [
@@ -2664,6 +2733,14 @@ class LuxriotCaptureDispatchTests(unittest.TestCase):
         self.assertEqual(
             LuxriotManager._normalize_json_alert_prompt(custom),
             custom,
+        )
+
+    def test_previous_english_contract_migrates_to_bounded_output_contract(self):
+        self.assertEqual(
+            LuxriotManager._normalize_json_alert_prompt(
+                PREVIOUS_ENGLISH_BATCH_STATE_JSON_PROMPT
+            ),
+            DEFAULT_ALERTS_JSON_PROMPT,
         )
 
     def test_dedicated_prompt_state_survives_stale_high_revision_summary_write(self):

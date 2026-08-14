@@ -1,4 +1,5 @@
 import ast
+import json
 import tempfile
 import time
 import unittest
@@ -132,6 +133,15 @@ class VlmAlertPromptContractTests(unittest.TestCase):
             DEFAULT_ALERTS_JSON_PROMPT,
         )
         self.assertIn("including empty arrays", DEFAULT_ALERTS_JSON_PROMPT)
+        self.assertIn("only allowed top-level JSON keys", DEFAULT_ALERTS_JSON_PROMPT)
+        self.assertIn("probe legends", DEFAULT_ALERTS_JSON_PROMPT)
+        self.assertIn("under 12 words", DEFAULT_ALERTS_JSON_PROMPT)
+        self.assertIn("Never claim complete coverage", DEFAULT_ALERTS_JSON_PROMPT)
+        self.assertTrue(
+            DEFAULT_ALERTS_JSON_PROMPT.rstrip().endswith(
+                '"scene":{},"routines":[],"memory_pass":[]}'
+            )
+        )
 
     def test_batch_state_recovers_complete_alert_from_truncated_json_prefix(self):
         frames = [
@@ -152,6 +162,87 @@ class VlmAlertPromptContractTests(unittest.TestCase):
         self.assertEqual(len(state["alerts"]), 1)
         self.assertEqual(state["alerts"][0]["title"], "Thumbs up")
         self.assertEqual(state["alerts"][0]["snapshot_indices"], [2])
+
+    def test_batch_state_recovers_markerless_v2_prefix_and_strips_prompt_leak(self):
+        frames = [
+            {"thumbnail": "frame-one", "captured_at": 100.0},
+            {"thumbnail": "frame-two", "captured_at": 101.0},
+        ]
+        summary = (
+            "### Scene description\n"
+            "A person gives a thumbs-up. Coverage is complete and matched.\n\n"
+            "### Episode update\nThumbs-up remains visible.\n\n"
+            '{"version":2,"alerts":[{"title":"Thumbs up",'
+            '"description":"Visible thumbs-up gesture", "severity":"info",'
+            '"snapshot_indices":[2]}],"events":[],"observed_states":[],'
+            '"cover":{"snapshot_index":2,"kind":"event"},'
+            '"scene":{"status":"matched","summary":"Person at desk"},'
+            '"routines":[],"memory_pass":[],"batch_end_ms":101000,'
+            '"clip_probe_legend":['
+        )
+
+        state = LuxriotManager._extract_batch_state(summary, frames)
+        canonical = LuxriotManager._render_reconciled_batch_state_summary(
+            summary,
+            state,
+        )
+
+        self.assertEqual(state["contract_status"], "partial_prefix_markerless")
+        self.assertEqual(state["alerts"][0]["title"], "Thumbs up")
+        self.assertIn("BATCH_STATE_JSON:", canonical)
+        self.assertNotIn("clip_probe_legend", canonical)
+        self.assertNotIn("batch_end_ms", canonical)
+        self.assertNotIn("Coverage is complete", canonical)
+        payload = json.loads(canonical.split("BATCH_STATE_JSON:\n", 1)[1])
+        self.assertEqual(
+            list(payload),
+            [
+                "version",
+                "alerts",
+                "events",
+                "observed_states",
+                "cover",
+                "scene",
+                "routines",
+                "memory_pass",
+            ],
+        )
+        self.assertEqual(payload["alerts"][0]["snapshot_indices"], [2])
+
+    def test_batch_state_does_not_treat_markerless_input_metadata_as_state(self):
+        frames = [{"thumbnail": "frame-one", "captured_at": 100.0}]
+        summary = (
+            "Scene notes.\n"
+            '{"version":2,"channel_id":7,"batch_end_ms":100000,'
+            '"clip_probe_legend":[]}'
+        )
+
+        state = LuxriotManager._extract_batch_state(summary, frames)
+
+        self.assertEqual(state["contract_status"], "missing_fallback")
+
+    def test_batch_state_accepts_complete_markerless_ordered_v2_object(self):
+        frames = [{"thumbnail": "frame-one", "captured_at": 100.0}]
+        summary = (
+            "A person remains at the desk.\n"
+            '{"version":2,"alerts":[],"events":[],"observed_states":[],'
+            '"cover":{"snapshot_index":1,"kind":"routine"},'
+            '"scene":{"status":"matched","summary":"Person at desk"},'
+            '"routines":[],"memory_pass":[]}'
+        )
+
+        state = LuxriotManager._extract_batch_state(summary, frames)
+        canonical = LuxriotManager._render_reconciled_batch_state_summary(
+            summary,
+            state,
+        )
+
+        self.assertEqual(state["contract_status"], "parsed_markerless")
+        self.assertIn("BATCH_STATE_JSON:", canonical)
+        self.assertEqual(
+            json.loads(canonical.split("BATCH_STATE_JSON:\n", 1)[1])["version"],
+            2,
+        )
 
     def test_truncated_event_prefix_can_reconcile_explicit_operator_alert(self):
         frames = [

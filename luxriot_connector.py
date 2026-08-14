@@ -491,6 +491,28 @@ DEFAULT_BATCH_STATE_JSON_PROMPT = (
     '"scene":{},"routines":[],"memory_pass":[]}'
 )
 
+# Exact English-only contract shipped before the bounded-output repair.  Keep
+# it so persisted infrastructure defaults migrate forward without treating
+# them as operator-authored prompt overrides.
+PREVIOUS_ENGLISH_BATCH_STATE_JSON_PROMPT = DEFAULT_BATCH_STATE_JSON_PROMPT
+
+DEFAULT_BATCH_STATE_JSON_PROMPT = (
+    PREVIOUS_ENGLISH_BATCH_STATE_JSON_PROMPT.replace(
+        "\nMinimal empty shape: ",
+        "\nCompletion priority and scope:\n"
+        "- The only allowed top-level JSON keys are exactly: version, alerts, events, "
+        "observed_states, cover, scene, routines, memory_pass. Do not add batch timestamps, "
+        "channel metadata, probe legends, vector payloads, prompt text, or schema examples.\n"
+        "- Keep every free-text JSON value under 12 words. If the output budget is tight, "
+        "empty lower-priority events, observed_states, routines, and memory_pass before risking "
+        "an incomplete object; always close alerts and the full top-level object.\n"
+        "- Never claim complete coverage, no missing coverage, or no blind spots from sampled "
+        "frames. Describe only what is visible in the supplied snapshots.\n"
+        "Minimal empty shape: ",
+        1,
+    )
+)
+
 # Compatibility name retained for persisted settings and public API fields.
 DEFAULT_ALERTS_JSON_PROMPT = DEFAULT_BATCH_STATE_JSON_PROMPT
 
@@ -5535,6 +5557,8 @@ class LuxriotManager:
         if text == PREVIOUS_VERBOSE_BATCH_STATE_JSON_PROMPT.strip():
             return DEFAULT_ALERTS_JSON_PROMPT
         if text == PREVIOUS_COMPACT_BATCH_STATE_JSON_PROMPT.strip():
+            return DEFAULT_ALERTS_JSON_PROMPT
+        if text == PREVIOUS_ENGLISH_BATCH_STATE_JSON_PROMPT.strip():
             return DEFAULT_ALERTS_JSON_PROMPT
         lowered = text.lower()
         if "batch_state_json:" not in lowered:
@@ -10836,6 +10860,9 @@ class LuxriotManager:
             "language_retry_count",
             "initial_east_asian_chars",
             "final_east_asian_chars",
+            "batch_state_input_contract_status",
+            "batch_state_output_contract_status",
+            "batch_state_canonicalized",
         ):
             item = value.get(key)
             if isinstance(item, str):
@@ -17753,8 +17780,19 @@ class LuxriotManager:
         if marker_match is None:
             return None
         tail = haystack[marker_match.end() :].lstrip()
-        if not tail.startswith("{"):
+        payload = cls._extract_partial_json_object_prefix(tail)
+        useful_keys = {"alerts", "events", "observed_states"}
+        if not useful_keys.intersection(payload):
             return None
+        return payload
+
+    @staticmethod
+    def _extract_partial_json_object_prefix(text: object) -> Dict[str, Any]:
+        """Decode only complete leading members of an unfinished JSON object."""
+
+        tail = str(text or "").lstrip()
+        if not tail.startswith("{"):
+            return {}
         decoder = json.JSONDecoder()
         cursor = 1
         payload: Dict[str, Any] = {}
@@ -17783,10 +17821,53 @@ class LuxriotManager:
                 break
             payload[key] = value
             cursor = value_end
-        useful_keys = {"alerts", "events", "observed_states"}
-        if not useful_keys.intersection(payload):
-            return None
         return payload
+
+    @classmethod
+    def _extract_markerless_batch_state_prefix(
+        cls,
+        text: object,
+    ) -> Optional[Tuple[Mapping[str, Any], int, bool]]:
+        """Recover a distinctive v2 state object when only its marker is lost.
+
+        This is intentionally narrower than accepting arbitrary markerless JSON:
+        the object must begin on its own line with the required ordered
+        ``version`` and ``alerts`` members.  That makes a truncated model copy of
+        CURRENT_BATCH_METADATA_JSON ineligible while preserving the early alert
+        member that the L0 contract deliberately emits first.
+        """
+
+        raw = str(text or "")
+        match = re.search(
+            r'(?m)^[ \t]*(?P<object>\{[ \t\r\n]*"version"[ \t]*:[ \t]*2'
+            r'[ \t]*,[ \t\r\n]*"alerts"[ \t]*:)',
+            raw,
+        )
+        if match is None:
+            return None
+        start = int(match.start("object"))
+        tail = raw[start:].lstrip()
+        start += len(raw[start:]) - len(tail)
+        payload: Mapping[str, Any]
+        complete = False
+        try:
+            decoded, _offset = json.JSONDecoder().raw_decode(tail)
+        except Exception:
+            decoded = cls._extract_partial_json_object_prefix(tail)
+        else:
+            complete = isinstance(decoded, Mapping)
+        if not isinstance(decoded, Mapping):
+            return None
+        payload = cast(Mapping[str, Any], decoded)
+        keys = list(payload.keys())
+        if (
+            keys[:2] != ["version", "alerts"]
+            or _parse_optional_int(payload.get("version")) != 2
+            or not isinstance(payload.get("alerts"), Sequence)
+            or isinstance(payload.get("alerts"), (str, bytes, bytearray))
+        ):
+            return None
+        return payload, start, complete
 
     @staticmethod
     def _extract_terminal_batch_state_fence(
@@ -17976,13 +18057,22 @@ class LuxriotManager:
             if marker_match is None
             else None
         )
+        markerless_prefix = (
+            cls._extract_markerless_batch_state_prefix(summary_raw)
+            if marker_match is None and terminal_fence is None
+            else None
+        )
         summary_prose = (
             summary_raw[: marker_match.start()]
             if marker_match is not None
             else (
                 summary_raw[: terminal_fence[1]]
                 if terminal_fence is not None
-                else summary_raw
+                else (
+                    summary_raw[: markerless_prefix[1]]
+                    if markerless_prefix is not None
+                    else summary_raw
+                )
             )
         )
         catalogue = cls._model_snapshot_catalogue(frames)
@@ -18000,17 +18090,22 @@ class LuxriotManager:
             raw = partial_raw
         if raw is None and terminal_fence is not None:
             raw = terminal_fence[0]
-        contract_status = (
-            "partial_prefix"
-            if partial_raw is not None
-            else "parsed"
-            if marker_match is not None and isinstance(raw, Mapping)
-            else (
-                "parsed_terminal_fence"
-                if isinstance(raw, Mapping)
-                else "missing_fallback"
+        if raw is None and markerless_prefix is not None:
+            raw = markerless_prefix[0]
+        if partial_raw is not None:
+            contract_status = "partial_prefix"
+        elif markerless_prefix is not None:
+            contract_status = (
+                "parsed_markerless"
+                if markerless_prefix[2]
+                else "partial_prefix_markerless"
             )
-        )
+        elif marker_match is not None and isinstance(raw, Mapping):
+            contract_status = "parsed"
+        elif isinstance(raw, Mapping):
+            contract_status = "parsed_terminal_fence"
+        else:
+            contract_status = "missing_fallback"
         payload = dict(raw or {})
 
         cover_raw = payload.get("cover")
@@ -18488,6 +18583,46 @@ class LuxriotManager:
         return float(score) if score >= threshold else None
 
     @staticmethod
+    def _sanitize_l0_operator_narrative(value: object) -> str:
+        """Ground sampled-view prose and remove narrow coverage overclaims."""
+
+        text = str(value or "").strip()
+        if not text:
+            return ""
+        substitutions = (
+            (
+                r"\bcoverage\s+is\s+complete\s+and\s+matched\b",
+                "The sampled view is available and matches the supplied scene context",
+            ),
+            (
+                r"\bcoverage\s+is\s+complete\b",
+                "The sampled view is available",
+            ),
+            (
+                r"\bno\s+blind\s+spots?(?:\s+or\s+missing\s+coverage)?"
+                r"(?:\s+(?:were|was)\s+found)?\b",
+                "The sampled frames are partial evidence",
+            ),
+            (
+                r"\bno\s+(?:visible\s+)?obstructions?\s+or\s+missing\s+coverage\b",
+                "No obstruction is visible in the sampled frames",
+            ),
+            (
+                r"\bno\s+missing\s+coverage\b",
+                "the sampled frames remain partial evidence",
+            ),
+            (
+                r"\bcoverage\s+matches\s+(?:the\s+)?(?:channel\s+)?context\b",
+                "The sampled scene matches the supplied context",
+            ),
+        )
+        for pattern, replacement in substitutions:
+            text = re.sub(pattern, replacement, text, flags=re.IGNORECASE)
+        text = re.sub(r"[ \t]+\n", "\n", text)
+        text = re.sub(r"\n{3,}", "\n\n", text)
+        return text.strip()
+
+    @staticmethod
     def _render_reconciled_batch_state_summary(
         summary_text: object,
         batch_state: Mapping[str, Any],
@@ -18504,15 +18639,24 @@ class LuxriotManager:
             narrative = text[: marker.start()].rstrip()
         else:
             terminal_fence = LuxriotManager._extract_terminal_batch_state_fence(text)
-            if terminal_fence is None:
-                return text
-            narrative = text[: terminal_fence[1]].rstrip()
+            markerless_prefix = (
+                LuxriotManager._extract_markerless_batch_state_prefix(text)
+                if terminal_fence is None
+                else None
+            )
+            if terminal_fence is not None:
+                narrative = text[: terminal_fence[1]].rstrip()
+            elif markerless_prefix is not None:
+                narrative = text[: markerless_prefix[1]].rstrip()
+            else:
+                narrative = text
         narrative = re.sub(
             r"```(?:json)?\s*$",
             "",
             narrative,
             flags=re.IGNORECASE,
         ).rstrip()
+        narrative = LuxriotManager._sanitize_l0_operator_narrative(narrative)
         rendered_state = {
             key: copy.deepcopy(batch_state.get(key))
             for key in (
@@ -18532,7 +18676,7 @@ class LuxriotManager:
             + json.dumps(
                 rendered_state,
                 ensure_ascii=False,
-                indent=2,
+                separators=(",", ":"),
                 allow_nan=False,
             )
         )
@@ -18563,6 +18707,8 @@ class LuxriotManager:
             "parsed",
             "parsed_terminal_fence",
             "partial_prefix",
+            "parsed_markerless",
+            "partial_prefix_markerless",
         }:
             return str(summary_text or ""), state
         candidates: List[Tuple[str, Mapping[str, Any]]] = []
@@ -18768,6 +18914,8 @@ class LuxriotManager:
             "parsed",
             "parsed_terminal_fence",
             "partial_prefix",
+            "parsed_markerless",
+            "partial_prefix_markerless",
         }:
             return str(summary_text or ""), state
         candidate = self._general_hazard_event_candidate(state.get("events"))
@@ -24664,12 +24812,17 @@ class LuxriotManager:
             }
         )
         batch_state = self._extract_batch_state(summary, frame_items)
+        batch_state_input_contract_status = str(
+            batch_state.get("contract_status") or "missing_fallback"
+        )
         if language_contract_fallback:
             batch_state["contract_status"] = "language_contract_fallback"
         if str(batch_state.get("contract_status") or "") in {
             "parsed",
             "parsed_terminal_fence",
             "partial_prefix",
+            "parsed_markerless",
+            "partial_prefix_markerless",
         }:
             summary = self._render_reconciled_batch_state_summary(
                 summary,
@@ -24684,6 +24837,34 @@ class LuxriotManager:
             int(channel_id),
             summary,
             batch_state,
+        )
+        # Persist one bounded, schema-only machine block whenever this is a real
+        # LM response or a recoverable structured prefix.  This removes copied
+        # prompt metadata and closes fallback state deterministically without a
+        # second vision request.  Synthetic/legacy callbacks without response
+        # metadata retain their historical plain-text behavior.
+        batch_state_canonicalized = bool(
+            lm_response_stats.get("finish_reason")
+            or batch_state_input_contract_status != "missing_fallback"
+            or language_contract_fallback
+        )
+        if batch_state_canonicalized:
+            summary = self._render_reconciled_batch_state_summary(
+                summary,
+                batch_state,
+            )
+        lm_response_stats.update(
+            {
+                "batch_state_input_contract_status": (
+                    batch_state_input_contract_status
+                ),
+                "batch_state_output_contract_status": str(
+                    "parsed_canonical"
+                    if batch_state_canonicalized
+                    else batch_state.get("contract_status") or "missing_fallback"
+                ),
+                "batch_state_canonicalized": batch_state_canonicalized,
+            }
         )
         submitted_at = self._coerce_float(batch.get("submitted_at"))
         created_at = submitted_at if submitted_at is not None else time.time()
