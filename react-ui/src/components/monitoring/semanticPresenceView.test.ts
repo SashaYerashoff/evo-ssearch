@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest'
 import type { SemanticPresenceClass } from '../../api/probes'
-import { presenceMatchesContext, presenceReaction, rankPresenceClasses } from './semanticPresenceView'
+import { presenceDisplaySignal, presenceMatchesContext, presenceReaction, rankPresenceClasses } from './semanticPresenceView'
 
 function semanticClass(
   key: string,
@@ -98,7 +98,7 @@ describe('semantic presence operator ranking', () => {
     ).map((item) => item.key)).toEqual(['fire', 'vehicle', 'smoke'])
   })
 
-  it('uses same-forward spatial history instead of pooled scene leakage', () => {
+  it('keeps whole-frame affinity authoritative when a spatial hint exists', () => {
     const person = semanticClass('person', 0.05, [0.05], 'above_baseline')
     Object.assign(person, {
       spatial_score: 0.12,
@@ -112,6 +112,33 @@ describe('semantic presence operator ranking', () => {
       spatial_history: [{ timestamp_ms: 60_000, score: 0.12, baseline: 0.119 }],
     })
 
-    expect(presenceReaction(person).reacting).toBe(false)
+    expect(presenceDisplaySignal(person)).toMatchObject({
+      spatial: false,
+      score: 0.11,
+      delta: 0.05,
+    })
+    expect(presenceReaction(person)).toMatchObject({
+      reacting: true,
+      direction: 'up',
+    })
+  })
+
+  it('uses spatial contrast only as a fallback when no whole-frame sample exists', () => {
+    const item: SemanticPresenceClass = {
+      key: 'person',
+      label: 'person',
+      spatial_score: 0.04,
+      spatial_baseline: 0.03,
+      spatial_delta: 0.01,
+      spatial_state: 'routine',
+      spatial_warmup: false,
+      spatial_samples: 4,
+    }
+
+    expect(presenceDisplaySignal(item)).toMatchObject({
+      spatial: true,
+      score: 0.04,
+      baseline: 0.03,
+    })
   })
 })

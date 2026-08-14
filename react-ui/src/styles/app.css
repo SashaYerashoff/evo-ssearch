@@ -2137,7 +2137,7 @@
 .pc-radar { color: var(--text-mut); }
 .probe-inspect-modal { max-width: 520px; }
 
-/* Semantic presence is a shadow score pulse, never an object counter. */
+/* Semantic affinity is a shadow pulse, never an object-presence claim. */
 .semantic-presence-card {
   min-width: 0; display: flex; flex-direction: column; gap: 9px; padding: 13px;
   border: 1px solid color-mix(in srgb, var(--accent) 32%, var(--line)); border-radius: 13px;
@@ -2174,6 +2174,7 @@
 .presence-class.reacting .presence-class-values b { color: var(--accent); }
 .presence-class-values span { color: var(--text-mut); font: 8px/1 var(--mono); }
 .presence-class-values em { grid-column: 1 / -1; color: var(--text-2); font: 9px/1 var(--mono); font-style: normal; }
+.presence-class-values small { grid-column: 1 / -1; color: var(--text-mut); font: 8px/1.25 var(--mono); }
 .presence-card-note, .presence-card-empty { color: var(--text-mut); font-size: 9.5px; line-height: 1.4; }
 .presence-card-error { display: flex; align-items: flex-start; gap: 6px; color: var(--danger); font-size: 10px; }
 .semantic-presence-card.compact { padding: 10px; }

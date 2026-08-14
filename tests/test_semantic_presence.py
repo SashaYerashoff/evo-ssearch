@@ -100,14 +100,65 @@ def test_probe_manager_scores_presence_from_the_existing_image_vector():
     )
 
 
+def test_whole_frame_affinity_responds_to_person_like_scene_change():
+    image_vectors = iter(
+        (
+            np.asarray([0.0, 1.0], dtype=np.float32),
+            np.asarray([0.0, 1.0], dtype=np.float32),
+            np.asarray([0.0, 1.0], dtype=np.float32),
+            np.asarray([1.0, 0.0], dtype=np.float32),
+        )
+    )
+
+    manager = ProbeManager(
+        embed_image_fn=lambda _image: next(image_vectors),
+        embed_text_fn=lambda _text: np.asarray([1.0, 0.0], dtype=np.float32),
+        embed_texts_fn=lambda texts: np.asarray(
+            [
+                [1.0, 0.0]
+                if "person" in text or "people" in text
+                else [0.0, 1.0]
+                for text in texts
+            ],
+            dtype=np.float32,
+        ),
+        jpeg_encoder=lambda _image, **_kwargs: "jpeg",
+        semantic_presence_enabled=True,
+        semantic_presence_classes=("person",),
+    )
+    manager.semantic_presence_tracker.warmup_samples = 3
+    phrases = [
+        prompt
+        for _label, prompts in manager.semantic_presence_tracker.prompt_plan(7)
+        for prompt in prompts
+    ]
+    manager.prewarm_texts(phrases)
+
+    with patch.object(ProbeBuffer, "_rebuild_index", return_value=None):
+        for timestamp_ms in (1_000, 2_000, 3_000, 4_000):
+            result = manager.add_frame(
+                7,
+                Image.new("RGB", (4, 4), color=(255, 255, 255)),
+                timestamp_ms,
+            )
+
+    person = result["semantic_presence"]["classes"][0]
+    assert person["score"] == 1.0
+    assert person["state"] == "above_baseline"
+    assert person["delta"] > 0.9
+    assert result["semantic_presence"]["semantics"] == (
+        "whole_frame_text_affinity_homeostasis_not_object_detection"
+    )
+
+
 def test_same_forward_patch_shadow_is_not_part_of_embedding_space():
     def embed_with_metadata(_image):
         return np.asarray([1.0, 0.0], dtype=np.float32), {
             "backend": "siglip2",
             "model": "test",
             "dimension": 2,
-            "_semantic_patch_presence_v1": {
-                "semantics": "same_forward_top_patch_text_affinity_shadow_v1",
+            "_semantic_patch_presence_v2": {
+                "semantics": "same_forward_patch_affinity_components_v2",
                 "classes": {
                     "person": {"score": 0.12, "contrast": 0.04},
                     "vehicle": {"score": 0.31, "contrast": 0.09},
@@ -141,18 +192,88 @@ def test_same_forward_patch_shadow_is_not_part_of_embedding_space():
             1_000,
         )
 
-    assert "_semantic_patch_presence_v1" not in result["embedding_space"]
+    assert "_semantic_patch_presence_v2" not in result["embedding_space"]
     by_label = {
         item["label"]: item
         for item in result["semantic_presence"]["classes"]
     }
-    assert by_label["person"]["spatial_score"] == 0.12
-    assert by_label["vehicle"]["spatial_score"] == 0.31
+    assert by_label["person"]["spatial_score"] == 0.04
+    assert by_label["person"]["spatial_raw_score"] == 0.12
+    assert by_label["vehicle"]["spatial_score"] == 0.09
+    assert by_label["vehicle"]["spatial_raw_score"] == 0.31
     assert by_label["vehicle"]["spatial_contrast"] == 0.09
+    assert by_label["vehicle"]["spatial_score_semantics"] == (
+        "top_patch_affinity_minus_patch_median"
+    )
     status = manager.status(7)["semantic_presence"]
     assert status["spatial_semantics"] == (
-        "same_forward_top_patch_text_affinity_shadow_v1"
+        "same_forward_patch_contrast_shadow_v2"
     )
+
+
+def test_spatial_homeostasis_rejects_common_mode_raw_affinity_shift():
+    samples = iter(
+        (
+            (0.12, 0.04),
+            (0.11, 0.04),
+            (0.10, 0.04),
+            # Camera exposure changes every raw patch affinity, but the local
+            # top-patch versus median contrast remains unchanged.
+            (0.04, 0.04),
+        )
+    )
+
+    def embed_with_metadata(_image):
+        raw_score, contrast = next(samples)
+        return np.asarray([1.0, 0.0], dtype=np.float32), {
+            "backend": "siglip2",
+            "model": "test",
+            "dimension": 2,
+            "_semantic_patch_presence_v2": {
+                "semantics": "same_forward_patch_affinity_components_v2",
+                "classes": {
+                    "person": {
+                        "score": raw_score,
+                        "contrast": contrast,
+                    },
+                },
+            },
+        }
+
+    manager = ProbeManager(
+        embed_image_fn=lambda _image: np.asarray([1.0, 0.0], dtype=np.float32),
+        embed_image_with_metadata_fn=embed_with_metadata,
+        embed_text_fn=lambda _text: np.asarray([1.0, 0.0], dtype=np.float32),
+        embed_texts_fn=lambda texts: np.asarray(
+            [[1.0, 0.0] for _text in texts],
+            dtype=np.float32,
+        ),
+        jpeg_encoder=lambda _image, **_kwargs: "jpeg",
+        semantic_presence_enabled=True,
+        semantic_presence_classes=("person",),
+    )
+    manager.semantic_patch_presence_tracker.warmup_samples = 3
+    phrases = [
+        prompt
+        for _label, prompts in manager.semantic_presence_tracker.prompt_plan(7)
+        for prompt in prompts
+    ]
+    manager.prewarm_texts(phrases)
+
+    with patch.object(ProbeBuffer, "_rebuild_index", return_value=None):
+        for timestamp_ms in (1_000, 2_000, 3_000, 4_000):
+            result = manager.add_frame(
+                7,
+                Image.new("RGB", (4, 4), color=(255, 255, 255)),
+                timestamp_ms,
+            )
+
+    person = result["semantic_presence"]["classes"][0]
+    assert person["spatial_raw_score"] == 0.04
+    assert person["spatial_score"] == 0.04
+    assert person["spatial_baseline"] == 0.04
+    assert person["spatial_delta"] == 0.0
+    assert person["spatial_state"] == "routine"
 
 
 def test_presence_is_archived_compactly_but_not_injected_into_vlm_prompt():

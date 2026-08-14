@@ -55,6 +55,7 @@ export function presenceMatchesContext(
 }
 
 function finite(value: unknown): number | null {
+  if (value == null) return null
   const number = Number(value)
   return Number.isFinite(number) ? number : null
 }
@@ -66,6 +67,23 @@ export function presenceClassKey(item: SemanticPresenceClass): string {
 export function presenceDisplaySignal(
   item: SemanticPresenceClass,
 ): PresenceDisplaySignal {
+  const pooled = Number(item.samples || 0) > 0
+    && finite(item.score) != null
+  if (pooled) {
+    return {
+      spatial: false,
+      score: item.score,
+      baseline: item.baseline,
+      deviation: item.deviation,
+      delta: item.delta,
+      z: item.z,
+      state: item.state,
+      warmup: item.warmup,
+      samples: item.samples,
+      timestamp_ms: item.timestamp_ms,
+      history: item.history,
+    }
+  }
   const spatial = Number(item.spatial_samples || 0) > 0
     && finite(item.spatial_score) != null
   return spatial
@@ -82,19 +100,29 @@ export function presenceDisplaySignal(
         timestamp_ms: item.spatial_timestamp_ms,
         history: item.spatial_history,
       }
-    : {
-        spatial: false,
-        score: item.score,
-        baseline: item.baseline,
-        deviation: item.deviation,
-        delta: item.delta,
-        z: item.z,
-        state: item.state,
-        warmup: item.warmup,
-        samples: item.samples,
-        timestamp_ms: item.timestamp_ms,
-        history: item.history,
-      }
+    : { spatial: false }
+}
+
+export function presenceSpatialSignal(
+  item: SemanticPresenceClass,
+): PresenceDisplaySignal | null {
+  if (
+    Number(item.spatial_samples || 0) <= 0
+    || finite(item.spatial_score) == null
+  ) return null
+  return {
+    spatial: true,
+    score: item.spatial_score,
+    baseline: item.spatial_baseline,
+    deviation: item.spatial_deviation,
+    delta: item.spatial_delta,
+    z: item.spatial_z,
+    state: item.spatial_state,
+    warmup: item.spatial_warmup,
+    samples: item.spatial_samples,
+    timestamp_ms: item.spatial_timestamp_ms,
+    history: item.spatial_history,
+  }
 }
 
 /**

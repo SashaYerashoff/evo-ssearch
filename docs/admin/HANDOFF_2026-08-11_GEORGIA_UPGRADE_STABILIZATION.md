@@ -3001,3 +3001,51 @@ HTTP call was 3.641 seconds and Luxriot delivery 65 ms. Only one scored sample
 crossed the tuned floor during this live gesture, so the new held-frame
 suppression counter correctly remained zero; the repeated-match branch is
 covered by its focused race test rather than claimed as a live observation.
+
+## 2026-08-14 semantic affinity homeostasis contract correction
+
+The operator screenshot in which `Person` fell when a person entered the frame
+exposed a contract bug rather than evidence that SigLIP had detected an absence.
+The UI unconditionally replaced the pooled whole-frame trace with an available
+patch trace. That patch trace was the raw mean of the highest-affinity 10% of
+patches, so camera exposure and other common-mode representation shifts could
+move all labels together. The patch tracker then treated that raw value as its
+homeostatic signal even though the same forward pass already provided a local
+contrast (`top-patch mean - patch median`).
+
+The corrected contract is deliberately narrower and does not claim object
+presence:
+
+```text
+main pulse      = whole-frame image/text affinity - that prompt's own
+                  per-channel whole-frame baseline
+patch shadow    = top-patch affinity - the same prompt's patch median
+patch response  = patch shadow - that prompt's own per-channel patch baseline
+operator probe  = operator positive affinity - operator negative affinity
+```
+
+The whole-frame and patch baselines never replace or update each other. The UI
+now keeps the whole-frame pulse authoritative whenever it has samples, shows
+patch contrast only as a secondary localization hint, and labels both as
+affinities that cannot by themselves mean `present` or `absent`. A generic
+negated text such as `scene without people` was intentionally not introduced:
+SigLIP text negation is not a calibrated empty/occupied classifier and using it
+would create another false semantic claim. Operator probes retain their explicit
+human-authored positive/negative comparison.
+
+Focused backend tests cover a person-like whole-frame transition, invariance of
+patch homeostasis under a synthetic common-mode raw-affinity shift, and the
+ephemeral/non-archived patch contract. Focused UI tests prove that patch data
+cannot override an available whole-frame trace. Backend tests (9), UI tests (8),
+the exact patch API smoke test, and the production UI build pass.
+
+The change is deployed to the rehearsal worker. At 22:39 local time `/ready`
+returned HTTP 200, SigLIP2 reported CUDA plus a healthy runtime canary, channels
+112 and 118 were restored, and both LM profiles returned 200. The deployed
+backend files match the repository byte for byte; the new hashed UI assets both
+return HTTP 200. The rehearsal `.env` remains unchanged at SHA-256
+`36f1163baeedbde90352d252dedc426978ed5a5d25864606732a7472d720fdde`,
+and llama.cpp remains on PIDs 11006/114612. A hard browser refresh is required
+before operator validation. Do not claim that a real person necessarily raises
+the new whole-frame trace until that live observation is made; the fix guarantees
+honest attribution of the signal, not detector-like monotonicity.

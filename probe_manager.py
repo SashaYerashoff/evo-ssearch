@@ -13,7 +13,7 @@ from embedding_space import embedding_space_fingerprint
 from semantic_presence import SemanticPresenceTracker
 
 
-_SEMANTIC_PATCH_METADATA_KEY = "_semantic_patch_presence_v1"
+_SEMANTIC_PATCH_METADATA_KEY = "_semantic_patch_presence_v2"
 
 
 class _FaissTypingStub:
@@ -813,15 +813,22 @@ class ProbeManager:
         classes = payload.get("classes") if isinstance(payload, Mapping) else None
         scores: Dict[str, float] = {}
         contrasts: Dict[str, float] = {}
+        raw_scores: Dict[str, float] = {}
         if isinstance(classes, Mapping):
             for label, raw in classes.items():
                 if not isinstance(raw, Mapping):
                     continue
                 try:
-                    scores[str(label)] = float(raw.get("score"))
-                    contrasts[str(label)] = float(raw.get("contrast"))
+                    raw_score = float(raw.get("score"))
+                    contrast = float(raw.get("contrast"))
                 except (TypeError, ValueError):
                     continue
+                # Raw top-patch affinity moves with exposure and other
+                # frame-wide representation shifts. Homeostasis only sees the
+                # localized excess over this prompt's own patch median.
+                scores[str(label)] = contrast
+                contrasts[str(label)] = contrast
+                raw_scores[str(label)] = raw_score
         if scores:
             status = self.semantic_patch_presence_tracker.update(
                 channel_id,
@@ -836,9 +843,10 @@ class ProbeManager:
         if contrasts:
             status = dict(status)
             status["contrasts"] = contrasts
-        status["semantics"] = str(
-            (payload or {}).get("semantics")
-            or "same_forward_top_patch_text_affinity_shadow_v1"
+            status["raw_scores"] = raw_scores
+        status["semantics"] = "same_forward_patch_contrast_shadow_v2"
+        status["source_semantics"] = str(
+            (payload or {}).get("semantics") or ""
         )
         return status
 
@@ -854,6 +862,7 @@ class ProbeManager:
             if isinstance(item, Mapping) and item.get("key")
         }
         contrasts = spatial_status.get("contrasts")
+        raw_scores = spatial_status.get("raw_scores")
         merged_classes: List[Dict[str, Any]] = []
         for raw in result.get("classes", []):
             if not isinstance(raw, Mapping):
@@ -877,6 +886,11 @@ class ProbeManager:
                         item[f"spatial_{key}"] = spatial[key]
                 if isinstance(contrasts, Mapping) and item.get("key") in contrasts:
                     item["spatial_contrast"] = contrasts[item["key"]]
+                if isinstance(raw_scores, Mapping) and item.get("key") in raw_scores:
+                    item["spatial_raw_score"] = raw_scores[item["key"]]
+                item["spatial_score_semantics"] = (
+                    "top_patch_affinity_minus_patch_median"
+                )
             merged_classes.append(item)
         result["classes"] = merged_classes
         result["spatial_semantics"] = spatial_status.get("semantics")
@@ -1444,7 +1458,7 @@ class ProbeManager:
         if self.semantic_presence_enabled:
             spatial_status = self.semantic_patch_presence_tracker.status(channel_id)
             spatial_status["semantics"] = (
-                "same_forward_top_patch_text_affinity_shadow_v1"
+                "same_forward_patch_contrast_shadow_v2"
             )
             result["semantic_presence"] = self._merge_spatial_presence(
                 self.semantic_presence_tracker.status(channel_id),

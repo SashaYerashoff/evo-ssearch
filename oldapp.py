@@ -237,7 +237,7 @@ _semantic_patch_bank_generation = ""
 _semantic_patch_bank_labels: Tuple[str, ...] = ()
 _semantic_patch_bank_ranges: Tuple[Tuple[int, int], ...] = ()
 _semantic_patch_bank_matrix: Optional[np.ndarray] = None
-_SEMANTIC_PATCH_METADATA_KEY = "_semantic_patch_presence_v1"
+_SEMANTIC_PATCH_METADATA_KEY = "_semantic_patch_presence_v2"
 dino_encoder: Optional[DINOEncoder] = None
 mask2former_head: Optional["Mask2FormerHead"] = None
 _mask2former_lock = Lock()
@@ -2063,7 +2063,7 @@ def _siglip_patch_presence_metadata_locked(
     return tuple(
         {
             _SEMANTIC_PATCH_METADATA_KEY: {
-                "semantics": "same_forward_top_patch_text_affinity_shadow_v1",
+                "semantics": "same_forward_patch_affinity_components_v2",
                 "classes": {
                     label: {
                         "score": round(float(materialized[index, class_index, 0]), 6),

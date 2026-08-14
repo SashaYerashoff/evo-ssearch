@@ -9,6 +9,7 @@ import {
   presenceDisplaySignal,
   presenceMatchesContext,
   presenceReaction,
+  presenceSpatialSignal,
   rankPresenceClasses,
 } from './semanticPresenceView'
 
@@ -85,19 +86,17 @@ export function SemanticPresenceCard({
   if (!presence?.enabled) return null
   const classes = rankPresenceClasses([...(presence.classes || [])], contextTexts)
     .slice(0, maxClasses ?? (compact ? 3 : 10))
-  const hasSpatial = classes.some((item) => presenceDisplaySignal(item).spatial)
+  const hasSpatial = classes.some((item) => presenceSpatialSignal(item) != null)
   const timestamp = Number(presence.timestamp_ms)
   const ageSeconds = Number.isFinite(timestamp) && timestamp > 0
     ? Math.max(0, (Date.now() - timestamp) / 1000)
     : null
   return (
-    <section className={`semantic-presence-card ${compact ? 'compact' : ''}`} aria-label="Semantic presence">
+    <section className={`semantic-presence-card ${compact ? 'compact' : ''}`} aria-label="Semantic affinity pulse">
       <div className="presence-card-head">
         <div>
-          <span><IconActivityHeartbeat size={15} /> Semantic presence</span>
-          <b>{hasSpatial
-            ? 'Same-forward patch response from each class baseline · spatial shadow, not object detection'
-            : 'Response from each class baseline · attention only, not object detection'}</b>
+          <span><IconActivityHeartbeat size={15} /> Semantic affinity pulse</span>
+          <b>Whole-frame affinity against this channel&apos;s usual baseline · attention signal, not a presence claim</b>
         </div>
         <i>{presence.state || 'warming_up'}{ageSeconds != null ? ` · ${ageSeconds.toFixed(ageSeconds < 10 ? 1 : 0)}s` : ''}</i>
       </div>
@@ -108,17 +107,18 @@ export function SemanticPresenceCard({
         {classes.map((item) => {
           const key = presenceClassKey(item)
           const view = presenceDisplaySignal(item)
+          const spatial = presenceSpatialSignal(item)
           const reaction = presenceReaction(item)
           const relevant = presenceMatchesContext(item, contextTexts)
           const responseLabel = view.warmup
-            ? `${view.spatial ? 'spatial · ' : ''}${view.samples || 0} warmup`
-            : reaction.current
-              ? `${view.spatial ? 'spatial · ' : ''}responding ${reaction.direction === 'down' ? '↓' : '↑'}`
+              ? `${view.spatial ? 'spatial fallback · ' : 'whole-frame · '}${view.samples || 0} warmup`
+              : reaction.current
+              ? `${view.spatial ? 'spatial fallback · ' : 'whole-frame response '}${reaction.direction === 'down' ? '↓' : '↑'}`
               : reaction.reacting
-                ? `${view.spatial ? 'spatial · ' : ''}recent response ${reaction.direction === 'down' ? '↓' : '↑'}`
+                ? `${view.spatial ? 'spatial fallback · ' : 'recent whole-frame response '}${reaction.direction === 'down' ? '↓' : '↑'}`
                 : relevant
-                  ? `${view.spatial ? 'spatial · ' : ''}probe context · baseline`
-                  : `${view.spatial ? 'spatial · ' : ''}baseline`
+                  ? `${view.spatial ? 'spatial fallback · ' : ''}probe context · usual`
+                  : `${view.spatial ? 'spatial fallback · ' : ''}usual`
           const content = <>
             <div className="presence-class-label">
               <b>{item.label}</b>
@@ -131,8 +131,14 @@ export function SemanticPresenceCard({
             <PresencePulse item={item} />
             <div className="presence-class-values">
               <b>{signed3(view.delta)}</b>
-              <span>{view.spatial ? 'patch' : 'raw'} {n3(view.score)}</span>
-              <em>base {n3(view.baseline)}</em>
+              <span>{view.spatial ? 'patch fallback' : 'frame'} {n3(view.score)}</span>
+              <em>usual {n3(view.baseline)}</em>
+              {spatial && (
+                <small>
+                  patch contrast {n3(spatial.score)} · usual {n3(spatial.baseline)}
+                  {item.spatial_raw_score != null ? ` · raw top ${n3(item.spatial_raw_score)}` : ''}
+                </small>
+              )}
             </div>
           </>
           return onInspect ? (
@@ -154,12 +160,12 @@ export function SemanticPresenceCard({
       </div>
       {!compact && (
         <div className="presence-card-note">
-          Responding classes stay on top for about 12 samples; routine rows stay stable. Raw scores are prompt-specific and cannot be compared between labels.
+          Whole-frame responses stay on top for about 12 samples; routine rows stay stable. Affinities are prompt-specific and never mean present or absent by themselves.
         </div>
       )}
       {onInspect && (
         <div className="presence-card-note">
-          Click a class for an on-demand patch hint. It is relative affinity, not a box detector.
+          {hasSpatial ? 'Patch contrast has its own baseline but never replaces the whole-frame pulse. ' : ''}Click a class for an on-demand localization hint; it is not a box detector.
         </div>
       )}
     </section>

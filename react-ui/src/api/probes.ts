@@ -143,6 +143,8 @@ export interface SemanticPresenceClass {
   spatial_timestamp_ms?: number | null
   spatial_history?: SemanticPresencePoint[]
   spatial_contrast?: number | null
+  spatial_raw_score?: number | null
+  spatial_score_semantics?: string
 }
 export interface SemanticPresenceStatus {
   enabled: boolean

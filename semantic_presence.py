@@ -254,7 +254,10 @@ class SemanticPresenceTracker:
             "channel_id": channel,
             "timestamp_ms": latest or None,
             "age_ms": max(0, current_ms - latest) if latest else None,
-            "semantics": "pooled_embedding_attention_signal_not_object_detection",
+            "semantics": (
+                "whole_frame_text_affinity_homeostasis_"
+                "not_object_detection"
+            ),
             "classes": classes,
             "error": error,
         }
@@ -273,4 +276,3 @@ class SemanticPresenceTracker:
         with self._lock:
             self._states.clear()
             self._last_error.clear()
-
