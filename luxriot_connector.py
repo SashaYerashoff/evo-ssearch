@@ -458,6 +458,8 @@ PREVIOUS_COMPACT_BATCH_STATE_JSON_PROMPT = DEFAULT_BATCH_STATE_JSON_PROMPT
 DEFAULT_BATCH_STATE_JSON_PROMPT = (
     "Machine-readable current-batch state for EVA memory, navigation, and alert actions:\n"
     "Use CURRENT snapshots as evidence. Memory, CV, probes, P/N/M, and vector signals direct attention only.\n"
+    "Write all human-readable prose and every free-text JSON string value in concise English only. "
+    "Never switch to Chinese, Japanese, Korean, or another output language.\n"
     "Before the JSON write no more than 36 words total under exactly these headings: "
     "### Scene description, ### Episode update, ### Routine and deviations, ### Worth to remember. "
     "Use one short sentence or None per heading. Do not repeat JSON detail.\n"
@@ -520,6 +522,21 @@ LIVE_OBSERVATION_STATE_PROMPT = (
     "- Never declare 'no safety hazard' or 'no danger': absence of visible harm in sampled snapshots is not proof "
     "of safety. A vector cue never confirms an event; without image support mark it visually unconfirmed. Preserve "
     "uncertainty because this state feeds EVA memory."
+)
+
+LIVE_OUTPUT_LANGUAGE_PROMPT = (
+    "Mandatory output-language contract:\n"
+    "Write the complete response in concise English only, including every free-text value inside "
+    "BATCH_STATE_JSON. Preserve literal schema keys and enum values. Do not emit Chinese, Japanese, "
+    "or Korean characters, and do not translate the Markdown headings or JSON keys."
+)
+
+LIVE_OUTPUT_LANGUAGE_RETRY_PROMPT = (
+    "The previous response violated the mandatory output-language contract. Rewrite the COMPLETE "
+    "response in concise English only. Preserve the same current visual evidence, alerts, events, "
+    "states, snapshot indices, severities, and JSON schema; translate free-text values without adding "
+    "or removing facts. Return all four required Markdown sections followed by one complete "
+    "BATCH_STATE_JSON object. Emit no Chinese, Japanese, or Korean characters and do not mention this correction."
 )
 
 VECTOR_SIGNAL_PROMPT_PREFIX = (
@@ -10815,6 +10832,10 @@ class LuxriotManager:
             "prompt_tokens",
             "completion_tokens",
             "total_tokens",
+            "language_contract_status",
+            "language_retry_count",
+            "initial_east_asian_chars",
+            "final_east_asian_chars",
         ):
             item = value.get(key)
             if isinstance(item, str):
@@ -17440,6 +17461,203 @@ class LuxriotManager:
         return f"{normalized[: max_len - 3].rstrip()}..."
 
     @staticmethod
+    def _east_asian_script_char_count(value: object) -> int:
+        """Count CJK, Japanese, or Korean code points in model output."""
+
+        count = 0
+        for char in str(value or ""):
+            codepoint = ord(char)
+            if (
+                0x3000 <= codepoint <= 0x30FF
+                or 0x3130 <= codepoint <= 0x318F
+                or 0x31F0 <= codepoint <= 0x31FF
+                or 0x3400 <= codepoint <= 0x4DBF
+                or 0x4E00 <= codepoint <= 0x9FFF
+                or 0xAC00 <= codepoint <= 0xD7AF
+                or 0xF900 <= codepoint <= 0xFAFF
+                or 0x20000 <= codepoint <= 0x2FA1F
+            ):
+                count += 1
+        return count
+
+    @classmethod
+    def _violates_l0_output_language_contract(cls, value: object) -> bool:
+        return cls._east_asian_script_char_count(value) > 0
+
+    @classmethod
+    def _sanitize_batch_state_output_language(
+        cls,
+        value: Mapping[str, Any],
+    ) -> Dict[str, Any]:
+        """Preserve structured evidence while removing a failed CJK completion."""
+
+        state = copy.deepcopy(dict(value))
+
+        def english(value: object, fallback: str) -> str:
+            text = str(value or "").strip()
+            return fallback if cls._violates_l0_output_language_contract(text) else text
+
+        safe_alerts: List[Dict[str, Any]] = []
+        for raw in state.get("alerts") or []:
+            if not isinstance(raw, Mapping):
+                continue
+            alert = dict(raw)
+            alert["title"] = english(
+                alert.get("title"),
+                "Operator review signal",
+            )
+            alert["description"] = english(
+                alert.get("description"),
+                "Current snapshots contain a structured operator-review signal.",
+            )
+            if "policy_criterion" in alert:
+                alert["policy_criterion"] = english(
+                    alert.get("policy_criterion"),
+                    "Configured operator criterion",
+                )
+            safe_alerts.append(alert)
+        state["alerts"] = safe_alerts
+
+        safe_events: List[Dict[str, Any]] = []
+        for index, raw in enumerate(state.get("events") or [], start=1):
+            if not isinstance(raw, Mapping):
+                continue
+            event = dict(raw)
+            event["event_id"] = english(
+                event.get("event_id"),
+                f"observed-event-{index}",
+            )
+            event["label"] = english(
+                event.get("label"),
+                "Observed current-batch event",
+            )
+            event["summary"] = english(
+                event.get("summary"),
+                "Current snapshots contain an observed event.",
+            )
+            safe_events.append(event)
+        state["events"] = safe_events
+
+        safe_states: List[Dict[str, Any]] = []
+        for index, raw in enumerate(state.get("observed_states") or [], start=1):
+            if not isinstance(raw, Mapping):
+                continue
+            observed = dict(raw)
+            observed["key"] = english(
+                observed.get("key"),
+                f"watched-state-{index}",
+            )
+            observed["label"] = english(
+                observed.get("label"),
+                "Watched state",
+            )
+            observed["evidence"] = english(
+                observed.get("evidence"),
+                "Current snapshot evidence.",
+            )
+            safe_states.append(observed)
+        state["observed_states"] = safe_states
+
+        cover_raw = state.get("cover")
+        if isinstance(cover_raw, Mapping):
+            cover = dict(cover_raw)
+            cover["reason"] = english(
+                cover.get("reason"),
+                "Current representative snapshot.",
+            )
+            state["cover"] = cover
+
+        scene_raw = state.get("scene")
+        if isinstance(scene_raw, Mapping):
+            scene = dict(scene_raw)
+            scene["summary"] = english(
+                scene.get("summary"),
+                "English scene wording was unavailable.",
+            )
+            state["scene"] = scene
+
+        safe_routines: List[Dict[str, Any]] = []
+        for index, raw in enumerate(state.get("routines") or [], start=1):
+            if not isinstance(raw, Mapping):
+                continue
+            routine = dict(raw)
+            routine["key"] = english(
+                routine.get("key"),
+                f"routine-{index}",
+            )
+            routine["label"] = english(
+                routine.get("label"),
+                "Observed routine",
+            )
+            safe_routines.append(routine)
+        state["routines"] = safe_routines
+        state["memory_pass"] = [
+            str(item)
+            for item in (state.get("memory_pass") or [])
+            if str(item or "").strip()
+            and not cls._violates_l0_output_language_contract(item)
+        ]
+        state["contract_status"] = "language_contract_fallback"
+
+        def scrub_remaining(value: object) -> object:
+            if isinstance(value, Mapping):
+                return {
+                    str(key): scrub_remaining(item)
+                    for key, item in value.items()
+                    if not cls._violates_l0_output_language_contract(key)
+                }
+            if isinstance(value, Sequence) and not isinstance(
+                value,
+                (str, bytes, bytearray),
+            ):
+                return [scrub_remaining(item) for item in value]
+            if isinstance(value, str) and cls._violates_l0_output_language_contract(
+                value
+            ):
+                return "Non-English model text omitted."
+            return value
+
+        return cast(Dict[str, Any], scrub_remaining(state))
+
+    @classmethod
+    def _render_l0_language_contract_fallback(
+        cls,
+        batch_state: Mapping[str, Any],
+    ) -> str:
+        safe_state = cls._sanitize_batch_state_output_language(batch_state)
+        rendered_state = {
+            key: copy.deepcopy(safe_state.get(key))
+            for key in (
+                "version",
+                "alerts",
+                "events",
+                "observed_states",
+                "cover",
+                "scene",
+                "routines",
+                "memory_pass",
+            )
+            if key in safe_state
+        }
+        return (
+            "### Scene description\n"
+            "The VLM processed the current snapshots, but reliable English scene wording was unavailable.\n\n"
+            "### Episode update\n"
+            "Structured current-batch signals are retained below for operator review.\n\n"
+            "### Routine and deviations\n"
+            "None\n\n"
+            "### Worth to remember\n"
+            "None\n\n"
+            "BATCH_STATE_JSON:\n"
+            + json.dumps(
+                rendered_state,
+                ensure_ascii=False,
+                indent=2,
+                allow_nan=False,
+            )
+        )
+
+    @staticmethod
     def _window_label(start_ts: Optional[float], end_ts: Optional[float]) -> str:
         if isinstance(start_ts, (int, float)):
             start_label = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(float(start_ts)))
@@ -19894,6 +20112,7 @@ class LuxriotManager:
             ("homeostasis", homeostasis),
             ("vector_signal", vector_prompt),
             ("observation_contract", LIVE_OBSERVATION_STATE_PROMPT),
+            ("output_language_contract", LIVE_OUTPUT_LANGUAGE_PROMPT),
         ):
             if str(text or "").strip():
                 protected_blocks.append(ProtectedPromptBlock(name, str(text)))
@@ -19912,6 +20131,7 @@ class LuxriotManager:
                 homeostasis,
                 vector_prompt,
                 LIVE_OBSERVATION_STATE_PROMPT,
+                LIVE_OUTPUT_LANGUAGE_PROMPT,
                 # Repeat only the concrete channel criteria at the final alert
                 # gate. Small VLMs otherwise describe a visible trigger
                 # correctly, then lose the earlier policy after the
@@ -24350,21 +24570,102 @@ class LuxriotManager:
             callback_kwargs["workload_class"] = lm_workload_class
         if callback_supports_max_tokens:
             callback_kwargs["max_tokens_override"] = generation_output_tokens
+
+        def invoke_lm(call_messages: List[Dict[str, Any]]) -> object:
+            if callback_kwargs:
+                return self.lm_callback(
+                    call_messages,
+                    model_hint,
+                    **callback_kwargs,
+                )
+            return self.lm_callback(call_messages, model_hint)
+
         inference_started_at_ms = int(time.time() * 1000.0)
-        if callback_kwargs:
-            summary = self.lm_callback(
-                messages,
-                model_hint,
-                **callback_kwargs,
-            )
-        else:
-            summary = self.lm_callback(messages, model_hint)
-        inference_completed_at_ms = int(time.time() * 1000.0)
-        lm_response_stats = self._compact_lm_response_stats(
-            getattr(summary, "eva_response_meta", None)
+        summary_response = invoke_lm(messages)
+        initial_lm_response_stats = self._compact_lm_response_stats(
+            getattr(summary_response, "eva_response_meta", None)
         )
-        summary = str(summary)
+        summary = str(summary_response)
+        initial_east_asian_chars = self._east_asian_script_char_count(summary)
+        final_east_asian_chars = initial_east_asian_chars
+        language_retry_count = 0
+        language_contract_status = "passed"
+        language_contract_fallback = False
+        retry_lm_response_stats: Dict[str, Any] = {}
+        if initial_east_asian_chars > 0:
+            language_retry_count = 1
+            language_contract_status = "retrying"
+            self._assert_summary_batch_current(batch)
+            retry_messages = [dict(message) for message in messages]
+            retry_messages.extend(
+                [
+                    {"role": "assistant", "content": summary},
+                    {
+                        "role": "user",
+                        "content": LIVE_OUTPUT_LANGUAGE_RETRY_PROMPT,
+                    },
+                ]
+            )
+            retry_response = invoke_lm(retry_messages)
+            retry_lm_response_stats = self._compact_lm_response_stats(
+                getattr(retry_response, "eva_response_meta", None)
+            )
+            summary = str(retry_response)
+            final_east_asian_chars = self._east_asian_script_char_count(summary)
+            if final_east_asian_chars > 0:
+                fallback_state = self._extract_batch_state(summary, frame_items)
+                summary = self._render_l0_language_contract_fallback(
+                    fallback_state,
+                )
+                final_east_asian_chars = self._east_asian_script_char_count(
+                    summary
+                )
+                language_contract_status = "fallback"
+                language_contract_fallback = True
+            else:
+                language_contract_status = "recovered"
+        inference_completed_at_ms = int(time.time() * 1000.0)
+        lm_response_stats = dict(
+            retry_lm_response_stats or initial_lm_response_stats
+        )
+        if language_retry_count:
+            for key in (
+                "admission_wait_ms",
+                "http_ms",
+                "prompt_tokens",
+                "completion_tokens",
+                "total_tokens",
+            ):
+                values = [
+                    stats.get(key)
+                    for stats in (
+                        initial_lm_response_stats,
+                        retry_lm_response_stats,
+                    )
+                    if isinstance(stats.get(key), (int, float))
+                ]
+                if values:
+                    lm_response_stats[key] = sum(values)
+            lm_response_stats["attempt_count"] = sum(
+                max(1, int(_parse_optional_int(stats.get("attempt_count")) or 1))
+                for stats in (
+                    initial_lm_response_stats,
+                    retry_lm_response_stats,
+                )
+            )
+            lm_response_stats["retried"] = True
+            lm_response_stats["retry_reason"] = "l0_output_language_contract"
+        lm_response_stats.update(
+            {
+                "language_contract_status": language_contract_status,
+                "language_retry_count": language_retry_count,
+                "initial_east_asian_chars": initial_east_asian_chars,
+                "final_east_asian_chars": final_east_asian_chars,
+            }
+        )
         batch_state = self._extract_batch_state(summary, frame_items)
+        if language_contract_fallback:
+            batch_state["contract_status"] = "language_contract_fallback"
         if str(batch_state.get("contract_status") or "") in {
             "parsed",
             "parsed_terminal_fence",

@@ -1533,6 +1533,104 @@ class LuxriotSummaryBackpressureTests(unittest.TestCase):
         self.assertEqual(stats["http_ms"], 91.25)
         self.assertNotIn("endpoint", stats)
 
+    def test_l0_retries_cjk_output_once_and_keeps_english_result(self):
+        calls = []
+        responses = [
+            (
+                "### Scene description\n室内场景，有人在电脑前。\n\n"
+                "### Episode update\n人保持坐姿。\n\n"
+                "### Routine and deviations\n常规工作。\n\n"
+                "### Worth to remember\nNone\n\n"
+                "BATCH_STATE_JSON:\n"
+                '{"version":2,"alerts":[],"events":[],"observed_states":[],'
+                '"cover":{"snapshot_index":1,"kind":"routine","reason":"室内场景",'
+                '"confidence":"medium"},"scene":{"status":"matched","summary":"有人工作"},'
+                '"routines":[],"memory_pass":[]}'
+            ),
+            (
+                "### Scene description\nA person is seated at a computer.\n\n"
+                "### Episode update\nThe person remains seated.\n\n"
+                "### Routine and deviations\nRoutine desk work.\n\n"
+                "### Worth to remember\nNone\n\n"
+                "BATCH_STATE_JSON:\n"
+                '{"version":2,"alerts":[],"events":[],"observed_states":[],'
+                '"cover":{"snapshot_index":1,"kind":"routine","reason":"Representative desk scene",'
+                '"confidence":"medium"},"scene":{"status":"matched","summary":"Person at desk"},'
+                '"routines":[],"memory_pass":[]}'
+            ),
+        ]
+
+        def lm_callback(messages, _hint):
+            calls.append(list(messages))
+            return responses[len(calls) - 1]
+
+        with tempfile.TemporaryDirectory() as temp:
+            manager = build_manager(Path(temp), lm_callback=lm_callback)
+            batch = manager.create_summary_batch(
+                channel_id=7,
+                run_id="run-7",
+                batch_size=2,
+                prompt="Describe.",
+                model_hint=None,
+                interval_sec=1.0,
+                frames=sample_frames(),
+            )
+            entry = manager.run_summary_batch(batch)
+
+        self.assertIn("concise English only", batch["system_prompt"])
+        self.assertEqual(len(calls), 2)
+        self.assertIn("violated the mandatory output-language contract", calls[1][-1]["content"])
+        self.assertIn("室内场景", calls[1][-2]["content"])
+        self.assertEqual(manager._east_asian_script_char_count(entry["summary"]), 0)
+        self.assertIn("A person is seated at a computer", entry["summary"])
+        self.assertEqual(entry["lm_response_stats"]["language_contract_status"], "recovered")
+        self.assertEqual(entry["lm_response_stats"]["language_retry_count"], 1)
+        self.assertEqual(entry["lm_response_stats"]["attempt_count"], 2)
+
+    def test_l0_quarantines_persistent_cjk_but_preserves_structured_alert(self):
+        calls = []
+        cjk_response = (
+            "### Scene description\n室内场景，有人在电脑前。\n\n"
+            "### Episode update\n人举起拇指。\n\n"
+            "### Routine and deviations\n常规工作。\n\n"
+            "### Worth to remember\nNone\n\n"
+            "BATCH_STATE_JSON:\n"
+            '{"version":2,"alerts":[{"title":"拇指手势","description":"当前画面可见手势",'
+            '"severity":"low","snapshot_indices":[1]}],"events":[],"observed_states":[],'
+            '"cover":{"snapshot_index":1,"kind":"event","reason":"可见手势",'
+            '"confidence":"medium"},"scene":{"status":"matched","summary":"有人工作"},'
+            '"routines":[{"key":"日常工作","label":"日常工作","state":"continuing",'
+            '"snapshot_indices":[1],"applies_to_event_keys":["先前事件"]}],'
+            '"memory_pass":["记住这个场景"]}'
+        )
+
+        def lm_callback(messages, _hint):
+            calls.append(list(messages))
+            return cjk_response
+
+        with tempfile.TemporaryDirectory() as temp:
+            manager = build_manager(Path(temp), lm_callback=lm_callback)
+            batch = manager.create_summary_batch(
+                channel_id=7,
+                run_id="run-7",
+                batch_size=2,
+                prompt="Describe.",
+                model_hint=None,
+                interval_sec=1.0,
+                frames=sample_frames(),
+            )
+            entry = manager.run_summary_batch(batch)
+
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(manager._east_asian_script_char_count(entry["summary"]), 0)
+        self.assertIn("reliable English scene wording was unavailable", entry["summary"])
+        self.assertEqual(entry["batch_state"]["contract_status"], "language_contract_fallback")
+        self.assertEqual(len(entry["batch_state"]["alerts"]), 1)
+        self.assertEqual(entry["batch_state"]["alerts"][0]["title"], "Operator review signal")
+        self.assertEqual(entry["batch_state"]["alerts"][0]["snapshot_indices"], [1])
+        self.assertEqual(entry["lm_response_stats"]["language_contract_status"], "fallback")
+        self.assertEqual(entry["lm_response_stats"]["final_east_asian_chars"], 0)
+
     def test_l0_generation_budget_is_shorter_for_heartbeat_than_event(self):
         calls = []
 
