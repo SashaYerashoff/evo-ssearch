@@ -2418,7 +2418,10 @@ class PostgresRuntimeStateStore(_TenantRepository):
         clauses.append(f"upper(payload_json->>'level') IN ({level_placeholders})")
         params.extend(sorted(normalized_levels))
         if start_ts is not None:
-            clauses.append("(payload_json->>'window_end')::double precision >= %s")
+            # Rollup windows are half-open at the left query boundary: a row
+            # ending exactly at from_ts belongs to the preceding period and
+            # must not leak into the requested archive page.
+            clauses.append("(payload_json->>'window_end')::double precision > %s")
             params.append(float(start_ts))
         if end_ts is not None:
             clauses.append("(payload_json->>'window_start')::double precision <= %s")

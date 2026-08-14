@@ -152,7 +152,7 @@ class DurableRollupMemoryStateStore(MemoryRuntimeStateStore):
                 continue
             if str(payload.get("level") or "").upper() not in allowed:
                 continue
-            if start_ts is not None and float(payload.get("window_end") or 0) < float(start_ts):
+            if start_ts is not None and float(payload.get("window_end") or 0) <= float(start_ts):
                 continue
             if end_ts is not None and float(payload.get("window_start") or 0) > float(end_ts):
                 continue
@@ -3252,6 +3252,37 @@ class LuxriotCaptureDispatchTests(unittest.TestCase):
             store.lock.release()
         reader.join(timeout=1.0)
         self.assertEqual(errors, [])
+
+    def test_postgres_rollup_range_excludes_row_ending_at_left_boundary(self):
+        calls = []
+
+        class Cursor:
+            def fetchall(self):
+                return []
+
+        class Connection:
+            def execute(self, query, params=None):
+                calls.append((query, params))
+                return Cursor()
+
+        class Transaction:
+            def __enter__(self):
+                return Connection()
+
+            def __exit__(self, *_args):
+                return False
+
+        class Pool:
+            def transaction(self, *_args, **_kwargs):
+                return Transaction()
+
+        store = PostgresRuntimeStateStore(Pool(), uuid4())
+        store.list_rollups(channel_id=112, start_ts=100.0, end_ts=200.0)
+
+        self.assertEqual(len(calls), 1)
+        query, params = calls[0]
+        self.assertIn("(payload_json->>'window_end')::double precision > %s", query)
+        self.assertIn(100.0, params)
 
     def test_channel_inventory_refresh_failure_retains_and_marks_stale_cache(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -8317,6 +8348,54 @@ class LuxriotCaptureDispatchTests(unittest.TestCase):
                 ["l0-missing-next-window"],
             )
 
+    def test_cached_rollup_range_excludes_preceding_boundary_window(self):
+        with tempfile.TemporaryDirectory() as temp:
+            state_store = DurableRollupMemoryStateStore()
+            manager = build_manager(
+                Path(temp),
+                runtime_state_store=state_store,
+            )
+            window_sec = int(manager.rollup_windows["L1"])
+            requested_start = float(
+                manager._bucket_start(1_781_700_000.0, window_sec)
+            )
+            for window_start, label in (
+                (requested_start - window_sec, "preceding"),
+                (requested_start, "requested"),
+            ):
+                rollup_id = manager._canonical_rollup_id(
+                    "L1",
+                    7,
+                    window_start,
+                    window_sec,
+                )
+                state_store.save_rollup(
+                    {
+                        "rollup_id": rollup_id,
+                        "channel_id": 7,
+                        "level": "L1",
+                        "source_level": "L0",
+                        "window_start": window_start,
+                        "window_end": window_start + window_sec,
+                        "window_sec": window_sec,
+                        "summary": operator_rollup_response(
+                            f"The {label} window."
+                        ),
+                        "summary_kind": "llm",
+                        "generation_status": "ready",
+                        "format_version": 2,
+                    }
+                )
+
+            rows = manager._list_cached_rollups(
+                7,
+                requested_start,
+                requested_start + window_sec - 0.001,
+            )
+
+            self.assertEqual(len(rows), 1)
+            self.assertIn("requested window", rows[0]["summary"])
+
     def test_readonly_summary_uses_durable_bucket_without_refresh_rebuild(self):
         with tempfile.TemporaryDirectory() as temp:
             manager = build_manager(Path(temp))
@@ -9130,10 +9209,41 @@ class LuxriotCaptureDispatchTests(unittest.TestCase):
         self.assertIn("unreviewed_alert_dismissal", issues)
         self.assertNotIn("no unresolved safety", sanitized.lower())
         self.assertNotIn("no immediate follow-up", sanitized.lower())
-        self.assertIn("5 alert signal emissions remain unreviewed", sanitized)
+        self.assertIn(
+            "Review the 5 sampled alert signal emissions under the configured policy",
+            sanitized,
+        )
         self.assertNotIn(
             "unreviewed_alert_dismissal",
             LuxriotManager._rollup_grounding_guard_issues(sanitized, node),
+        )
+
+    def test_unreviewed_alert_disclosure_is_not_repeated_across_sections(self):
+        disclosure = (
+            "No operator feedback was supplied for these alerts; they remain "
+            "unreviewed and unclassified."
+        )
+        summary = operator_rollup_response(
+            "A person and cat were visible in sampled frames.",
+            alerts=f"{disclosure}\n{disclosure}",
+            takeaway=(
+                "No immediate follow-up is required.\n"
+                f"{disclosure}"
+            ),
+        )
+        node = {"alert_total": 5, "operator_feedback": {}}
+
+        sanitized = LuxriotManager._sanitize_rollup_operator_overclaims(
+            summary,
+            node,
+        )
+
+        self.assertEqual(sanitized.count(disclosure), 1)
+        self.assertEqual(
+            sanitized.count(
+                "Review the 5 sampled alert signal emissions under the configured policy"
+            ),
+            1,
         )
 
     def test_repeated_alert_total_is_presented_as_sampled_emissions(self):

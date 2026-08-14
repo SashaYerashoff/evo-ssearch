@@ -19663,6 +19663,8 @@ class LuxriotManager:
             else None
         )
         output: List[str] = []
+        current_section = ""
+        unreviewed_disclosure_emitted = False
         has_operator_incident_basis = cls._rollup_has_operator_incident_basis(node)
         alert_total = int(
             _parse_optional_int(node.get("alert_total")) or 0
@@ -19674,6 +19676,9 @@ class LuxriotManager:
         )
         for raw_line in str(value or "").splitlines():
             line = raw_line
+            section_match = re.match(r"^\s*###\s+(.+?)\s*$", line)
+            if section_match:
+                current_section = str(section_match.group(1) or "").strip().casefold()
             issues = set(cls._rollup_operator_semantic_guard_issues(line))
             prefix_match = re.match(r"^(\s*(?:[-*•]\s+|\d+[.)]\s+)?)", line)
             prefix = prefix_match.group(1) if prefix_match else ""
@@ -19682,15 +19687,21 @@ class LuxriotManager:
                 and cls._rollup_unreviewed_alert_dismissal_claim(line)
             )
             if unreviewed_dismissal:
-                line = (
-                    prefix
-                    + "No operator disposition is inferred; "
-                    + f"{alert_total} alert signal emission"
-                    + ("s" if alert_total != 1 else "")
-                    + " remain unreviewed under the configured policy."
-                )
-                output.append(line)
-                continue
+                if current_section == "operator takeaway":
+                    line = (
+                        prefix
+                        + f"Review the {alert_total} sampled alert signal emission"
+                        + ("s" if alert_total != 1 else "")
+                        + " under the configured policy; no operator disposition is inferred."
+                    )
+                else:
+                    line = (
+                        prefix
+                        + "No operator disposition is inferred; "
+                        + f"{alert_total} alert signal emission"
+                        + ("s" if alert_total != 1 else "")
+                        + " remain unreviewed under the configured policy."
+                    )
             unqualified_alert_count = (
                 "alert_emission_count_unqualified" in node_issues
                 and alert_total > 1
@@ -19811,6 +19822,24 @@ class LuxriotManager:
                     prefix
                     + "Review the observable sequence only; the sampled frames do not establish intent."
                 )
+            normalized_line = " ".join(line.split()).casefold()
+            is_unreviewed_disclosure = bool(
+                re.search(r"\bremain(?:s)?\s+unreviewed\b", normalized_line)
+                and re.search(
+                    r"\b(?:operator\s+feedback|alerts?|signal\s+emissions?)\b",
+                    normalized_line,
+                )
+            )
+            if is_unreviewed_disclosure:
+                if unreviewed_disclosure_emitted:
+                    continue
+                unreviewed_disclosure_emitted = True
+            if (
+                normalized_line
+                and output
+                and normalized_line == " ".join(output[-1].split()).casefold()
+            ):
+                continue
             output.append(line)
         return "\n".join(output).strip()
 
@@ -21975,7 +22004,7 @@ class LuxriotManager:
                 return False
             window_start = self._coerce_float(value.get("window_start"))
             window_end = self._coerce_float(value.get("window_end"))
-            if start_ts is not None and (window_end is None or window_end < start_ts):
+            if start_ts is not None and (window_end is None or window_end <= start_ts):
                 return False
             if end_ts is not None and (window_start is None or window_start > end_ts):
                 return False
@@ -22041,7 +22070,7 @@ class LuxriotManager:
                 continue
             window_start = self._coerce_float(normalized.get("window_start"))
             window_end = self._coerce_float(normalized.get("window_end"))
-            if start_ts is not None and (window_end is None or window_end < start_ts):
+            if start_ts is not None and (window_end is None or window_end <= start_ts):
                 continue
             if end_ts is not None and (window_start is None or window_start > end_ts):
                 continue
