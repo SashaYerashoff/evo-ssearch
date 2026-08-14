@@ -2909,3 +2909,40 @@ separate operational optimization target.
 
 No new immutable upgrade archive or Desktop launcher pin was produced in this
 pass.
+
+## 2026-08-14 operator-probe routing into the fast VLM gate
+
+The explicit channel-112 thumbs-up alert exposed an evidence-routing gap rather
+than a Qwen recognition failure. SigLIP2 scored a short gesture above the tuned
+probe floors, while ordinary L0 selected the adjacent 4-second samples after
+the hand had disappeared. The fast VLM also woke only for a later coarse CV
+burst, so neither path received the exact scored image.
+
+A calibrated, operator-authored bookmark-probe match now wakes the bounded fast
+VLM lane and carries its exact scored frame with the
+`operator_probe_match` role. The P/N/M values remain attention hints only; the
+VLM must still ground an alert in the supplied image. If the asynchronous score
+arrives after a CV fast pass has entered inference, the exact frame is retained
+as a pending follow-up instead of being lost to the inflight guard or cooldown.
+`/ready` exposes both the new trigger count and
+`deferred_probe_matches_total`.
+
+Two live thumbs-up gestures approximately 36 seconds apart then produced two
+independent, visually grounded fast-VLM alerts. The first gesture frame at
+20:44:03.948 reached Luxriot acknowledgement at 20:44:19.381: 15.433 seconds
+end to end, including 39 ms for bookmark delivery. The second completed its VLM
+decision in 10.760 seconds and was intentionally deduplicated from external
+delivery by the configured 60-second VLM bookmark cooldown. A single
+intermediate SigLIP threshold crossing did not become a VLM alert.
+
+The direct probe lane remained independent: each short gesture produced only
+one above-floor 1 Hz sample, so its two-hits-within-3.2-seconds confirmation
+contract correctly sent no direct probe bookmark. The fast visual gate is what
+provided grounded recall for these short actions.
+
+The fast prompt now also requires numeric `version: 2`, and the backend repairs
+and re-renders any other version before alert parsing or archival. This closes a
+Qwen edge case observed live as string `"1"` and a timestamp placed in the
+version field. The original 12 related fast/probe checks, the new inflight race
+test, and the focused fast contract/timing test pass. The rehearsal `.env` and
+both llama.cpp processes remained unchanged.

@@ -1085,6 +1085,180 @@ class ApiDataflowSmokeTests(unittest.TestCase):
         finally:
             runtime.shutdown()
 
+    def test_operator_probe_match_routes_exact_frame_to_fast_vlm(self) -> None:
+        runtime = oldapp._FastVlmAlertRuntime()
+        runtime.require_operator_policy = False
+        try:
+            trigger_ms = 200_000
+            observation = {
+                "timestamp_ms": trigger_ms,
+                "thumbnail": "exact-scored-frame",
+                "capture_selection": {"selection_mode": "normal"},
+                "motion_aggregate": {"moving_fraction": 0.05},
+            }
+            probe = {
+                "id": "probe-thumbs-up",
+                "name": "Thumbs up",
+                "positives": ["Thumbs up gesture"],
+                "negatives": ["Victory gesture"],
+            }
+            score = {
+                "pos_score": 0.108,
+                "neg_score": 0.074,
+                "margin": 0.034,
+            }
+
+            with patch.object(runtime, "_submit") as submit:
+                runtime.observe_operator_probe_match(
+                    112,
+                    observation,
+                    probe,
+                    score,
+                )
+                submit.assert_not_called()
+                runtime.observe(
+                    112,
+                    {
+                        "timestamp_ms": trigger_ms + runtime.post_roll_ms,
+                        "thumbnail": "post-roll-frame",
+                        "capture_selection": {"selection_mode": "normal"},
+                    },
+                )
+
+            submit.assert_called_once()
+            channel_id, episode = submit.call_args.args
+            self.assertEqual(channel_id, 112)
+            self.assertEqual(episode["reason"], "operator_probe_match")
+            self.assertEqual(
+                episode["trigger_frame"]["thumbnail"],
+                "exact-scored-frame",
+            )
+            self.assertEqual(
+                episode["probe_attention"]["positive_text"],
+                "Thumbs up gesture",
+            )
+            self.assertEqual(
+                runtime.status()["trigger_counts"]["operator_probe_match"],
+                1,
+            )
+        finally:
+            runtime.shutdown()
+
+    def test_fast_vlm_evidence_keeps_exact_operator_probe_frame(self) -> None:
+        runtime = oldapp._FastVlmAlertRuntime()
+        runtime.max_frames = 4
+        trigger_ms = 300_000
+
+        class Session:
+            @staticmethod
+            def recent_frame_items(_limit: int = 90) -> List[Dict[str, Any]]:
+                return [
+                    {
+                        "timestamp_ms": timestamp_ms,
+                        "thumbnail": f"frame-{timestamp_ms}",
+                        "capture_selection": {"activity_x": activity},
+                    }
+                    for timestamp_ms, activity in (
+                        (trigger_ms - 4_000, 0.1),
+                        (trigger_ms - 2_500, 0.2),
+                        (trigger_ms - 1_000, 0.3),
+                        (trigger_ms + 1_000, 0.9),
+                        (trigger_ms + 2_500, 0.1),
+                    )
+                ]
+
+        exact_frame = {
+            "timestamp_ms": trigger_ms,
+            "thumbnail": "exact-scored-frame",
+            "capture_selection": {"activity_x": 0.05},
+        }
+        try:
+            with patch.dict(oldapp.luxriot_manager.sessions, {112: Session()}):
+                frames = runtime._episode_frames(
+                    112,
+                    trigger_ms,
+                    trigger_ms + 2_500,
+                    trigger_frame=exact_frame,
+                )
+        finally:
+            runtime.shutdown()
+
+        self.assertEqual(len(frames), 4)
+        matched = [
+            frame
+            for frame in frames
+            if "operator_probe_match" in frame.get("attention_roles", [])
+        ]
+        self.assertEqual(len(matched), 1)
+        self.assertEqual(matched[0]["thumbnail"], "exact-scored-frame")
+
+    def test_operator_probe_match_is_deferred_while_fast_vlm_is_inflight(self) -> None:
+        runtime = oldapp._FastVlmAlertRuntime()
+        runtime.require_operator_policy = False
+        trigger_ms = 400_000
+        observation = {
+            "timestamp_ms": trigger_ms,
+            "thumbnail": "late-exact-scored-frame",
+            "capture_selection": {"selection_mode": "normal"},
+        }
+        probe = {
+            "id": "probe-thumbs-up",
+            "name": "Thumbs up",
+            "positives": ["Thumbs up gesture"],
+            "negatives": ["Victory gesture"],
+        }
+        score = {
+            "pos_score": 0.108,
+            "neg_score": 0.074,
+            "margin": 0.034,
+        }
+        try:
+            runtime._inflight_channels.add(112)
+            with patch.object(runtime, "_submit") as submit:
+                runtime.observe_operator_probe_match(
+                    112,
+                    observation,
+                    probe,
+                    score,
+                )
+                runtime.observe(
+                    112,
+                    {
+                        "timestamp_ms": trigger_ms + runtime.post_roll_ms,
+                        "thumbnail": "post-roll-during-inflight",
+                        "capture_selection": {"selection_mode": "normal"},
+                    },
+                )
+                submit.assert_not_called()
+                self.assertEqual(runtime.status()["pending_channels"], 1)
+
+                runtime._inflight_channels.discard(112)
+                runtime.observe(
+                    112,
+                    {
+                        "timestamp_ms": trigger_ms + runtime.post_roll_ms + 1_000,
+                        "thumbnail": "post-roll-after-inflight",
+                        "capture_selection": {"selection_mode": "normal"},
+                    },
+                )
+
+            submit.assert_called_once()
+            _channel_id, episode = submit.call_args.args
+            self.assertEqual(episode["reason"], "operator_probe_match")
+            self.assertEqual(
+                episode["trigger_frame"]["thumbnail"],
+                "late-exact-scored-frame",
+            )
+            status = runtime.status()
+            self.assertEqual(status["deferred_probe_matches_total"], 1)
+            self.assertEqual(
+                status["trigger_counts"]["operator_probe_match"],
+                1,
+            )
+        finally:
+            runtime._inflight_channels.discard(112)
+            runtime.shutdown()
+
     def test_fast_vlm_alert_allows_only_one_inflight_episode_per_channel(self) -> None:
         runtime = oldapp._FastVlmAlertRuntime()
         started = threading.Event()
@@ -1175,7 +1349,10 @@ class ApiDataflowSmokeTests(unittest.TestCase):
                     "_render_alert_policy_prompt",
                     return_value="",
                 ),
-                patch("oldapp._call_video_understanding", return_value=summary),
+                patch(
+                    "oldapp._call_video_understanding",
+                    return_value=summary,
+                ) as call_vlm,
                 patch.object(
                     oldapp.luxriot_manager,
                     "_extract_batch_state",
@@ -1195,7 +1372,7 @@ class ApiDataflowSmokeTests(unittest.TestCase):
                     oldapp.luxriot_manager,
                     "process_summary_alerts",
                     return_value=AlertDeliveryResult(),
-                ),
+                ) as process_alerts,
                 patch.object(
                     oldapp.luxriot_manager,
                     "emit_attention_event",
@@ -1221,6 +1398,15 @@ class ApiDataflowSmokeTests(unittest.TestCase):
                 emitted[0][1]["record"]["latency_trace"]["lm_effective_capacity"],
                 1,
             )
+            messages = call_vlm.call_args.args[0]
+            system_text = " ".join(
+                str(part.get("text") or "")
+                for part in messages[0]["content"]
+                if isinstance(part, dict)
+            )
+            self.assertIn("numeric `version`: 2", system_text)
+            delivered_summary = str(process_alerts.call_args.args[1])
+            self.assertIn('"version":2', delivered_summary)
         finally:
             runtime.shutdown()
 
@@ -1267,6 +1453,69 @@ class ApiDataflowSmokeTests(unittest.TestCase):
                 self.assertIsNone(runtime.status()["last_error"])
         finally:
             runtime.shutdown()
+
+    def test_realtime_probe_match_wakes_fast_vlm_before_confirmation(self) -> None:
+        runtime = oldapp._RealtimeProbeBookmarkRuntime()
+        runtime.confirm_hits = 2
+        timestamp_ms = int(time.time() * 1000.0)
+        observation = {
+            "timestamp_ms": timestamp_ms,
+            "thumbnail": "scored-frame",
+            "embedding": np.asarray([1.0, 0.0], dtype=np.float32),
+            "embedding_space": {"model": "siglip2"},
+        }
+        probe = {
+            "id": "probe-thumbs-up",
+            "name": "Thumbs up",
+            "channel_id": 112,
+            "enabled": True,
+            "bookmark": True,
+            "bookmark_authorized": True,
+            "origin": "operator",
+            "positives": ["Thumbs up gesture"],
+            "negatives": ["Victory gesture"],
+            "pos_floor": 0.05,
+            "margin": 0.02,
+        }
+        score = {
+            "timestamp_ms": timestamp_ms,
+            "pos_score": 0.11,
+            "neg_score": 0.07,
+            "margin": 0.04,
+        }
+        try:
+            with (
+                patch.object(oldapp.probes_store, "list_probes", return_value=[probe]),
+                patch.object(
+                    oldapp,
+                    "_probe_embedding_calibration_state",
+                    return_value="calibrated",
+                ),
+                patch.object(
+                    oldapp.probe_manager,
+                    "score_current_frame",
+                    return_value={
+                        "result": score,
+                        "scoring_embedding": np.asarray(
+                            [1.0, 0.0],
+                            dtype=np.float32,
+                        ),
+                    },
+                ),
+                patch.object(
+                    oldapp.fast_vlm_alerts,
+                    "observe_operator_probe_match",
+                ) as route_match,
+                patch.object(oldapp, "_maybe_send_probe_bookmark") as send,
+            ):
+                runtime._evaluate(112, observation)
+        finally:
+            runtime.shutdown()
+
+        route_match.assert_called_once_with(112, observation, probe, score)
+        send.assert_not_called()
+        self.assertEqual(runtime.status()["matched_total"], 1)
+        self.assertEqual(runtime.status()["confirmed_total"], 0)
 
     def test_fast_vlm_alert_routes_large_semantic_change_with_cv_motion(self) -> None:
         runtime = oldapp._FastVlmAlertRuntime()

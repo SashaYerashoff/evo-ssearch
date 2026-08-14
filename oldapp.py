@@ -11026,6 +11026,7 @@ class _FastVlmAlertRuntime:
         self._trigger_counts: Dict[str, int] = {
             "cv_burst": 0,
             "semantic_motion_change": 0,
+            "operator_probe_match": 0,
         }
         self._last_semantic_delta: Dict[int, float] = {}
         self._last_decisions: Dict[int, Dict[str, Any]] = {}
@@ -11035,6 +11036,7 @@ class _FastVlmAlertRuntime:
             "submitted_total": 0,
             "completed_total": 0,
             "suppressed_while_inflight_total": 0,
+            "deferred_probe_matches_total": 0,
             "alert_batches_total": 0,
             "bookmarks_sent_total": 0,
             "rejected_total": 0,
@@ -11155,7 +11157,7 @@ class _FastVlmAlertRuntime:
                 self._trigger_counts[counter_key] = (
                     self._trigger_counts.get(counter_key, 0) + 1
                 )
-            if pending is not None:
+            if pending is not None and channel not in self._inflight_channels:
                 trigger_ms = int(pending["trigger_timestamp_ms"])
                 if int(timestamp_ms) >= trigger_ms + self.post_roll_ms:
                     dispatch = dict(pending)
@@ -11166,6 +11168,115 @@ class _FastVlmAlertRuntime:
             self._status["pending_channels"] = len(self._pending)
         if dispatch is not None:
             self._submit(channel, dispatch)
+
+    def observe_operator_probe_match(
+        self,
+        channel_id: int,
+        observation: Mapping[str, Any],
+        probe: Mapping[str, Any],
+        score: Mapping[str, Any],
+    ) -> None:
+        """Route a tuned operator-probe hit into visual VLM confirmation.
+
+        The SigLIP score is an attention hint, never alert evidence.  Keeping
+        the exact scored thumbnail in the pending episode prevents a short,
+        local gesture from falling between the coarser L0/CV samples before
+        the fast VLM gets a chance to inspect it.
+        """
+
+        if not self.enabled:
+            return
+        channel = int(channel_id)
+        if self.require_operator_policy:
+            policy = luxriot_manager.get_alert_policy_prompt(channel)
+            if not str(policy or "").strip():
+                with self._lock:
+                    self._status["suppressed_without_operator_policy_total"] += 1
+                return
+        timestamp_ms = _to_optional_int(observation.get("timestamp_ms"))
+        thumbnail = str(observation.get("thumbnail") or "").strip()
+        if timestamp_ms is None or not thumbnail:
+            return
+
+        positives = [
+            str(item).strip()
+            for item in (probe.get("positives") or [])
+            if str(item or "").strip()
+        ]
+        negatives = [
+            str(item).strip()
+            for item in (probe.get("negatives") or [])
+            if str(item or "").strip()
+        ]
+        probe_attention = {
+            "probe_id": str(probe.get("id") or "")[:160],
+            "probe_name": str(probe.get("name") or "operator probe")[:160],
+            "positive_text": positives[0][:240] if positives else "",
+            "negative_text": negatives[0][:240] if negatives else "",
+            "pos_score": _to_float(score.get("pos_score"), 0.0),
+            "neg_score": _to_float(score.get("neg_score"), 0.0),
+            "margin": _to_float(score.get("margin"), 0.0),
+        }
+        trigger_frame = {
+            key: observation.get(key)
+            for key in (
+                "timestamp_ms",
+                "thumbnail",
+                "capture_selection",
+                "motion_aggregate",
+                "selection_provenance",
+            )
+            if observation.get(key) is not None
+        }
+        probe_episode = {
+            "trigger_timestamp_ms": int(timestamp_ms),
+            "created_at_ms": int(time.time() * 1000.0),
+            "reason": "operator_probe_match",
+            "semantic_delta": None,
+            "moving_fraction": _to_float(
+                (observation.get("motion_aggregate") or {}).get("moving_fraction")
+                if isinstance(observation.get("motion_aggregate"), Mapping)
+                else 0.0,
+                0.0,
+            ),
+            "probe_attention": probe_attention,
+            "trigger_frame": trigger_frame,
+        }
+        with self._lock:
+            pending = self._pending.get(channel)
+            last_dispatched = int(self._last_dispatched_ms.get(channel, 0))
+            if pending is not None:
+                # Preserve the earliest trigger, but replace a routing-only
+                # episode with the exact operator-probe evidence when the two
+                # arrive for the same short action.
+                newly_routed = "probe_attention" not in pending
+                pending.setdefault("probe_attention", probe_attention)
+                pending.setdefault("trigger_frame", trigger_frame)
+                if newly_routed:
+                    self._trigger_counts["operator_probe_match"] = (
+                        self._trigger_counts.get("operator_probe_match", 0) + 1
+                    )
+                return
+            if channel in self._inflight_channels:
+                # The CV lane can enter inference a fraction of a second
+                # before the asynchronous probe score completes.  Preserve
+                # the exact scored frame as the next bounded visual check;
+                # ordinary observations will dispatch it after the current
+                # episode closes instead of losing it to inflight/cooldown.
+                self._pending[channel] = probe_episode
+                self._trigger_counts["operator_probe_match"] = (
+                    self._trigger_counts.get("operator_probe_match", 0) + 1
+                )
+                self._status["deferred_probe_matches_total"] += 1
+                self._status["pending_channels"] = len(self._pending)
+                return
+            if int(timestamp_ms) - last_dispatched < self.cooldown_ms:
+                return
+            self._pending[channel] = probe_episode
+            self._trigger_counts["operator_probe_match"] = (
+                self._trigger_counts.get("operator_probe_match", 0) + 1
+            )
+            self._status["pending_channels"] = len(self._pending)
 
     def _submit(self, channel_id: int, episode: Mapping[str, Any]) -> None:
         if not self._capacity.acquire(blocking=False):
@@ -11278,7 +11389,14 @@ class _FastVlmAlertRuntime:
             },
         )
 
-    def _episode_frames(self, channel_id: int, trigger_ms: int, post_ms: int) -> List[Dict[str, Any]]:
+    def _episode_frames(
+        self,
+        channel_id: int,
+        trigger_ms: int,
+        post_ms: int,
+        *,
+        trigger_frame: Optional[Mapping[str, Any]] = None,
+    ) -> List[Dict[str, Any]]:
         with luxriot_manager.cache_lock:
             session = luxriot_manager.sessions.get(int(channel_id))
         if session is None:
@@ -11296,6 +11414,19 @@ class _FastVlmAlertRuntime:
                     for item in session.recent_frames
                     if isinstance(item, Mapping) and str(item.get("thumbnail") or "").strip()
                 ]
+        if (
+            isinstance(trigger_frame, Mapping)
+            and str(trigger_frame.get("thumbnail") or "").strip()
+        ):
+            scored_frame = dict(trigger_frame)
+            scored_frame["operator_probe_match"] = True
+            scored_timestamp_ms = self._frame_timestamp_ms(scored_frame)
+            frames = [
+                frame
+                for frame in frames
+                if self._frame_timestamp_ms(frame) != scored_timestamp_ms
+            ]
+            frames.append(scored_frame)
         frames = [
             frame
             for frame in frames
@@ -11321,7 +11452,36 @@ class _FastVlmAlertRuntime:
         selected[self._frame_timestamp_ms(frames[-1])] = frames[-1]
         ordered = sorted(selected.values(), key=self._frame_timestamp_ms)
         if len(ordered) > self.max_frames:
-            ordered = ordered[: self.max_frames - 1] + [ordered[-1]]
+            probe_frame = next(
+                (
+                    frame
+                    for frame in ordered
+                    if bool(frame.get("operator_probe_match"))
+                ),
+                None,
+            )
+            if probe_frame is None:
+                ordered = ordered[: self.max_frames - 1] + [ordered[-1]]
+            else:
+                priority = [ordered[0], probe_frame, apex, ordered[-1]]
+                keep: Dict[int, Dict[str, Any]] = {
+                    self._frame_timestamp_ms(frame): frame
+                    for frame in priority
+                }
+                if len(keep) < self.max_frames:
+                    for frame in sorted(
+                        ordered,
+                        key=lambda item: abs(
+                            self._frame_timestamp_ms(item) - trigger_ms
+                        ),
+                    ):
+                        keep.setdefault(self._frame_timestamp_ms(frame), frame)
+                        if len(keep) >= self.max_frames:
+                            break
+                ordered = sorted(
+                    keep.values(),
+                    key=self._frame_timestamp_ms,
+                )[: self.max_frames]
         for index, frame in enumerate(ordered):
             timestamp = self._frame_timestamp_ms(frame)
             roles: List[str] = []
@@ -11333,6 +11493,8 @@ class _FastVlmAlertRuntime:
                 roles.append("onset")
             if frame is apex:
                 roles.append("apex")
+            if bool(frame.get("operator_probe_match")):
+                roles.append("operator_probe_match")
             if timestamp > trigger_ms:
                 roles.append("post")
             frame["attention_roles"] = roles or ["support"]
@@ -11342,7 +11504,16 @@ class _FastVlmAlertRuntime:
         executor_started_at_ms = int(time.time() * 1000.0)
         trigger_ms = _to_int(episode.get("trigger_timestamp_ms"), 0)
         post_ms = _to_int(episode.get("observed_post_timestamp_ms"), trigger_ms)
-        frames = self._episode_frames(channel_id, trigger_ms, post_ms)
+        frames = self._episode_frames(
+            channel_id,
+            trigger_ms,
+            post_ms,
+            trigger_frame=(
+                episode.get("trigger_frame")
+                if isinstance(episode.get("trigger_frame"), Mapping)
+                else None
+            ),
+        )
         if len(frames) < 2:
             raise RuntimeError("fast VLM episode has fewer than two evidence frames")
         episode_id = str(
@@ -11365,7 +11536,8 @@ class _FastVlmAlertRuntime:
             "Raise an alert only when the images themselves ground a current operator criterion or an "
             "immediate safety hazard such as collision risk, fall/collapse, fire, or dangerous intrusion. "
             "Do not describe routine. Return only `BATCH_STATE_JSON:` followed by one compact JSON object. "
-            "Always include version and alerts. Include events or observed_states only when they provide current "
+            "Always use numeric `version`: 2 and include alerts. Include events or "
+            "observed_states only when they provide current "
             "visual evidence for an operator criterion; omit cover, scene, routines, and memory_pass in this fast phase. "
             "Each alert uses title, description, severity, state, "
             "snapshot_indices, timestamp_ms. If uncertain, use alerts: [].\n\n"
@@ -11379,6 +11551,18 @@ class _FastVlmAlertRuntime:
             "These signals select evidence but do not prove an alert.\n"
             + "\n".join(role_lines)
         )
+        probe_attention = episode.get("probe_attention")
+        if isinstance(probe_attention, Mapping):
+            task_prompt += (
+                "\nAn operator-authored semantic probe selected the frame marked "
+                "operator_probe_match. Treat this only as an attention hint and verify the image: "
+                f"name={str(probe_attention.get('probe_name') or '')[:160]!r}; "
+                f"positive={str(probe_attention.get('positive_text') or '')[:240]!r}; "
+                f"negative={str(probe_attention.get('negative_text') or '')[:240]!r}; "
+                f"P={_to_float(probe_attention.get('pos_score'), 0.0):.3f}; "
+                f"N={_to_float(probe_attention.get('neg_score'), 0.0):.3f}; "
+                f"M={_to_float(probe_attention.get('margin'), 0.0):.3f}."
+            )
         messages = _build_luxriot_messages(
             f"#{channel_id}",
             frames,
@@ -11412,6 +11596,13 @@ class _FastVlmAlertRuntime:
             summary,
             batch_state,
         )
+        if _to_int(batch_state.get("version"), 0) != 2:
+            batch_state = dict(batch_state)
+            batch_state["version"] = 2
+            summary = luxriot_manager._render_reconciled_batch_state_summary(
+                summary,
+                batch_state,
+            )
         batch_start_ms = min(self._frame_timestamp_ms(frame) for frame in frames)
         batch_end_ms = max(self._frame_timestamp_ms(frame) for frame in frames)
         with luxriot_manager._session_side_effect_lock_for(channel_id):
@@ -11963,6 +12154,32 @@ class _RealtimeProbeBookmarkRuntime:
                 continue
             with self._lock:
                 self._status["matched_total"] += 1
+            # A single tuned operator-probe match is sufficient to route the
+            # exact scored frame to the bounded visual alert gate.  Direct
+            # probe bookmarks still keep their independent repeated-hit
+            # confirmation contract below; the VLM must visually confirm its
+            # own alert and never treats this score as proof.
+            try:
+                fast_runtime = globals().get("fast_vlm_alerts")
+                route_match = getattr(
+                    fast_runtime,
+                    "observe_operator_probe_match",
+                    None,
+                )
+                if callable(route_match):
+                    route_match(
+                        int(channel_id),
+                        observation,
+                        probe,
+                        score,
+                    )
+            except Exception:
+                app.logger.exception(
+                    "Failed to route operator probe match to fast VLM "
+                    "channel_id=%s probe_id=%s",
+                    channel_id,
+                    probe.get("id"),
+                )
             strong = bool(
                 pos_score >= pos_floor + self.strong_score_boost
                 and margin >= margin_floor + self.strong_score_boost
