@@ -8914,6 +8914,76 @@ class LuxriotCaptureDispatchTests(unittest.TestCase):
             self.assertEqual(cached["generation_status"], "failed")
             self.assertEqual(cached["generation_error"], "invalid_operator_contract")
 
+    def test_successful_rollup_retry_clears_stale_generation_error(self):
+        with tempfile.TemporaryDirectory() as temp:
+            state_store = DurableRollupMemoryStateStore()
+            manager = build_manager(
+                Path(temp),
+                lm_callback=lambda _messages, _model: "invalid response",
+                runtime_state_store=state_store,
+            )
+            manager.rollup_llm_levels = {"L1"}
+            manager.rollup_llm_max_new_per_call = 10
+            manager.record_summary_log(
+                7,
+                {
+                    "channel_id": 7,
+                    "run_id": "run-7",
+                    "summary": "A person remained near the desk.",
+                    "frame_count": 12,
+                    "created_at": 1_781_700_000.0,
+                },
+            )
+
+            failed = manager.summary_rollups(
+                7,
+                run_selector="all",
+                level_limit=10,
+            )["levels"]["L1"][0]
+            self.assertEqual(failed["generation_status"], "failed")
+            self.assertIn("generation_error", failed)
+
+            manager.lm_callback = lambda _messages, _model: operator_rollup_response(
+                "A person remained near the desk throughout the sampled window."
+            )
+            recovered = manager.summary_rollups(
+                7,
+                run_selector="all",
+                level_limit=10,
+            )["levels"]["L1"][0]
+
+            self.assertEqual(recovered["summary_kind"], "llm")
+            self.assertEqual(recovered["generation_status"], "ready")
+            self.assertNotIn("generation_error", recovered)
+            cached = manager._get_cached_rollup_record(recovered["rollup_id"])
+            self.assertIsNotNone(cached)
+            self.assertNotIn("generation_error", cached)
+
+    def test_ready_cached_rollup_normalization_drops_stale_generation_error(self):
+        with tempfile.TemporaryDirectory() as temp:
+            manager = build_manager(Path(temp))
+            normalized = manager._normalize_cached_rollup_entry(
+                {
+                    "rollup_id": "l1-ch7-w900-1781700000",
+                    "channel_id": 7,
+                    "level": "L1",
+                    "source_level": "L0",
+                    "window_start": 1_781_700_000.0,
+                    "window_end": 1_781_700_900.0,
+                    "window_sec": 900,
+                    "summary": operator_rollup_response(
+                        "A recovered semantic summary."
+                    ),
+                    "summary_kind": "llm",
+                    "generation_status": "ready",
+                    "generation_error": "old endpoint unavailable",
+                    "format_version": 2,
+                }
+            )
+
+            self.assertIsNotNone(normalized)
+            self.assertNotIn("generation_error", normalized)
+
     def test_rollup_contract_accepts_harmless_heading_drift_without_retry(self):
         with tempfile.TemporaryDirectory() as temp:
             calls = []

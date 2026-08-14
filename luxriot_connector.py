@@ -21579,7 +21579,18 @@ class LuxriotManager:
         if incident_compositions:
             normalized["incident_compositions"] = incident_compositions
         generation_error = str(entry.get("generation_error") or "").strip()
-        if generation_error:
+        successful_generation_status = generation_status.lower() in {
+            "ready",
+            "cached",
+            "legacy_ready",
+            "legacy_sanitized",
+            "semantic_guard_sanitized",
+        }
+        # A generation error describes the attempt that produced a degraded
+        # row.  Once the same canonical window has a successful semantic
+        # replacement, carrying that old error forward creates a contradictory
+        # API contract (ready + failed) and makes the UI look unhealthy.
+        if generation_error and not successful_generation_status:
             normalized["generation_error"] = generation_error[:240]
         if level == "L3":
             normalized["review_only"] = bool(
@@ -22078,6 +22089,18 @@ class LuxriotManager:
                         continue
                     merged = dict(current)
                     merged.update(row_dict)
+                    if (
+                        "generation_error" not in row_dict
+                        and str(row_dict.get("generation_status") or "").strip().lower()
+                        in {
+                            "ready",
+                            "cached",
+                            "legacy_ready",
+                            "legacy_sanitized",
+                            "semantic_guard_sanitized",
+                        }
+                    ):
+                        merged.pop("generation_error", None)
                     generated_kind = str(row_dict.get("summary_kind") or "").strip().lower()
                     current_kind = str(current.get("summary_kind") or "").strip().lower()
                     generated_signature = str(row_dict.get("source_signature") or "").strip()
@@ -23155,6 +23178,7 @@ class LuxriotManager:
                     node["memory_update"] = dict(cached_memory) if isinstance(cached_memory, Mapping) else {}
                     node["summary_kind"] = "legacy_cached" if cached_legacy else "llm_cached"
                     node["generation_status"] = "legacy_ready" if cached_legacy else "cached"
+                    node.pop("generation_error", None)
                     node["format_version"] = cached_format_version
                     backfill_cached_incident_memory(rollup_id, cached, node)
                     if cached_legacy and cached_signature != source_signature:
@@ -23229,6 +23253,7 @@ class LuxriotManager:
                 node["memory_update"] = memory_update
                 node["summary_kind"] = "llm"
                 node["generation_status"] = "ready"
+                node.pop("generation_error", None)
                 node["format_version"] = ROLLUP_OPERATOR_FORMAT_VERSION
                 if level != "L3":
                     self._update_channel_routine_context(
