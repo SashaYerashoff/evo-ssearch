@@ -106,6 +106,12 @@ def test_eight_concurrent_channels_are_encoded_in_one_microbatch():
     status = batcher.status()
     assert status["counters"]["completed_total"] == 8
     assert status["largest_batch_size"] == 8
+    assert status["batch_size_counts"] == {"8": 1}
+    assert status["average_compute_ms_per_item"] >= 0.0
+    assert status["compute_only_images_per_sec"] > 0.0
+    assert status["recent"]["window_batches"] == 1
+    assert status["recent"]["batch_size_p50"] == 8.0
+    assert status["recent"]["batch_size_p95"] == 8.0
 
 
 def test_single_channel_is_not_lost_when_batch_wait_expires():

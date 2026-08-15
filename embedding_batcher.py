@@ -92,6 +92,11 @@ class ImageEmbeddingBatcher:
         self._batch_queue_wait_ms_total = 0.0
         self._batch_queue_wait_ms_last = 0.0
         self._batch_queue_wait_ms_max = 0.0
+        self._recent_batch_sizes: Deque[float] = deque(maxlen=256)
+        self._recent_batch_compute_ms: Deque[float] = deque(maxlen=256)
+        self._recent_batch_queue_wait_ms: Deque[float] = deque(maxlen=256)
+        self._recent_compute_ms_per_item: Deque[float] = deque(maxlen=256)
+        self._batch_size_counts: Counter[int] = Counter()
         self._last_error: Optional[str] = None
         if autostart:
             self.start()
@@ -196,6 +201,25 @@ class ImageEmbeddingBatcher:
     def status(self) -> dict[str, Any]:
         with self._condition:
             completed_batches = int(self._counters.get("batches_total", 0))
+            completed_items = int(self._counters.get("completed_total", 0))
+
+            def percentile(values: Sequence[float], fraction: float) -> float:
+                ordered = sorted(float(value) for value in values)
+                if not ordered:
+                    return 0.0
+                index = max(
+                    0,
+                    min(
+                        len(ordered) - 1,
+                        int(round((len(ordered) - 1) * float(fraction))),
+                    ),
+                )
+                return round(ordered[index], 3)
+
+            recent_batch_sizes = tuple(self._recent_batch_sizes)
+            recent_compute_ms = tuple(self._recent_batch_compute_ms)
+            recent_queue_wait_ms = tuple(self._recent_batch_queue_wait_ms)
+            recent_per_item_ms = tuple(self._recent_compute_ms_per_item)
             return {
                 "started": bool(self._thread is not None and self._thread.is_alive()),
                 "stopping": bool(self._stopping),
@@ -214,6 +238,16 @@ class ImageEmbeddingBatcher:
                     if completed_batches
                     else 0.0
                 ),
+                "average_compute_ms_per_item": (
+                    round(self._batch_compute_ms_total / completed_items, 3)
+                    if completed_items
+                    else 0.0
+                ),
+                "compute_only_images_per_sec": (
+                    round(completed_items * 1000.0 / self._batch_compute_ms_total, 3)
+                    if completed_items and self._batch_compute_ms_total > 0.0
+                    else 0.0
+                ),
                 "last_batch_compute_ms": round(self._batch_compute_ms_last, 3),
                 "max_batch_compute_ms": round(self._batch_compute_ms_max, 3),
                 "average_batch_queue_wait_ms": (
@@ -230,6 +264,21 @@ class ImageEmbeddingBatcher:
                     3,
                 ),
                 "largest_batch_size": self._batch_size_max,
+                "batch_size_counts": {
+                    str(size): int(count)
+                    for size, count in sorted(self._batch_size_counts.items())
+                },
+                "recent": {
+                    "window_batches": len(recent_batch_sizes),
+                    "batch_size_p50": percentile(recent_batch_sizes, 0.50),
+                    "batch_size_p95": percentile(recent_batch_sizes, 0.95),
+                    "compute_ms_p50": percentile(recent_compute_ms, 0.50),
+                    "compute_ms_p95": percentile(recent_compute_ms, 0.95),
+                    "queue_wait_ms_p50": percentile(recent_queue_wait_ms, 0.50),
+                    "queue_wait_ms_p95": percentile(recent_queue_wait_ms, 0.95),
+                    "compute_ms_per_item_p50": percentile(recent_per_item_ms, 0.50),
+                    "compute_ms_per_item_p95": percentile(recent_per_item_ms, 0.95),
+                },
                 "last_error": self._last_error,
                 "counters": dict(sorted(self._counters.items())),
             }
@@ -312,6 +361,13 @@ class ImageEmbeddingBatcher:
                         self._batch_compute_ms_max,
                         batch_compute_ms,
                     )
+                    self._recent_batch_sizes.append(float(len(batch)))
+                    self._recent_batch_compute_ms.append(batch_compute_ms)
+                    self._recent_batch_queue_wait_ms.append(oldest_wait_ms)
+                    self._recent_compute_ms_per_item.append(
+                        batch_compute_ms / float(len(batch))
+                    )
+                    self._batch_size_counts[len(batch)] += 1
                     self._batch_queue_wait_ms_total += oldest_wait_ms
                     self._batch_queue_wait_ms_last = oldest_wait_ms
                     self._batch_queue_wait_ms_max = max(
