@@ -3049,3 +3049,106 @@ and llama.cpp remains on PIDs 11006/114612. A hard browser refresh is required
 before operator validation. Do not claim that a real person necessarily raises
 the new whole-frame trace until that live observation is made; the fix guarantees
 honest attribution of the signal, not detector-like monotonicity.
+
+## 2026-08-15 fixed-shape SigLIP CUDA Graph stabilization
+
+Sasha accepted ordinary VLM delivery up to 30 seconds for this pilot, while
+reaffirming that a bookmark-enabled operator probe must keep its independent
+direct path and must not wait for VLM confirmation. The SigLIP optimization
+therefore changed only execution. It did not change the checkpoint, processor,
+dtype, embedding fingerprint, probe phrases, thresholds, archive vectors, VLM
+or agent services, or the rehearsal `.env`.
+
+Recovery commit `8a8bf81` first added bounded rolling microbatch telemetry and
+temporarily aligned the code default with the documented 75 ms gather window.
+Live evidence rejected that tuning: with two phase-offset channels only 8 of
+155 batches combined two images, while batch two took approximately twice the
+GPU time of batch one. The longer wait did not buy throughput and only added
+operator latency. Commit `7017825` therefore restores the 8 ms gather default
+and adds a batch-one CUDA Graph runner with a generation-bound eager fallback.
+
+The runner captures only the pinned fixed `pixel_values` shape. Batch two,
+CPU inputs, dynamic processor keys, capture failures, replay failures and a
+failed equivalence check all stay on the eager path. Graph-owned tensors are
+released when the encoder generation resets. `/ready` exposes graph state,
+capture/replay/eager counters, failure reasons and first-capture validation.
+The first real frame is compared against eager before the graph can enter probe
+or archive state. Both pooled output and the same-forward final patch tensor
+must be finite, cosine-equivalent and within a 0.001 absolute tolerance.
+
+The production-generation validation passed more strictly than required:
+
+```text
+pooled cosine / max_abs:   1.00000012 / 0.0
+patch cosine / max_abs:    1.0        / 0.0
+graph state / failures:    captured   / 0
+replays / eager batch-two: 490        / 9
+```
+
+A separate two-image A/B on the actual RTX 5060 Ti proved that replay input is
+not stuck on the capture frame. Both distinct images matched their own eager
+pooled and patch outputs with `max_abs=0`; their cross-image pooled cosine was
+0.99509, confirming that the graph consumed the changed pixels. The isolated
+same-image benchmark measured eager vision forward at approximately 72 ms and
+graph replay at 2.27 ms median / 8.12 ms p95 before downstream patch aggregation.
+`torch.compile` was deliberately not enabled: its cold Inductor compile took
+long enough to be operationally unsuitable, while the installed Transformers
+runtime already selected SDPA.
+
+After 499 live batches, the bounded 256-batch execution window reported:
+
+```text
+batch size p50 / p95:      1 / 1
+total compute p50 / p95:   88.0 ms / 244.8 ms
+last complete batch:       114.6 ms
+last model/CUDA stage:     24.8 / 25.9 ms
+last exact preprocessing:  76.3 ms
+microbatch queue depth:    0
+```
+
+The remaining tail includes the intentionally shared RTX 5060 Ti agent bursts,
+the controlled two-image A/B run, and occasional exact preprocessing variance;
+it is not an accumulating queue. The realtime operator-probe lane was enabled,
+had no error or pending-latest backlog, and its last no-match evaluation
+completed in 187 ms at 649 ms source-event age. No live gesture crossed the
+probe threshold during this measurement, so this slice does not claim a new
+bookmark acknowledgement latency. The independent direct bookmark contract is
+covered by the focused race/coalescing tests and remains downstream of SigLIP
+confirmation, not downstream of VLM.
+
+The latest ordinary fast VLM check completed in 10.334 seconds with a 3.406
+second HTTP inference and no alert, inside the operator-accepted 30-second VLM
+envelope. Archive and CLIP queues were empty; both channels had fresh frames and
+no probe errors. Channel 118 remained on its working live-segment source but
+still exposed an intermittent snapshot timeout diagnostic; that is a Luxriot
+capture fallback issue, not SigLIP backpressure, and remains separate work.
+
+The deployed runtime files match reviewed source. Final process/config identity:
+
+```text
+Gunicorn master / worker:  4127 / 1618708
+VLM llama.cpp PID:         11006
+Agent llama.cpp PID:       114612
+.env SHA-256:              36f1163baeedbde90352d252dedc426978ed5a5d25864606732a7472d720fdde
+```
+
+Targeted verification passed: 10 CUDA-graph/microbatch tests, 24 embedding
+policy tests including pooled/patch equivalence, 33 semantic-presence/probe/
+archive tests, and four direct-probe lane tests. Python compilation and diff
+checks passed. Source `main` was pushed through `7017825`.
+
+The 3-4 minute cold Transformers/SigLIP worker bootstrap remains unsolved. On
+the final HUP, Gunicorn retired the old worker before the new worker had loaded
+the required embedder, producing a temporary `/ready=503` window even though
+both llama.cpp servers and the master stayed alive. Fixing readiness-gated
+handover is now a higher-value reliability task than caching ephemeral heatmap
+patch tensors. The latter remains intentionally deferred because the current
+contract says patch tokens are neither cached nor persisted, and graph replay
+has already made the extra vision forward inexpensive.
+
+Remaining VLM work is operational rather than a new local model change: soak
+mixed L0/fast/agent traffic for language retry, bounded-contract repair and
+truncation tails; repeat representative Georgia-scene quality checks without
+unsupported intent wording; decide whether the agent profile is a required
+readiness gate; and perform the final two-server Georgia topology preflight
+while preserving every existing endpoint, context, capacity and `.env` value.
