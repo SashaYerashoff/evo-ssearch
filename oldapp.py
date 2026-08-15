@@ -140,6 +140,7 @@ from incident_store import (
 from embedding_batcher import EmbeddingBatchOutput, ImageEmbeddingBatcher
 from semantic_patch_attention import build_patch_affinity_payload
 from semantic_presence import SEMANTIC_PRESENCE_PROMPTS
+from siglip_cuda_graph import SiglipCudaGraphRunner
 from embedding_space import (
     embedding_space_fingerprint,
     embedding_space_requires_identity,
@@ -238,6 +239,10 @@ _semantic_patch_bank_labels: Tuple[str, ...] = ()
 _semantic_patch_bank_ranges: Tuple[Tuple[int, int], ...] = ()
 _semantic_patch_bank_matrix: Optional[np.ndarray] = None
 _SEMANTIC_PATCH_METADATA_KEY = "_semantic_patch_presence_v2"
+_siglip_cuda_graph_runner = SiglipCudaGraphRunner(
+    torch,
+    enabled=bool(getattr(config, "SIGLIP_CUDA_GRAPH_ENABLED", True)),
+)
 dino_encoder: Optional[DINOEncoder] = None
 mask2former_head: Optional["Mask2FormerHead"] = None
 _mask2former_lock = Lock()
@@ -1678,6 +1683,7 @@ def _begin_clip_runtime_generation() -> None:
     global _clip_runtime_canary_last_check
     global _clip_runtime_canary_vision_signature
     clip_runtime_generation = secrets.token_hex(8)
+    _siglip_cuda_graph_runner.clear(clip_runtime_generation)
     with _clip_runtime_canary_lock:
         _clip_runtime_canary_image_baseline = None
         _clip_runtime_canary_text_baseline = None
@@ -1702,6 +1708,7 @@ def _clear_clip_runtime_generation() -> None:
     global _clip_runtime_canary_last_check
     global _clip_runtime_canary_vision_signature
     clip_runtime_generation = ""
+    _siglip_cuda_graph_runner.clear()
     with _clip_runtime_canary_lock:
         _clip_runtime_canary_image_baseline = None
         _clip_runtime_canary_text_baseline = None
@@ -1966,6 +1973,51 @@ def _siglip_feature_tensor(value: Any) -> torch.Tensor:
     raise RuntimeError(
         "SigLIP2 feature API returned no pooled two-dimensional tensor"
     )
+
+
+def _siglip_cuda_graph_equivalence(
+    eager_output: Any,
+    graph_output: Any,
+) -> Mapping[str, Any]:
+    """Validate the first captured output before it can enter probe state."""
+
+    def compare(left: torch.Tensor, right: torch.Tensor) -> Dict[str, Any]:
+        if left.shape != right.shape or not left.numel():
+            return {"ok": False, "cosine": 0.0, "max_abs": None}
+        left_float = left.detach().float().reshape(int(left.shape[0]), -1)
+        right_float = right.detach().float().reshape(int(right.shape[0]), -1)
+        finite = bool(
+            torch.isfinite(left_float).all().item()
+            and torch.isfinite(right_float).all().item()
+        )
+        left_norm = _normalize_l2_embeddings(left_float)
+        right_norm = _normalize_l2_embeddings(right_float)
+        cosine = float((left_norm * right_norm).sum(dim=-1).amin().item())
+        max_abs = float((left_float - right_float).abs().amax().item())
+        return {
+            "ok": bool(finite and cosine >= 0.99999 and max_abs <= 0.001),
+            "cosine": round(cosine, 8),
+            "max_abs": round(max_abs, 8),
+        }
+
+    pooled = compare(
+        _siglip_feature_tensor(eager_output),
+        _siglip_feature_tensor(graph_output),
+    )
+    eager_patches = getattr(eager_output, "last_hidden_state", None)
+    graph_patches = getattr(graph_output, "last_hidden_state", None)
+    if isinstance(eager_patches, torch.Tensor) and isinstance(
+        graph_patches,
+        torch.Tensor,
+    ):
+        patches = compare(eager_patches, graph_patches)
+    else:
+        patches = {"ok": False, "cosine": 0.0, "max_abs": None}
+    return {
+        "ok": bool(pooled["ok"] and patches["ok"]),
+        "pooled": pooled,
+        "patches": patches,
+    }
 
 
 def _semantic_patch_prompt_bank_locked(
@@ -2554,9 +2606,12 @@ def _clip_image_batch_with_space_locked(
                 )
                 if key in model_inputs
             }
-            vision_outputs = cast(Any, clip_model).vision_model(
-                **vision_inputs,
-                return_dict=True,
+            vision_outputs, _graph_replayed = _siglip_cuda_graph_runner.run(
+                cast(Any, clip_model).vision_model,
+                vision_inputs,
+                generation=clip_runtime_generation,
+                device=clip_runtime_device,
+                validator=_siglip_cuda_graph_equivalence,
             )
             image_features = _siglip_feature_tensor(vision_outputs)
             patch_tensor = getattr(vision_outputs, "last_hidden_state", None)
@@ -2649,7 +2704,7 @@ def _get_live_clip_batcher() -> ImageEmbeddingBatcher:
                 _clip_image_batch_with_space,
                 max_batch_size=int(getattr(config, "LIVE_CLIP_BATCH_SIZE", 8)),
                 max_wait_ms=float(
-                    getattr(config, "LIVE_CLIP_BATCH_WAIT_MS", 75.0)
+                    getattr(config, "LIVE_CLIP_BATCH_WAIT_MS", 8.0)
                 ),
                 queue_capacity=int(
                     getattr(config, "LIVE_CLIP_BATCH_QUEUE_CAPACITY", 128)
@@ -8158,6 +8213,7 @@ def _check_attention_ready() -> Dict[str, Any]:
         semantic_snapshot_archive=semantic_status,
         clip_microbatcher=clip_batch_status,
         clip_encoder_timing=_clip_runtime_timing_status(),
+        siglip_cuda_graph=_siglip_cuda_graph_runner.status(),
         realtime_probe_bookmarks=realtime_probe_bookmarks.status(),
         fast_vlm_alerts=fast_vlm_alerts.status(),
         capture_runtime=sorted(

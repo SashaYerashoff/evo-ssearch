@@ -244,6 +244,34 @@ class EmbeddingPolicyTests(unittest.TestCase):
         with patch.object(oldapp, "clip_model", model):
             self.assertEqual(oldapp._siglip_projection_dimension(), 768)
 
+    def test_siglip_cuda_graph_equivalence_checks_pool_and_patches(self) -> None:
+        pooled = oldapp.torch.tensor([[1.0, 0.0]], dtype=oldapp.torch.float32)
+        patches = oldapp.torch.tensor(
+            [[[1.0, 0.0], [0.0, 1.0]]],
+            dtype=oldapp.torch.float32,
+        )
+        eager = SimpleNamespace(
+            pooler_output=pooled,
+            last_hidden_state=patches,
+        )
+        identical = SimpleNamespace(
+            pooler_output=pooled.clone(),
+            last_hidden_state=patches.clone(),
+        )
+        drifted = SimpleNamespace(
+            pooler_output=pooled.clone(),
+            last_hidden_state=oldapp.torch.zeros_like(patches),
+        )
+
+        healthy = oldapp._siglip_cuda_graph_equivalence(eager, identical)
+        unhealthy = oldapp._siglip_cuda_graph_equivalence(eager, drifted)
+
+        self.assertTrue(healthy["ok"])
+        self.assertEqual(healthy["pooled"]["cosine"], 1.0)
+        self.assertEqual(healthy["patches"]["max_abs"], 0.0)
+        self.assertFalse(unhealthy["ok"])
+        self.assertFalse(unhealthy["patches"]["ok"])
+
     def test_siglip_init_fails_closed_instead_of_changing_embedding_space(self) -> None:
         config.EXPERIMENTAL_EMBEDDERS_ENABLED = True
         config.CLIP_MODEL = "google/siglip2-base-patch16-224"
