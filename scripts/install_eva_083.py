@@ -1300,7 +1300,7 @@ def build_plan(prepared: PreparedInstall) -> list[PlanAction]:
         "rollback",
         (
             "allow automatic rollback only before the new service becomes active; hand off the explicit "
-            f"manual rollback at {options.backup_root}/LATEST for disaster recovery"
+            f"manual scripts/rollback.sh command using {options.backup_root}/LATEST for disaster recovery"
         ),
     ))
     return actions

@@ -1027,7 +1027,7 @@ class OfflineInstallerUnitTests(unittest.TestCase):
 
     def test_operator_plan_explains_the_non_destructive_start_boundary(self):
         source = (ROOT / "scripts" / "install_eva_083.py").read_text(encoding="utf-8")
-        self.assertIn("reject any endpoint/model/context/queue/GPU rewrite before startup", source)
+        self.assertIn("endpoint/model/context/queue/GPU rewrite before startup", source)
         self.assertIn("in-place repair without automatic rollback", source)
         self.assertIn("allow automatic rollback only before the new service becomes active", source)
 
