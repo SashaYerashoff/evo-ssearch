@@ -19,6 +19,7 @@ import {
   buildIncidentDraftFromSummary,
   buildSummaryBookmarkInput,
   buildCaptureInput,
+  captureSettingsForChannel,
   fullLiveMediaUrl,
   mergeRuntime,
   recentFrameUrl,
@@ -415,8 +416,8 @@ export function VideoScreen({
   const [incidentLoading, setIncidentLoading] = useState(false)
   const [streams, setStreams] = useState<StreamsStatus>({})
   const [feed, setFeed] = useState<SummaryEntry[]>([])
-  const [batch, setBatch] = useState('12')
-  const [every, setEvery] = useState('5')
+  const [batch, setBatch] = useState('')
+  const [every, setEvery] = useState('')
   const [period, setPeriod] = useState<SummaryPeriod>('live')
   const [resolution, setResolution] = useState<SummaryResolution>('AUTO')
   const [customFrom, setCustomFrom] = useState('')
@@ -450,7 +451,7 @@ export function VideoScreen({
   const modelPreviewRef = useRef<HTMLImageElement>(null)
   const livePreviewImageRef = useRef<HTMLImageElement>(null)
   const livePreviewVideoRef = useRef<HTMLVideoElement>(null)
-  const hydratedSettingsChannelRef = useRef<number | null>(null)
+  const hydratedSettingsKeyRef = useRef<string | null>(null)
 
   const releasePreviewMedia = useCallback(() => {
     const modelImage = modelPreviewRef.current
@@ -468,6 +469,7 @@ export function VideoScreen({
   const channelName = useCallback((id: number) => channels.find((c) => c.id === id)?.title, [channels])
   const runtime: ChannelRuntime[] = mergeRuntime(streams, channelName)
   const settingsRt = runtime.find((c) => c.channelId === settingsChannelId) || null
+  const effectiveCaptureSettings = captureSettingsForChannel(streams, settingsChannelId)
   const reviewRt = runtime.find((c) => c.channelId === reviewChannelId) || null
   const previewChannelId = reviewPreviewOpen
     ? reviewChannelId
@@ -642,21 +644,20 @@ export function VideoScreen({
     setActiveTab(nextTab)
   }, [activeTab, showIncidents])
   useEffect(() => {
-    hydratedSettingsChannelRef.current = null
-    setBatch('12')
-    setEvery('5')
+    hydratedSettingsKeyRef.current = null
+    setBatch('')
+    setEvery('')
     setSettingsDirty(false)
   }, [settingsChannelId])
   useEffect(() => {
-    if (settingsChannelId == null || settingsRt?.channelId !== settingsChannelId) return
-    if (hydratedSettingsChannelRef.current === settingsChannelId) return
-    const nextBatch = Number(settingsRt.video?.batch_size)
-    const nextEvery = Number(settingsRt.video?.interval_sec)
-    setBatch(Number.isFinite(nextBatch) && nextBatch > 0 ? String(nextBatch) : '12')
-    setEvery(Number.isFinite(nextEvery) && nextEvery > 0 ? String(nextEvery) : '5')
-    hydratedSettingsChannelRef.current = settingsChannelId
+    if (settingsChannelId == null || !effectiveCaptureSettings || settingsDirty) return
+    const settingsKey = `${settingsChannelId}:${effectiveCaptureSettings.batchSize}:${effectiveCaptureSettings.intervalSec}`
+    if (hydratedSettingsKeyRef.current === settingsKey) return
+    setBatch(String(effectiveCaptureSettings.batchSize))
+    setEvery(String(effectiveCaptureSettings.intervalSec))
+    hydratedSettingsKeyRef.current = settingsKey
     setSettingsDirty(false)
-  }, [settingsChannelId, settingsRt])
+  }, [effectiveCaptureSettings, settingsChannelId, settingsDirty])
 
   // poll streams (runtime) every 4s
   useEffect(() => { const t = window.setInterval(loadStreams, 4000); return () => window.clearInterval(t) }, [loadStreams])
@@ -790,7 +791,7 @@ export function VideoScreen({
   }, [previewBust, previewChannelId, previewMode])
 
   const start = async () => {
-    if (settingsChannelId == null) return
+    if (settingsChannelId == null || !batch || !every) return
     setBusy(true); setError(null)
     try {
       const r = await videoApi.startCapture(buildCaptureInput(settingsChannelId, { batch, every }))
@@ -799,7 +800,7 @@ export function VideoScreen({
       const effectiveEvery = Number(r.session?.interval_sec)
       if (Number.isFinite(effectiveBatch) && effectiveBatch > 0) setBatch(String(effectiveBatch))
       if (Number.isFinite(effectiveEvery) && effectiveEvery > 0) setEvery(String(effectiveEvery))
-      hydratedSettingsChannelRef.current = settingsChannelId
+      hydratedSettingsKeyRef.current = `${settingsChannelId}:${effectiveBatch}:${effectiveEvery}`
       setSettingsDirty(false)
       await loadStreams()
     } catch (e: any) { setError(e?.message || 'Start failed') } finally { setBusy(false) }
@@ -910,12 +911,11 @@ export function VideoScreen({
     setSettingsDirty(true)
   }, [])
   const discardSettingsDraft = useCallback(() => {
-    const nextBatch = Number(settingsRt?.video?.batch_size)
-    const nextEvery = Number(settingsRt?.video?.interval_sec)
-    setBatch(Number.isFinite(nextBatch) && nextBatch > 0 ? String(nextBatch) : '12')
-    setEvery(Number.isFinite(nextEvery) && nextEvery > 0 ? String(nextEvery) : '5')
+    if (!effectiveCaptureSettings) return
+    setBatch(String(effectiveCaptureSettings.batchSize))
+    setEvery(String(effectiveCaptureSettings.intervalSec))
     setSettingsDirty(false)
-  }, [settingsRt])
+  }, [effectiveCaptureSettings])
 
   const previewCard = (
     <div className="vid-preview-card">
@@ -999,8 +999,10 @@ export function VideoScreen({
         settingsChannelId={settingsChannelId} onSettingsChannel={(channelId) => requestSettingsChannel(channelId)}
         reviewChannelId={reviewChannelId} onReviewChannel={setReviewChannelId}
         onReload={reloadChannels}
-        batch={batch} onBatch={updateBatch} every={every} onEvery={updateEvery}
-        canCapture={canCapture} canManagePrompts={canManagePrompts}
+        batch={batch} onBatch={updateBatch}
+        allowedBatchSizes={(streams.capture_defaults?.allowed_batch_sizes || []).map(String)}
+        every={every} onEvery={updateEvery}
+        canCapture={canCapture} canManagePrompts={canManagePrompts} samplingReady={Boolean(batch && every)}
         capturing={capturing} busy={busy} onStart={start} onStop={stop} onFlush={flush}
         onPromptSettings={() => setPromptOpen(true)}
         period={period} onPeriod={selectPeriod} resolution={resolution} onResolution={setResolution}

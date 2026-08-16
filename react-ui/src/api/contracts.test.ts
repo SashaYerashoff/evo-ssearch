@@ -47,6 +47,7 @@ import {
   buildPromptSettingsPayload,
   buildSessionQuery,
   buildSummaryFeedQuery,
+  captureSettingsForChannel,
   fullLiveMediaUrl,
   recentFrameUrl,
 } from './video'
@@ -299,6 +300,21 @@ describe('React/backend contract normalizers', () => {
       batch_size: 12,
       interval_sec: 5,
     })
+  })
+
+  it('hydrates capture settings from runtime, saved state, then server defaults', () => {
+    const status = {
+      video_streams: [{ channel_id: 7, batch_size: 4, interval_sec: 0.5 }],
+      capture_configurations: [
+        { channel_id: 7, batch_size: 8, interval_sec: 2 },
+        { channel_id: 8, batch_size: 8, interval_sec: 2 },
+      ],
+      capture_defaults: { batch_size: 12, interval_sec: 1, allowed_batch_sizes: [4, 8, 12, 16] },
+    }
+    expect(captureSettingsForChannel(status, 7)).toEqual({ batchSize: 4, intervalSec: 0.5, source: 'runtime' })
+    expect(captureSettingsForChannel(status, 8)).toEqual({ batchSize: 8, intervalSec: 2, source: 'saved' })
+    expect(captureSettingsForChannel(status, 9)).toEqual({ batchSize: 12, intervalSec: 1, source: 'server_default' })
+    expect(captureSettingsForChannel({}, 9)).toBeNull()
   })
 
   it('supplies a useful prompt for image-only agent messages', () => {

@@ -889,7 +889,7 @@ def _siglip2_runtime_findings(
     options: InstallerOptions,
     values: Mapping[str, str],
 ) -> list[Finding]:
-    """Prove an adopted venv understands SigLIP2 before stopping EVA."""
+    """Prove SigLIP2 is usable now or installable offline before stopping EVA."""
 
     model = str(values.get("EVOSSEARCH_CLIP_MODEL") or "").strip().lower()
     if "siglip2" not in model:
@@ -914,9 +914,66 @@ def _siglip2_runtime_findings(
         check=False,
     )
     if probe.returncode != 0:
+        wheelhouse = options.bundle_dir / "wheelhouse"
+        if not _wheelhouse_files(options.bundle_dir):
+            return [Finding(
+                "FAIL",
+                "target venv cannot load the SigLIP2 runtime contract "
+                "(requires transformers>=4.52) and the bundle has no wheelhouse",
+            )]
+        requirement_files = [options.source_dir / "requirements.txt"]
+        database_requirements = options.source_dir / "requirements-db.txt"
+        if database_requirements.is_file():
+            requirement_files.append(database_requirements)
+        common_args = [
+            "--dry-run",
+            "--no-index",
+            "--find-links",
+            str(wheelhouse),
+        ]
+        for requirement_file in requirement_files:
+            common_args.extend(("-r", str(requirement_file)))
+        commands: list[list[str]] = []
+        venv_pip = options.app_dir / ".venv" / "bin" / "pip"
+        if venv_pip.is_file() and os.access(venv_pip, os.X_OK):
+            commands.append([str(venv_pip), "install", *common_args])
+        commands.append([str(python), "-m", "pip", "install", *common_args])
+        uv = shutil.which("uv")
+        if uv:
+            commands.append([
+                uv,
+                "pip",
+                "install",
+                "--python",
+                str(python),
+                *common_args,
+            ])
+        errors: list[str] = []
+        for command in commands:
+            resolution = subprocess.run(
+                tuple(command),
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                check=False,
+            )
+            if resolution.returncode == 0:
+                return [Finding(
+                    "OK",
+                    "target venv needs the SigLIP2 dependency upgrade; bundled wheelhouse resolves all Python requirements offline",
+                )]
+            detail_rows = [
+                row.strip()
+                for row in (resolution.stderr or resolution.stdout or "").splitlines()
+                if row.strip()
+            ]
+            if detail_rows:
+                errors.append(detail_rows[-1][:300])
+        detail = errors[-1] if errors else "no compatible pip/uv resolver is available"
         return [Finding(
             "FAIL",
-            "target venv cannot load the SigLIP2 runtime contract (requires transformers>=4.52); use a reviewed wheelhouse",
+            "target venv cannot load SigLIP2 and bundled wheelhouse resolution failed: "
+            + detail,
         )]
     return [Finding("OK", "target venv supports the SigLIP2 runtime contract")]
 

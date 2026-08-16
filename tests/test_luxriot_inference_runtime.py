@@ -5729,6 +5729,43 @@ class LuxriotCaptureDispatchTests(unittest.TestCase):
             self.assertNotIn(7, manager.shared_probe_channels)
             self.assertIn(7, manager.paused_probe_channels)
 
+    def test_stream_status_exposes_server_defaults_and_saved_capture_settings(self):
+        with tempfile.TemporaryDirectory() as temp:
+            manager = build_manager(
+                Path(temp),
+                runtime_state_store=MemoryRuntimeStateStore(),
+                config_overrides={
+                    "LUXRIOT_BATCH_SIZES": (4, 8, 12, 16),
+                    "LUXRIOT_DEFAULT_BATCH_SIZE": 12,
+                },
+            )
+            manager._set_desired_live_session(
+                9,
+                enabled=False,
+                batch_size=8,
+                interval_sec=2.0,
+                model_hint="vlm_b",
+            )
+
+            streams = manager.streams_status()
+
+            self.assertEqual(streams["capture_defaults"]["batch_size"], 12)
+            self.assertEqual(streams["capture_defaults"]["interval_sec"], 5.0)
+            self.assertEqual(streams["capture_defaults"]["allowed_batch_sizes"], [4, 8, 12, 16])
+            self.assertEqual(
+                streams["capture_configurations"],
+                [
+                    {
+                        "channel_id": 9,
+                        "enabled": False,
+                        "batch_size": 8,
+                        "interval_sec": 2.0,
+                        "model": "vlm_b",
+                        "updated_at": streams["capture_configurations"][0]["updated_at"],
+                    }
+                ],
+            )
+
     def test_probe_capture_prefers_shared_video_over_existing_analytics_session(self):
         with tempfile.TemporaryDirectory() as temp:
             manager = build_manager(Path(temp))

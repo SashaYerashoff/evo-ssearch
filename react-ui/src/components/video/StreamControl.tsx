@@ -19,7 +19,6 @@ import type { SummaryPeriod, SummaryResolution } from './summaryView'
 import type { IncidentPeriod } from '../incidents/IncidentReview'
 import { useI18n, type TranslationKey } from '../../i18n/I18nProvider'
 
-const BATCHES = ['4', '8', '12', '16']
 export const PERIODS: Array<{ v: SummaryPeriod; label: string }> = [
   { v: 'live', label: 'Live' },
   { v: 'today', label: 'Today' },
@@ -70,9 +69,11 @@ export function StreamControl(p: {
   onReviewChannel: (id: number) => void
   onReload: () => void
   batch: string; onBatch: (v: string) => void
+  allowedBatchSizes: string[]
   every: string; onEvery: (v: string) => void
   canCapture: boolean
   canManagePrompts: boolean
+  samplingReady: boolean
   capturing: boolean; busy: boolean
   onStart: () => void; onStop: () => void; onFlush: () => void
   onPromptSettings: () => void
@@ -103,6 +104,9 @@ export function StreamControl(p: {
   const resolutions = RESOLUTIONS.map((item) => ({ ...item, label: t(RESOLUTION_LABEL_KEYS[item.v]) }))
   const settingsTitle = p.channels.find((c) => c.id === p.settingsChannelId)?.title || '—'
   const reviewTitle = p.channels.find((c) => c.id === p.reviewChannelId)?.title || '—'
+  const batchOptions = p.allowedBatchSizes.length > 0
+    ? p.allowedBatchSizes
+    : (p.batch ? [p.batch] : [])
   const settingsSummary = `${settingsTitle} · ${t('video.batch').toLocaleLowerCase()} ${p.batch} · ${p.every}s · ${p.capturing ? t('status.capturing') : t('status.idle')}`
   const reviewSummary = [
     reviewTitle,
@@ -144,7 +148,7 @@ export function StreamControl(p: {
             <div className="vid-control-group-title">{t('video.sampling')}</div>
             <div className="vid-control-fields">
               <div className="wfield batch"><label>{t('video.batch')}</label>
-                <Dropdown value={p.batch} onChange={p.onBatch} options={BATCHES.map((b) => ({ value: b, label: b }))} />
+                <Dropdown value={p.batch} onChange={p.onBatch} options={batchOptions.map((b) => ({ value: b, label: b }))} />
               </div>
               <div className="wfield xs"><label>{t('video.every')}</label>
                 <input type="number" min={0.2} max={300} step={0.1} value={p.every} onChange={(e) => p.onEvery(e.target.value)} />
@@ -156,10 +160,10 @@ export function StreamControl(p: {
             <div className="vid-tb-actions">
               {p.canCapture && (p.capturing
                 ? <>
-                    <button className="mon-btn accent vid-toggle" disabled={p.busy || !p.settingsDirty} onClick={p.onStart} title="Restart this stream with the edited sampling and inference settings"><IconPlayerPlay size={15} /> {t('video.applyChanges')}</button>
+                    <button className="mon-btn accent vid-toggle" disabled={p.busy || !p.settingsDirty || !p.samplingReady} onClick={p.onStart} title="Restart this stream with the edited sampling and inference settings"><IconPlayerPlay size={15} /> {t('video.applyChanges')}</button>
                     <button className="mon-btn danger" disabled={p.busy} onClick={p.onStop}><IconPlayerStop size={15} /> {t('video.stop')}</button>
                   </>
-                : <button className="mon-btn accent vid-toggle" disabled={p.busy} onClick={p.onStart}><IconPlayerPlay size={15} /> {t('video.start')}</button>)}
+                : <button className="mon-btn accent vid-toggle" disabled={p.busy || !p.samplingReady} onClick={p.onStart}><IconPlayerPlay size={15} /> {t('video.start')}</button>)}
               {p.canCapture && <button className="mon-btn" disabled={p.busy || !p.capturing} onClick={p.onFlush}><IconDroplet size={15} /> {t('video.flush')}</button>}
               {p.canManagePrompts && <button className="mon-btn" onClick={p.onPromptSettings} title="System prompt and alert settings"><IconSettings size={15} /> {t('video.prompts')}</button>}
               {p.settingsDirty && <button className="mon-btn" disabled={p.busy} onClick={p.onDiscardSettings}>{t('video.discard')}</button>}

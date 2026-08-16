@@ -946,6 +946,10 @@ class HttpAuthRouteTests(unittest.TestCase):
                 {"channel_id": 8},
             ],
             "analytics_streams": [{"channel_id": 8}],
+            "capture_configurations": [
+                {"channel_id": 7, "batch_size": 8, "interval_sec": 2.0},
+                {"channel_id": 8, "batch_size": 16, "interval_sec": 1.0},
+            ],
             "paused_analytics_channels": [7, 8],
             "video_history_channels": [7, 8],
             "running_total": 3,
@@ -967,6 +971,10 @@ class HttpAuthRouteTests(unittest.TestCase):
         payload = stream_status.get_json()
         self.assertEqual(payload["video_streams"], [{"channel_id": 7}])
         self.assertEqual(payload["analytics_streams"], [])
+        self.assertEqual(
+            payload["capture_configurations"],
+            [{"channel_id": 7, "batch_size": 8, "interval_sec": 2.0}],
+        )
         self.assertEqual(payload["paused_analytics_channels"], [7])
         self.assertEqual(payload["video_history_channels"], [7])
         self.assertEqual(payload["running_total"], 1)

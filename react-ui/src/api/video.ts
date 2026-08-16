@@ -27,6 +27,15 @@ export interface Stream {
 export interface StreamsStatus {
   video_streams?: Stream[]
   analytics_streams?: Stream[]
+  capture_defaults?: { batch_size?: number; interval_sec?: number; allowed_batch_sizes?: number[] }
+  capture_configurations?: Array<{
+    channel_id: number
+    enabled?: boolean
+    batch_size?: number
+    interval_sec?: number
+    model?: string | null
+    updated_at?: number | null
+  }>
   desired_video_missing?: any[]
   paused_analytics_channels?: number[]
   running_total?: number
@@ -292,4 +301,33 @@ export function mergeRuntime(s: StreamsStatus, channelName: (id: number) => stri
   for (const v of s.video_streams || []) ensure(v.channel_id).video = v
   for (const a of s.analytics_streams || []) ensure(a.channel_id).probe = a
   return Array.from(map.values()).sort((a, b) => a.channelId - b.channelId)
+}
+
+export interface CaptureSettings {
+  batchSize: number
+  intervalSec: number
+  source: 'runtime' | 'saved' | 'server_default'
+}
+
+export function captureSettingsForChannel(
+  status: StreamsStatus,
+  channelId: number | null,
+): CaptureSettings | null {
+  if (channelId == null) return null
+  const runtime = (status.video_streams || []).find((row) => Number(row.channel_id) === channelId)
+  const saved = (status.capture_configurations || []).find((row) => Number(row.channel_id) === channelId)
+  const defaults = status.capture_defaults || {}
+  const candidates: Array<{ row: any; source: CaptureSettings['source'] }> = [
+    { row: runtime, source: 'runtime' },
+    { row: saved, source: 'saved' },
+    { row: defaults, source: 'server_default' },
+  ]
+  for (const candidate of candidates) {
+    const batchSize = Number(candidate.row?.batch_size)
+    const intervalSec = Number(candidate.row?.interval_sec)
+    if (Number.isFinite(batchSize) && batchSize > 0 && Number.isFinite(intervalSec) && intervalSec > 0) {
+      return { batchSize, intervalSec, source: candidate.source }
+    }
+  }
+  return null
 }

@@ -27317,6 +27317,40 @@ class LuxriotManager:
             for channel_id, state in desired_live.items()
             if bool(state.get("enabled"))
         )
+        configured_batch_sizes = [
+            int(value)
+            for value in (getattr(self.config, "LUXRIOT_BATCH_SIZES", ()) or ())
+            if _parse_optional_int(value) is not None and int(value) > 0
+        ]
+        default_batch_size = int(
+            getattr(
+                self.config,
+                "LUXRIOT_DEFAULT_BATCH_SIZE",
+                configured_batch_sizes[0] if configured_batch_sizes else 12,
+            )
+        )
+        if configured_batch_sizes and default_batch_size not in configured_batch_sizes:
+            default_batch_size = configured_batch_sizes[0]
+        default_interval_sec = self._normalize_capture_interval_sec(
+            getattr(self.config, "LUXRIOT_SNAPSHOT_INTERVAL", 5.0)
+        ) or 5.0
+        capture_configurations = [
+            {
+                "channel_id": int(channel_id),
+                "enabled": bool(state.get("enabled")),
+                "batch_size": int(
+                    _parse_optional_int(state.get("batch_size")) or default_batch_size
+                ),
+                "interval_sec": float(
+                    self._coerce_float(state.get("interval_sec"))
+                    or default_interval_sec
+                ),
+                "model": str(state.get("model_hint") or "").strip() or None,
+                "updated_at": self._coerce_float(state.get("updated_at")),
+            }
+            for channel_id, state in sorted(desired_live.items())
+            if int(channel_id) > 0 and isinstance(state, Mapping)
+        ]
         desired_missing = [
             {
                 "channel_id": channel_id,
@@ -27438,6 +27472,12 @@ class LuxriotManager:
             "video_streams": sorted(video_streams, key=lambda item: int(item.get("channel_id", 0))),
             "analytics_streams": sorted(analytics_streams, key=lambda item: int(item.get("channel_id", 0))),
             "channel_status_digest": sorted(status_digest.values(), key=lambda item: int(item.get("channel_id", 0))),
+            "capture_defaults": {
+                "batch_size": default_batch_size,
+                "interval_sec": default_interval_sec,
+                "allowed_batch_sizes": configured_batch_sizes,
+            },
+            "capture_configurations": capture_configurations,
             "desired_video_channels": desired_video_channels,
             "desired_video_missing": desired_missing,
             "paused_analytics_channels": sorted(paused),

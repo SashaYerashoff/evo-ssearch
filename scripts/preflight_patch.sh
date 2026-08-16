@@ -230,7 +230,7 @@ if [[ -n "${BUNDLE_DIR}" ]]; then
       wheel_count="$(find "${BUNDLE_DIR}/wheelhouse" -type f \( -name '*.whl' -o -name '*.tar.gz' -o -name '*.zip' \) | wc -l | tr -d ' ')"
       ok "wheelhouse found with ${wheel_count} files"
     else
-      warn "no wheelhouse in bundle; install will reuse existing venv dependencies"
+      warn "no wheelhouse in bundle; outer installer must prove the existing venv satisfies release dependencies"
     fi
   else
     fail "bundle directory not found: ${BUNDLE_DIR}"
@@ -305,16 +305,7 @@ if [[ -f "${ENV_FILE}" ]]; then
     EVOSSEARCH_LUXRIOT_BASE_URL \
     EVOSSEARCH_LUXRIOT_USERNAME \
     EVOSSEARCH_LUXRIOT_PASSWORD \
-    EVOSSEARCH_LM_PROFILE_AGENT_BASE_URL \
-    EVOSSEARCH_LM_PROFILE_AGENT_MODEL \
-    EVOSSEARCH_LM_PROFILE_VLM_A1_BASE_URL \
-    EVOSSEARCH_LM_PROFILE_VLM_A1_MODEL \
-    EVOSSEARCH_LM_PROFILE_VLM_A0_BASE_URL \
-    EVOSSEARCH_LM_PROFILE_VLM_A0_MODEL \
-    EVOSSEARCH_LM_PROFILE_VLM_B1_BASE_URL \
-    EVOSSEARCH_LM_PROFILE_VLM_B1_MODEL \
-    EVOSSEARCH_LM_PROFILE_VLM_B0_BASE_URL \
-    EVOSSEARCH_LM_PROFILE_VLM_B0_MODEL \
+    EVOSSEARCH_LM_PROFILES \
     EVOSSEARCH_LM_VLM_BALANCER_ENABLED \
     EVOSSEARCH_LM_VLM_BALANCER_PROFILES \
     EVA_DATABASE_DSN \
@@ -324,6 +315,18 @@ if [[ -f "${ENV_FILE}" ]]; then
     if [[ -n "${value}" ]]; then
       printf '%s=%s\n' "${key}" "$(redact_value "${key}" "${value}")"
     fi
+  done
+  profile_ids="$(read_env_var EVOSSEARCH_LM_PROFILES "${ENV_FILE}")"
+  for profile_id in ${profile_ids//,/ }; do
+    [[ -n "${profile_id}" ]] || continue
+    profile_env_id="$(printf '%s' "${profile_id}" | tr '[:lower:]' '[:upper:]' | tr -c 'A-Z0-9' '_')"
+    for suffix in BASE_URL MODEL KIND MAX_INFLIGHT; do
+      key="EVOSSEARCH_LM_PROFILE_${profile_env_id}_${suffix}"
+      value="$(read_env_var "${key}" "${ENV_FILE}")"
+      if [[ -n "${value}" ]]; then
+        printf '%s=%s\n' "${key}" "$(redact_value "${key}" "${value}")"
+      fi
+    done
   done
   workers="$(read_env_var EVOSSEARCH_GUNICORN_WORKERS "${ENV_FILE}")"
   if [[ -n "${workers}" && "${workers}" != "1" ]]; then

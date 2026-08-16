@@ -1152,7 +1152,7 @@ def _filter_stream_status_for_context(
     filtered = dict(status)
     if not _auth_enabled() or context is None:
         return filtered
-    for key in ("video_streams", "analytics_streams"):
+    for key in ("video_streams", "analytics_streams", "capture_configurations"):
         filtered[key] = [
             item
             for item in filtered.get(key) or []

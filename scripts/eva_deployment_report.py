@@ -230,6 +230,13 @@ def _profile_ids(values: Mapping[str, str]) -> list[str]:
     return list(dict.fromkeys(item.strip() for item in raw.split(",") if item.strip()))
 
 
+def _nonnegative_int(value: Any) -> int:
+    try:
+        return max(0, int(str(value or "0").strip()))
+    except (TypeError, ValueError):
+        return 0
+
+
 def _profile_status(values: Mapping[str, str]) -> list[dict[str, Any]]:
     output: list[dict[str, Any]] = []
     for profile_id in _profile_ids(values):
@@ -268,13 +275,25 @@ def _profile_status(values: Mapping[str, str]) -> list[dict[str, Any]]:
                     "id": profile_id,
                     "ok": bool(200 <= response.status < 400 and served and (not model or model in served)),
                     "status": "reachable",
+                    "base_url": base_url,
                     "model": model,
+                    "kind": str(values.get(f"EVOSSEARCH_LM_PROFILE_{env_id}_KIND") or "").strip(),
+                    "max_inflight": _nonnegative_int(values.get(f"EVOSSEARCH_LM_PROFILE_{env_id}_MAX_INFLIGHT")),
                     "served_models": served,
                 }
             )
         except Exception as exc:
             output.append(
-                {"id": profile_id, "ok": False, "status": "unavailable", "model": model, "error": type(exc).__name__}
+                {
+                    "id": profile_id,
+                    "ok": False,
+                    "status": "unavailable",
+                    "base_url": base_url,
+                    "model": model,
+                    "kind": str(values.get(f"EVOSSEARCH_LM_PROFILE_{env_id}_KIND") or "").strip(),
+                    "max_inflight": _nonnegative_int(values.get(f"EVOSSEARCH_LM_PROFILE_{env_id}_MAX_INFLIGHT")),
+                    "error": type(exc).__name__,
+                }
             )
     return output
 
@@ -321,6 +340,9 @@ def collect(
         "inference": {
             "ready_check": checks.get("lm_profiles") if isinstance(checks.get("lm_profiles"), dict) else {},
             "profiles": _profile_status(values),
+        },
+        "semantic": {
+            "ready_check": checks.get("embedder") if isinstance(checks.get("embedder"), dict) else {},
         },
         "streams": _summary_activity(values, minutes=activity_minutes),
     }
@@ -369,6 +391,8 @@ def evaluate(report: Mapping[str, Any], baseline: Mapping[str, Any] | None = Non
     inference = report.get("inference") if isinstance(report.get("inference"), Mapping) else {}
     profiles = inference.get("profiles") if isinstance(inference.get("profiles"), list) else []
     streams = report.get("streams") if isinstance(report.get("streams"), Mapping) else {}
+    semantic = report.get("semantic") if isinstance(report.get("semantic"), Mapping) else {}
+    semantic_ready = semantic.get("ready_check") if isinstance(semantic.get("ready_check"), Mapping) else {}
 
     if not service.get("ok"):
         failures.append("eva-ai.service is not active")
@@ -396,6 +420,11 @@ def evaluate(report: Mapping[str, Any], baseline: Mapping[str, Any] | None = Non
         warnings.append("stream activity could not be measured")
     elif int(streams.get("channels") or 0) == 0:
         warnings.append("no active pre-update stream baseline; configure/start streams before acceptance")
+    semantic_status = str(semantic_ready.get("status") or "unknown")
+    if semantic_status == "not_loaded":
+        warnings.append("semantic backend is idle and will load on the first enabled semantic probe")
+    elif semantic_ready and not semantic_ready.get("ok"):
+        failures.append(f"semantic backend is unhealthy: {semantic_status}")
     return {
         "status": "FAIL" if failures else ("WARN" if warnings else "PASS"),
         "failures": failures,
@@ -413,6 +442,8 @@ def render_text(report: Mapping[str, Any], assessment: Mapping[str, Any]) -> str
     streams = report.get("streams") if isinstance(report.get("streams"), Mapping) else {}
     inference = report.get("inference") if isinstance(report.get("inference"), Mapping) else {}
     profiles = inference.get("profiles") if isinstance(inference.get("profiles"), list) else []
+    semantic = report.get("semantic") if isinstance(report.get("semantic"), Mapping) else {}
+    semantic_ready = semantic.get("ready_check") if isinstance(semantic.get("ready_check"), Mapping) else {}
     gpu = host.get("gpu") if isinstance(host.get("gpu"), Mapping) else {}
     rows = [
         "EVA AI DEPLOYMENT REPORT",
@@ -434,8 +465,16 @@ def render_text(report: Mapping[str, Any], assessment: Mapping[str, Any]) -> str
         ),
         f"Luxriot Evo: {'REACHABLE' if luxriot_ready.get('ok') else ('NOT CONFIGURED' if not luxriot.get('configured') else 'UNAVAILABLE')}",
         "Inference: " + ", ".join(
-            f"{row.get('id')}={'READY' if row.get('ok') else 'FAILED'}"
+            f"{row.get('id')}={'READY' if row.get('ok') else 'FAILED'} "
+            f"({row.get('base_url') or 'no URL'} · {row.get('model') or 'no model'} · max {row.get('max_inflight') or '?'})"
             for row in profiles if isinstance(row, Mapping)
+        ),
+        (
+            "Semantic: READY"
+            if semantic_ready.get("ok")
+            else "Semantic: IDLE — loads on first enabled semantic probe"
+            if semantic_ready.get("status") == "not_loaded"
+            else f"Semantic: {str(semantic_ready.get('status') or 'UNKNOWN').upper()}"
         ),
         (
             "Streams: WORKING — "

@@ -470,13 +470,29 @@ if [[ -d "${SIGLIP2_SOURCE}/blobs" && -d "${SIGLIP2_SOURCE}/snapshots" ]]; then
   ok "installed offline SigLIP2 cache at ${SIGLIP2_TARGET}"
 fi
 
-if [[ -d "${BUNDLE_DIR}/wheelhouse" && -x "${APP_DIR}/.venv/bin/pip" ]]; then
+if [[ -d "${BUNDLE_DIR}/wheelhouse" && -x "${APP_DIR}/.venv/bin/python" ]]; then
   log "Installing offline wheels from bundle wheelhouse"
-  run_as_user "${APP_OWNER%%:*}" bash -lc \
-    "cd '${APP_DIR}' && .venv/bin/pip install --no-index --find-links '${BUNDLE_DIR}/wheelhouse' -r requirements.txt"
+  REQUIREMENT_ARGS=(
+    -r "${APP_DIR}/requirements.txt"
+  )
   if [[ -f "${APP_DIR}/requirements-db.txt" ]]; then
-    run_as_user "${APP_OWNER%%:*}" bash -lc \
-      "cd '${APP_DIR}' && .venv/bin/pip install --no-index --find-links '${BUNDLE_DIR}/wheelhouse' -r requirements-db.txt"
+    REQUIREMENT_ARGS+=( -r "${APP_DIR}/requirements-db.txt" )
+  fi
+  if [[ -x "${APP_DIR}/.venv/bin/pip" ]]; then
+    run_as_user "${APP_OWNER%%:*}" \
+      "${APP_DIR}/.venv/bin/pip" install --no-index \
+      --find-links "${BUNDLE_DIR}/wheelhouse" "${REQUIREMENT_ARGS[@]}"
+  elif "${APP_DIR}/.venv/bin/python" -m pip --version >/dev/null 2>&1; then
+    run_as_user "${APP_OWNER%%:*}" \
+      "${APP_DIR}/.venv/bin/python" -m pip install --no-index \
+      --find-links "${BUNDLE_DIR}/wheelhouse" "${REQUIREMENT_ARGS[@]}"
+  elif command -v uv >/dev/null 2>&1; then
+    UV_BIN="$(command -v uv)"
+    run_as_user "${APP_OWNER%%:*}" \
+      "${UV_BIN}" pip install --python "${APP_DIR}/.venv/bin/python" --no-index \
+      --find-links "${BUNDLE_DIR}/wheelhouse" "${REQUIREMENT_ARGS[@]}"
+  else
+    die "wheelhouse is present but target venv has no usable pip and uv is unavailable"
   fi
   ok "offline dependency install completed"
 else
