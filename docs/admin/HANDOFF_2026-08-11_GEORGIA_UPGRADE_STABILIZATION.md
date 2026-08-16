@@ -3261,3 +3261,41 @@ then add seeded archive/summary, operator-RBAC, disposable incident and deployme
 tags in separate fixture-controlled passes. Compare pass rate and per-scenario
 tool plans before looking at aggregate latency. Do not interpret skipped fixture
 scenarios as passes or failures.
+
+## 2026-08-16 Georgia release notes and bounded latency preflight
+
+The cumulative Russian release notes for the field conversation are now in
+`readiness/RELEASE_NOTES_0.8.1_TO_0.8.7_RU.md`. They explicitly separate CV,
+SigLIP, VLM processing and Evo acknowledgement, mark Incident Review as FiP,
+and retain the semantic-presence/patch-affinity honesty boundary.
+
+`scripts/georgia_release_latency_report.py` produces a secret-safe JSON and
+Markdown snapshot without creating probes, alerts or bookmarks. Its database
+read is bounded to the latest 1024 rows per source: the first diagnostic draft
+proved that scanning and decompressing every historical VLM evidence payload
+could itself consume about a minute of PostgreSQL/CPU and perturb the live
+SigLIP window. The bounded version completes in about ten seconds with the CV
+benchmark enabled and does not import the runtime/CUDA stack.
+
+The 2026-08-16 two-channel snapshot is stored as:
+
+```text
+artifacts/release/georgia-runtime-2026-08-16.json
+readiness/GEORGIA_RUNTIME_TIMINGS_2026-08-16.md
+```
+
+Key observed values were CV apex 5.2/12.3 ms p50/p95; loaded SigLIP compute
+70/380 ms with queue wait 11/95 ms and zero final depth/inflight; current full
+L0 VLM inference 9.7/17.7 seconds; current full L0 event-to-Evo acknowledgement
+25.1/37.7 seconds with 45 ms median EVA-to-Evo delivery. Bounded seven-day
+validation samples retain direct-probe 0.889/2.843 seconds p50/p95 and fast-VLM
+13.0/18.3 seconds. A separate quiet-window observation and isolated CUDA graph
+benchmark remain materially faster; the loaded window is deliberately reported
+instead of hidden.
+
+The remaining release actions are operational rather than a safe last-minute
+logic change: build a newly named immutable patch bundle from the clean final
+commit, pin the Desktop rehearsal launcher to its exact commit/checksum, run the
+read-only 0.8.1/`0006` preflight, and collect one fresh direct-probe and one
+VLM-policy thumbs-up acknowledgement after the update. Do not alter the live
+`.env`, inference units, model endpoints, contexts or capacities while doing so.
