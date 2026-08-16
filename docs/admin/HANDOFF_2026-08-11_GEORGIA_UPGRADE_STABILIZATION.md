@@ -3299,3 +3299,11 @@ commit, pin the Desktop rehearsal launcher to its exact commit/checksum, run the
 read-only 0.8.1/`0006` preflight, and collect one fresh direct-probe and one
 VLM-policy thumbs-up acknowledgement after the update. Do not alter the live
 `.env`, inference units, model endpoints, contexts or capacities while doing so.
+
+The first 2026-08-16 archive candidate named `...-793b11c.tar.gz` was rejected
+before use. Its broad `--exclude=video` pattern removed seven tracked files from
+`react-ui/src/components/video` even though the prebuilt React `dist` remained
+present. The builder/install copy patterns are now root-scoped (`/video/`) and
+the builder fails unless every Git-tracked source file is present in the bundle
+snapshot. Do not use or repin the rejected `793b11c` archive; only the later
+candidate built from the exclude regression fix is eligible for rehearsal.

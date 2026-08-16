@@ -207,6 +207,15 @@ class UpdateBundleTests(unittest.TestCase):
         self.assertIn('"${BUNDLE_DIR}/update.sh"', BUILD_SCRIPT)
         self.assertIn('chmod 0755 "${BUNDLE_DIR}/update.sh"', BUILD_SCRIPT)
 
+    def test_runtime_video_exclude_is_root_scoped_and_tracked_source_is_complete(self):
+        self.assertIn('"--exclude=/video/"', BUILD_SCRIPT)
+        self.assertNotIn('"--exclude=video"', BUILD_SCRIPT)
+        self.assertIn("tracked source file missing from bundle snapshot", BUILD_SCRIPT)
+        self.assertIn('"--exclude=/video/"', INSTALL_SCRIPT)
+        self.assertNotIn('"--exclude=video"', INSTALL_SCRIPT)
+        self.assertIn("--exclude=/video/", SCRIPT)
+        self.assertNotIn("--exclude=video --exclude=models", SCRIPT)
+
     def test_media_runtime_is_required_and_checked_before_confirmation(self):
         media_check = SCRIPT.index('MEDIA_RUNTIME="')
         checksum = SCRIPT.index("sha256sum -c SHA256SUMS")

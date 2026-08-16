@@ -974,7 +974,7 @@ if [[ "${MODE}" == "user" ]]; then
     --exclude=.git --exclude=.local --exclude=.venv
     --exclude=__pycache__ --exclude='*.pyc' --exclude=.pytest_cache
     --exclude=dist --exclude=node_modules --exclude=detections_archive
-    --exclude=video --exclude=models --exclude='*.mp4' --exclude='*.avi'
+    --exclude=/video/ --exclude=/models/ --exclude='*.mp4' --exclude='*.avi'
     --exclude='*.mov' --exclude='*.mkv' --exclude=probes_store.json
     --exclude=probe_channel_groups.json
     --exclude=luxriot_summary_state.json --exclude=luxriot_rollups_cache.json

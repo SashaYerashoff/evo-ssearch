@@ -87,7 +87,7 @@ rsync -a --delete --delete-excluded \
     --exclude=/dist/ \
     --exclude=detections_archive/ \
     --exclude=inference_spool/ \
-    --exclude=video/ \
+    --exclude=/video/ \
     --exclude=probes_store.json \
     --exclude=probe_channel_groups.json \
     --exclude=luxriot_rollups_cache.json \

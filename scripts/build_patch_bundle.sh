@@ -197,8 +197,8 @@ COMMON_EXCLUDES=(
   "--exclude=dist"
   "--exclude=node_modules"
   "--exclude=detections_archive"
-  "--exclude=video"
-  "--exclude=models"
+  "--exclude=/video/"
+  "--exclude=/models/"
   "--exclude=qwen-cookbooks"
   "--exclude=*.mp4"
   "--exclude=*.avi"
@@ -222,6 +222,33 @@ if command -v rsync >/dev/null 2>&1; then
 else
   tar "${COMMON_EXCLUDES[@]}" -cf - -C "${REPO_ROOT}" . | tar -xf - -C "${SNAPSHOT_DIR}"
 fi
+
+# An rsync/tar exclude intended for mutable root runtime data must never match a
+# same-named tracked source directory (for example react-ui/.../video). The
+# manifest's clean commit is only meaningful when every tracked file made it
+# into the snapshot.
+"${PYTHON_BIN}" - "${REPO_ROOT}" "${SNAPSHOT_DIR}" <<'PY'
+import subprocess
+import sys
+from pathlib import Path
+
+repo = Path(sys.argv[1])
+snapshot = Path(sys.argv[2])
+tracked = subprocess.check_output(
+    ("git", "-C", str(repo), "ls-files", "-z")
+).split(b"\0")
+missing = [
+    raw.decode("utf-8", errors="surrogateescape")
+    for raw in tracked
+    if raw and not (snapshot / raw.decode("utf-8", errors="surrogateescape")).is_file()
+]
+if missing:
+    print("FAIL: tracked source file missing from bundle snapshot:", file=sys.stderr)
+    for path in missing[:40]:
+        print(f"  {path}", file=sys.stderr)
+    raise SystemExit(1)
+print(f"OK: tracked source snapshot complete ({len(tracked) - 1} files)")
+PY
 
 if [[ ! -f "${REPO_ROOT}/react-ui/dist/index.html" ]]; then
   fail "React production build is missing: ${REPO_ROOT}/react-ui/dist/index.html"
