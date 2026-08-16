@@ -1237,8 +1237,8 @@ def build_plan(prepared: PreparedInstall) -> list[PlanAction]:
         PlanAction(
             "inference",
             (
-                "preserve the complete existing external agent/VLM inference policy; abort and roll back on "
-                "any endpoint/model/context/queue/GPU change"
+                "preserve the complete existing external agent/VLM inference policy; reject any "
+                "endpoint/model/context/queue/GPU rewrite before startup"
                 if prepared.inference_policy_hash is not None
                 else "create the reviewed inference policy for a fresh installation"
             ),
@@ -1289,10 +1289,19 @@ def build_plan(prepared: PreparedInstall) -> list[PlanAction]:
     else:
         actions.append(PlanAction("service", "leave service stopped by explicit operator request"))
     if options.verify:
-        actions.append(PlanAction("health", "run existing scripts/verify_patch.sh for /health and /ready"))
+        actions.append(PlanAction(
+            "health",
+            (
+                "run scripts/verify_patch.sh for /health and /ready; once the new service is active, "
+                "report dependency failures for in-place repair without automatic rollback"
+            ),
+        ))
     actions.append(PlanAction(
         "rollback",
-        f"handoff scripts/rollback.sh with the backup recorded under {options.backup_root}/LATEST",
+        (
+            "allow automatic rollback only before the new service becomes active; hand off the explicit "
+            f"manual rollback at {options.backup_root}/LATEST for disaster recovery"
+        ),
     ))
     return actions
 

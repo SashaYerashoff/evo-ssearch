@@ -1025,6 +1025,12 @@ class OfflineInstallerUnitTests(unittest.TestCase):
         self.assertIn("post-start-acceptance-warning.txt", source)
         self.assertIn("code and database were left in place for repair", source)
 
+    def test_operator_plan_explains_the_non_destructive_start_boundary(self):
+        source = (ROOT / "scripts" / "install_eva_083.py").read_text(encoding="utf-8")
+        self.assertIn("reject any endpoint/model/context/queue/GPU rewrite before startup", source)
+        self.assertIn("in-place repair without automatic rollback", source)
+        self.assertIn("allow automatic rollback only before the new service becomes active", source)
+
     def test_verified_code_only_adopt_warns_but_does_not_block_existing_placeholder(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
