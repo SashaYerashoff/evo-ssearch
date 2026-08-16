@@ -5784,6 +5784,7 @@ class LuxriotManager:
         probe_manager: Optional[ProbeManagerLike] = None,
         runtime_state_store: Optional[Any] = None,
         summary_archive_callback: Optional[SummaryArchiveFn] = None,
+        model_router: Optional[Callable[..., Mapping[str, Any]]] = None,
     ) -> None:
         self.config = config
         self.lm_callback = lm_callback
@@ -5798,6 +5799,7 @@ class LuxriotManager:
         # the PostgreSQL archive implementation.
         self.semantic_snapshot_writer: Optional[Any] = None
         self.runtime_state_store = runtime_state_store
+        self.model_router = model_router
         self.summary_dispatcher: Optional[SummaryDispatcherFn] = None
         self.summary_archive_callback: Optional[SummaryArchiveFn] = summary_archive_callback
         self.summary_archive_history_loader: Optional[SummaryArchiveHistoryLoaderFn] = None
@@ -17047,12 +17049,17 @@ class LuxriotManager:
                 for channel_id, state in desired.items()
             }
 
+    def desired_live_sessions_snapshot(self) -> Dict[int, Dict[str, Any]]:
+        """Return a defensive copy of durable capture routing/configuration."""
+
+        return self._load_desired_live_sessions()
+
     def _save_desired_live_sessions(self, sessions: Mapping[int, Mapping[str, Any]]) -> None:
         state_store = getattr(self, "runtime_state_store", None)
         if state_store is None:
             return
         payload = {
-            "version": 1,
+            "version": 2,
             "updated_at": time.time(),
             "sessions": {
                 str(int(channel_id)): dict(state)
@@ -17076,6 +17083,8 @@ class LuxriotManager:
         batch_size: Optional[int] = None,
         prompt: Optional[str] = None,
         model_hint: Optional[str] = None,
+        model_selector: Optional[str] = None,
+        routing_metadata: Optional[Mapping[str, Any]] = None,
         interval_sec: Optional[float] = None,
         restore_error: Optional[str] = None,
     ) -> None:
@@ -17101,6 +17110,41 @@ class LuxriotManager:
                 current["model_hint"] = str(model_hint)
             elif enabled:
                 current["model_hint"] = ""
+            if model_selector is not None:
+                current["model_selector"] = str(model_selector)
+            elif enabled and model_hint is not None:
+                # A direct caller supplying a concrete model is an explicit
+                # pin. Do not leave a stale Auto selector/routing envelope
+                # behind from the channel's previous run.
+                pinned_profile_id = str(model_hint).strip()
+                current["model_selector"] = pinned_profile_id
+                current["assigned_profile_id"] = pinned_profile_id or None
+                current["routing_mode"] = "manual"
+                current["routing"] = {
+                    "mode": "manual",
+                    "assigned_profile_id": pinned_profile_id or None,
+                    "strategy": "operator_pinned",
+                }
+            if isinstance(routing_metadata, Mapping):
+                routing = {
+                    key: copy.deepcopy(routing_metadata.get(key))
+                    for key in (
+                        "mode",
+                        "assigned_profile_id",
+                        "strategy",
+                        "reason",
+                        "request_demand_fps",
+                        "selected_capacity",
+                        "selected_projected_load",
+                    )
+                    if routing_metadata.get(key) is not None
+                }
+                current["routing"] = routing
+                current["routing_mode"] = str(routing.get("mode") or "").strip() or None
+                assigned_profile_id = str(
+                    routing.get("assigned_profile_id") or model_hint or ""
+                ).strip()
+                current["assigned_profile_id"] = assigned_profile_id or None
             if interval_sec is not None:
                 current["interval_sec"] = float(interval_sec)
             if restore_error:
@@ -17113,7 +17157,12 @@ class LuxriotManager:
             desired[int(channel_id)] = current
             self._save_desired_live_sessions(desired)
 
-    def restore_desired_live_sessions(self, *, max_channels: Optional[int] = None) -> Dict[str, Any]:
+    def restore_desired_live_sessions(
+        self,
+        *,
+        max_channels: Optional[int] = None,
+        routing_plan: Optional[Mapping[int, Mapping[str, Any]]] = None,
+    ) -> Dict[str, Any]:
         try:
             desired = self._load_desired_live_sessions()
         except Exception as exc:
@@ -17141,11 +17190,51 @@ class LuxriotManager:
             if index:
                 time.sleep(0.2)
             try:
+                planned = (
+                    routing_plan.get(int(channel_id), {})
+                    if isinstance(routing_plan, Mapping)
+                    else {}
+                )
+                if not isinstance(planned, Mapping):
+                    planned = {}
+                if bool(planned.get("blocked")):
+                    message = _safe_error_text(
+                        planned.get("error") or "automatic VLM routing has no available profile",
+                        500,
+                    )
+                    failed.append(
+                        {
+                            "channel_id": channel_id,
+                            "error": "VlmRoutingUnavailable",
+                            "message": message,
+                        }
+                    )
+                    with self.cache_lock:
+                        self.live_session_restore_errors[channel_id] = message
+                    continue
+                routing_metadata = planned.get("routing")
+                if not isinstance(routing_metadata, Mapping):
+                    routing_metadata = state.get("routing")
+                model_hint = str(
+                    planned.get("assigned_profile_id")
+                    or state.get("assigned_profile_id")
+                    or state.get("model_hint")
+                    or ""
+                ).strip() or None
+                model_selector = str(
+                    planned.get("model_selector")
+                    or state.get("model_selector")
+                    or ""
+                ).strip() or None
                 status = self.start_session(
                     channel_id=channel_id,
                     batch_size=_parse_optional_int(state.get("batch_size")),
                     prompt=str(state.get("prompt") or ""),
-                    model_hint=str(state.get("model_hint") or "").strip() or None,
+                    model_hint=model_hint,
+                    model_selector=model_selector,
+                    routing_metadata=(
+                        routing_metadata if isinstance(routing_metadata, Mapping) else None
+                    ),
                     interval_sec=self._normalize_capture_interval_sec(state.get("interval_sec")),
                     update_desired=True,
                 )
@@ -17153,6 +17242,8 @@ class LuxriotManager:
                     {
                         "channel_id": channel_id,
                         "model": status.get("model"),
+                        "model_selector": model_selector,
+                        "assigned_profile_id": model_hint,
                         "batch_size": status.get("batch_size"),
                     }
                 )
@@ -26401,6 +26492,8 @@ class LuxriotManager:
         system_prompt: Optional[str] = None,
         interval_sec: Optional[float] = None,
         update_desired: bool = True,
+        model_selector: Optional[str] = None,
+        routing_metadata: Optional[Mapping[str, Any]] = None,
     ) -> Dict[str, Any]:
         side_effect_lock = self._session_side_effect_lock_for(channel_id)
         with side_effect_lock:
@@ -26413,6 +26506,8 @@ class LuxriotManager:
                 interval_sec=interval_sec,
                 update_desired=update_desired,
                 session_generation="",
+                model_selector=model_selector,
+                routing_metadata=routing_metadata,
             )
 
     def _start_session_for_generation(
@@ -26425,6 +26520,8 @@ class LuxriotManager:
         interval_sec: Optional[float] = None,
         update_desired: bool = True,
         session_generation: str = "",
+        model_selector: Optional[str] = None,
+        routing_metadata: Optional[Mapping[str, Any]] = None,
     ) -> Dict[str, Any]:
         configured_sizes = getattr(self.config, "LUXRIOT_BATCH_SIZES", None)
         sizes = [
@@ -26461,6 +26558,29 @@ class LuxriotManager:
         prompt = prompt or ""
         normalized_model_hint = str(model_hint or "").strip() or None
         requested_interval_sec = self._normalize_capture_interval_sec(interval_sec)
+        if (
+            normalized_model_hint is None
+            and model_selector is None
+            and callable(self.model_router)
+        ):
+            routed = self.model_router(
+                channel_id=int(channel_id),
+                batch_size=int(batch),
+                interval_sec=requested_interval_sec,
+            )
+            if not isinstance(routed, Mapping):
+                raise ValueError("VLM model router returned an invalid assignment")
+            normalized_model_hint = str(
+                routed.get("assigned_profile_id") or routed.get("model_hint") or ""
+            ).strip() or None
+            model_selector = str(routed.get("model_selector") or "").strip() or None
+            routed_metadata = routed.get("routing")
+            if isinstance(routed_metadata, Mapping):
+                routing_metadata = routed_metadata
+            if normalized_model_hint is None:
+                raise ValueError(
+                    str(routed.get("error") or "Auto VLM routing found no available profile")
+                )
         previous_override_present = False
         previous_channel_overrides: Dict[str, Any] = {}
         with self.cache_lock:
@@ -26519,6 +26639,8 @@ class LuxriotManager:
                 batch_size=batch,
                 prompt=prompt,
                 model_hint=normalized_model_hint,
+                model_selector=model_selector,
+                routing_metadata=routing_metadata,
                 interval_sec=effective_interval_sec,
             )
 
@@ -27346,11 +27468,37 @@ class LuxriotManager:
                     or default_interval_sec
                 ),
                 "model": str(state.get("model_hint") or "").strip() or None,
+                "model_selector": str(state.get("model_selector") or "").strip() or None,
+                "assigned_profile_id": str(
+                    state.get("assigned_profile_id")
+                    or state.get("model_hint")
+                    or ""
+                ).strip() or None,
+                "routing_mode": str(state.get("routing_mode") or "").strip() or None,
+                "routing_strategy": str(
+                    (state.get("routing") or {}).get("strategy")
+                    if isinstance(state.get("routing"), Mapping)
+                    else ""
+                ).strip() or None,
+                "routing_reason": str(
+                    (state.get("routing") or {}).get("reason")
+                    if isinstance(state.get("routing"), Mapping)
+                    else ""
+                ).strip() or None,
+                "routing_capacity": (
+                    _parse_optional_int((state.get("routing") or {}).get("selected_capacity"))
+                    if isinstance(state.get("routing"), Mapping)
+                    else None
+                ),
                 "updated_at": self._coerce_float(state.get("updated_at")),
             }
             for channel_id, state in sorted(desired_live.items())
             if int(channel_id) > 0 and isinstance(state, Mapping)
         ]
+        capture_configuration_by_channel = {
+            int(item["channel_id"]): item
+            for item in capture_configurations
+        }
         desired_missing = [
             {
                 "channel_id": channel_id,
@@ -27365,6 +27513,16 @@ class LuxriotManager:
         ]
         for item in video_streams:
             channel_id = int(item.get("channel_id") or 0)
+            capture_configuration = capture_configuration_by_channel.get(channel_id, {})
+            for key in (
+                "model_selector",
+                "assigned_profile_id",
+                "routing_mode",
+                "routing_strategy",
+                "routing_reason",
+                "routing_capacity",
+            ):
+                item[key] = capture_configuration.get(key)
             item["desired"] = channel_id in desired_video_channels
             item["last_restore_error"] = restore_errors.get(channel_id)
             digest = status_digest.setdefault(

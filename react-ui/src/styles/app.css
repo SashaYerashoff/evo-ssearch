@@ -1520,6 +1520,10 @@
 .vid-control-group .wfield { gap: 5px; min-width: 0; }
 .vid-control-group .wfield > label { color: var(--text-mut); font-size: 9px; letter-spacing: .05em; text-transform: uppercase; }
 .vid-control-group.source .wfield, .vid-control-group.inference .wfield { width: 100%; }
+.vid-routing-status {
+  min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  color: var(--text-mut); font-size: 9.5px; line-height: 1.25;
+}
 .vid-control-group.sampling .wfield.batch { width: 82px; flex: 0 0 82px; }
 .vid-control-group.sampling .wfield.xs { min-width: 78px; flex: 1; }
 .vid-control-group .wfield input,

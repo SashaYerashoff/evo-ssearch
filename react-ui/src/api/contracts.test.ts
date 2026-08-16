@@ -47,6 +47,7 @@ import {
   buildPromptSettingsPayload,
   buildSessionQuery,
   buildSummaryFeedQuery,
+  captureRoutingForChannel,
   captureSettingsForChannel,
   fullLiveMediaUrl,
   recentFrameUrl,
@@ -295,10 +296,12 @@ describe('React/backend contract normalizers', () => {
     expect(buildCaptureInput(7, {
       batch: '12',
       every: '5',
+      model: '__auto__',
     })).toEqual({
       channel_id: 7,
       batch_size: 12,
       interval_sec: 5,
+      model: '__auto__',
     })
   })
 
@@ -315,6 +318,43 @@ describe('React/backend contract normalizers', () => {
     expect(captureSettingsForChannel(status, 8)).toEqual({ batchSize: 8, intervalSec: 2, source: 'saved' })
     expect(captureSettingsForChannel(status, 9)).toEqual({ batchSize: 12, intervalSec: 1, source: 'server_default' })
     expect(captureSettingsForChannel({}, 9)).toBeNull()
+  })
+
+  it('keeps legacy VLM pins explicit and hydrates new channels as auto', () => {
+    const catalog = {
+      default_profile_id: 'vlm-a',
+      auto_model_selector: '__auto__',
+      vlm_balancer: { enabled: true, strategy: 'capacity_aware_least_projected_load' },
+    }
+    const status = {
+      video_streams: [{
+        channel_id: 7,
+        model: 'vlm-b',
+        model_selector: '__auto__',
+        assigned_profile_id: 'vlm-b',
+        routing_mode: 'auto',
+        routing_capacity: 4,
+      }],
+      capture_configurations: [{ channel_id: 8, model: 'vlm-local' }],
+    }
+    expect(captureRoutingForChannel(status, 7, catalog)).toMatchObject({
+      selector: '__auto__',
+      assignedProfileId: 'vlm-b',
+      mode: 'auto',
+      capacity: 4,
+      source: 'runtime',
+    })
+    expect(captureRoutingForChannel(status, 8, catalog)).toMatchObject({
+      selector: 'vlm-local',
+      assignedProfileId: 'vlm-local',
+      mode: 'legacy_pinned',
+      source: 'saved',
+    })
+    expect(captureRoutingForChannel(status, 9, catalog)).toMatchObject({
+      selector: '__auto__',
+      mode: 'auto',
+      source: 'server_default',
+    })
   })
 
   it('supplies a useful prompt for image-only agent messages', () => {

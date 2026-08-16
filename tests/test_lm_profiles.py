@@ -492,6 +492,192 @@ class LmProfileRuntimeTests(unittest.TestCase):
         self.assertEqual(manual_hint, "vlm-b")
         self.assertEqual(manual_meta["mode"], "manual")
 
+    def test_auto_balancer_accounts_for_capacity_and_existing_stream_demand(self):
+        profiles = {
+            "vlm-spark": {
+                "id": "vlm-spark",
+                "kind": "vlm",
+                "base_url": "http://spark.local/v1",
+                "model": "qwen-vlm",
+                "enabled": True,
+            },
+            "vlm-local": {
+                "id": "vlm-local",
+                "kind": "vlm",
+                "base_url": "http://local.local/v1",
+                "model": "qwen-vlm",
+                "enabled": True,
+            },
+        }
+        four_spark_streams = {
+            channel_id: {
+                "enabled": True,
+                "assigned_profile_id": "vlm-spark",
+                "interval_sec": 2.0,
+            }
+            for channel_id in (1, 2, 3, 4)
+        }
+        with (
+            patch.object(oldapp.config, "LM_PROFILES", profiles),
+            patch.object(oldapp.config, "LM_VLM_PROFILE_ID", "vlm-spark"),
+            patch.object(oldapp.config, "LM_VLM_BALANCER_ENABLED", True),
+            patch.object(oldapp.config, "LM_VLM_BALANCER_PROFILES", ("vlm-spark", "vlm-local")),
+            patch.object(oldapp, "_cached_vlm_profile_health", return_value={"state": "unknown"}),
+            patch.object(oldapp, "_cached_served_lm_capacity", return_value=None),
+            patch.object(oldapp, "_vlm_admission_pressure_by_resource", return_value={}),
+            patch.dict(
+                os.environ,
+                {
+                    "EVOSSEARCH_LM_PROFILE_VLM_SPARK_MAX_INFLIGHT": "4",
+                    "EVOSSEARCH_LM_PROFILE_VLM_LOCAL_MAX_INFLIGHT": "1",
+                },
+                clear=False,
+            ),
+        ):
+            first_hint, first_meta = oldapp._resolve_luxriot_vlm_model_hint(
+                112,
+                "__auto__",
+                interval_sec=2.0,
+                desired_states={},
+            )
+            fifth_hint, fifth_meta = oldapp._resolve_luxriot_vlm_model_hint(
+                118,
+                "__auto__",
+                interval_sec=2.0,
+                desired_states=four_spark_streams,
+            )
+
+        self.assertEqual(first_hint, "vlm-spark")
+        self.assertEqual(first_meta["selected_capacity"], 4)
+        self.assertEqual(first_meta["strategy"], "capacity_aware_least_projected_load")
+        self.assertEqual(fifth_hint, "vlm-local")
+        self.assertEqual(fifth_meta["selected_capacity"], 1)
+
+    def test_restore_planner_fills_equal_profiles_before_reusing_one(self):
+        profiles = {
+            f"vlm-{index}": {
+                "id": f"vlm-{index}",
+                "kind": "vlm",
+                "base_url": f"http://vlm-{index}.local/v1",
+                "model": "qwen-vlm",
+                "enabled": True,
+            }
+            for index in range(4)
+        }
+        states = {
+            channel_id: {
+                "enabled": True,
+                "model_selector": "__auto__",
+                "routing_mode": "auto",
+                "interval_sec": 2.0,
+            }
+            for channel_id in range(1, 9)
+        }
+        with (
+            patch.object(oldapp.config, "LM_PROFILES", profiles),
+            patch.object(oldapp.config, "LM_VLM_PROFILE_ID", "vlm-0"),
+            patch.object(oldapp.config, "LM_VLM_BALANCER_ENABLED", True),
+            patch.object(oldapp.config, "LM_VLM_BALANCER_PROFILES", tuple(profiles)),
+            patch.object(oldapp, "_cached_vlm_profile_health", return_value={"state": "unknown"}),
+            patch.object(oldapp, "_cached_served_lm_capacity", return_value=None),
+            patch.object(oldapp, "_vlm_admission_pressure_by_resource", return_value={}),
+            patch.dict(os.environ, {"EVOSSEARCH_LM_MAX_INFLIGHT": "1"}, clear=False),
+        ):
+            plan = oldapp._build_luxriot_vlm_restore_routing_plan(states)
+
+        counts = {profile_id: 0 for profile_id in profiles}
+        for row in plan.values():
+            counts[str(row["assigned_profile_id"])] += 1
+        self.assertEqual(counts, {profile_id: 2 for profile_id in profiles})
+
+    def test_auto_balancer_excludes_recently_unavailable_profile(self):
+        profiles = {
+            "vlm-down": {
+                "id": "vlm-down",
+                "kind": "vlm",
+                "base_url": "http://down.local/v1",
+                "model": "qwen-vlm",
+                "enabled": True,
+            },
+            "vlm-up": {
+                "id": "vlm-up",
+                "kind": "vlm",
+                "base_url": "http://up.local/v1",
+                "model": "qwen-vlm",
+                "enabled": True,
+            },
+        }
+
+        def health(profile):
+            return {
+                "state": "unavailable" if profile.get("id") == "vlm-down" else "healthy",
+            }
+
+        with (
+            patch.object(oldapp.config, "LM_PROFILES", profiles),
+            patch.object(oldapp.config, "LM_VLM_PROFILE_ID", "vlm-up"),
+            patch.object(oldapp.config, "LM_VLM_BALANCER_ENABLED", True),
+            patch.object(oldapp.config, "LM_VLM_BALANCER_PROFILES", ("vlm-down", "vlm-up")),
+            patch.object(oldapp, "_cached_vlm_profile_health", side_effect=health),
+            patch.object(oldapp, "_cached_served_lm_capacity", return_value=None),
+            patch.object(oldapp, "_vlm_admission_pressure_by_resource", return_value={}),
+        ):
+            hint, meta = oldapp._resolve_luxriot_vlm_model_hint(
+                7,
+                "__auto__",
+                interval_sec=2.0,
+                desired_states={},
+            )
+
+        self.assertEqual(hint, "vlm-up")
+        self.assertEqual([row["profile_id"] for row in meta["candidates"]], ["vlm-up"])
+
+    def test_auto_balancer_avoids_profile_with_active_and_queued_work(self):
+        profiles = {
+            "vlm-busy": {
+                "id": "vlm-busy",
+                "kind": "vlm",
+                "base_url": "http://busy.local/v1",
+                "model": "qwen-vlm",
+                "enabled": True,
+            },
+            "vlm-idle": {
+                "id": "vlm-idle",
+                "kind": "vlm",
+                "base_url": "http://idle.local/v1",
+                "model": "qwen-vlm",
+                "enabled": True,
+            },
+        }
+        with (
+            patch.object(oldapp.config, "LM_PROFILES", profiles),
+            patch.object(oldapp.config, "LM_VLM_PROFILE_ID", "vlm-busy"),
+            patch.object(oldapp.config, "LM_VLM_BALANCER_ENABLED", True),
+            patch.object(oldapp.config, "LM_VLM_BALANCER_PROFILES", ("vlm-busy", "vlm-idle")),
+            patch.object(oldapp, "_cached_vlm_profile_health", return_value={"state": "unknown"}),
+            patch.object(oldapp, "_cached_served_lm_capacity", return_value=None),
+            patch.object(
+                oldapp,
+                "_vlm_admission_pressure_by_resource",
+                return_value={
+                    "http://busy.local/v1": {"active": 1, "queued": 2},
+                    "http://idle.local/v1": {"active": 0, "queued": 0},
+                },
+            ),
+            patch.dict(os.environ, {"EVOSSEARCH_LM_MAX_INFLIGHT": "1"}, clear=False),
+        ):
+            hint, meta = oldapp._resolve_luxriot_vlm_model_hint(
+                7,
+                "__auto__",
+                interval_sec=2.0,
+                desired_states={},
+            )
+
+        self.assertEqual(hint, "vlm-idle")
+        busy = next(row for row in meta["candidates"] if row["profile_id"] == "vlm-busy")
+        idle = next(row for row in meta["candidates"] if row["profile_id"] == "vlm-idle")
+        self.assertGreater(busy["projected_load"], idle["projected_load"])
+
     def test_ready_checks_required_vlm_profiles_without_secrets(self):
         profiles = {
             "default": {

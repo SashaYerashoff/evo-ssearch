@@ -71,6 +71,10 @@ export function StreamControl(p: {
   batch: string; onBatch: (v: string) => void
   allowedBatchSizes: string[]
   every: string; onEvery: (v: string) => void
+  routingSelector: string
+  onRoutingSelector: (v: string) => void
+  routingOptions: Array<{ value: string; label: string }>
+  routingStatus: string
   canCapture: boolean
   canManagePrompts: boolean
   samplingReady: boolean
@@ -154,6 +158,17 @@ export function StreamControl(p: {
                 <input type="number" min={0.2} max={300} step={0.1} value={p.every} onChange={(e) => p.onEvery(e.target.value)} />
               </div>
             </div>
+          </section>
+          <section className="vid-control-group inference">
+            <div className="vid-control-group-title">VLM inference</div>
+            <div className="wfield"><label>Routing</label>
+              <Dropdown
+                value={p.routingSelector}
+                onChange={p.onRoutingSelector}
+                options={p.routingOptions}
+              />
+            </div>
+            <div className="vid-routing-status" title={p.routingStatus}>{p.routingStatus}</div>
           </section>
           <section className="vid-control-group actions">
             <div className="vid-control-group-title">{t('video.runtime')}</div>

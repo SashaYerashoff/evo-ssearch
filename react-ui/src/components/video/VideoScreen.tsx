@@ -19,12 +19,14 @@ import {
   buildIncidentDraftFromSummary,
   buildSummaryBookmarkInput,
   buildCaptureInput,
+  captureRoutingForChannel,
   captureSettingsForChannel,
   fullLiveMediaUrl,
   mergeRuntime,
   recentFrameUrl,
   videoApi,
   type ChannelRuntime,
+  type LmModelCatalog,
   type StreamsStatus,
   type SummaryEntry,
 } from '../../api/video'
@@ -418,6 +420,8 @@ export function VideoScreen({
   const [feed, setFeed] = useState<SummaryEntry[]>([])
   const [batch, setBatch] = useState('')
   const [every, setEvery] = useState('')
+  const [routingSelector, setRoutingSelector] = useState('')
+  const [lmCatalog, setLmCatalog] = useState<LmModelCatalog | null>(null)
   const [period, setPeriod] = useState<SummaryPeriod>('live')
   const [resolution, setResolution] = useState<SummaryResolution>('AUTO')
   const [customFrom, setCustomFrom] = useState('')
@@ -470,6 +474,7 @@ export function VideoScreen({
   const runtime: ChannelRuntime[] = mergeRuntime(streams, channelName)
   const settingsRt = runtime.find((c) => c.channelId === settingsChannelId) || null
   const effectiveCaptureSettings = captureSettingsForChannel(streams, settingsChannelId)
+  const effectiveCaptureRouting = captureRoutingForChannel(streams, settingsChannelId, lmCatalog)
   const reviewRt = runtime.find((c) => c.channelId === reviewChannelId) || null
   const previewChannelId = reviewPreviewOpen
     ? reviewChannelId
@@ -491,6 +496,49 @@ export function VideoScreen({
   const selectorLabel = selectorEnabled
     ? `${selectorBias}${selectorSource ? ` · ${selectorSource}` : ''}`
     : 'off · midpoint'
+  const routingOptions = useMemo(() => {
+    const profileIds = new Set(
+      (lmCatalog?.vlm_balancer?.profile_ids || []).map((value) => String(value)),
+    )
+    const options: Array<{ value: string; label: string }> = []
+    if (lmCatalog?.vlm_balancer?.enabled) {
+      options.push({
+        value: String(lmCatalog.auto_model_selector || '__auto__'),
+        label: `${String(lmCatalog.auto_model_label || 'Auto balance')} · capacity aware`,
+      })
+    }
+    for (const profile of lmCatalog?.profiles || []) {
+      const profileId = String(profile.id || '').trim()
+      const kind = String(profile.kind || '').toLowerCase()
+      if (!profileId || profile.enabled === false) continue
+      if (profileIds.size > 0 ? !profileIds.has(profileId) : !['vlm', 'vision', 'video'].includes(kind)) continue
+      const model = String(profile.model || '').trim()
+      const capacity = Number(profile.effective_capacity)
+      const health = String(profile.routing_health || (profile.available ? 'healthy' : 'unknown'))
+      options.push({
+        value: String(profile.selector || profileId),
+        label: [
+          profileId,
+          model && model !== profileId ? model : '',
+          Number.isFinite(capacity) ? `capacity ${capacity}` : '',
+          health,
+        ].filter(Boolean).join(' · '),
+      })
+    }
+    if (routingSelector && !options.some((option) => option.value === routingSelector)) {
+      options.push({ value: routingSelector, label: `${routingSelector} · legacy pinned` })
+    }
+    return options
+  }, [lmCatalog, routingSelector])
+  const assignedRoutingProfile = effectiveCaptureRouting?.assignedProfileId
+    || String(settingsRt?.video?.assigned_profile_id || settingsRt?.video?.model || '').trim()
+    || null
+  const routingStatus = [
+    effectiveCaptureRouting?.mode === 'auto' ? 'Auto' : effectiveCaptureRouting?.mode === 'legacy_pinned' ? 'Legacy pinned' : 'Manual',
+    assignedRoutingProfile ? `assigned ${assignedRoutingProfile}` : 'not assigned yet',
+    effectiveCaptureRouting?.capacity ? `capacity ${effectiveCaptureRouting.capacity}` : '',
+    effectiveCaptureRouting?.reason ? effectiveCaptureRouting.reason.replace(/_/g, ' ') : '',
+  ].filter(Boolean).join(' · ')
   const lastLatency = settingsRt?.video?.last_latency_trace || {}
   const lastInputStats = settingsRt?.video?.last_llm_input_stats || {}
   const lastResponseStats = settingsRt?.video?.last_lm_response_stats || {}
@@ -504,6 +552,10 @@ export function VideoScreen({
 
   const loadStreams = useCallback(async () => {
     try { setStreams(await videoApi.streams()) } catch (e: any) { setError(e?.message || 'Streams failed') }
+  }, [])
+
+  const loadLmCatalog = useCallback(async () => {
+    try { setLmCatalog(await videoApi.lmModels()) } catch (e: any) { setError(e?.message || 'VLM profiles failed') }
   }, [])
 
   useEffect(() => {
@@ -566,6 +618,9 @@ export function VideoScreen({
   }, [reviewChannelId, customBounds, period, resolution])
 
   useEffect(() => { loadStreams() }, [loadStreams])
+  useEffect(() => {
+    if (activeTab === 'settings') void loadLmCatalog()
+  }, [activeTab, loadLmCatalog])
   useEffect(() => {
     if (!drive || drive.effect.target !== 'video') return
     const { action, payload } = drive.effect
@@ -647,17 +702,19 @@ export function VideoScreen({
     hydratedSettingsKeyRef.current = null
     setBatch('')
     setEvery('')
+    setRoutingSelector('')
     setSettingsDirty(false)
   }, [settingsChannelId])
   useEffect(() => {
-    if (settingsChannelId == null || !effectiveCaptureSettings || settingsDirty) return
-    const settingsKey = `${settingsChannelId}:${effectiveCaptureSettings.batchSize}:${effectiveCaptureSettings.intervalSec}`
+    if (settingsChannelId == null || !effectiveCaptureSettings || !effectiveCaptureRouting || settingsDirty) return
+    const settingsKey = `${settingsChannelId}:${effectiveCaptureSettings.batchSize}:${effectiveCaptureSettings.intervalSec}:${effectiveCaptureRouting.selector}`
     if (hydratedSettingsKeyRef.current === settingsKey) return
     setBatch(String(effectiveCaptureSettings.batchSize))
     setEvery(String(effectiveCaptureSettings.intervalSec))
+    setRoutingSelector(effectiveCaptureRouting.selector)
     hydratedSettingsKeyRef.current = settingsKey
     setSettingsDirty(false)
-  }, [effectiveCaptureSettings, settingsChannelId, settingsDirty])
+  }, [effectiveCaptureRouting, effectiveCaptureSettings, settingsChannelId, settingsDirty])
 
   // poll streams (runtime) every 4s
   useEffect(() => { const t = window.setInterval(loadStreams, 4000); return () => window.clearInterval(t) }, [loadStreams])
@@ -794,13 +851,19 @@ export function VideoScreen({
     if (settingsChannelId == null || !batch || !every) return
     setBusy(true); setError(null)
     try {
-      const r = await videoApi.startCapture(buildCaptureInput(settingsChannelId, { batch, every }))
+      const r = await videoApi.startCapture(buildCaptureInput(settingsChannelId, {
+        batch,
+        every,
+        model: routingSelector,
+      }))
       if (!r.success) throw new Error(r.error || 'Start failed')
       const effectiveBatch = Number(r.session?.batch_size)
       const effectiveEvery = Number(r.session?.interval_sec)
       if (Number.isFinite(effectiveBatch) && effectiveBatch > 0) setBatch(String(effectiveBatch))
       if (Number.isFinite(effectiveEvery) && effectiveEvery > 0) setEvery(String(effectiveEvery))
-      hydratedSettingsKeyRef.current = `${settingsChannelId}:${effectiveBatch}:${effectiveEvery}`
+      const effectiveSelector = String(r.session?.model_selector || routingSelector).trim()
+      if (effectiveSelector) setRoutingSelector(effectiveSelector)
+      hydratedSettingsKeyRef.current = `${settingsChannelId}:${effectiveBatch}:${effectiveEvery}:${effectiveSelector}`
       setSettingsDirty(false)
       await loadStreams()
     } catch (e: any) { setError(e?.message || 'Start failed') } finally { setBusy(false) }
@@ -910,12 +973,17 @@ export function VideoScreen({
     setEvery(value)
     setSettingsDirty(true)
   }, [])
+  const updateRoutingSelector = useCallback((value: string) => {
+    setRoutingSelector(value)
+    setSettingsDirty(true)
+  }, [])
   const discardSettingsDraft = useCallback(() => {
-    if (!effectiveCaptureSettings) return
+    if (!effectiveCaptureSettings || !effectiveCaptureRouting) return
     setBatch(String(effectiveCaptureSettings.batchSize))
     setEvery(String(effectiveCaptureSettings.intervalSec))
+    setRoutingSelector(effectiveCaptureRouting.selector)
     setSettingsDirty(false)
-  }, [effectiveCaptureSettings])
+  }, [effectiveCaptureRouting, effectiveCaptureSettings])
 
   const previewCard = (
     <div className="vid-preview-card">
@@ -1002,7 +1070,9 @@ export function VideoScreen({
         batch={batch} onBatch={updateBatch}
         allowedBatchSizes={(streams.capture_defaults?.allowed_batch_sizes || []).map(String)}
         every={every} onEvery={updateEvery}
-        canCapture={canCapture} canManagePrompts={canManagePrompts} samplingReady={Boolean(batch && every)}
+        routingSelector={routingSelector} onRoutingSelector={updateRoutingSelector}
+        routingOptions={routingOptions} routingStatus={routingStatus}
+        canCapture={canCapture} canManagePrompts={canManagePrompts} samplingReady={Boolean(batch && every && routingSelector)}
         capturing={capturing} busy={busy} onStart={start} onStop={stop} onFlush={flush}
         onPromptSettings={() => setPromptOpen(true)}
         period={period} onPeriod={selectPeriod} resolution={resolution} onResolution={setResolution}

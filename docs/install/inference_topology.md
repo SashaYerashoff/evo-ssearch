@@ -63,18 +63,35 @@ Optional 9B deep L3 is configured through
 `EVOSSEARCH_LUXRIOT_ROLLUP_L3_DEEP_*`; it is not the live agent fallback and
 does not run outside the persisted quiet-window and attention gates.
 
-## Multiple VLM hosts (balancer)
+## Multiple VLM hosts (assignment planner)
 
-With more than one VLM host, enable the static balancer to spread channels:
+With more than one VLM host, enable Auto routing across the declared profiles:
 
 ```env
 EVOSSEARCH_LM_VLM_BALANCER_ENABLED=true
 EVOSSEARCH_LM_VLM_BALANCER_PROFILES=vlm-1,vlm-2[,...]
+EVOSSEARCH_LM_PROFILE_VLM_1_MAX_INFLIGHT=4
+EVOSSEARCH_LM_PROFILE_VLM_2_MAX_INFLIGHT=1
 ```
 
-The balancer is **static channel→profile routing**, not health-aware failover. If
-a VLM host dies, its channels stop being described until reassignment — watch
-coverage (see [observability](../admin/observability.md)).
+Auto is a **session assignment**, not per-request round robin. At stream start
+EVA compares the profiles' configured/served capacity, the steady demand of
+already assigned streams (`~1 / snapshot_interval_s` images/s), current
+admission `active + queued`, and cached `/models` health. Equal projected loads
+use a deterministic channel/profile tie-break. The chosen profile is persisted
+and remains stable so one channel's L0 continuity does not bounce between model
+servers.
+
+The Stream settings UI shows the selector separately from the actual assigned
+profile. Choosing a profile creates a durable manual pin. Choosing Auto permits
+EVA to re-plan that channel on a later restart. Desired sessions written by an
+older EVA do not contain the original selector, so the upgrade treats their
+existing profile as `legacy pinned` rather than silently redistributing a site.
+An operator must explicitly change those channels to Auto.
+
+This is not in-flight failover: if a host dies after a session was assigned, its
+channels stop being described until restart/reassignment. Watch coverage (see
+[observability](../admin/observability.md)).
 
 ## Sizing the VLM load
 
@@ -91,7 +108,7 @@ before scaling, or coverage gaps appear (dropped batches).
 
 Levers when the VLM can't keep up:
 - Increase `snapshot_interval` (less blind only if the host was saturated).
-- Add VLM hosts + balancer profiles.
+- Add VLM hosts + Auto-routing profiles with truthful per-profile capacity.
 - Enable the durable inference queue + bounded worker pool (off by default;
   validate on a stand first).
 

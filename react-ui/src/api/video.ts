@@ -12,6 +12,12 @@ export interface Stream {
   interval_sec?: number
   batch_size?: number
   model?: string | null
+  model_selector?: string | null
+  assigned_profile_id?: string | null
+  routing_mode?: string | null
+  routing_strategy?: string | null
+  routing_reason?: string | null
+  routing_capacity?: number | null
   pending_frames?: number
   max_buffer_frames?: number
   recent_frame_count?: number
@@ -34,6 +40,12 @@ export interface StreamsStatus {
     batch_size?: number
     interval_sec?: number
     model?: string | null
+    model_selector?: string | null
+    assigned_profile_id?: string | null
+    routing_mode?: string | null
+    routing_strategy?: string | null
+    routing_reason?: string | null
+    routing_capacity?: number | null
     updated_at?: number | null
   }>
   desired_video_missing?: any[]
@@ -162,13 +174,16 @@ export interface CaptureInput {
 
 export function buildCaptureInput(
   channelId: number,
-  values: { batch: string; every: string },
+  values: { batch: string; every: string; model?: string },
 ): CaptureInput {
-  return {
+  const payload: CaptureInput = {
     channel_id: channelId,
     batch_size: Number(values.batch),
     interval_sec: Number(values.every),
   }
+  const model = String(values.model || '').trim()
+  if (model) payload.model = model
+  return payload
 }
 
 export interface PromptSettings {
@@ -201,6 +216,23 @@ export interface LmModelCatalog {
   default_model?: string
   auto_model_selector?: string
   auto_model_label?: string
+  default_profile_id?: string
+  profiles?: Array<{
+    id?: string
+    kind?: string
+    model?: string
+    selector?: string
+    enabled?: boolean
+    available?: boolean
+    effective_capacity?: number
+    routing_health?: string
+    gpu?: string
+  }>
+  vlm_balancer?: {
+    enabled?: boolean
+    profile_ids?: string[]
+    strategy?: string
+  }
   error?: string | null
   [k: string]: any
 }
@@ -309,6 +341,16 @@ export interface CaptureSettings {
   source: 'runtime' | 'saved' | 'server_default'
 }
 
+export interface CaptureRouting {
+  selector: string
+  assignedProfileId: string | null
+  mode: 'auto' | 'manual' | 'legacy_pinned' | 'default'
+  strategy: string | null
+  reason: string | null
+  capacity: number | null
+  source: 'runtime' | 'saved' | 'server_default'
+}
+
 export function captureSettingsForChannel(
   status: StreamsStatus,
   channelId: number | null,
@@ -330,4 +372,62 @@ export function captureSettingsForChannel(
     }
   }
   return null
+}
+
+export function captureRoutingForChannel(
+  status: StreamsStatus,
+  channelId: number | null,
+  catalog: LmModelCatalog | null = null,
+): CaptureRouting | null {
+  if (channelId == null) return null
+  const runtime = (status.video_streams || []).find((row) => Number(row.channel_id) === channelId)
+  const saved = (status.capture_configurations || []).find((row) => Number(row.channel_id) === channelId)
+  const candidates: Array<{ row: any; source: CaptureRouting['source'] }> = [
+    { row: runtime, source: 'runtime' },
+    { row: saved, source: 'saved' },
+  ]
+  for (const candidate of candidates) {
+    if (!candidate.row) continue
+    const explicitSelector = String(candidate.row.model_selector || '').trim()
+    const routingMode = String(candidate.row.routing_mode || '').trim().toLowerCase()
+    const assignedProfileId = String(
+      candidate.row.assigned_profile_id || candidate.row.model || '',
+    ).trim() || null
+    if (explicitSelector || assignedProfileId || routingMode) {
+      const autoSelector = String(catalog?.auto_model_selector || '__auto__')
+      const isAuto = routingMode === 'auto' || explicitSelector === autoSelector
+      const selector = explicitSelector || assignedProfileId || (
+        isAuto ? autoSelector : String(catalog?.default_profile_id || catalog?.default_model || '')
+      )
+      return {
+        selector,
+        assignedProfileId,
+        mode: isAuto
+          ? 'auto'
+          : explicitSelector
+            ? 'manual'
+            : assignedProfileId
+              ? 'legacy_pinned'
+              : 'default',
+        strategy: String(candidate.row.routing_strategy || '').trim() || null,
+        reason: String(candidate.row.routing_reason || '').trim() || null,
+        capacity: Number.isFinite(Number(candidate.row.routing_capacity))
+          ? Number(candidate.row.routing_capacity)
+          : null,
+        source: candidate.source,
+      }
+    }
+  }
+  const autoEnabled = Boolean(catalog?.vlm_balancer?.enabled)
+  return {
+    selector: autoEnabled
+      ? String(catalog?.auto_model_selector || '__auto__')
+      : String(catalog?.default_profile_id || catalog?.default_model || ''),
+    assignedProfileId: null,
+    mode: autoEnabled ? 'auto' : 'default',
+    strategy: String(catalog?.vlm_balancer?.strategy || '').trim() || null,
+    reason: null,
+    capacity: null,
+    source: 'server_default',
+  }
 }

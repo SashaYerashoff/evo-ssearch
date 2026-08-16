@@ -5085,10 +5085,158 @@ def _stable_vlm_profile_for_key(key: str, profile_ids: Sequence[str]) -> Optiona
     return str(profile_ids[slot])
 
 
+def _stable_vlm_profile_rank(key: str, profile_id: str) -> int:
+    normalized_key = str(key or "default").strip() or "default"
+    digest = hashlib.sha256(
+        f"vlm:{normalized_key}:{str(profile_id or '').strip()}".encode("utf-8")
+    ).digest()
+    return int.from_bytes(digest[:8], "big")
+
+
+def _vlm_assignment_demand(interval_sec: Any) -> float:
+    """Estimate one stream's steady VLM image rate.
+
+    A batch of N images collected every T seconds costs roughly N images once
+    per N*T seconds, so the long-run demand is approximately 1/T images/s.
+    Keep the estimate bounded to the same interval contract as capture.
+    """
+
+    try:
+        interval = float(interval_sec)
+    except (TypeError, ValueError):
+        interval = float(getattr(config, "LUXRIOT_SNAPSHOT_INTERVAL", 5.0) or 5.0)
+    if not math.isfinite(interval) or interval <= 0:
+        interval = 5.0
+    interval = max(0.2, min(300.0, interval))
+    return 1.0 / interval
+
+
+def _vlm_assignment_demands_from_states(
+    states: Optional[Mapping[Any, Mapping[str, Any]]],
+    *,
+    exclude_assignment_key: Optional[str] = None,
+) -> Dict[str, float]:
+    demands: Dict[str, float] = {}
+    excluded = str(exclude_assignment_key or "").strip()
+    for raw_key, state in (states or {}).items():
+        if not isinstance(state, Mapping) or not bool(state.get("enabled")):
+            continue
+        if excluded and str(raw_key).strip() == excluded:
+            continue
+        assigned_profile_id = str(
+            state.get("assigned_profile_id")
+            or state.get("model_hint")
+            or ""
+        ).strip()
+        if not assigned_profile_id:
+            continue
+        demands[assigned_profile_id] = (
+            demands.get(assigned_profile_id, 0.0)
+            + _vlm_assignment_demand(state.get("interval_sec"))
+        )
+    return demands
+
+
+def _cached_vlm_profile_health(profile: Mapping[str, Any]) -> Dict[str, Any]:
+    profile_id = str(profile.get("id") or "").strip()
+    configured_model = str(profile.get("model") or "").strip()
+    resource = normalize_lm_resource(str(profile.get("base_url") or ""), "")
+    now = time.monotonic()
+    try:
+        with _lm_served_models_cache_lock:
+            cached = _lm_served_models_cache.get(resource)
+    except NameError:
+        cached = None
+    if cached is None:
+        return {"profile_id": profile_id, "state": "unknown", "cache_stale": True}
+    expires_at, payload = cached
+    cache_stale = now >= float(expires_at)
+    known = bool(payload.get("known"))
+    served_models = {
+        str(item).strip()
+        for item in (payload.get("served_models") or [])
+        if str(item).strip()
+    }
+    if known and configured_model and configured_model in served_models:
+        state = "healthy"
+    elif known:
+        state = "model_mismatch"
+    elif cache_stale:
+        # A stale transport failure must not quarantine a recovered endpoint
+        # forever. It becomes unknown until the next diagnostics refresh.
+        state = "unknown"
+    else:
+        state = "unavailable"
+    return {
+        "profile_id": profile_id,
+        "state": state,
+        "cache_stale": cache_stale,
+    }
+
+
+def _vlm_admission_pressure_by_resource() -> Dict[str, Dict[str, int]]:
+    try:
+        status = _lm_admission_controller.status()
+    except (NameError, AttributeError, RuntimeError):
+        return {}
+    pressure: Dict[str, Dict[str, int]] = {}
+    for row in status.get("resources") or []:
+        if not isinstance(row, Mapping):
+            continue
+        resource = str(row.get("resource") or "").strip()
+        if not resource:
+            continue
+        pressure[resource] = {
+            "active": max(0, int(row.get("active") or 0)),
+            "queued": max(0, int(row.get("queued") or 0)),
+        }
+    return pressure
+
+
+def _vlm_routing_candidates(profile_ids: Sequence[str]) -> List[Dict[str, Any]]:
+    profiles = _configured_lm_profiles()
+    admission_pressure = _vlm_admission_pressure_by_resource()
+    rows: List[Dict[str, Any]] = []
+    for profile_id in profile_ids:
+        profile = profiles.get(str(profile_id))
+        if not isinstance(profile, Mapping):
+            continue
+        resolved = _resolve_lm_profile(profile_id=str(profile_id))
+        resource = normalize_lm_resource(str(resolved.get("base_url") or ""), "")
+        health = _cached_vlm_profile_health(resolved)
+        configured_capacity = configured_lm_capacity(str(profile_id), default=1)
+        served_capacity = _cached_served_lm_capacity(resource)
+        capacity = (
+            min(configured_capacity, served_capacity)
+            if served_capacity is not None and served_capacity > 0
+            else configured_capacity
+        )
+        pressure = admission_pressure.get(resource, {})
+        rows.append(
+            {
+                "profile_id": str(profile_id),
+                "capacity": max(1, int(capacity)),
+                "capacity_source": (
+                    "served_and_configured" if served_capacity is not None else "configured"
+                ),
+                "health": str(health.get("state") or "unknown"),
+                "health_cache_stale": bool(health.get("cache_stale")),
+                "active": max(0, int(pressure.get("active") or 0)),
+                "queued": max(0, int(pressure.get("queued") or 0)),
+            }
+        )
+    healthy = [row for row in rows if row["health"] == "healthy"]
+    if healthy:
+        return healthy
+    return [row for row in rows if row["health"] == "unknown"]
+
+
 def _resolve_vlm_auto_model_hint(
     requested_model_hint: Optional[str],
     *,
     assignment_key: str,
+    assigned_demands: Optional[Mapping[str, float]] = None,
+    request_demand: float = 1.0,
 ) -> Tuple[Optional[str], Dict[str, Any]]:
     raw_hint = str(requested_model_hint or "").strip()
     profiles = _configured_lm_profiles()
@@ -5098,6 +5246,7 @@ def _resolve_vlm_auto_model_hint(
             "requested": raw_hint,
             "assigned_profile_id": raw_hint if raw_hint in profiles else None,
             "balancer_enabled": _vlm_balancer_enabled(),
+            "strategy": "operator_pinned",
         }
 
     default_profile = _resolve_lm_profile(kind="vlm")
@@ -5112,32 +5261,79 @@ def _resolve_vlm_auto_model_hint(
         }
 
     profile_ids = _configured_vlm_balancer_profile_ids()
-    selected_profile_id = _stable_vlm_profile_for_key(assignment_key, profile_ids)
-    if not selected_profile_id:
-        return (default_selector if raw_hint else None), {
-            "mode": "default",
-            "requested": raw_hint or None,
-            "assigned_profile_id": str(default_profile.get("id") or "").strip() or None,
-            "balancer_enabled": True,
-            "profile_count": 0,
-            "reason": "no_vlm_profiles",
+    candidates = _vlm_routing_candidates(profile_ids)
+    normalized_demand = max(0.000001, float(request_demand or 0.0))
+    demand_by_profile = {
+        str(profile_id): max(0.0, float(value or 0.0))
+        for profile_id, value in (assigned_demands or {}).items()
+    }
+    scored: List[Tuple[float, int, Dict[str, Any]]] = []
+    diagnostics: List[Dict[str, Any]] = []
+    for candidate in candidates:
+        profile_id = str(candidate["profile_id"])
+        capacity = max(1, int(candidate["capacity"]))
+        assigned_demand = float(demand_by_profile.get(profile_id, 0.0))
+        runtime_pressure = (
+            int(candidate.get("active") or 0) + int(candidate.get("queued") or 0)
+        ) / capacity
+        projected_load = ((assigned_demand + normalized_demand) / capacity) + runtime_pressure
+        row = {
+            **candidate,
+            "assigned_demand_fps": round(assigned_demand, 6),
+            "projected_load": round(projected_load, 6),
         }
+        diagnostics.append(row)
+        scored.append(
+            (
+                projected_load,
+                _stable_vlm_profile_rank(assignment_key, profile_id),
+                row,
+            )
+        )
+    if not scored:
+        return None, {
+            "mode": "auto",
+            "requested": raw_hint or None,
+            "assigned_profile_id": None,
+            "balancer_enabled": True,
+            "profile_count": len(profile_ids),
+            "strategy": "capacity_aware_least_projected_load",
+            "reason": "no_healthy_or_unknown_vlm_profiles",
+            "candidates": [],
+        }
+    _, _, selected = min(scored, key=lambda item: (item[0], item[1]))
+    selected_profile_id = str(selected["profile_id"])
     return selected_profile_id, {
         "mode": "auto",
         "requested": raw_hint or None,
         "assigned_profile_id": selected_profile_id,
         "balancer_enabled": True,
         "profile_count": len(profile_ids),
+        "strategy": "capacity_aware_least_projected_load",
+        "reason": "lowest_projected_load",
+        "request_demand_fps": round(normalized_demand, 6),
+        "selected_capacity": int(selected["capacity"]),
+        "selected_projected_load": float(selected["projected_load"]),
+        "candidates": diagnostics,
     }
 
 
 def _resolve_luxriot_vlm_model_hint(
     channel_id: int,
     requested_model_hint: Optional[str],
+    *,
+    interval_sec: Optional[float] = None,
+    desired_states: Optional[Mapping[Any, Mapping[str, Any]]] = None,
 ) -> Tuple[Optional[str], Dict[str, Any]]:
+    assignment_key = str(int(channel_id))
     return _resolve_vlm_auto_model_hint(
         requested_model_hint,
-        assignment_key=str(int(channel_id)),
+        assignment_key=assignment_key,
+        assigned_demands=_vlm_assignment_demands_from_states(
+            desired_states,
+            exclude_assignment_key=assignment_key,
+        ),
+        request_demand=_vlm_assignment_demand(interval_sec),
     )
 
 
@@ -5216,14 +5412,28 @@ def _resolve_lm_profile(
 
 
 def _public_lm_profile(profile: Mapping[str, Any]) -> Dict[str, Any]:
+    profile_id = str(profile.get("id") or "")
+    resource = normalize_lm_resource(str(profile.get("base_url") or ""), "")
+    configured_capacity = configured_lm_capacity(profile_id, default=1)
+    served_capacity = _cached_served_lm_capacity(resource)
+    effective_capacity = (
+        min(configured_capacity, served_capacity)
+        if served_capacity is not None and served_capacity > 0
+        else configured_capacity
+    )
+    health = _cached_vlm_profile_health(profile)
     return {
-        "id": str(profile.get("id") or ""),
+        "id": profile_id,
         "kind": str(profile.get("kind") or "general"),
         "model": str(profile.get("model") or ""),
         "selector": _lm_profile_selector_value(profile),
         "timeout": int(profile.get("timeout") or config.LM_TIMEOUT),
         "enabled": _lm_profile_enabled(profile),
         "gpu": str(profile.get("gpu") or ""),
+        "configured_capacity": configured_capacity,
+        "served_capacity": served_capacity,
+        "effective_capacity": effective_capacity,
+        "routing_health": str(health.get("state") or "unknown"),
     }
 
 
@@ -6538,6 +6748,44 @@ current_json_prompt = str(getattr(config, 'LUXRIOT_ALERTS_JSON_PROMPT', '') or '
 if (not current_json_prompt) or _is_outdated_luxriot_json_prompt(current_json_prompt):
     config.LUXRIOT_ALERTS_JSON_PROMPT = LUXRIOT_ALERTS_JSON_PROMPT_DEFAULT
 
+
+def _route_unresolved_luxriot_session(
+    *,
+    channel_id: int,
+    batch_size: int,
+    interval_sec: Optional[float],
+) -> Dict[str, Any]:
+    manager = globals().get("luxriot_manager")
+    desired_states: Dict[int, Dict[str, Any]] = {}
+    if manager is not None:
+        try:
+            desired_states = manager.desired_live_sessions_snapshot()
+        except Exception:
+            desired_states = {}
+    assigned_profile_id, routing = _resolve_luxriot_vlm_model_hint(
+        int(channel_id),
+        LM_AUTO_BALANCE_SELECTOR,
+        interval_sec=interval_sec,
+        desired_states=desired_states,
+    )
+    if not assigned_profile_id:
+        return {
+            "error": "Auto VLM routing found no healthy or unverified inference profile.",
+            "model_selector": LM_AUTO_BALANCE_SELECTOR,
+            "routing": routing,
+        }
+    selector = (
+        LM_AUTO_BALANCE_SELECTOR
+        if routing.get("mode") == "auto"
+        else assigned_profile_id
+    )
+    return {
+        "model_selector": selector,
+        "assigned_profile_id": assigned_profile_id,
+        "routing": routing,
+    }
+
+
 luxriot_manager = LuxriotManager(
     config=config,
     lm_callback=_call_video_understanding,
@@ -6546,7 +6794,75 @@ luxriot_manager = LuxriotManager(
     alert_parser=_parse_lm_alerts,
     probe_manager=None,  # will be assigned after probe_manager init
     runtime_state_store=_build_luxriot_runtime_state_store(),
+    model_router=_route_unresolved_luxriot_session,
 )
+
+
+def _luxriot_desired_live_states() -> Dict[int, Dict[str, Any]]:
+    try:
+        return luxriot_manager.desired_live_sessions_snapshot()
+    except Exception:
+        return {}
+
+
+def _desired_state_uses_auto_routing(state: Mapping[str, Any]) -> bool:
+    selector = str(state.get("model_selector") or "").strip()
+    mode = str(state.get("routing_mode") or "").strip().lower()
+    return _is_auto_lm_selector(selector) or mode == "auto"
+
+
+def _build_luxriot_vlm_restore_routing_plan(
+    states: Optional[Mapping[int, Mapping[str, Any]]] = None,
+) -> Dict[int, Dict[str, Any]]:
+    desired = {
+        int(channel_id): dict(state)
+        for channel_id, state in (states or _luxriot_desired_live_states()).items()
+        if int(channel_id) > 0 and isinstance(state, Mapping) and bool(state.get("enabled"))
+    }
+    pinned_states = {
+        channel_id: state
+        for channel_id, state in desired.items()
+        if not _desired_state_uses_auto_routing(state)
+    }
+    assigned_demands = _vlm_assignment_demands_from_states(pinned_states)
+    plan: Dict[int, Dict[str, Any]] = {}
+    for channel_id, state in sorted(desired.items()):
+        if not _desired_state_uses_auto_routing(state):
+            continue
+        request_demand = _vlm_assignment_demand(state.get("interval_sec"))
+        assigned_profile_id, routing = _resolve_vlm_auto_model_hint(
+            LM_AUTO_BALANCE_SELECTOR,
+            assignment_key=str(channel_id),
+            assigned_demands=assigned_demands,
+            request_demand=request_demand,
+        )
+        if not assigned_profile_id:
+            plan[channel_id] = {
+                "blocked": True,
+                "model_selector": LM_AUTO_BALANCE_SELECTOR,
+                "routing": routing,
+                "error": str(routing.get("reason") or "no VLM profile is available"),
+            }
+            continue
+        assigned_demands[assigned_profile_id] = (
+            assigned_demands.get(assigned_profile_id, 0.0) + request_demand
+        )
+        plan[channel_id] = {
+            "model_selector": LM_AUTO_BALANCE_SELECTOR,
+            "assigned_profile_id": assigned_profile_id,
+            "routing": routing,
+        }
+    return plan
+
+
+def _restore_luxriot_desired_live_sessions() -> Dict[str, Any]:
+    states = _luxriot_desired_live_states()
+    routing_plan = _build_luxriot_vlm_restore_routing_plan(states)
+    if not routing_plan:
+        return luxriot_manager.restore_desired_live_sessions()
+    return luxriot_manager.restore_desired_live_sessions(routing_plan=routing_plan)
+
+
 luxriot_manager.rollup_lm_callback = _call_rollup_understanding
 try:
     with luxriot_manager.cache_lock:
@@ -8559,7 +8875,7 @@ def initialize_runtime_services() -> None:
         luxriot_manager.start_rollup_workers()
         try:
             _luxriot_restore_result = (
-                luxriot_manager.restore_desired_live_sessions()
+                _restore_luxriot_desired_live_sessions()
             )
         except Exception as exc:
             _luxriot_restore_result = {
@@ -8586,7 +8902,7 @@ def complete_runtime_handover() -> Dict[str, Any]:
             _configure_inference_queue()
             luxriot_manager.start_rollup_workers()
             _luxriot_restore_result = (
-                luxriot_manager.restore_desired_live_sessions()
+                _restore_luxriot_desired_live_sessions()
             )
         except Exception as exc:
             _luxriot_restore_result = {
@@ -9755,6 +10071,7 @@ def _fetch_lm_model_catalog(force: bool = False) -> Dict[str, Any]:
         "vlm_balancer": {
             "enabled": _vlm_balancer_enabled(),
             "profile_ids": _configured_vlm_balancer_profile_ids(),
+            "strategy": "capacity_aware_least_projected_load",
         },
         "profile_errors": {},
         "source": "fallback",
@@ -17846,9 +18163,24 @@ def luxriot_start_capture():
         interval_sec = _parse_luxriot_capture_interval_sec(data)
     except ValueError as exc:
         return jsonify({'error': str(exc)}), 400
+    desired_states = _luxriot_desired_live_states()
     model_hint, model_selection = _resolve_luxriot_vlm_model_hint(
         channel_id,
         requested_model_hint,
+        interval_sec=interval_sec,
+        desired_states=desired_states,
+    )
+    if model_selection.get("mode") == "auto" and not model_hint:
+        return jsonify(
+            {
+                "error": "Auto VLM routing found no healthy or unverified inference profile.",
+                "routing": model_selection,
+            }
+        ), 503
+    model_selector = (
+        LM_AUTO_BALANCE_SELECTOR
+        if model_selection.get("mode") == "auto"
+        else requested_model_hint
     )
     system_prompt = (data.get('system_prompt') or '').strip() or None
     try:
@@ -17859,11 +18191,18 @@ def luxriot_start_capture():
             model_hint=model_hint,
             system_prompt=system_prompt,
             interval_sec=interval_sec,
+            model_selector=model_selector,
+            routing_metadata=model_selection,
         )
         if isinstance(status, Mapping):
             status = dict(status)
             status["model_selection"] = model_selection.get("mode")
             status["assigned_profile_id"] = model_selection.get("assigned_profile_id")
+            status["model_selector"] = model_selector
+            status["routing_strategy"] = model_selection.get("strategy")
+            status["routing_reason"] = model_selection.get("reason")
+            status["routing_capacity"] = model_selection.get("selected_capacity")
+            status["routing_candidates"] = model_selection.get("candidates") or []
         audit_error = _write_completion_audit_or_error(
             action="luxriot.capture.start.completed",
             result="success",
@@ -17881,6 +18220,9 @@ def luxriot_start_capture():
                 "assigned_profile_id": model_selection.get("assigned_profile_id"),
                 "balancer_enabled": model_selection.get("balancer_enabled"),
                 "balancer_profile_count": model_selection.get("profile_count"),
+                "routing_strategy": model_selection.get("strategy"),
+                "routing_reason": model_selection.get("reason"),
+                "routing_capacity": model_selection.get("selected_capacity"),
                 "session_running": bool(status.get("running"))
                 if isinstance(status, Mapping)
                 else None,

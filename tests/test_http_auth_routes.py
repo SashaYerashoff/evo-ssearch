@@ -1138,6 +1138,13 @@ class HttpAuthRouteTests(unittest.TestCase):
         payload = response.get_json()
         self.assertEqual(payload["session"]["model_selection"], "auto")
         self.assertEqual(payload["session"]["assigned_profile_id"], captured["model_hint"])
+        self.assertEqual(payload["session"]["model_selector"], "__auto__")
+        self.assertEqual(captured["model_selector"], "__auto__")
+        self.assertEqual(captured["routing_metadata"]["mode"], "auto")
+        self.assertEqual(
+            captured["routing_metadata"]["strategy"],
+            "capacity_aware_least_projected_load",
+        )
         event = next(
             event
             for event in self.audit.events

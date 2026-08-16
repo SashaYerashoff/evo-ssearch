@@ -48,8 +48,12 @@ for a government buyer. Each item has the mitigation in place. Pairs with
   without monitoring.
 - **Single Gunicorn worker.** A crash stops capture until restart. *Mitigation:*
   desired sessions auto-restore; graceful-restart flush. No HA in the pilot.
-- **Static VLM balancer, no failover.** A dead VLM host stops its channels until
-  reassignment. *Mitigation:* coverage visibility.
+- **Session-level VLM assignment, no in-flight failover.** Auto routing chooses a
+  healthy profile from configured capacity, existing stream demand, and current
+  admission pressure, then keeps that assignment stable for the session. A host
+  that dies after assignment still stops its channels until restart/reassignment.
+  *Mitigation:* coverage visibility; explicit Auto sessions are replanned during
+  restore, while manual and legacy pins are never moved silently.
 - **Hard kill (SIGKILL)** can lose up to the persist-debounce interval of summary
   history. Graceful restarts flush.
 

@@ -5761,6 +5761,12 @@ class LuxriotCaptureDispatchTests(unittest.TestCase):
                         "batch_size": 8,
                         "interval_sec": 2.0,
                         "model": "vlm_b",
+                        "model_selector": None,
+                        "assigned_profile_id": "vlm_b",
+                        "routing_mode": None,
+                        "routing_strategy": None,
+                        "routing_reason": None,
+                        "routing_capacity": None,
                         "updated_at": streams["capture_configurations"][0]["updated_at"],
                     }
                 ],
@@ -11622,20 +11628,62 @@ class LuxriotCaptureDispatchTests(unittest.TestCase):
                     batch_size=12,
                     prompt="Describe activity.",
                     model_hint="vlm-a1",
+                    model_selector="__auto__",
+                    routing_metadata={
+                        "mode": "auto",
+                        "assigned_profile_id": "vlm-a1",
+                        "strategy": "capacity_aware_least_projected_load",
+                        "reason": "lowest_projected_load",
+                        "selected_capacity": 4,
+                    },
                     interval_sec=4.5,
                 )
 
             state = runtime_store.load_state(manager.DESIRED_LIVE_SESSIONS_KEY)
+            self.assertEqual(state["version"], 2)
             self.assertTrue(state["sessions"]["7"]["enabled"])
             self.assertEqual(state["sessions"]["7"]["batch_size"], 12)
             self.assertEqual(state["sessions"]["7"]["prompt"], "Describe activity.")
             self.assertEqual(state["sessions"]["7"]["model_hint"], "vlm-a1")
+            self.assertEqual(state["sessions"]["7"]["model_selector"], "__auto__")
+            self.assertEqual(state["sessions"]["7"]["routing_mode"], "auto")
+            self.assertEqual(state["sessions"]["7"]["assigned_profile_id"], "vlm-a1")
+            self.assertEqual(state["sessions"]["7"]["routing"]["selected_capacity"], 4)
             self.assertEqual(state["sessions"]["7"]["interval_sec"], 4.5)
 
             manager.stop_session(7)
 
             state = runtime_store.load_state(manager.DESIRED_LIVE_SESSIONS_KEY)
             self.assertFalse(state["sessions"]["7"]["enabled"])
+
+    def test_direct_manual_model_clears_stale_auto_routing_state(self):
+        with tempfile.TemporaryDirectory() as temp:
+            runtime_store = MemoryRuntimeStateStore()
+            manager = build_manager(Path(temp), runtime_state_store=runtime_store)
+            manager._set_desired_live_session(
+                7,
+                enabled=True,
+                model_hint="vlm-a1",
+                model_selector="__auto__",
+                routing_metadata={
+                    "mode": "auto",
+                    "assigned_profile_id": "vlm-a1",
+                    "strategy": "capacity_aware_least_projected_load",
+                },
+            )
+
+            manager._set_desired_live_session(
+                7,
+                enabled=True,
+                model_hint="vlm-local",
+            )
+
+            state = runtime_store.load_state(manager.DESIRED_LIVE_SESSIONS_KEY)["sessions"]["7"]
+            self.assertEqual(state["model_selector"], "vlm-local")
+            self.assertEqual(state["model_hint"], "vlm-local")
+            self.assertEqual(state["assigned_profile_id"], "vlm-local")
+            self.assertEqual(state["routing_mode"], "manual")
+            self.assertEqual(state["routing"]["strategy"], "operator_pinned")
 
     def test_restore_desired_live_sessions_starts_enabled_channels(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -11666,6 +11714,57 @@ class LuxriotCaptureDispatchTests(unittest.TestCase):
             self.assertIn(7, manager.sessions)
             self.assertEqual(manager.sessions[7].model_hint, "vlm-a1")
             self.assertEqual(manager.sessions[7].interval, 4.5)
+
+    def test_restore_routing_plan_reassigns_auto_without_touching_legacy_pin(self):
+        with tempfile.TemporaryDirectory() as temp:
+            runtime_store = MemoryRuntimeStateStore()
+            runtime_store.save_state(
+                LuxriotManager.DESIRED_LIVE_SESSIONS_KEY,
+                {
+                    "version": 2,
+                    "sessions": {
+                        "7": {
+                            "enabled": True,
+                            "batch_size": 8,
+                            "model_hint": "vlm-old",
+                            "model_selector": "__auto__",
+                            "routing_mode": "auto",
+                            "interval_sec": 2.0,
+                        },
+                        "8": {
+                            "enabled": True,
+                            "batch_size": 8,
+                            "model_hint": "vlm-pinned",
+                            "interval_sec": 2.0,
+                        },
+                    },
+                },
+            )
+            manager = build_manager(Path(temp), runtime_state_store=runtime_store)
+            routing_plan = {
+                7: {
+                    "model_selector": "__auto__",
+                    "assigned_profile_id": "vlm-new",
+                    "routing": {
+                        "mode": "auto",
+                        "assigned_profile_id": "vlm-new",
+                        "strategy": "capacity_aware_least_projected_load",
+                    },
+                },
+            }
+
+            with patch.object(LuxriotCaptureSession, "start", return_value=None):
+                result = manager.restore_desired_live_sessions(routing_plan=routing_plan)
+
+            self.assertTrue(result["ok"])
+            self.assertEqual(manager.sessions[7].model_hint, "vlm-new")
+            self.assertEqual(manager.sessions[8].model_hint, "vlm-pinned")
+            state = runtime_store.load_state(manager.DESIRED_LIVE_SESSIONS_KEY)
+            self.assertEqual(state["sessions"]["7"]["model_selector"], "__auto__")
+            self.assertEqual(state["sessions"]["7"]["assigned_profile_id"], "vlm-new")
+            self.assertEqual(state["sessions"]["8"]["model_selector"], "vlm-pinned")
+            self.assertEqual(state["sessions"]["8"]["routing_mode"], "manual")
+            self.assertEqual(state["sessions"]["8"]["assigned_profile_id"], "vlm-pinned")
 
 
 class LuxriotInferenceQueueRuntimeTests(unittest.TestCase):

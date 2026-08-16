@@ -190,7 +190,8 @@ thresholds, alert policy, live sampling, or the live routine context.
 | `EVOSSEARCH_LUXRIOT_L0_HEARTBEAT_OUTPUT_TOKENS` / `_EVENT_OUTPUT_TOKENS` (`320/384`) | Per-request generation caps below the L0 envelope ceiling. The compact state contract keeps routine batches fresh while event/manual descriptions retain room for distinct alerts and episode state |
 | `EVOSSEARCH_LUXRIOT_L0_INCIDENT_BUDGET_TOKENS` (`900`) | Sub-budget shared by at most four incident contexts in an L0 request; incidents 5–8 remain scheduler state only |
 | `EVOSSEARCH_LUXRIOT_L0_VISION_TOKENS_PER_IMAGE_ESTIMATE` (`300`) | Conservative accounting estimate per selected frame for telemetry and fail-before-send budget checks |
-| `EVOSSEARCH_LM_VLM_BALANCER_ENABLED` | Static channel→profile routing across multiple VLM hosts |
+| `EVOSSEARCH_LM_VLM_BALANCER_ENABLED` | Enables capacity/health/admission-aware session assignment across multiple VLM profiles. Auto assignments are persisted and replanned on restore; manual and pre-selector legacy pins remain fixed. This is not per-request round robin or in-flight failover |
+| `EVOSSEARCH_LM_VLM_BALANCER_PROFILES` | Ordered comma-separated set of eligible VLM profile IDs. Order is not a priority: projected load chooses the profile and a stable channel/profile hash breaks equal-load ties |
 | `EVOSSEARCH_LM_VIDEO_DEFAULT_FRAMES` / `_MAX_FRAMES` | Offline/video-description frame limits |
 | `EVOSSEARCH_LM_VIDEO_MAX_EDGE` | Resize max edge before sending images to VLM |
 | `EVOSSEARCH_LM_VIDEO_MAX_TOKENS` / `_TEMPERATURE` | VLM output sampling limits |
