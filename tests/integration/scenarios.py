@@ -12,6 +12,8 @@ Scenarios tagged `requires` need setup the harness can't do alone:
   - "non_admin": run with an operator (not admin) account to test the redirect;
   - "seed": seed a known archive needle/probe fixture first;
   - "summary_seed": seed a known prose-only summary fixture and restart/load it;
+  - "probe_apply": allow one exact disabled probe Apply/persistence/cleanup cycle;
+  - "prompt_preview": use an engineer allowed to preview channel prompt changes;
   - "incident_preview": allow creation of a disposable preview action plan;
   - "incident": provide EVA_LIVE_INCIDENT_ID for an existing test incident;
   - "deploy": allow a disposable, persistent survey-only deployment workflow.
@@ -19,6 +21,7 @@ Scenarios tagged `requires` need setup the harness can't do alone:
 from __future__ import annotations
 
 import re
+from collections import Counter
 from dataclasses import dataclass
 from typing import Any, Callable, List, Optional, Tuple, Union
 
@@ -67,6 +70,7 @@ class UiEffectCheck:
     action: str
     tool: str = ""
     desc: str = ""
+    payload_predicate: Optional[Callable[[dict], bool]] = None
 
 
 @dataclass(frozen=True)
@@ -82,7 +86,10 @@ class Scenario:
     prose_must_not: Tuple[str, ...] = ()    # soft
     requires: Tuple[str, ...] = ()
     max_tool_calls: Optional[int] = 16
+    optimal_tool_calls: Optional[int] = None
     warn_after_seconds: Optional[float] = 120.0
+    max_answer_chars: Optional[int] = 8000
+    workflow: str = ""
     note: str = ""
 
 
@@ -148,6 +155,103 @@ def _preview_only(args: dict) -> bool:
     return args.get("preview") is not False
 
 
+def _has_explicit_time_scope(args: dict) -> bool:
+    return any(
+        args.get(key) not in (None, "")
+        for key in (
+            "relative_range",
+            "since_hours",
+            "since_ms",
+            "until_ms",
+            "from_ts",
+            "to_ts",
+            "day_hint",
+            "start_time",
+            "end_time",
+        )
+    )
+
+
+def _archive_search_is_scoped(args: dict) -> bool:
+    return bool(
+        str(args.get("query") or "").strip()
+        and (
+            args.get("channel_id") is not None
+            or str(args.get("channel_ref") or "").strip()
+        )
+        and _has_explicit_time_scope(args)
+    )
+
+
+def _summary_read_is_scoped(args: dict) -> bool:
+    return bool(
+        (
+            args.get("channel_id") is not None
+            or str(args.get("channel_ref") or "").strip()
+        )
+        and _has_explicit_time_scope(args)
+    )
+
+
+def _probe_preview_is_complete(args: dict) -> bool:
+    positives = [str(value).strip().lower() for value in args.get("positives") or []]
+    negatives = [str(value).strip().lower() for value in args.get("negatives") or []]
+    return bool(
+        args.get("preview") is not False
+        and str(args.get("name") or "").strip().lower()
+        == "agent acceptance headphones"
+        and "person wearing headphones" in positives
+        and "person at desk, bare ears visible" in negatives
+        and abs(float(args.get("pos_floor") or 0.0) - 0.05) < 1e-6
+        and abs(float(args.get("margin_thr") or 0.0) - 0.01) < 1e-6
+        and args.get("bookmark_enabled") is False
+        and args.get("enabled") is False
+    )
+
+
+def _probe_preview_ui_payload(payload: dict) -> bool:
+    """Desired operator handoff: enough state to render the exact draft."""
+
+    positives = [str(value).strip().lower() for value in payload.get("positives") or []]
+    negatives = [str(value).strip().lower() for value in payload.get("negatives") or []]
+    return bool(
+        str(payload.get("name") or "").strip().lower()
+        == "agent acceptance headphones"
+        and "person wearing headphones" in positives
+        and "person at desk, bare ears visible" in negatives
+        and abs(float(payload.get("pos_floor") or 0.0) - 0.05) < 1e-6
+        and abs(float(payload.get("margin", payload.get("margin_thr")) or 0.0) - 0.01) < 1e-6
+        and payload.get("bookmark", payload.get("bookmark_enabled")) is False
+        and payload.get("enabled") is False
+    )
+
+
+def _alert_policy_read(args: dict) -> bool:
+    return args.get("channel_id") is not None or bool(
+        str(args.get("channel_ref") or "").strip()
+    )
+
+
+def _alert_policy_preview(args: dict) -> bool:
+    changes = args.get("changes") if isinstance(args.get("changes"), dict) else {}
+    policy = str(changes.get("alert_policy_prompt") or "").strip().lower()
+    return bool(
+        args.get("preview") is not False
+        and policy
+        and "thumbs up" in policy
+        and set(changes) == {"alert_policy_prompt"}
+    )
+
+
+def _video_activity_report(args: dict) -> bool:
+    report_type = str(args.get("report_type") or "video_descriptions").strip()
+    return report_type == "video_descriptions" and _has_explicit_time_scope(args)
+
+
+def _runtime_inventory(args: dict) -> bool:
+    return args.get("runtime_only") is True
+
+
 def _contains_seeded_needle(result: Any) -> bool:
     if not isinstance(result, dict):
         return False
@@ -175,11 +279,142 @@ SCENARIOS: List[Scenario] = [
     Scenario(
         name="status_report_from_tool",
         message="List active video-description streams, models, queues, dropped frames, and last errors.",
-        tool_checks=(ToolCheck("list_video_summary_channels", desc="status must come from a tool"),),
+        tool_checks=(ToolCheck(
+            "list_video_summary_channels",
+            arg_predicate=_runtime_inventory,
+            desc="status must come from authoritative current runtime, not history",
+        ),),
         prose_must_not=(r"\bagent model\b",),
         max_tool_calls=4,
+        optimal_tool_calls=1,
         warn_after_seconds=45,
         note="Runtime status must come from the video-description status tool, not docs or guessed agent-LM state.",
+    ),
+    Scenario(
+        name="archive_period_search_projects_results",
+        message=(
+            "Search channel {channel_ref}'s visual archive for a person during the rolling last 30 minutes. "
+            "Show the returned picture candidates, state the exact checked window and coverage, and do not search other channels."
+        ),
+        tool_checks=(
+            ToolCheck(
+                "search_archive",
+                arg_predicate=_archive_search_is_scoped,
+                desc="archive query must carry both the requested channel and frozen period",
+            ),
+        ),
+        ui_effect_checks=(
+            UiEffectCheck(
+                "archive",
+                "show_results",
+                "search_archive",
+                "the same result set and filters must be projected into Archive",
+            ),
+        ),
+        prose_must=(r"coverage|covered|inspected|checked", r"30\s*(?:minute|min)"),
+        max_tool_calls=4,
+        optimal_tool_calls=2,
+        warn_after_seconds=90,
+        note="End-to-end archive search by requested channel/time with trusted UI projection.",
+    ),
+    Scenario(
+        name="summary_period_search_projects_review",
+        message=(
+            "Review video summaries for channel {channel_ref} for the rolling last hour. "
+            "Open the matching Stream Review period and report coverage, recent events, and any gaps."
+        ),
+        tool_checks=(
+            ToolCheck(
+                "get_video_summaries",
+                arg_predicate=_summary_read_is_scoped,
+                desc="summary retrieval must preserve the requested channel and period",
+            ),
+        ),
+        ui_effect_checks=(
+            UiEffectCheck(
+                "video",
+                "show_period",
+                "get_video_summaries",
+                "the same resolved window must drive Stream Review",
+            ),
+        ),
+        prose_must=(r"coverage|covered|gap", r"event|activity|no data"),
+        max_tool_calls=5,
+        optimal_tool_calls=2,
+        warn_after_seconds=90,
+    ),
+    Scenario(
+        name="probe_turnkey_preview_projects_editor_state",
+        message=(
+            "Prepare a new disabled, non-bookmarking semantic probe on channel {channel_ref}. "
+            "Name it 'Agent acceptance headphones'. Positive: 'person wearing headphones'. "
+            "Negative visible contrast: 'person at desk, bare ears visible'. Use positive floor 0.05 and margin 0.01. "
+            "Prepare the exact preview only; do not apply it from chat."
+        ),
+        tool_checks=(
+            ToolCheck(
+                "create_probe",
+                arg_predicate=_probe_preview_is_complete,
+                desc="one exact safe probe preview with name, P/N, thresholds and disabled side effects",
+            ),
+        ),
+        ui_effect_checks=(
+            UiEffectCheck(
+                "probes",
+                "show_preview",
+                "create_probe",
+                "Probe editor must receive the exact draft, not merely navigate to the board",
+                payload_predicate=_probe_preview_ui_payload,
+            ),
+        ),
+        prose_must=(r"preview", r"Apply"),
+        prose_must_not=(r"created and active", r"already applied"),
+        requires=("probe_apply",),
+        max_tool_calls=4,
+        optimal_tool_calls=1,
+        warn_after_seconds=90,
+        workflow="probe_apply_roundtrip",
+        note="The desired UI payload is intentionally strict and exposes the current missing prefilled-modal seam.",
+    ),
+    Scenario(
+        name="vlm_alert_policy_preview_projects_settings",
+        message=(
+            "For channel {channel_ref}, append a VLM alert criterion for a visible thumbs up gesture. "
+            "Preserve every existing criterion and change only alert_policy_prompt. Prepare a preview only; do not apply."
+        ),
+        tool_checks=(
+            ToolCheck(
+                "get_prompt_settings",
+                arg_predicate=_alert_policy_read,
+                desc="read the effective channel policy before modifying it",
+            ),
+            ToolCheck(
+                "update_prompt_settings",
+                arg_predicate=_alert_policy_preview,
+                desc="preview only the channel alert policy and preserve other prompt settings",
+            ),
+        ),
+        tool_order_checks=(
+            ToolOrderCheck(
+                ("get_prompt_settings",),
+                ("update_prompt_settings",),
+                "effective settings must be read before the append preview",
+            ),
+        ),
+        ui_effect_checks=(
+            UiEffectCheck(
+                "video",
+                "show_prompt_preview",
+                "update_prompt_settings",
+                "the preview must be visible in Stream Settings",
+            ),
+        ),
+        prose_must=(r"preview", r"thumbs.?up", r"preserv"),
+        prose_must_not=(r"already applied", r"probe created"),
+        requires=("prompt_preview",),
+        max_tool_calls=4,
+        optimal_tool_calls=2,
+        warn_after_seconds=90,
     ),
     Scenario(
         name="overnight_summary_completes_without_confirmation_loop",
@@ -284,6 +519,25 @@ SCENARIOS: List[Scenario] = [
         tool_checks=(ToolCheck("generate_report", desc="video-description-first report"),),
         prose_must=(r"deliver|cooldown|disabled|sent|pipeline health|parsed",),
         note="Detection pipeline health is reported separately from incidents.",
+    ),
+    Scenario(
+        name="activity_report_is_scoped_and_grounded",
+        message=(
+            "Prepare an operator activity report for channel {channel_ref} for the rolling last hour. "
+            "Include video-description coverage, notable recent events, stream health and up to five evidence frames."
+        ),
+        tool_checks=(
+            ToolCheck(
+                "generate_report",
+                arg_predicate=_video_activity_report,
+                desc="activity report must be video-description-first and explicitly time-scoped",
+            ),
+        ),
+        prose_must=(r"coverage|covered|gap", r"health|stream", r"event|activity"),
+        max_tool_calls=4,
+        optimal_tool_calls=2,
+        warn_after_seconds=90,
+        note="Exercises activity, recent evidence and pipeline state in one bounded report.",
     ),
     Scenario(
         name="prose_only_event_marked_unconfirmed",
@@ -470,6 +724,12 @@ def run_scenario(transcript: Transcript, scenario: Scenario) -> Tuple[List[str],
                 not check.tool
                 or (isinstance(effect.get("source"), dict) and effect["source"].get("tool") == check.tool)
             )
+            and (
+                check.payload_predicate is None
+                or check.payload_predicate(
+                    effect.get("payload") if isinstance(effect.get("payload"), dict) else {}
+                )
+            )
         ]
         if not matching:
             hard.append(
@@ -488,3 +748,120 @@ def run_scenario(transcript: Transcript, scenario: Scenario) -> Tuple[List[str],
         )
 
     return hard, soft
+
+
+def generation_quality(transcript: Transcript, scenario: Scenario) -> dict:
+    """Return a deterministic, model-comparable response-quality rubric.
+
+    It deliberately does not ask another LLM to judge the answer. Every point
+    is reproducible across candidate models and can be traced to one failed
+    expectation or presentation defect.
+    """
+
+    text = str(transcript.text or "").strip()
+    checks: List[dict] = []
+
+    def add(name: str, passed: bool, weight: float, detail: str = "") -> None:
+        checks.append({
+            "name": name,
+            "passed": bool(passed),
+            "weight": float(weight),
+            "detail": detail,
+        })
+
+    add("nonempty_answer", bool(text), 15.0, "final answer must not be empty")
+    required_weight = 40.0 / max(1, len(scenario.prose_must))
+    for pattern in scenario.prose_must:
+        add(
+            f"required:{pattern}",
+            re.search(pattern, text, flags=re.IGNORECASE) is not None,
+            required_weight,
+            "scenario-specific grounded content",
+        )
+    forbidden_weight = 20.0 / max(1, len(scenario.prose_must_not))
+    for pattern in scenario.prose_must_not:
+        add(
+            f"forbidden:{pattern}",
+            re.search(pattern, text, flags=re.IGNORECASE) is None,
+            forbidden_weight,
+            "unsupported or lifecycle-confusing wording",
+        )
+
+    # Generic presentation checks receive the unallocated portion when a
+    # scenario has few prose assertions. The score remains normalized below.
+    sentences = [
+        re.sub(r"\s+", " ", item.strip().lower())
+        for item in re.split(r"(?<=[.!?])\s+|\n+", text)
+        if len(item.strip()) >= 24
+    ]
+    repeated_sentences = sum(count - 1 for count in Counter(sentences).values() if count > 1)
+    cjk_count = sum(
+        1
+        for char in text
+        if "\u3400" <= char <= "\u4dbf"
+        or "\u4e00" <= char <= "\u9fff"
+        or "\uac00" <= char <= "\ud7af"
+    )
+    raw_tool_leak = bool(re.search(
+        r"(?:tool_call_id|<\|tool_call\|>|\"arguments\"\s*:\s*\{)",
+        text,
+        flags=re.IGNORECASE,
+    ))
+    add("no_repeated_sentences", repeated_sentences == 0, 10.0, f"repeats={repeated_sentences}")
+    add("english_contract", cjk_count == 0, 5.0, f"CJK characters={cjk_count}")
+    add("no_raw_tool_protocol_leak", not raw_tool_leak, 5.0)
+    if scenario.max_answer_chars is not None:
+        add(
+            "bounded_answer",
+            len(text) <= int(scenario.max_answer_chars),
+            5.0,
+            f"chars={len(text)} limit={scenario.max_answer_chars}",
+        )
+
+    total_weight = sum(float(item["weight"]) for item in checks) or 1.0
+    passed_weight = sum(
+        float(item["weight"])
+        for item in checks
+        if item["passed"]
+    )
+    return {
+        "score": round(100.0 * passed_weight / total_weight, 2),
+        "answer_chars": len(text),
+        "answer_words": len(re.findall(r"\S+", text)),
+        "repeated_sentences": repeated_sentences,
+        "cjk_characters": cjk_count,
+        "checks": checks,
+    }
+
+
+def tool_efficiency(transcript: Transcript, scenario: Scenario) -> dict:
+    actual = int(transcript.tool_call_count)
+    target = scenario.optimal_tool_calls
+    duplicates = transcript.exact_duplicate_tool_calls
+    tool_errors = sum(bool(error) for _name, _result, error in transcript.tool_results)
+    score = 100.0
+    if target is not None and actual > int(target):
+        score -= min(60.0, 12.5 * (actual - int(target)))
+    score -= min(50.0, 25.0 * len(duplicates))
+    score -= min(50.0, 20.0 * tool_errors)
+    if transcript.budget_stops:
+        score = 0.0
+    return {
+        "score": round(max(0.0, score), 2),
+        "actual_tool_calls": actual,
+        "optimal_tool_calls": target,
+        "max_tool_calls": scenario.max_tool_calls,
+        "exact_duplicate_calls": duplicates,
+        "tool_errors": tool_errors,
+        "tool_result_chars": sum(
+            int(item.get("result_chars") or 0)
+            for item in transcript.tool_trace
+        ),
+        "max_context_tokens": max(
+            (
+                int(item.get("estimated_tokens") or 0)
+                for item in transcript.context_metrics
+            ),
+            default=0,
+        ),
+    }

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Create/update a non-admin operator account for live integration smoke.
+"""Create/update a scoped operator or engineer for live integration smoke.
 
 This is a dev/acceptance helper, not a production credential policy. It keeps
 the restricted-help smoke repeatable without hand-editing users in the UI.
@@ -38,7 +38,7 @@ def _load_local_env() -> None:
 
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Bootstrap a non-admin EVA operator for live-smoke RBAC tests."
+        description="Bootstrap a scoped EVA operator/engineer for live acceptance tests."
     )
     parser.add_argument(
         "--tenant-id",
@@ -53,6 +53,12 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--username", default="operator-smoke")
     parser.add_argument("--display-name", default="Live Smoke Operator")
     parser.add_argument(
+        "--role",
+        choices=(Role.OPERATOR.value, Role.ENGINEER.value),
+        default=Role.OPERATOR.value,
+        help="Scoped role to assign; engineer is required for probe/prompt Apply coverage.",
+    )
+    parser.add_argument(
         "--channel-id",
         default=os.getenv("EVOSSEARCH_LUXRIOT_DEFAULT_CHANNEL_ID", ""),
         help="Allowed channel id; defaults to EVOSSEARCH_LUXRIOT_DEFAULT_CHANNEL_ID.",
@@ -60,12 +66,12 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--password-env",
         default="EVA_LIVE_OPERATOR_PASSWORD",
-        help="Environment variable containing the operator password.",
+        help="Environment variable containing the smoke user's password.",
     )
     parser.add_argument(
         "--set-password",
         action="store_true",
-        help="Reset password even if the operator already exists.",
+        help="Reset password even if the smoke user already exists.",
     )
     parser.add_argument(
         "--base-url",
@@ -96,7 +102,7 @@ def _password(env_name: str) -> str:
     value = os.getenv(env_name, "")
     if value:
         return value
-    password = getpass.getpass(f"Password for smoke operator ({env_name}): ")
+    password = getpass.getpass(f"Password for smoke user ({env_name}): ")
     confirmation = getpass.getpass("Confirm password: ")
     if password != confirmation:
         raise SystemExit("Passwords do not match.")
@@ -140,7 +146,7 @@ def main(argv: list[str] | None = None) -> int:
                 actor_user_id=actor_id,
                 username=args.username,
                 password=password,
-                roles=[Role.OPERATOR.value],
+                roles=[args.role],
                 display_name=args.display_name,
                 allowed_channel_ids=[channel_id],
                 is_active=True,
@@ -149,7 +155,7 @@ def main(argv: list[str] | None = None) -> int:
         else:
             updates: dict[str, object] = {
                 "display_name": args.display_name,
-                "roles": [Role.OPERATOR.value],
+                "roles": [args.role],
                 "allowed_channel_ids": [channel_id],
                 "is_active": True,
             }
@@ -166,14 +172,15 @@ def main(argv: list[str] | None = None) -> int:
         pool.close()
 
     print(
-        f"Smoke operator {action}: tenant={tenant_id} "
+        f"Smoke user {action}: tenant={tenant_id} role={args.role} "
         f"user={record.username} id={record.user_id} channel={channel_id}"
     )
-    print("\n# restricted-help live-smoke:")
+    print("\n# live agent acceptance:")
     print(f"export EVA_LIVE_BASE_URL={args.base_url}")
     print(f"export EVA_LIVE_USER={record.username}")
     print(f"export EVA_LIVE_CHANNEL_REF={channel_id}")
-    print(f"export EVA_LIVE_INCLUDE=non_admin")
+    include = "non_admin" if args.role == Role.OPERATOR.value else "probe_apply,prompt_preview"
+    print(f"export EVA_LIVE_INCLUDE={include}")
     print(f"# export {args.password_env}=<operator password>")
     print(
         ".venv/bin/pytest -q tests/integration/test_live_agent.py -s"

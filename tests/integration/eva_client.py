@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import json
 import re
+import threading
 import time
 from collections import Counter
 from dataclasses import dataclass, field
@@ -25,7 +26,21 @@ from typing import Any, Dict, List, Optional, Tuple
 import requests
 
 
-def parse_sse_events(lines: Any) -> List[Dict[str, Any]]:
+class SseDeadlineExceeded(TimeoutError):
+    """Wall-clock deadline hit while heartbeats kept an SSE socket alive."""
+
+    def __init__(self, deadline_sec: float, events: List[Dict[str, Any]]) -> None:
+        self.deadline_sec = float(deadline_sec)
+        self.events = [dict(event) for event in events]
+        super().__init__(f"SSE wall-clock deadline exceeded after {deadline_sec:.3f}s")
+
+
+def parse_sse_events(
+    lines: Any,
+    *,
+    elapsed_fn: Optional[Any] = None,
+    deadline_sec: Optional[float] = None,
+) -> List[Dict[str, Any]]:
     """Parse an SSE byte/line stream into a list of decoded `data:` JSON events.
 
     Tolerant: ignores comment/heartbeat lines and non-JSON data payloads.
@@ -51,11 +66,32 @@ def parse_sse_events(lines: Any) -> List[Dict[str, Any]]:
             except json.JSONDecodeError:
                 continue
             if isinstance(obj, dict):
+                if callable(elapsed_fn):
+                    try:
+                        obj["_received_at_sec"] = round(
+                            max(0.0, float(elapsed_fn())),
+                            6,
+                        )
+                    except Exception:
+                        pass
                 events.append(obj)
                 if payload == payloads[0]:
                     return
 
+    def enforce_deadline() -> None:
+        if deadline_sec is None or not callable(elapsed_fn):
+            return
+        try:
+            elapsed = max(0.0, float(elapsed_fn()))
+        except Exception:
+            return
+        if elapsed < float(deadline_sec):
+            return
+        flush()
+        raise SseDeadlineExceeded(float(deadline_sec), events)
+
     for raw in lines:
+        enforce_deadline()
         if raw is None:
             continue
         line = raw.decode("utf-8", "ignore") if isinstance(raw, (bytes, bytearray)) else str(raw)
@@ -68,6 +104,7 @@ def parse_sse_events(lines: Any) -> List[Dict[str, Any]]:
         if not line.startswith("data:"):
             continue
         data_parts.append(line[len("data:"):].lstrip())
+    enforce_deadline()
     flush()
     return events
 
@@ -78,6 +115,7 @@ class Transcript:
 
     events: List[Dict[str, Any]] = field(default_factory=list)
     elapsed_seconds: float = 0.0
+    telemetry_samples: List[Dict[str, Any]] = field(default_factory=list)
 
     @property
     def tool_calls(self) -> List[Tuple[str, Dict[str, Any]]]:
@@ -174,6 +212,259 @@ class Transcript:
         return trace
 
     @property
+    def tool_timings(self) -> List[Dict[str, Any]]:
+        """Pair streamed calls/results and expose client-observed wall time.
+
+        This is deliberately transport-level timing. It includes gateway and
+        tool execution time, but excludes the model's decision before the call.
+        """
+
+        result_events_by_id = {
+            str(event.get("call_id")): event
+            for event in self.events
+            if event.get("type") == "tool_result" and event.get("call_id")
+        }
+        result_events_without_id: Dict[str, List[Dict[str, Any]]] = {}
+        for event in self.events:
+            if event.get("type") != "tool_result" or event.get("call_id"):
+                continue
+            result_events_without_id.setdefault(
+                str(event.get("name") or ""),
+                [],
+            ).append(event)
+
+        rows: List[Dict[str, Any]] = []
+        used_without_id: Counter[str] = Counter()
+        for event in self.events:
+            if event.get("type") != "tool_call":
+                continue
+            call_id = str(event.get("call_id") or "")
+            name = str(event.get("name") or "")
+            result_event = result_events_by_id.get(call_id) if call_id else None
+            if result_event is None and not call_id:
+                candidates = result_events_without_id.get(name) or []
+                index = used_without_id[name]
+                if index < len(candidates):
+                    result_event = candidates[index]
+                    used_without_id[name] += 1
+            started = _finite_number(event.get("_received_at_sec"))
+            completed = _finite_number(
+                result_event.get("_received_at_sec")
+                if isinstance(result_event, dict)
+                else None
+            )
+            row: Dict[str, Any] = {
+                "call_id": call_id or None,
+                "name": name,
+                "started_at_sec": started,
+                "completed_at_sec": completed,
+                "error": bool(result_event and result_event.get("error")),
+            }
+            if started is not None and completed is not None:
+                row["duration_ms"] = round(
+                    max(0.0, completed - started) * 1000.0,
+                    3,
+                )
+            rows.append(row)
+        return rows
+
+    @property
+    def exact_duplicate_tool_calls(self) -> List[Dict[str, Any]]:
+        seen: Counter[str] = Counter()
+        duplicates: List[Dict[str, Any]] = []
+        for name, args in self.tool_calls:
+            try:
+                key = json.dumps(
+                    [name, args],
+                    ensure_ascii=True,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                    default=str,
+                )
+            except Exception:
+                key = f"{name}:{args!r}"
+            seen[key] += 1
+            if seen[key] > 1:
+                duplicates.append({"name": name, "args": dict(args)})
+        return duplicates
+
+    @property
+    def admission_metrics(self) -> Dict[str, Any]:
+        """Summarize the LM admission queue sampled during this turn."""
+
+        samples: List[Dict[str, Any]] = []
+        errors = 0
+        for sample in self.telemetry_samples:
+            if sample.get("path") != "/lm/admission":
+                continue
+            payload = sample.get("payload")
+            if isinstance(payload, dict) and isinstance(payload.get("resources"), list):
+                samples.append(sample)
+            else:
+                errors += 1
+
+        # Heartbeats carry the exact agent resource even when the authenticated
+        # polling endpoint is unavailable. Fold them into the same format.
+        for event in self.events:
+            admission = event.get("lm_admission")
+            if event.get("type") != "heartbeat" or not isinstance(admission, dict):
+                continue
+            samples.append({
+                "path": "/lm/admission",
+                "at_sec": event.get("_received_at_sec"),
+                "payload": {"resources": [dict(admission)]},
+                "source": "sse_heartbeat",
+            })
+
+        resources: Dict[str, Dict[str, Any]] = {}
+        for sample in samples:
+            payload = sample.get("payload") or {}
+            for raw in payload.get("resources") or []:
+                if not isinstance(raw, dict):
+                    continue
+                resource = str(raw.get("resource") or "unknown")
+                row = resources.setdefault(resource, {
+                    "resource": resource,
+                    "sample_count": 0,
+                    "max_active": 0,
+                    "max_queued": 0,
+                    "max_oldest_queue_age_sec": 0.0,
+                    "first_counters": None,
+                    "last_counters": None,
+                    "first_average_wait_ms": 0.0,
+                    "last_average_wait_ms": 0.0,
+                })
+                row["sample_count"] += 1
+                row["max_active"] = max(
+                    int(row["max_active"]),
+                    int(_finite_number(raw.get("active")) or 0),
+                )
+                row["max_queued"] = max(
+                    int(row["max_queued"]),
+                    int(_finite_number(raw.get("queued")) or 0),
+                )
+                row["max_oldest_queue_age_sec"] = round(max(
+                    float(row["max_oldest_queue_age_sec"]),
+                    float(_finite_number(raw.get("oldest_queue_age_sec")) or 0.0),
+                ), 3)
+                counters = raw.get("counters")
+                if isinstance(counters, dict):
+                    normalized = {
+                        str(key): int(value)
+                        for key, value in counters.items()
+                        if _finite_number(value) is not None
+                    }
+                    if row["first_counters"] is None:
+                        row["first_counters"] = normalized
+                        row["first_average_wait_ms"] = float(
+                            _finite_number(raw.get("average_wait_ms")) or 0.0
+                        )
+                    row["last_counters"] = normalized
+                    row["last_average_wait_ms"] = float(
+                        _finite_number(raw.get("average_wait_ms")) or 0.0
+                    )
+
+        totals = {
+            "agent_admissions": 0,
+            "agent_queued": 0,
+            "agent_completed": 0,
+            "agent_failed": 0,
+            "agent_wait_ms_estimate": 0.0,
+            "max_active": 0,
+            "max_queued": 0,
+            "max_oldest_queue_age_sec": 0.0,
+        }
+        compact_resources: List[Dict[str, Any]] = []
+        for row in resources.values():
+            first = row.pop("first_counters") or {}
+            last = row.pop("last_counters") or {}
+            deltas = {
+                key: max(0, int(last.get(key, 0)) - int(first.get(key, 0)))
+                for key in set(first) | set(last)
+            }
+            admitted = deltas.get("admitted_agent", 0)
+            first_admitted = int(first.get("admitted_total", 0))
+            last_admitted = int(last.get("admitted_total", 0))
+            first_wait_total = float(row.pop("first_average_wait_ms")) * first_admitted
+            last_wait_total = float(row.pop("last_average_wait_ms")) * last_admitted
+            wait_delta = max(0.0, last_wait_total - first_wait_total)
+            agent_wait_estimate = (
+                wait_delta * admitted / max(1, deltas.get("admitted_total", 0))
+                if admitted
+                else 0.0
+            )
+            row["counter_delta"] = {
+                key: value for key, value in sorted(deltas.items()) if value
+            }
+            row["agent_wait_ms_estimate"] = round(agent_wait_estimate, 3)
+            totals["agent_admissions"] += admitted
+            totals["agent_queued"] += deltas.get("queued_agent", 0)
+            totals["agent_completed"] += deltas.get("completed_agent", 0)
+            totals["agent_failed"] += deltas.get("failed_agent", 0)
+            totals["agent_wait_ms_estimate"] += agent_wait_estimate
+            totals["max_active"] = max(totals["max_active"], int(row["max_active"]))
+            totals["max_queued"] = max(totals["max_queued"], int(row["max_queued"]))
+            totals["max_oldest_queue_age_sec"] = max(
+                totals["max_oldest_queue_age_sec"],
+                float(row["max_oldest_queue_age_sec"]),
+            )
+            compact_resources.append(row)
+        totals["agent_wait_ms_estimate"] = round(
+            float(totals["agent_wait_ms_estimate"]),
+            3,
+        )
+        totals["max_oldest_queue_age_sec"] = round(
+            float(totals["max_oldest_queue_age_sec"]),
+            3,
+        )
+        return {
+            "sample_count": len(samples),
+            "sample_errors": errors,
+            **totals,
+            "resources": sorted(compact_resources, key=lambda item: item["resource"]),
+        }
+
+    @property
+    def performance_metrics(self) -> Dict[str, Any]:
+        timings = self.tool_timings
+        timed_tool_ms = sum(
+            float(row.get("duration_ms") or 0.0)
+            for row in timings
+        )
+        received = [
+            float(value)
+            for value in (
+                _finite_number(event.get("_received_at_sec"))
+                for event in self.events
+            )
+            if value is not None
+        ]
+
+        def first_at(event_type: str) -> Optional[float]:
+            for event in self.events:
+                if event.get("type") != event_type:
+                    continue
+                value = _finite_number(event.get("_received_at_sec"))
+                if value is not None:
+                    return round(float(value), 6)
+            return None
+
+        return {
+            "elapsed_seconds": round(float(self.elapsed_seconds), 6),
+            "first_event_seconds": round(min(received), 6) if received else None,
+            "first_tool_call_seconds": first_at("tool_call"),
+            "first_text_seconds": first_at("text"),
+            "done_seconds": first_at("done"),
+            "tool_wall_ms": round(timed_tool_ms, 3),
+            "non_tool_wall_ms": round(
+                max(0.0, float(self.elapsed_seconds) * 1000.0 - timed_tool_ms),
+                3,
+            ),
+            "tool_timings": timings,
+            "lm_admission": self.admission_metrics,
+        }
+
+    @property
     def dangling_tool_calls(self) -> List[str]:
         """Return calls that never received a matching tool_result event."""
 
@@ -226,9 +517,28 @@ class Transcript:
         ids: List[str] = []
         for _n, result, _err in self.tool_results:
             if isinstance(result, dict):
-                approval = result.get("approval")
-                if isinstance(approval, dict) and approval.get("plan_id"):
-                    ids.append(str(approval["plan_id"]))
+                for key in ("approval", "action_plan"):
+                    approval = result.get(key)
+                    if isinstance(approval, dict) and approval.get("plan_id"):
+                        plan_id = str(approval["plan_id"])
+                        if plan_id not in ids:
+                            ids.append(plan_id)
+        return ids
+
+    def approval_plan_ids_for(self, tool_name: str) -> List[str]:
+        """Return approval IDs produced by one exact tool."""
+
+        ids: List[str] = []
+        for name, result, _err in self.tool_results:
+            if name != tool_name or not isinstance(result, dict):
+                continue
+            for key in ("approval", "action_plan"):
+                approval = result.get(key)
+                if not isinstance(approval, dict) or not approval.get("plan_id"):
+                    continue
+                plan_id = str(approval["plan_id"])
+                if plan_id not in ids:
+                    ids.append(plan_id)
         return ids
 
     def prose_has(self, pattern: str) -> bool:
@@ -246,17 +556,40 @@ def combine_transcripts(transcripts: List[Transcript]) -> Transcript:
     if not transcripts:
         return Transcript()
     events: List[Dict[str, Any]] = []
-    for transcript in transcripts[:-1]:
-        events.extend(
-            event
-            for event in transcript.events
-            if event.get("type") not in {"text", "session", "done"}
-        )
-    events.extend(transcripts[-1].events)
+    telemetry: List[Dict[str, Any]] = []
+    offset = 0.0
+    for index, transcript in enumerate(transcripts):
+        is_last = index == len(transcripts) - 1
+        for raw_event in transcript.events:
+            if not is_last and raw_event.get("type") in {"text", "session", "done"}:
+                continue
+            event = dict(raw_event)
+            received = _finite_number(event.get("_received_at_sec"))
+            if received is not None:
+                event["_received_at_sec"] = round(offset + received, 6)
+            events.append(event)
+        for raw_sample in transcript.telemetry_samples:
+            sample = dict(raw_sample)
+            sampled_at = _finite_number(sample.get("at_sec"))
+            if sampled_at is not None:
+                sample["at_sec"] = round(offset + sampled_at, 6)
+            telemetry.append(sample)
+        offset += float(transcript.elapsed_seconds)
     return Transcript(
         events=events,
-        elapsed_seconds=sum(item.elapsed_seconds for item in transcripts),
+        elapsed_seconds=offset,
+        telemetry_samples=telemetry,
     )
+
+
+def _finite_number(value: Any) -> Optional[float]:
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    if number != number or abs(number) == float("inf"):
+        return None
+    return number
 
 
 class EvaSession:
@@ -295,7 +628,16 @@ class EvaSession:
             timeout=self.timeout,
         )
         resp.raise_for_status()
-        return resp.json()
+        payload = resp.json()
+        # Site-specific deployments deliberately rename the CSRF cookie.  The
+        # authenticated contract tells clients the effective name; learning it
+        # here keeps the harness aligned with the same runtime ground truth as
+        # the React client instead of assuming the development default.
+        if isinstance(payload, dict):
+            csrf_cookie = str(payload.get("csrfCookie") or "").strip()
+            if csrf_cookie:
+                self.csrf_cookie = csrf_cookie
+        return payload
 
     def whoami(self) -> Dict[str, Any]:
         resp = self.http.get(f"{self.base_url}/auth/me", timeout=self.timeout)
@@ -322,13 +664,88 @@ class EvaSession:
             raise TypeError(f"{normalized} returned {type(payload).__name__}, expected object")
         return payload
 
-    def ask(self, message: str, session_id: Optional[str] = None, image_b64: Optional[str] = None) -> Transcript:
+    def post_json(
+        self,
+        path: str,
+        *,
+        body: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        """POST one authenticated frontend endpoint and require an object response."""
+
+        normalized = "/" + str(path or "").lstrip("/")
+        resp = self.http.post(
+            f"{self.base_url}{normalized}",
+            json=body or {},
+            headers=self._csrf_headers(),
+            timeout=self.timeout,
+        )
+        try:
+            payload = resp.json()
+        except ValueError:
+            payload = {"raw": resp.text[:500]}
+        if not isinstance(payload, dict):
+            raise TypeError(f"{normalized} returned {type(payload).__name__}, expected object")
+        return {"status": resp.status_code, **payload}
+
+    def ask(
+        self,
+        message: str,
+        session_id: Optional[str] = None,
+        image_b64: Optional[str] = None,
+        *,
+        operator_mode: bool = False,
+        console_context: Optional[Dict[str, Any]] = None,
+        telemetry_interval_sec: float = 0.25,
+    ) -> Transcript:
         body: Dict[str, Any] = {"message": message}
         if session_id:
             body["session_id"] = session_id
         if image_b64:
             body["image_b64"] = image_b64
+        if operator_mode:
+            body["operator_mode"] = True
+        if isinstance(console_context, dict):
+            body["console_context"] = dict(console_context)
         started = time.monotonic()
+        telemetry_samples: List[Dict[str, Any]] = []
+        telemetry_stop = threading.Event()
+        telemetry_interval = max(0.1, min(5.0, float(telemetry_interval_sec)))
+
+        def sample_admission() -> None:
+            http = requests.Session()
+            http.verify = self.verify_tls
+            http.cookies.update(self.http.cookies)
+            try:
+                while not telemetry_stop.is_set():
+                    sampled_at = max(0.0, time.monotonic() - started)
+                    try:
+                        response = http.get(
+                            f"{self.base_url}/lm/admission",
+                            timeout=min(self.timeout, 5.0),
+                        )
+                        payload = response.json()
+                        telemetry_samples.append({
+                            "path": "/lm/admission",
+                            "at_sec": round(sampled_at, 6),
+                            "status": response.status_code,
+                            "payload": payload if isinstance(payload, dict) else {},
+                        })
+                    except Exception as exc:
+                        telemetry_samples.append({
+                            "path": "/lm/admission",
+                            "at_sec": round(sampled_at, 6),
+                            "error": f"{type(exc).__name__}: {exc}"[:300],
+                        })
+                    telemetry_stop.wait(telemetry_interval)
+            finally:
+                http.close()
+
+        sampler = threading.Thread(
+            target=sample_admission,
+            name="eva-live-agent-admission-sampler",
+            daemon=True,
+        )
+        sampler.start()
         resp = self.http.post(
             f"{self.base_url}/agent/chat",
             json=body,
@@ -336,10 +753,39 @@ class EvaSession:
             stream=True,
             timeout=self.timeout,
         )
-        resp.raise_for_status()
+        try:
+            try:
+                resp.raise_for_status()
+            except requests.HTTPError as exc:
+                detail = resp.text.strip()[:500]
+                raise requests.HTTPError(
+                    f"{exc}; response={detail}",
+                    response=resp,
+                ) from exc
+            events = parse_sse_events(
+                resp.iter_lines(),
+                elapsed_fn=lambda: time.monotonic() - started,
+                deadline_sec=self.timeout,
+            )
+            elapsed = time.monotonic() - started
+        except SseDeadlineExceeded as exc:
+            elapsed = time.monotonic() - started
+            events = list(exc.events)
+            events.append({
+                "type": "error",
+                "error": "wall_clock_deadline_exceeded",
+                "message": str(exc),
+                "deadline_seconds": round(float(exc.deadline_sec), 3),
+                "_received_at_sec": round(float(elapsed), 6),
+            })
+        finally:
+            resp.close()
+            telemetry_stop.set()
+            sampler.join(timeout=6.0)
         return Transcript(
-            events=parse_sse_events(resp.iter_lines()),
-            elapsed_seconds=time.monotonic() - started,
+            events=events,
+            elapsed_seconds=elapsed,
+            telemetry_samples=telemetry_samples,
         )
 
     def apply_plan(self, plan_id: str, session_id: Optional[str] = None) -> Dict[str, Any]:

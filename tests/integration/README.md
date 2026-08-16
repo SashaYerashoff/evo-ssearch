@@ -1,15 +1,20 @@
 # Live agent integration smoke
 
 Acceptance smoke that drives the **real running agent** over its HTTP/SSE
-contract and asserts **structure** (tool calls + `tool_result` fields), not LLM
-prose. Golden/unit tests gate the build; this is acceptance — opt-in, never in
-the default suite so model variability can't flake CI.
+contract and asserts **structure** (tool calls + `tool_result` fields), while
+also scoring prose quality and tool efficiency for model comparison. Golden/unit
+tests gate the build; this is acceptance — opt-in, never in the default suite so
+model variability can't flake CI.
 
 Each scenario starts in a fresh agent session. Intentional multi-turn workflows
 declare their setup turns in the scenario catalog, so results are not silently
 contaminated by earlier, unrelated tests. The checker fails on an SSE stream
 without `done`, dangling tool calls, tool/context-budget exhaustion, a scenario's
 tool-count ceiling, invalid tool order, or a missing trusted UI projection.
+During each turn it samples `/lm/admission`, timestamps every SSE/tool event and
+records first-event/first-tool/first-text latency, per-tool wall time, sampled
+queue depth/age, admission counters, result/context size, duplicate calls, and
+the final generation rubric.
 
 ## Principle
 - **Don't disable the secure gates.** Use an **admin** account, but keep
@@ -20,17 +25,31 @@ tool-count ceiling, invalid tool order, or a missing trusted UI projection.
 - **Assert structure, not mood.** Tool-call sequence, `safe_to_apply`,
   `calibration_status`, `recommended_probe_args`, `restricted_matches`,
   `delivery_status`, and the action receipt are deterministic given the tools.
-  Prose checks are *soft warnings*.
+  Prose checks are *soft warnings*. The 0–100 generation score penalizes missing
+  requested facts, repetition, protocol leakage, unexpected CJK output and
+  excessive length; it is a reproducible comparison signal, not a judge of
+  scene truth.
 
 ## Setup (dev box)
 1. Service running (e.g. `https://127.0.0.1:5443`), secure mode on.
 2. Admin user: `python scripts/bootstrap_admin.py` (see admin_guide).
-3. For the redirect scenario, also create an **operator** (non-admin) account:
+3. For read/write scenarios, use an admin or dedicated **engineer** account.
+   The `probe_apply` workflow creates one disabled, non-bookmarking probe,
+   verifies it after UI Apply and deletes only that exact test probe by ID.
+   A scoped test engineer can be bootstrapped without changing normal users:
+   ```bash
+   EVA_LIVE_ENGINEER_PASSWORD='...' \
+   .venv/bin/python scripts/bootstrap_live_smoke_operator.py \
+     --role engineer --username engineer-smoke \
+     --display-name 'Live Acceptance Engineer' --channel-id 112 \
+     --password-env EVA_LIVE_ENGINEER_PASSWORD --set-password
+   ```
+4. For the redirect scenario, also create an **operator** (non-admin) account:
    ```bash
    EVA_LIVE_OPERATOR_PASSWORD='...' \
    .venv/bin/python scripts/bootstrap_live_smoke_operator.py --channel-id 112 --set-password
    ```
-4. For deterministic archive needle/calibration scenarios, seed the provided
+5. For deterministic archive needle/calibration scenarios, seed the provided
    archive/probe fixtures. The separate `summary_seed` tag is only for an
    environment where a known prose-only summary fixture has also been loaded;
    `seed_demo_fixtures.py` intentionally does not mutate summary history.
@@ -42,11 +61,12 @@ EVA_LIVE_USER=admin EVA_LIVE_PASSWORD='...' \
 EVA_LIVE_CHANNEL_REF='Zenbook webcam' \
 EVA_LIVE_NEEDLE_QUERY='person lying on the ground at night' \
 EVA_LIVE_PROBE_NAME='smoke: thumbs up gesture' \
-EVA_LIVE_INCLUDE=seed \
-EVA_LIVE_REPORT_PATH=/tmp/eva-agent-core.json \
+EVA_LIVE_INCLUDE=seed,probe_apply,prompt_preview \
+EVA_LIVE_REPORT_PATH=artifacts/agent_acceptance/qwen-current.json \
 .venv/bin/pytest -q tests/integration/test_live_agent.py -s
 ```
-- `EVA_LIVE_INCLUDE` lists prerequisite tags you've set up (`seed`, `non_admin`).
+- `EVA_LIVE_INCLUDE` lists prerequisite tags you've set up (`seed`, `non_admin`,
+  `probe_apply`, `prompt_preview`, `incident_preview`, `incident`, `deploy`).
   Scenarios needing an unmet tag are skipped (not failed).
 - Do not combine `EVA_LIVE_USER=admin` with `EVA_LIVE_INCLUDE=non_admin`.
   Run restricted-help coverage as a separate pass with an operator account:
@@ -63,14 +83,23 @@ EVA_LIVE_REPORT_PATH=/tmp/eva-agent-core.json \
 - `EVA_LIVE_PROBE_NAME` is the seeded/configured probe used by the calibration scenario.
 - `EVA_LIVE_SCENARIOS` optionally runs a comma-separated subset by exact name.
 - `EVA_LIVE_REPORT_PATH` writes a comparison-friendly JSON report containing
-  outcome, latency, tool count/sequence, compact per-call result sizes,
-  server-reported context metrics, budget stops, UI effects, warnings, and final
-  answer. This makes context growth and repeated-tool loops diagnosable without
-  relying on model prose.
+  outcome, first-token/tool and total latency, tool count/sequence/wall time,
+  sampled LM admission queue, compact per-call result sizes, server-reported
+  context metrics, budget stops, UI effects, workflow receipts, quality and
+  efficiency scores, warnings, and final answer. A Markdown sibling is emitted
+  automatically.
+- `EVA_LIVE_OPERATOR_MODE=true` (the default) exercises the actual
+  operator-mode agent contract. Set it false only for an explicit comparison.
+- `EVA_LIVE_TELEMETRY_INTERVAL=0.25` controls admission sampling; spikes shorter
+  than the interval can still be missed.
 - `EVA_LIVE_TIMEOUT` is the per-turn HTTP/SSE timeout in seconds (default `300`).
+  It is a real wall-clock deadline: SSE heartbeats cannot keep a stuck turn
+  alive forever, and partial tool events remain in the report on expiry.
 - `EVA_LIVE_INCIDENT_ID` supplies the existing incident used by the opt-in
   `follow_incident_stays_preview_only` scenario.
-- `EVA_LIVE_CSRF_COOKIE` overrides the CSRF cookie name (default `eva_csrf`).
+- The client learns the effective CSRF cookie name from `/auth/login`, matching
+  site-specific deployments. `EVA_LIVE_CSRF_COOKIE` only supplies the initial
+  fallback (default `eva_csrf`).
 - `EVA_LIVE_VERIFY_TLS=1` enables TLS verification. By default the smoke accepts
   the local self-signed dev certificate.
 
@@ -85,18 +114,41 @@ receipt = session.apply_plan(plan_id, session_id=t.session_id)   # simulates UI 
 t2 = session.ask("did that apply?", session_id=t.session_id)     # must report applied (with receipt)
 ```
 
+The tagged `probe_apply` scenario performs this round-trip itself. It refuses to
+apply a draft unless name, P/N semantics, floor, margin and disabled
+bookmark/enabled flags are exact. A pre-existing probe with the acceptance name
+is treated as a fixture collision and is never silently overwritten or deleted.
+
+## Compare models
+
+Save one report per model/hardware run without changing the scenario catalog,
+then compare them:
+
+```bash
+.venv/bin/python scripts/compare_agent_acceptance.py \
+  artifacts/agent_acceptance/qwen-5060ti.json \
+  artifacts/agent_acceptance/qwen-gb10.json
+```
+
+The model summary exposes pass rate, p50/p95, generation quality, tool
+efficiency, total tools/LM admissions and max sampled queue; the second table
+keeps per-scenario regressions visible instead of hiding them in an average.
+
 ## What is / isn't covered here
 - **Covered (live):** tool wiring, SSE streaming, auth/CSRF, the structural
   contracts above, isolated and explicit multi-turn sessions, overnight review,
   recent-alert research, transition/dwell counting, trusted Archive UI effects,
-  the preview/apply lifecycle, broad-channel chunking, and opt-in incident/deploy
-  workflows.
+  exact-window archive and summary search, activity/system/event reports,
+  probe preview/apply/persistence/cleanup, VLM alert-policy preview, the trusted
+  user-interface effect envelope, broad-channel chunking, and opt-in
+  incident/deploy workflows.
 - **Not here (build-gating golden/unit):** calibration verdict math, negation
   rejection, provenance/`delivery_status`, transition debounce, the status
   digest — those are deterministic and live in the normal pytest suite.
-- **Browser-only (manual / Playwright later):** rendered cards, role-based UI
-  hiding, the physical Apply button. The Apply *receipt* itself is API-testable
-  (above), so the browser layer is a thin visual smoke.
+- **Browser-only (manual / Playwright later):** pixels, role-based UI hiding and
+  the physical click target. The harness does require the same trusted target,
+  action and payload that the React console consumes; it therefore catches a
+  backend/UI projection gap before the final visual smoke.
 
 `test_sse_parser.py` here is deterministic and **does** run in the normal suite —
 it regression-covers the harness (parser + scenario checker) without a live service.

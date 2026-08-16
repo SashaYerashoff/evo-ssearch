@@ -3152,3 +3152,112 @@ truncation tails; repeat representative Georgia-scene quality checks without
 unsupported intent wording; decide whether the agent profile is a required
 readiness gate; and perform the final two-server Georgia topology preflight
 while preserving every existing endpoint, context, capacity and `.env` value.
+
+## 2026-08-15 supervised agent acceptance baseline on RTX 5060 Ti
+
+The operator/agent requirements discussed during stabilization are now an
+opt-in live acceptance matrix rather than an informal checklist. The harness
+drives the real authenticated `/agent/chat` SSE route with operator mode enabled
+and covers:
+
+- exact-window archive image search plus trusted Archive projection;
+- exact-window video-summary research plus Stream Review projection;
+- turnkey semantic-probe preview, UI Apply, persisted-value verification and
+  exact-ID cleanup;
+- read-before-write VLM alert-policy preview plus Stream Settings projection;
+- recent alerts/notable events, video-description health, activity reports and
+  current runtime status;
+- calibration, chat-apply refusal, help routing, broad-channel chunking and
+  visual-state transition counting;
+- existing opt-in incident and deployment scenarios when their disposable
+  fixtures are explicitly enabled.
+
+Each turn records client-observed first event/tool/text, total and per-tool wall
+time, tool order/count/duplicate calls, compact result/context size, resource-wide
+`/lm/admission` samples, sampled queue depth/age, a deterministic generation
+quality rubric and a tool-efficiency score. JSON and Markdown reports use the
+same schema across models. `scripts/compare_agent_acceptance.py` prints model and
+per-scenario comparison tables.
+
+Two harness defects were found and fixed before accepting the baseline. The
+client now learns the site-specific CSRF cookie name from `/auth/login` instead
+of assuming `eva_csrf`. It also enforces a real SSE wall-clock deadline;
+heartbeats can no longer keep a stuck turn alive forever, and partial events are
+retained on expiry. The scoped bootstrap helper now supports either operator or
+engineer roles. A dedicated `engineer-smoke` user remains in the rehearsal DB,
+limited to channel 112; its generated password was ephemeral and must be reset
+with the helper for a later run. No ordinary account was changed.
+
+The repeatable baseline used the current local RTX 5060 Ti agent profile:
+
+```text
+agent profile/model: qwen3.5-9b-mtp at 127.0.0.1:1235
+executed:            15 (10 pass, 5 structural fail; 6 fixture-gated skipped)
+latency min/p50/p95: 14.508 / 49.598 / 96.163 seconds
+latency max:         100.369 seconds
+quality/efficiency:  91.33 / 96.50
+tool calls:          25
+agent admissions:    27 (resource-wide counter delta)
+sampled queue max:   2; oldest sampled age 24.905 seconds
+estimated wait:      26.882 seconds total across observed agent admissions
+```
+
+Most elapsed time was agent inference/decision time, not domain tools. Examples:
+`apply_directly_is_refused_in_chat` spent 94.112/94.360 seconds outside its
+247 ms tool call; the missing-tool VLM-policy turn spent all 81.701 seconds in
+the agent; probe drafting spent 61.000/62.935 seconds outside the 1.935-second
+tool. The genuinely tool-heavy outliers were visual transition counting
+(44.004 seconds of 89.063) and archive search/vision verification (20.260 of
+45.148). A prior exploratory calibration turn took 417 seconds, while the final
+controlled baseline passed in 49.598 seconds with only 1.264 seconds of measured
+tool wall time. Treat that as a real variance/overlap signal, not a stable SigLIP
+cost.
+
+The five structural failures are concrete comparison targets for the next
+model:
+
+1. Probe drafting and secure Apply succeeded, the exact disabled/non-bookmarking
+   probe was present in `/probes/list`, and cleanup succeeded. The preview SSE
+   effect did not contain `probes:show_preview` with enough P/N/threshold state
+   to open a prefilled React editor. This is a backend/UI projection seam, not a
+   failure to author or persist the probe.
+2. The model selected no tool for the VLM alert-policy request, so it never read
+   effective settings, never prepared the narrow preview and never produced
+   `video:show_prompt_preview`.
+3. The overnight workflow retrieved summaries before normalizing the requested
+   rolling 24-hour window, then normalized and repeated the retrieval. The final
+   answer was useful, but the plan order was inefficient and unsafe as a frozen
+   scope contract.
+4. The UI how-to request selected no `lookup_help` tool.
+5. The activity request used `normalize_time_window` plus
+   `get_video_summaries` rather than the requested scoped `generate_report`
+   contract. Its prose also mixed the displayed UTC hour with event times outside
+   that displayed hour; the stored answer needs human grounding review even
+   though the current lexical quality rubric scored it highly.
+
+Two non-structural quality warnings remain: the safe chat-apply refusal did not
+explicitly tell the operator about Preview/Apply, and the pipeline-health report
+did not clearly separate parse, delivery, cooldown/disabled and sent state.
+The deterministic quality score is therefore only a reproducible model-comparison
+signal, not proof of factual grounding; full answers remain in the JSON.
+
+The baseline artifacts are:
+
+```text
+artifacts/agent_acceptance/2026-08-15-qwen35-9b-5060ti.json
+artifacts/agent_acceptance/2026-08-15-qwen35-9b-5060ti.md
+```
+
+The final probe workflow receipt records `persisted=true`,
+`cleanup_succeeded=true` and HTTP 200 for both Apply and cleanup. The rehearsal
+returned `/ready=200` throughout the completed matrix. Its `.env` was not edited
+and still hashes to
+`36f1163baeedbde90352d252dedc426978ed5a5d25864606732a7472d720fdde`.
+
+For the Dell/GB10 run, change only the agent inference profile through the
+intended settings/config path, preserve the scenario catalog and report one file
+per model. First run the same 15-scenario core with `probe_apply,prompt_preview`;
+then add seeded archive/summary, operator-RBAC, disposable incident and deployment
+tags in separate fixture-controlled passes. Compare pass rate and per-scenario
+tool plans before looking at aggregate latency. Do not interpret skipped fixture
+scenarios as passes or failures.
