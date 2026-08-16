@@ -153,6 +153,15 @@ if [[ -n "${SIGLIP2_CACHE_REPO}" ]]; then
     fail "SigLIP2 cache repository is incomplete: ${SIGLIP2_CACHE_REPO}"
     exit 1
   }
+  SIGLIP2_REVISION="75de2d55ec2d0b4efc50b3e9ad70dba96a7b2fa2"
+  SIGLIP2_SNAPSHOT="${SIGLIP2_CACHE_REPO}/snapshots/${SIGLIP2_REVISION}"
+  for required in config.json model.safetensors preprocessor_config.json tokenizer.json tokenizer_config.json; do
+    [[ -s "${SIGLIP2_SNAPSHOT}/${required}" ]] || {
+      fail "SigLIP2 revision ${SIGLIP2_REVISION} is missing ${required}"
+      exit 1
+    }
+  done
+  need_cmd sha256sum
 fi
 
 TMP_DIR="$(mktemp -d)"
@@ -368,7 +377,14 @@ if [[ -n "${SIGLIP2_CACHE_REPO}" ]]; then
     fail "SigLIP2 cache has no materialized snapshot"
     exit 1
   }
-  ok "SigLIP2 offline model included"
+  (
+    cd "${BUNDLE_DIR}/models/huggingface"
+    find models--google--siglip2-base-patch16-224 -type f -print0 \
+      | sort -z \
+      | xargs -0 sha256sum > SHA256SUMS
+    sha256sum -c SHA256SUMS >/dev/null
+  )
+  ok "checksummed SigLIP2 offline model included"
 fi
 
 {

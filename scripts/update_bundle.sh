@@ -1,16 +1,17 @@
 #!/usr/bin/env bash
 # EVA AI 0.8.7 post-migration adopt upgrade from an unpacked offline bundle.
 #
-# Model/server policy: the preflight only *describes* the configured LM
-# topology (remote vLLM for VLM streams, local LM Studio/llama.cpp for the
-# agent). Configuration that cannot be verified produces warnings, never a
-# stop, and the updater never writes model or server settings.
+# Inference policy: external agent/VLM endpoints are described and fingerprint-
+# protected.  The local semantic backend is a separate release-owned contract:
+# the known 0.8.1 OpenAI CLIP default is migrated to the bundled SigLIP2 model.
 
 set -Eeuo pipefail
 umask 077
 
 EXPECTED_VERSION="β 0.8.7"
 EXPECTED_SCHEMA="20260805_0013"
+SIGLIP2_MODEL="google/siglip2-base-patch16-224"
+SIGLIP2_REVISION="75de2d55ec2d0b4efc50b3e9ad70dba96a7b2fa2"
 MODE="auto"
 APP_DIR=""
 ENV_FILE=""
@@ -29,6 +30,8 @@ else
   exit 1
 fi
 SOURCE_DIR="${BUNDLE_DIR}/repo"
+SIGLIP2_CACHE_ROOT="${BUNDLE_DIR}/models/huggingface"
+SIGLIP2_SOURCE="${SIGLIP2_CACHE_ROOT}/models--google--siglip2-base-patch16-224"
 
 usage() {
   cat <<'USAGE'
@@ -287,6 +290,55 @@ if [[ -z "$(read_env_value EVOSSEARCH_ARCHIVE_RETENTION_ENABLED)" \
   printf 'WARN: legacy config has no archive retention policy; this update will disable automatic pruning to prevent silent evidence loss.\n' >&2
   printf '      Review retention in Settings after the archive has been validated.\n' >&2
 fi
+
+CURRENT_CLIP_MODEL="$(read_env_value EVOSSEARCH_CLIP_MODEL)"
+CURRENT_PRODUCTION_CLIP_MODEL="$(read_env_value EVOSSEARCH_PRODUCTION_CLIP_MODEL)"
+ACTIVE_SEMANTIC_MODEL="${CURRENT_CLIP_MODEL:-${CURRENT_PRODUCTION_CLIP_MODEL}}"
+SEMANTIC_MIGRATION_REQUIRED=false
+SIGLIP2_RUNTIME_REQUIRED=false
+CUSTOM_SEMANTIC_MODEL=""
+for candidate_model in "${CURRENT_CLIP_MODEL}" "${CURRENT_PRODUCTION_CLIP_MODEL}"; do
+  case "${candidate_model,,}" in
+    ""|vit-b/32|vit-b-32|openai/clip-vit-base-patch32|google/siglip2-base-patch16-224) ;;
+    *) CUSTOM_SEMANTIC_MODEL="${candidate_model}" ;;
+  esac
+done
+case "${CUSTOM_SEMANTIC_MODEL:-${ACTIVE_SEMANTIC_MODEL,,}}" in
+  ""|vit-b/32|vit-b-32|openai/clip-vit-base-patch32)
+    SEMANTIC_MIGRATION_REQUIRED=true
+    SIGLIP2_RUNTIME_REQUIRED=true
+    ;;
+  google/siglip2-base-patch16-224)
+    SIGLIP2_RUNTIME_REQUIRED=true
+    ;;
+  *)
+    printf 'WARN: preserving explicit custom semantic model %s; bundled SigLIP2 will not replace it.\n' \
+      "${ACTIVE_SEMANTIC_MODEL}" >&2
+    ;;
+esac
+if [[ "${SIGLIP2_RUNTIME_REQUIRED}" == true ]]; then
+  CURRENT_CLIP_REVISION="$(read_env_value EVOSSEARCH_CLIP_MODEL_REVISION)"
+  if [[ "${SEMANTIC_MIGRATION_REQUIRED}" != true \
+     && -n "${CURRENT_CLIP_REVISION}" \
+     && "${CURRENT_CLIP_REVISION}" != "${SIGLIP2_REVISION}" ]]; then
+    stop "configured SigLIP2 revision ${CURRENT_CLIP_REVISION} is not the bundled release revision ${SIGLIP2_REVISION}"
+  fi
+  MODEL_CACHE_DIR="$(read_env_value EVOSSEARCH_MODEL_CACHE_DIR)"
+  if [[ -z "${MODEL_CACHE_DIR}" ]]; then
+    if [[ "${MODE}" == "user" ]]; then
+      MODEL_CACHE_DIR="${APP_DIR}/.local/models/huggingface"
+    else
+      MODEL_CACHE_DIR="/var/lib/eva-ai/models/huggingface"
+    fi
+  fi
+  [[ "${MODEL_CACHE_DIR}" == /* && "${MODEL_CACHE_DIR}" != "/" ]] \
+    || stop "EVOSSEARCH_MODEL_CACHE_DIR must be a safe absolute path"
+  if [[ "${SEMANTIC_MIGRATION_REQUIRED}" == true ]]; then
+    ok "semantic migration planned: ${ACTIVE_SEMANTIC_MODEL:-implicit OpenAI CLIP} -> ${SIGLIP2_MODEL}"
+  else
+    ok "SigLIP2 semantic backend already selected; offline cache will be reconciled"
+  fi
+fi
 [[ -f "${SOURCE_DIR}/VERSION" ]] || stop "bundle VERSION is missing"
 [[ "$(tr -d '\r\n' < "${SOURCE_DIR}/VERSION")" == "${EXPECTED_VERSION}" ]] || stop "bundle VERSION is not ${EXPECTED_VERSION}"
 [[ -f "${SOURCE_DIR}/react-ui/dist/index.html" ]] \
@@ -296,10 +348,12 @@ MANIFEST_STATUS="$(sed -n 's/^working_tree_status=//p' "${BUNDLE_DIR}/manifest.t
 BUNDLE_COMMIT="$(sed -n 's/^git_commit=//p' "${BUNDLE_DIR}/manifest.txt" | tail -n 1)"
 MEDIA_RUNTIME="$(sed -n 's/^media_runtime=//p' "${BUNDLE_DIR}/manifest.txt" | tail -n 1)"
 MEDIA_PLATFORM="$(sed -n 's/^media_runtime_platform=//p' "${BUNDLE_DIR}/manifest.txt" | tail -n 1)"
+SIGLIP2_PAYLOAD="$(sed -n 's/^siglip2_model=//p' "${BUNDLE_DIR}/manifest.txt" | tail -n 1)"
 [[ "${MANIFEST_VERSION}" == "${EXPECTED_VERSION}" ]] || stop "manifest version is not ${EXPECTED_VERSION}"
 [[ "${MANIFEST_STATUS}" == "clean" ]] || stop "bundle was built from a dirty working tree"
 [[ "${BUNDLE_COMMIT}" =~ ^[0-9a-f]{40}$ ]] || stop "manifest git_commit is missing or invalid"
 [[ "${MEDIA_RUNTIME}" == "included" ]] || stop "offline FFmpeg/OpenCV runtime is missing from this bundle"
+[[ "${SIGLIP2_PAYLOAD}" == "included" ]] || stop "offline SigLIP2 model is missing from this bundle"
 [[ "${MEDIA_PLATFORM}" == "linux-x86_64" && "$(uname -m)" == "x86_64" ]] \
   || stop "media runtime requires Linux x86_64"
 [[ -x "${BUNDLE_DIR}/runtime/ffmpeg/bin/ffmpeg" ]] || stop "bundled ffmpeg is missing"
@@ -315,6 +369,19 @@ MEDIA_PLATFORM="$(sed -n 's/^media_runtime_platform=//p' "${BUNDLE_DIR}/manifest
 "${BUNDLE_DIR}/runtime/ffmpeg/bin/ffprobe" -version >/dev/null \
   || stop "bundled ffprobe failed to start"
 ok "offline FFmpeg/ffprobe payload is intact and executable"
+
+[[ -s "${SIGLIP2_CACHE_ROOT}/SHA256SUMS" ]] \
+  || stop "offline SigLIP2 checksum manifest is missing"
+SIGLIP2_SNAPSHOT="${SIGLIP2_SOURCE}/snapshots/${SIGLIP2_REVISION}"
+for required in config.json model.safetensors preprocessor_config.json tokenizer.json tokenizer_config.json; do
+  [[ -s "${SIGLIP2_SNAPSHOT}/${required}" ]] \
+    || stop "offline SigLIP2 revision ${SIGLIP2_REVISION} is missing ${required}"
+done
+(
+  cd "${SIGLIP2_CACHE_ROOT}"
+  sha256sum -c SHA256SUMS >/dev/null
+) || stop "offline SigLIP2 checksum verification failed"
+ok "offline SigLIP2 ${SIGLIP2_REVISION:0:12} payload is intact"
 
 DEPLOYED_VERSION="$(tr -d '\r\n' < "${APP_DIR}/VERSION" 2>/dev/null || true)"
 [[ -n "${DEPLOYED_VERSION}" ]] || stop "installed VERSION is missing; cannot create a verifiable rollback handoff"
@@ -512,7 +579,7 @@ if [[ -n "${ACTIVE_RUNTIME_AGENT_BASE_URL}" && -n "${AGENT_LM_BASE_URL}" \
   ENDPOINTS_UNDERSTOOD=false
   printf 'WARN: selected config does not match the active runtime agent profile (%s != %s).\n' \
     "${AGENT_LM_BASE_URL%/}" "${ACTIVE_RUNTIME_AGENT_BASE_URL%/}" >&2
-  printf '      Continuing; this updater never rewrites model or server endpoints, so the running configuration stays authoritative.\n' >&2
+  printf '      Continuing; this updater never rewrites agent/VLM model or server endpoints, so the running topology stays authoritative.\n' >&2
 fi
 if [[ -n "${ACTIVE_RUNTIME_LUXRIOT_BASE_URL}" && -n "${LUXRIOT_BASE_URL}" \
   && "${ACTIVE_RUNTIME_LUXRIOT_BASE_URL%/}" != "${LUXRIOT_BASE_URL%/}" ]]; then
@@ -580,7 +647,7 @@ PY
 fi
 
 say "Model/server configuration preflight (read-only)"
-printf 'This updater never writes model or server settings; every finding below is informational.\n'
+printf 'Agent/VLM endpoints and models are read-only here; local CLIP-to-SigLIP2 migration is reported separately.\n'
 if [[ -z "${CONFIGURED_AGENT_MODEL}" ]]; then
   if [[ -n "${LEGACY_AGENT_MODEL}" ]]; then
     printf 'WARN: Agent model is set only in the legacy %s/.env (%s), not in %s; EVA keeps using its configured defaults.\n' \
@@ -659,7 +726,7 @@ if [[ -n "${CONFIGURED_LM_PROFILE_IDS}" ]]; then
 else
   printf 'WARN: EVOSSEARCH_LM_PROFILES is not set in %s; EVA runs on the single default LM profile.\n' "${ENV_FILE}" >&2
 fi
-ok "model/server preflight finished; no configuration was or will be modified"
+ok "external agent/VLM policy inspected read-only; semantic migration is tracked separately"
 INFERENCE_POLICY_HASH_BEFORE="$(inference_policy_fingerprint)"
 [[ "${INFERENCE_POLICY_HASH_BEFORE}" =~ ^[0-9a-f]{64}$ ]] \
   || stop "could not fingerprint the existing inference policy"
@@ -687,6 +754,18 @@ PY
 )"
 if [[ -n "${MISSING_IMPORTS}" ]]; then
   stop "existing .venv cannot import modules required by ${EXPECTED_VERSION}: ${MISSING_IMPORTS}. The requirements files match, but these packages are not actually installed, and this adopt bundle carries no wheelhouse. Install them into the venv (or build a --with-wheelhouse bundle) before updating; nothing was changed."
+fi
+if [[ "${SIGLIP2_RUNTIME_REQUIRED}" == true ]]; then
+  target_python - <<'PY' >/dev/null 2>&1 || \
+    stop "existing .venv cannot satisfy the SigLIP2 runtime contract (transformers>=4.52); use a reviewed wheelhouse before updating"
+import importlib.util
+import re
+from importlib.metadata import version
+transformers_version = version("transformers")
+parts = tuple(int(value) for value in re.findall(r"\d+", transformers_version)[:2])
+assert parts >= (4, 52), transformers_version
+assert importlib.util.find_spec("transformers.models.siglip2") is not None
+PY
 fi
 ok "existing .venv imports every ${EXPECTED_VERSION} runtime dependency (OpenCV comes from the bundle when needed)"
 
@@ -1004,6 +1083,26 @@ else
     --skip-pg-dump --no-start --no-verify
 fi
 
+if [[ "${SIGLIP2_RUNTIME_REQUIRED}" == true ]]; then
+  SIGLIP2_TARGET="${MODEL_CACHE_DIR}/models--google--siglip2-base-patch16-224"
+  if [[ "${MODE}" == "user" ]]; then
+    install -d -m 0750 "${MODEL_CACHE_DIR}" "${SIGLIP2_TARGET}"
+    if command -v rsync >/dev/null 2>&1; then
+      rsync -a "${SIGLIP2_SOURCE}/" "${SIGLIP2_TARGET}/"
+    else
+      tar -cf - -C "${SIGLIP2_SOURCE}" . | tar -xf - -C "${SIGLIP2_TARGET}"
+    fi
+  fi
+  TARGET_SIGLIP2_SNAPSHOT="${SIGLIP2_TARGET}/snapshots/${SIGLIP2_REVISION}"
+  [[ -s "${TARGET_SIGLIP2_SNAPSHOT}/config.json" \
+     && -s "${TARGET_SIGLIP2_SNAPSHOT}/model.safetensors" \
+     && -s "${TARGET_SIGLIP2_SNAPSHOT}/preprocessor_config.json" \
+     && -s "${TARGET_SIGLIP2_SNAPSHOT}/tokenizer.json" \
+     && -s "${TARGET_SIGLIP2_SNAPSHOT}/tokenizer_config.json" ]] \
+    || stop "installed SigLIP2 cache is incomplete at ${TARGET_SIGLIP2_SNAPSHOT}"
+  ok "offline SigLIP2 cache installed at ${SIGLIP2_TARGET}"
+fi
+
 MEDIA_INSTALL=(
   "${BUNDLE_DIR}/scripts/install_media_runtime.sh"
   --bundle-dir "${BUNDLE_DIR}"
@@ -1020,7 +1119,10 @@ else
   as_root "${MEDIA_INSTALL[@]}"
 fi
 
-target_python - "${ENV_FILE}" "${EXPECTED_VERSION}" "${APP_DIR}/.eva-bundle-commit" "${BUNDLE_COMMIT}" "${ARCHIVE_RETENTION_POLICY_MISSING}" <<'PY'
+target_python - "${ENV_FILE}" "${EXPECTED_VERSION}" "${APP_DIR}/.eva-bundle-commit" "${BUNDLE_COMMIT}" \
+  "${ARCHIVE_RETENTION_POLICY_MISSING}" "${SIGLIP2_RUNTIME_REQUIRED}" \
+  "${SEMANTIC_MIGRATION_REQUIRED}" "${MODEL_CACHE_DIR:-}" \
+  "${SIGLIP2_MODEL}" "${SIGLIP2_REVISION}" <<'PY'
 import os
 import re
 import stat
@@ -1033,23 +1135,79 @@ version = sys.argv[2]
 marker_path = Path(sys.argv[3])
 bundle_commit = sys.argv[4]
 archive_retention_policy_missing = sys.argv[5].strip().lower() == "true"
+siglip_required = sys.argv[6].strip().lower() == "true"
+semantic_migration = sys.argv[7].strip().lower() == "true"
+model_cache_dir = sys.argv[8]
+siglip_model = sys.argv[9]
+siglip_revision = sys.argv[10]
 original = path.read_text(encoding="utf-8")
-replacement = f'EVOSSEARCH_APP_VERSION="{version}"'
-updated, count = re.subn(
-    r"(?m)^[ \t]*EVOSSEARCH_APP_VERSION[ \t]*=.*$",
-    replacement,
-    original,
-)
-if count == 0:
-    updated = original.rstrip("\n") + "\n" + replacement + "\n"
+
+def env_value(content, key):
+    match = re.search(
+        rf"(?m)^[ \t]*(?:export[ \t]+)?{re.escape(key)}[ \t]*=[ \t]*(.*)$",
+        content,
+    )
+    if match is None:
+        return ""
+    value = match.group(1).strip()
+    if len(value) >= 2 and value[0] == value[-1] and value[0] in {"'", '"'}:
+        value = value[1:-1]
+    return value
+
+def set_env(content, key, value, *, replace=False):
+    replacement = f"{key}='{value}'"
+    pattern = re.compile(
+        rf"(?m)^[ \t]*(?:export[ \t]+)?{re.escape(key)}[ \t]*=.*$"
+    )
+    if pattern.search(content):
+        return pattern.sub(replacement, content) if replace else content
+    return content.rstrip("\n") + "\n" + replacement + "\n"
+
+updated = set_env(original, "EVOSSEARCH_APP_VERSION", version, replace=True)
 if archive_retention_policy_missing:
-    retention_replacement = "EVOSSEARCH_ARCHIVE_RETENTION_ENABLED=false"
     updated = (
         updated.rstrip("\n")
         + "\n\n# Added by EVA AI upgrade safety: review retention before enabling pruning.\n"
-        + retention_replacement
+        + "EVOSSEARCH_ARCHIVE_RETENTION_ENABLED=false"
         + "\n"
     )
+if siglip_required:
+    updated = set_env(updated, "EVOSSEARCH_MODEL_CACHE_DIR", model_cache_dir)
+    legacy_models = {
+        "vit-b/32",
+        "vit-b-32",
+        "openai/clip-vit-base-patch32",
+    }
+    for key in ("EVOSSEARCH_PRODUCTION_CLIP_MODEL", "EVOSSEARCH_CLIP_MODEL"):
+        current = env_value(updated, key).casefold()
+        replace = semantic_migration and current in legacy_models
+        if not current or replace:
+            updated = set_env(updated, key, siglip_model, replace=replace)
+    updated = set_env(
+        updated,
+        "EVOSSEARCH_CLIP_MODEL_REVISION",
+        siglip_revision,
+        replace=semantic_migration,
+    )
+    updated = set_env(
+        updated,
+        "EVOSSEARCH_EMBEDDER_FALLBACK_ENABLED",
+        "false",
+        replace=True,
+    )
+if semantic_migration:
+    for key, legacy_default, siglip_default in (
+        ("EVOSSEARCH_PROBE_POS_FLOOR_DEFAULT", "0.28", "0.05"),
+        ("EVOSSEARCH_PROBE_MARGIN_DEFAULT", "0.08", "0.02"),
+    ):
+        current = env_value(updated, key)
+        if not current or current == legacy_default:
+            updated = set_env(
+                updated,
+                key,
+                siglip_default,
+                replace=bool(current),
+            )
 st = path.stat()
 fd, temp_name = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
 try:
@@ -1129,7 +1287,7 @@ printf 'Service: %s.service (%s systemd)\n' "${SERVICE_NAME}" "${MODE}"
 if [[ -n "${EFFECTIVE_AGENT_CONTEXT_FLOOR}" ]]; then
   printf 'Agent context: %s tokens observed (PRESERVED; target recommendation is %s)\n' \
     "${EFFECTIVE_AGENT_CONTEXT_FLOOR}" "${EXPECTED_AGENT_CONTEXT}"
-  printf 'Inference was not changed. Reconfigure the server and EVA context separately after acceptance if desired.\n'
+  printf 'External agent/VLM inference was not changed. Reconfigure its context separately after acceptance if desired.\n'
 elif [[ "${CONTEXT_UNKNOWN_ACCEPTED}" == true ]]; then
   printf 'Agent context: UNVERIFIED (operator accepted the warning)\n'
   printf 'WARN: EVA is up, but agent LM availability/context still requires manual verification.\n'

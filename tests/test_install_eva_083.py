@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib.util
+import hashlib
 import inspect
 import io
 import os
@@ -55,8 +56,19 @@ def make_siglip_cache(cache_root: Path) -> Path:
         / "75de2d55ec2d0b4efc50b3e9ad70dba96a7b2fa2"
     )
     snapshot.mkdir(parents=True, exist_ok=True)
-    (snapshot / "config.json").write_text("{}\n", encoding="utf-8")
-    (snapshot / "model.safetensors").write_bytes(b"test")
+    for name, payload in {
+        "config.json": b"{}\n",
+        "model.safetensors": b"test-weights",
+        "preprocessor_config.json": b"{}\n",
+        "tokenizer.json": b"{}\n",
+        "tokenizer_config.json": b"{}\n",
+    }.items():
+        (snapshot / name).write_bytes(payload)
+    checksums = []
+    for candidate in sorted(path for path in cache_root.rglob("*") if path.is_file()):
+        relative = candidate.relative_to(cache_root)
+        checksums.append(f"{hashlib.sha256(candidate.read_bytes()).hexdigest()}  {relative}")
+    (cache_root / "SHA256SUMS").write_text("\n".join(checksums) + "\n", encoding="utf-8")
     return snapshot
 
 
@@ -393,6 +405,74 @@ class OfflineInstallerUnitTests(unittest.TestCase):
         self.assertNotIn("EVOSSEARCH_MODEL_CACHE_DIR", updates)
         self.assertNotIn("EVOSSEARCH_CLIP_MODEL", updates)
 
+    def test_adopt_does_not_attach_siglip_revision_to_custom_model(self):
+        existing = dict(COMPLETE_ENV)
+        existing["EVOSSEARCH_CLIP_MODEL"] = "site/custom-embedder"
+        raw = env_text(existing)
+        resolution = installer.EnvResolution(Path("/x/.env"), Path("/x/.env"), raw, existing)
+
+        values, updates, missing = installer.prepare_env_values(
+            resolution,
+            environ={},
+            non_interactive=True,
+        )
+
+        self.assertEqual(missing, [])
+        self.assertEqual(values["EVOSSEARCH_CLIP_MODEL"], "site/custom-embedder")
+        self.assertNotIn("EVOSSEARCH_CLIP_MODEL_REVISION", values)
+        self.assertNotIn("EVOSSEARCH_PRODUCTION_CLIP_MODEL", updates)
+        self.assertNotIn("EVOSSEARCH_MODEL_CACHE_DIR", updates)
+
+    def test_adopt_migrates_only_known_legacy_clip_coordinates_to_siglip2(self):
+        existing = dict(COMPLETE_ENV)
+        existing.update({
+            "EVOSSEARCH_PRODUCTION_CLIP_MODEL": "ViT-B/32",
+            "EVOSSEARCH_CLIP_MODEL": "ViT-B/32",
+            "EVOSSEARCH_CLIP_MODEL_REVISION": "legacy-revision",
+            "EVOSSEARCH_EMBEDDER_FALLBACK_ENABLED": "true",
+            "EVOSSEARCH_PROBE_POS_FLOOR_DEFAULT": "0.28",
+            "EVOSSEARCH_PROBE_MARGIN_DEFAULT": "0.08",
+        })
+        raw = env_text(existing)
+        resolution = installer.EnvResolution(Path("/x/.env"), Path("/x/.env"), raw, existing)
+
+        values, updates, missing = installer.prepare_env_values(
+            resolution,
+            environ={},
+            non_interactive=True,
+        )
+        rendered = installer.render_env_update(raw, updates)
+        projected = installer.parse_env_text(rendered)
+
+        self.assertEqual(missing, [])
+        self.assertEqual(values["EVOSSEARCH_CLIP_MODEL"], installer.SIGLIP2_MODEL)
+        self.assertEqual(projected["EVOSSEARCH_CLIP_MODEL"], installer.SIGLIP2_MODEL)
+        self.assertEqual(projected["EVOSSEARCH_PRODUCTION_CLIP_MODEL"], installer.SIGLIP2_MODEL)
+        self.assertEqual(projected["EVOSSEARCH_CLIP_MODEL_REVISION"], installer.SIGLIP2_REVISION)
+        self.assertEqual(projected["EVOSSEARCH_EMBEDDER_FALLBACK_ENABLED"], "false")
+        self.assertEqual(projected["EVOSSEARCH_PROBE_POS_FLOOR_DEFAULT"], "0.05")
+        self.assertEqual(projected["EVOSSEARCH_PROBE_MARGIN_DEFAULT"], "0.02")
+        self.assertEqual(
+            installer.inference_policy_fingerprint(projected),
+            installer.inference_policy_fingerprint(existing),
+        )
+
+    def test_siglip_bundle_checksum_corruption_is_a_preflight_failure(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cache_root = Path(tmp) / "models" / "huggingface"
+            snapshot = make_siglip_cache(cache_root)
+            (snapshot / "model.safetensors").write_bytes(b"corrupted")
+
+            findings = installer._siglip2_cache_findings(
+                cache_root,
+                installer.SIGLIP2_REVISION,
+            )
+
+        self.assertTrue(any(
+            finding.level == "FAIL" and "checksum mismatch" in finding.message
+            for finding in findings
+        ))
+
     def test_legacy_adopt_disables_unconfigured_archive_retention(self):
         existing = dict(COMPLETE_ENV)
         existing.pop("EVOSSEARCH_ARCHIVE_RETENTION_ENABLED")
@@ -538,8 +618,15 @@ class OfflineInstallerUnitTests(unittest.TestCase):
         existing = dict(COMPLETE_ENV)
         existing.pop("EVOSSEARCH_LM_PROFILE_VLM_BASE_URL")
         existing.pop("EVOSSEARCH_LM_PROFILE_VLM_MODEL")
-        existing["EVOSSEARCH_LM_PROFILE_VLM_A1_BASE_URL"] = "http://vlm-a:8001/v1"
-        existing["EVOSSEARCH_LM_PROFILE_VLM_A1_MODEL"] = "qwen3-vl-4b"
+        existing["EVOSSEARCH_LM_PROFILES"] = "agent,vlm_a1,vlm_a2,vlm_b1,vlm_b2"
+        for profile, host, port in (
+            ("VLM_A1", "vlm-a", 8001),
+            ("VLM_A2", "vlm-a", 8002),
+            ("VLM_B1", "vlm-b", 8001),
+            ("VLM_B2", "vlm-b", 8002),
+        ):
+            existing[f"EVOSSEARCH_LM_PROFILE_{profile}_BASE_URL"] = f"http://{host}:{port}/v1"
+            existing[f"EVOSSEARCH_LM_PROFILE_{profile}_MODEL"] = "qwen3-vl-4b"
         resolution = installer.EnvResolution(Path("/x/.env"), Path("/x/.env"), "", existing)
 
         _values, updates, missing = installer.prepare_env_values(
@@ -552,6 +639,10 @@ class OfflineInstallerUnitTests(unittest.TestCase):
         self.assertNotIn("EVOSSEARCH_LM_PROFILE_VLM_BASE_URL", updates)
         self.assertNotIn("EVOSSEARCH_LM_PROFILE_VLM_MODEL", updates)
         self.assertNotIn("EVOSSEARCH_LM_VLM_PROFILE_ID", updates)
+        projected = dict(_values)
+        for key, value in existing.items():
+            if key.startswith("EVOSSEARCH_LM_PROFILE_VLM_"):
+                self.assertEqual(projected[key], value)
 
     def test_selected_nonstandard_agent_profile_satisfies_agent_contract(self):
         existing = dict(COMPLETE_ENV)

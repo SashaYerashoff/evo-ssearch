@@ -52,7 +52,7 @@ class UpdateBundleTests(unittest.TestCase):
         self.assertIn("active runtime identity loaded from /ready", SCRIPT)
         self.assertIn("selected config does not match the active runtime agent profile", SCRIPT)
         self.assertIn("selected config does not match the active Luxriot endpoint", SCRIPT)
-        self.assertIn("never rewrites model or server endpoints", SCRIPT)
+        self.assertIn("never rewrites agent/VLM model or server endpoints", SCRIPT)
         self.assertIn("WARN: active service reports %s while %s/VERSION is %s", SCRIPT)
         self.assertIn("--verified-adopt-existing-config", SCRIPT)
 
@@ -122,7 +122,7 @@ class UpdateBundleTests(unittest.TestCase):
         self.assertLess(context_check, confirmation)
         self.assertIn("Continue without changing the inference configuration? [y/N]", SCRIPT)
         self.assertIn("short-context update declined; nothing was changed", SCRIPT)
-        self.assertIn("Inference was not changed", SCRIPT)
+        self.assertIn("External agent/VLM inference was not changed", SCRIPT)
         self.assertNotIn("EVOSSEARCH_AGENT_CONTEXT_LIMIT_TOKENS={temporary_agent_context}", SCRIPT)
         self.assertNotIn('key == "EVOSSEARCH_AGENT_CONTEXT_LIMIT_TOKENS"', SCRIPT)
 
@@ -136,13 +136,17 @@ class UpdateBundleTests(unittest.TestCase):
         self.assertIn("unknown agent context declined; nothing was changed", SCRIPT)
         self.assertIn("Agent context: UNVERIFIED", SCRIPT)
 
-    def test_update_never_writes_model_or_server_settings(self):
+    def test_update_preserves_external_inference_but_migrates_local_semantics(self):
         self.assertNotIn("DEFAULT_AGENT_MODEL", SCRIPT)
         self.assertNotIn("AGENT_MODEL_TO_PERSIST", SCRIPT)
         self.assertNotIn("adopted_agent_model", SCRIPT)
         self.assertNotIn("EVOSSEARCH_LM_PROFILE_AGENT_MODEL={", SCRIPT)
         self.assertNotIn('env "EVOSSEARCH_LM_PROFILE_AGENT_MODEL=', SCRIPT)
-        self.assertIn("no configuration was or will be modified", SCRIPT)
+        self.assertIn("external agent/VLM policy inspected read-only", SCRIPT)
+        self.assertIn("semantic migration planned", SCRIPT)
+        self.assertIn("EVOSSEARCH_CLIP_MODEL_REVISION", SCRIPT)
+        self.assertIn("EVOSSEARCH_EMBEDDER_FALLBACK_ENABLED", SCRIPT)
+        self.assertIn("transformers>=4.52", SCRIPT)
 
     def test_update_fingerprints_and_preserves_inference_policy(self):
         self.assertIn("inference_policy_fingerprint()", SCRIPT)
@@ -288,6 +292,11 @@ class UpdateBundleTests(unittest.TestCase):
         self.assertIn('models--google--siglip2-base-patch16-224', BUILD_SCRIPT)
         self.assertIn('models--google--siglip2-base-patch16-224', INSTALL_SCRIPT)
         self.assertIn('installed offline SigLIP2 cache', INSTALL_SCRIPT)
+        self.assertIn('siglip2_model=//p', SCRIPT)
+        self.assertIn('offline SigLIP2 model is missing from this bundle', SCRIPT)
+        self.assertIn('sha256sum -c SHA256SUMS', SCRIPT)
+        self.assertIn('sha256sum -c SHA256SUMS', INSTALL_SCRIPT)
+        self.assertIn('SHA256SUMS', BUILD_SCRIPT)
 
     def test_all_code_snapshots_exclude_runtime_private_and_large_trees(self):
         for source in (SCRIPT, INSTALL_SCRIPT, ROLLBACK_SCRIPT):

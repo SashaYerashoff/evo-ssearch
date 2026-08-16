@@ -34,8 +34,10 @@
   acceptance harness с таймингами, очередью, планом инструментов и оценкой
   ответа.
 - Настройки теперь показывают источник значения и предупреждают, если service
-  config не объявлен. Обновление сохраняет существующие `.env`, inference URL,
-  модели, контекст, capacity, Luxriot и tenant-настройки.
+  config не объявлен. Обновление сохраняет внешние agent/VLM URL, модели,
+  контекст, capacity, Luxriot и tenant-настройки. Локальный semantic backend —
+  единственное намеренное исключение: штатный `ViT-B/32` из `0.8.1`
+  транзакционно переводится на SigLIP2.
 - Operator guide доступен на английском и грузинском, интерфейсные тексты — на
   английском и латышском.
 
@@ -127,6 +129,16 @@ credentials/изображения. Для итоговой приёмки вс�
   осознанной настройки.
 - React build и self-contained FFmpeg/OpenCV runtime входят в checksummed
   payload. Updater отказывает, если обязательная часть отсутствует.
+- Полный offline cache `google/siglip2-base-patch16-224` immutable-ревизии
+  `75de2d55…` также входит в payload и имеет собственный checksum manifest.
+  Preflight проверяет веса, processor/tokenizer и свободное место до остановки
+  EVA; apply устанавливает cache локально на машине EVA. Четыре внешних VLM
+  inference на двух адресах не являются частью этого payload и остаются под
+  до/после fingerprint-гардом вместе с agent endpoint.
+- При распознанном legacy `ViT-B/32` updater меняет только координаты
+  embedding-space: model/revision, запрет fallback в другой embedding-space и
+  нетюнингованные старые default-пороги `0.28/0.08` → `0.05/0.02`. Явно
+  выбранная сторонняя semantic model/cache не перезаписывается.
 - После apply проверяются `/health`, `/ready`, схема `0013`, React marker,
   доступность Luxriot, VLM/agent endpoints и появление новой archive-записи.
 - Конфигурация отдельных inference-сервисов хешируется до/после обновления;
@@ -137,6 +149,10 @@ credentials/изображения. Для итоговой приёмки вс�
 - Первый cold start/recovery SigLIP worker может занимать несколько минут;
   архитектуру handover перед пилотом не меняем. После прогрева CUDA graph должен
   быть `captured`, а live queue — пустой.
+- Существующие пробы, вручную откалиброванные в пространстве OpenAI CLIP,
+  нельзя считать автоматически откалиброванными для SigLIP2. После обновления
+  их P/N/M-пульс и пороги надо просмотреть на живом scored frame; архивные
+  embeddings разделяются fingerprint’ом модели и не должны смешиваться.
 - У `emu1` медленный snapshot endpoint. Для динамичного канала штатный путь —
   `live_segment`; красный snapshot counter сам по себе не означает остановку
   видео, если segment progress и timestamps продолжаются.

@@ -65,6 +65,15 @@ DEFAULT_ENV_FILE = Path("/etc/eva-ai/eva-ai.env")
 DEFAULT_BACKUP_ROOT = Path("/var/backups/eva-ai")
 DEFAULT_UNIT_FILE = Path("/etc/systemd/system/eva-ai.service")
 DEFAULT_LOCK_FILE = Path("/run/lock/eva-ai-083-installer.lock")
+SIGLIP2_MODEL = "google/siglip2-base-patch16-224"
+SIGLIP2_REVISION = "75de2d55ec2d0b4efc50b3e9ad70dba96a7b2fa2"
+_LEGACY_OPENAI_CLIP_MODELS = frozenset(
+    {
+        "vit-b/32",
+        "vit-b-32",
+        "openai/clip-vit-base-patch32",
+    }
+)
 
 _ENV_KEY_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 _SECRET_MARKERS = ("PASSWORD", "SECRET", "TOKEN", "API_KEY", "DSN", "DATABASE_URL")
@@ -75,6 +84,16 @@ _INSTALLER_MANAGED_ENV_KEYS = frozenset(
         "EVOSSEARCH_APP_VERSION",
         "EVOSSEARCH_UI_MODE",
         "EVOSSEARCH_ARCHIVE_RETENTION_ENABLED",
+        # These are release-owned embedding-space coordinates.  They may be
+        # replaced only when prepare_env_values has positively identified the
+        # 0.8.1 OpenAI CLIP default; arbitrary site-selected models/caches are
+        # still preserved.
+        "EVOSSEARCH_PRODUCTION_CLIP_MODEL",
+        "EVOSSEARCH_CLIP_MODEL",
+        "EVOSSEARCH_CLIP_MODEL_REVISION",
+        "EVOSSEARCH_EMBEDDER_FALLBACK_ENABLED",
+        "EVOSSEARCH_PROBE_POS_FLOOR_DEFAULT",
+        "EVOSSEARCH_PROBE_MARGIN_DEFAULT",
     }
 )
 
@@ -497,9 +516,9 @@ def prepare_env_values(
             "EVOSSEARCH_EMBEDDER": "clip",
             "EVOSSEARCH_DINO_SEGMENTS_ENABLED": "false",
             "EVOSSEARCH_EXPERIMENTAL_EMBEDDERS_ENABLED": "true",
-            "EVOSSEARCH_PRODUCTION_CLIP_MODEL": "google/siglip2-base-patch16-224",
-            "EVOSSEARCH_CLIP_MODEL": "google/siglip2-base-patch16-224",
-            "EVOSSEARCH_CLIP_MODEL_REVISION": "75de2d55ec2d0b4efc50b3e9ad70dba96a7b2fa2",
+            "EVOSSEARCH_PRODUCTION_CLIP_MODEL": SIGLIP2_MODEL,
+            "EVOSSEARCH_CLIP_MODEL": SIGLIP2_MODEL,
+            "EVOSSEARCH_CLIP_MODEL_REVISION": SIGLIP2_REVISION,
             "EVOSSEARCH_GUNICORN_WORKERS": "1",
             "EVOSSEARCH_GUNICORN_THREADS": "8",
             "EVOSSEARCH_LUXRIOT_LIVE_MEDIA_MAX_SECONDS": "120",
@@ -532,23 +551,56 @@ def prepare_env_values(
     for key, value in defaults.items():
         add_missing(key, value)
 
-    # 0.8.7 makes SigLIP2 the production semantic space.  Legacy env files did
-    # not name either the cache root or model revision, so merely copying the
-    # weights into the appliance would leave the runtime looking in the old
-    # per-user default cache.  Append only: an explicitly configured client
-    # model/cache is never replaced.
-    for key, value in {
-        "EVOSSEARCH_MODEL_CACHE_DIR": "/var/lib/eva-ai/models/huggingface",
-        "EVOSSEARCH_PRODUCTION_CLIP_MODEL": "google/siglip2-base-patch16-224",
-        "EVOSSEARCH_CLIP_MODEL": "google/siglip2-base-patch16-224",
-        "EVOSSEARCH_CLIP_MODEL_REVISION": "75de2d55ec2d0b4efc50b3e9ad70dba96a7b2fa2",
-        "EVOSSEARCH_EMBEDDER_FALLBACK_ENABLED": "false",
-    }.items():
-        add_missing(key, value)
+    # 0.8.7 makes SigLIP2 the production semantic space.  Missing coordinates
+    # are appended.  The known 0.8.1 OpenAI CLIP default is an explicit release
+    # migration and is replaced atomically with the environment backup; an
+    # arbitrary site-selected model/cache remains untouched.
+    configured_clip_models = [
+        str(values.get(key) or "").strip()
+        for key in ("EVOSSEARCH_PRODUCTION_CLIP_MODEL", "EVOSSEARCH_CLIP_MODEL")
+        if str(values.get(key) or "").strip()
+    ]
+    custom_clip_model = any(
+        model.casefold() not in _LEGACY_OPENAI_CLIP_MODELS
+        and model.casefold() != SIGLIP2_MODEL.casefold()
+        for model in configured_clip_models
+    )
+    legacy_clip_migration = bool(
+        not custom_clip_model
+        and any(model.casefold() in _LEGACY_OPENAI_CLIP_MODELS for model in configured_clip_models)
+    )
+    siglip2_release_managed = not custom_clip_model
+    if siglip2_release_managed:
+        for key, value in {
+            "EVOSSEARCH_MODEL_CACHE_DIR": "/var/lib/eva-ai/models/huggingface",
+            "EVOSSEARCH_PRODUCTION_CLIP_MODEL": SIGLIP2_MODEL,
+            "EVOSSEARCH_CLIP_MODEL": SIGLIP2_MODEL,
+            "EVOSSEARCH_CLIP_MODEL_REVISION": SIGLIP2_REVISION,
+            "EVOSSEARCH_EMBEDDER_FALLBACK_ENABLED": "false",
+        }.items():
+            add_missing(key, value)
+    if legacy_clip_migration:
+        for key in ("EVOSSEARCH_PRODUCTION_CLIP_MODEL", "EVOSSEARCH_CLIP_MODEL"):
+            current = str(values.get(key) or "").strip()
+            if not current or current.casefold() in _LEGACY_OPENAI_CLIP_MODELS:
+                values[key] = SIGLIP2_MODEL
+                updates[key] = SIGLIP2_MODEL
+        values["EVOSSEARCH_CLIP_MODEL_REVISION"] = SIGLIP2_REVISION
+        updates["EVOSSEARCH_CLIP_MODEL_REVISION"] = SIGLIP2_REVISION
+        values["EVOSSEARCH_EMBEDDER_FALLBACK_ENABLED"] = "false"
+        updates["EVOSSEARCH_EMBEDDER_FALLBACK_ENABLED"] = "false"
+        for key, legacy_default, siglip_default in (
+            ("EVOSSEARCH_PROBE_POS_FLOOR_DEFAULT", "0.28", "0.05"),
+            ("EVOSSEARCH_PROBE_MARGIN_DEFAULT", "0.08", "0.02"),
+        ):
+            current = str(values.get(key) or "").strip()
+            if not current or current == legacy_default:
+                values[key] = siglip_default
+                updates[key] = siglip_default
 
     # Release identity and the accepted console belong to installed code, not
-    # site topology.  Model endpoints, channels, credentials and tenant values
-    # remain preserve/append-only.  The legacy console remains available at
+    # site topology.  External LM endpoints/models, channels, credentials and
+    # tenant values remain preserve/append-only.  The legacy console remains available at
     # /?ui=legacy for emergency recovery.
     managed = {
         "EVOSSEARCH_APP_VERSION": EXPECTED_VERSION,
@@ -772,6 +824,102 @@ def _siglip2_cache_snapshot(cache_root: Path, revision: str) -> Path | None:
     return None
 
 
+def _siglip2_cache_findings(cache_root: Path, revision: str) -> list[Finding]:
+    """Verify the complete, checksummed offline semantic-model payload."""
+
+    checksum_file = cache_root / "SHA256SUMS"
+    snapshot = _siglip2_cache_snapshot(cache_root, revision)
+    if snapshot is None:
+        return [Finding(
+            "FAIL",
+            f"offline bundle has no complete SigLIP2 snapshot for revision {revision}",
+        )]
+    required_snapshot_files = (
+        "config.json",
+        "model.safetensors",
+        "preprocessor_config.json",
+        "tokenizer.json",
+        "tokenizer_config.json",
+    )
+    repository = cache_root / "models--google--siglip2-base-patch16-224"
+    try:
+        repository_root = repository.resolve(strict=True)
+        for name in required_snapshot_files:
+            candidate = snapshot / name
+            resolved = candidate.resolve(strict=True)
+            if repository_root != resolved and repository_root not in resolved.parents:
+                raise ValueError(f"snapshot link escapes model repository: {name}")
+            if not candidate.is_file() or candidate.stat().st_size <= 0:
+                raise ValueError(f"required snapshot file is empty: {name}")
+        if not checksum_file.is_file():
+            raise ValueError("SHA256SUMS is missing")
+        checked = 0
+        for raw_line in checksum_file.read_text(encoding="utf-8").splitlines():
+            line = raw_line.strip()
+            if not line:
+                continue
+            match = re.fullmatch(r"([0-9a-fA-F]{64})\s+\*?(.+)", line)
+            if match is None:
+                raise ValueError("SHA256SUMS contains an invalid row")
+            expected, relative = match.groups()
+            candidate = cache_root / relative
+            resolved = candidate.resolve(strict=True)
+            cache_root_resolved = cache_root.resolve(strict=True)
+            if cache_root_resolved != resolved and cache_root_resolved not in resolved.parents:
+                raise ValueError(f"checksum path escapes model cache: {relative}")
+            digest = hashlib.sha256()
+            with candidate.open("rb") as handle:
+                for chunk in iter(lambda: handle.read(4 * 1024 * 1024), b""):
+                    digest.update(chunk)
+            if digest.hexdigest().lower() != expected.lower():
+                raise ValueError(f"checksum mismatch: {relative}")
+            checked += 1
+        if checked == 0:
+            raise ValueError("SHA256SUMS is empty")
+    except (OSError, RuntimeError, ValueError) as exc:
+        return [Finding("FAIL", f"bundled SigLIP2 verification failed: {exc}")]
+    return [Finding(
+        "OK",
+        f"offline SigLIP2 revision {revision} verified ({checked} checksums)",
+    )]
+
+
+def _siglip2_runtime_findings(
+    options: InstallerOptions,
+    values: Mapping[str, str],
+) -> list[Finding]:
+    """Prove an adopted venv understands SigLIP2 before stopping EVA."""
+
+    model = str(values.get("EVOSSEARCH_CLIP_MODEL") or "").strip().lower()
+    if "siglip2" not in model:
+        return []
+    python = options.app_dir / ".venv" / "bin" / "python"
+    if not python.is_file() or not os.access(python, os.X_OK):
+        return []
+    probe = subprocess.run(
+        (
+            str(python),
+            "-c",
+            (
+                "import importlib.util,re; from importlib.metadata import version; "
+                "v=version('transformers'); "
+                "parts=tuple(int(x) for x in re.findall(r'\\d+', v)[:2]); "
+                "assert parts >= (4,52), v; "
+                "assert importlib.util.find_spec('transformers.models.siglip2') is not None"
+            ),
+        ),
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        check=False,
+    )
+    if probe.returncode != 0:
+        return [Finding(
+            "FAIL",
+            "target venv cannot load the SigLIP2 runtime contract (requires transformers>=4.52); use a reviewed wheelhouse",
+        )]
+    return [Finding("OK", "target venv supports the SigLIP2 runtime contract")]
+
+
 def _media_runtime_findings(bundle_dir: Path) -> list[Finding]:
     """Validate an optional self-contained media payload before apply.
 
@@ -872,6 +1020,7 @@ def collect_preflight(
         elif path.suffix == ".sh" and not os.access(path, os.X_OK):
             add("FAIL", f"installer helper is not executable: {path}")
     findings.extend(_media_runtime_findings(options.bundle_dir))
+    findings.extend(_siglip2_runtime_findings(options, values))
     source_version = _version(options.source_dir)
     if source_version == EXPECTED_VERSION:
         add("OK", f"source version is {EXPECTED_VERSION}")
@@ -978,7 +1127,7 @@ def collect_preflight(
     elif resolution.source_kind == "copy":
         add(
             "OK",
-            "existing environment will be copied without overwriting keys: "
+            "existing environment will be copied with only reviewed release-owned keys migrated: "
             f"{resolution.source} -> {resolution.target}",
         )
     else:
@@ -1010,16 +1159,11 @@ def collect_preflight(
         ).expanduser()
         bundled_cache = options.bundle_dir / "models" / "huggingface"
         target_snapshot = _siglip2_cache_snapshot(target_cache, revision)
-        bundled_snapshot = _siglip2_cache_snapshot(bundled_cache, revision)
+        findings.extend(_siglip2_cache_findings(bundled_cache, revision))
         if target_snapshot is not None:
             add("OK", f"SigLIP2 is already cached locally at {target_snapshot}")
-        elif bundled_snapshot is not None:
-            add("OK", f"offline bundle contains SigLIP2 at {bundled_snapshot}")
         else:
-            add(
-                "FAIL",
-                "SigLIP2 is configured but neither the target cache nor the offline bundle contains its weights",
-            )
+            add("OK", f"SigLIP2 will be installed into local cache {target_cache}")
 
     try:
         disk_path = options.app_dir.parent if options.app_dir.parent.exists() else Path("/")
@@ -1070,10 +1214,10 @@ def collect_preflight(
 def build_plan(prepared: PreparedInstall) -> list[PlanAction]:
     options = prepared.options
     env_action = (
-        f"preserve {prepared.env.source} and append only {len(prepared.updates)} missing key(s)"
+        f"preserve {prepared.env.source} and apply {len(prepared.updates)} reviewed release default/migration key(s)"
         if prepared.env.source_kind == "in-place"
         else (
-            f"copy {prepared.env.source} to {prepared.env.target}, preserving all existing keys"
+            f"copy {prepared.env.source} to {prepared.env.target}, preserving site keys and applying reviewed release migrations"
             if prepared.env.source_kind == "copy"
             else f"create {prepared.env.target} with mode 0600"
         )

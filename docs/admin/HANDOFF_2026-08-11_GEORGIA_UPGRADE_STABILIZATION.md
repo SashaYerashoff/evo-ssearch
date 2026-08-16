@@ -3307,3 +3307,29 @@ present. The builder/install copy patterns are now root-scoped (`/video/`) and
 the builder fails unless every Git-tracked source file is present in the bundle
 snapshot. Do not use or repin the rejected `793b11c` archive; only the later
 candidate built from the exclude regression fix is eligible for rehearsal.
+
+## 2026-08-16 mandatory offline SigLIP2 migration payload
+
+The Georgia topology boundary is now explicit. EVA, PostgreSQL, the agent and
+the local semantic encoder share the i9/12 GB RTX appliance; four VLM inference
+instances remain external on two IP addresses with one port per instance. The
+updater fingerprints every `EVOSSEARCH_LM_*`, `EVOSSEARCH_AGENT_*`,
+`EVOSSEARCH_INFERENCE_*` value and GPU visibility, so those external endpoints,
+models, contexts, queues and credentials cannot drift during apply.
+
+The local OpenAI CLIP -> SigLIP2 change is deliberately separate and
+release-owned. A final Georgia bundle is invalid unless it contains the complete
+Hugging Face cache repository for
+`google/siglip2-base-patch16-224@75de2d55ec2d0b4efc50b3e9ad70dba96a7b2fa2`,
+including weights, processor/tokenizer files and an inner `SHA256SUMS`. The
+universal installer validates that payload in dry-run, installs it into the
+configured local model cache, atomically migrates the known `ViT-B/32` model
+coordinates, disables cross-embedding fallback, and lets the existing env/DB
+backup restore the prior semantic configuration on rollback. Arbitrary custom
+semantic models and cache paths are preserved rather than guessed.
+
+The earlier `3a6b37f` archive is therefore also not a Georgia release candidate:
+its tracked source snapshot and media runtime are correct, but its manifest says
+`siglip2_model=not_included`. Build and pin a newly named immutable archive only
+after the installer tests, real cache checksum verification and clean commit
+all pass.

@@ -431,6 +431,13 @@ ok "copied patch files"
 
 SIGLIP2_SOURCE="${BUNDLE_DIR}/models/huggingface/models--google--siglip2-base-patch16-224"
 if [[ -d "${SIGLIP2_SOURCE}/blobs" && -d "${SIGLIP2_SOURCE}/snapshots" ]]; then
+  SIGLIP2_CHECKSUM_ROOT="${BUNDLE_DIR}/models/huggingface"
+  [[ -s "${SIGLIP2_CHECKSUM_ROOT}/SHA256SUMS" ]] \
+    || die "offline SigLIP2 checksum manifest is missing"
+  (
+    cd "${SIGLIP2_CHECKSUM_ROOT}"
+    sha256sum -c SHA256SUMS >/dev/null
+  ) || die "offline SigLIP2 checksum verification failed"
   MODEL_CACHE_DIR="$(read_env_var EVOSSEARCH_MODEL_CACHE_DIR "${ENV_FILE}")"
   if [[ -z "${MODEL_CACHE_DIR}" ]]; then
     MODEL_CACHE_DIR="/var/lib/eva-ai/models/huggingface"
