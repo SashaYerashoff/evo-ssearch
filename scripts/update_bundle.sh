@@ -1251,6 +1251,14 @@ esac
 
 say "Starting and checking EVA AI"
 systemctl_write start "${SERVICE_NAME}.service"
+SERVICE_STATE="$(systemctl_read is-active "${SERVICE_NAME}.service" 2>/dev/null || true)"
+[[ "${SERVICE_STATE}" == "active" ]] \
+  || stop "service state is ${SERVICE_STATE:-unknown}; pre-start automatic rollback remains armed: ${BACKUP_ROOT}"
+# Crossing this boundary is deliberate: once the new runtime is active it may
+# accept frames and write archive state. A dependency/readiness failure must be
+# reported and repaired in place, never converted into an automatic rollback.
+ROLLBACK_ARMED=false
+ok "new EVA process is active; automatic rollback disarmed before dependency checks"
 READY_JSON=""
 POST_UPDATE_DEGRADED=false
 READY_DEADLINE=$((SECONDS + 240))
@@ -1269,18 +1277,21 @@ while (( SECONDS < READY_DEADLINE )); do
   sleep 5
 done
 
-SERVICE_STATE="$(systemctl_read is-active "${SERVICE_NAME}.service" 2>/dev/null || true)"
-[[ "${SERVICE_STATE}" == "active" ]] || stop "service state is ${SERVICE_STATE:-unknown}; backup root: ${BACKUP_ROOT}"
-[[ -n "${READY_JSON}" ]] || stop "service started but /ready did not report ${EXPECTED_VERSION}; backup root: ${BACKUP_ROOT}"
-curl -skfS --max-time 5 "${BASE_URL}/health" >/dev/null \
-  || stop "service is active but /health failed; backup root: ${BACKUP_ROOT}"
-ROLLBACK_ARMED=false
+if [[ -z "${READY_JSON}" ]]; then
+  POST_UPDATE_DEGRADED=true
+  printf 'WARN: service is active but /ready did not report %s; leaving the new runtime and database in place for repair.\n' \
+    "${EXPECTED_VERSION}" >&2
+fi
+if ! curl -skfS --max-time 5 "${BASE_URL}/health" >/dev/null; then
+  POST_UPDATE_DEGRADED=true
+  printf 'WARN: service is active but /health failed; leaving the new runtime and database in place for repair.\n' >&2
+fi
 
 printf '\n============================================================\n'
 printf 'OK: EVA AI %s is up and running\n' "${EXPECTED_VERSION}"
 if [[ "${POST_UPDATE_DEGRADED}" == true ]]; then
-  printf 'WARN: /ready is degraded, matching the pre-update state (an external dependency such as the VLM server is still unavailable).\n'
-  printf '      Model and server settings were not changed by this update.\n'
+  printf 'WARN: post-start acceptance is degraded. Inspect the deployment report and repair failed dependencies in place.\n'
+  printf '      The updater did not roll back the running service or database. Model and server settings were not changed.\n'
 fi
 printf 'URL: %s\n' "${BASE_URL}"
 printf 'Service: %s.service (%s systemd)\n' "${SERVICE_NAME}" "${MODE}"

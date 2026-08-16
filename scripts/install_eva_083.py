@@ -1701,6 +1701,7 @@ def apply_install(prepared: PreparedInstall) -> Path:
     unit_preexisted = options.unit_file.exists()
     env_preinstall_backup: Path | None = None
     latest_before_apply = _latest_backup_marker(options.backup_root)
+    runtime_started = False
 
     try:
         # This must precede even the env staging below.  Alembic itself needs
@@ -1841,6 +1842,11 @@ def apply_install(prepared: PreparedInstall) -> Path:
         if options.start:
             runner.run(("systemctl", "enable", options.service_name + ".service"))
             runner.run(("systemctl", "restart", options.service_name + ".service"))
+            runner.run(("systemctl", "is-active", options.service_name + ".service"))
+            # From this point the new runtime may accept frames and mutate the
+            # archive. Dependency acceptance errors are repaired in place;
+            # an automatic rollback could discard those new writes.
+            runtime_started = True
         if options.verify:
             verify = options.app_dir / "scripts" / "verify_patch.sh"
             runner.run((
@@ -1861,7 +1867,26 @@ def apply_install(prepared: PreparedInstall) -> Path:
                 phase="post-update verification",
             )
         return backup_dir
-    except Exception:
+    except Exception as exc:
+        if runtime_started and backup_dir is not None:
+            safe_error = redact_text(str(exc), secret_values)
+            warning_path = backup_dir / "post-start-acceptance-warning.txt"
+            _atomic_write(
+                warning_path,
+                (
+                    "The new EVA runtime became active. Automatic rollback was disabled "
+                    "before dependency acceptance checks.\n"
+                    f"{type(exc).__name__}: {safe_error}\n"
+                ),
+                0o600,
+            )
+            print(
+                "POST-START ACCEPTANCE ERROR: the new EVA runtime is active; "
+                "code and database were left in place for repair. "
+                f"Details: {warning_path}",
+                file=sys.stderr,
+            )
+            return backup_dir
         if backup_dir is None:
             latest = options.backup_root / "LATEST"
             if latest.is_file():

@@ -1010,6 +1010,21 @@ class OfflineInstallerUnitTests(unittest.TestCase):
             self.assertEqual(environment["EVA_PATCH_CONFIRM_DB_RESTORE"], "yes")
             self.assertEqual(environment["EVA_PATCH_PG_DSN"], prepared.migration_dsn)
 
+    def test_post_start_acceptance_failure_is_left_for_in_place_repair(self):
+        source = (ROOT / "scripts" / "install_eva_083.py").read_text(encoding="utf-8")
+        active = source.index(
+            'runner.run(("systemctl", "is-active", options.service_name + ".service"))'
+        )
+        boundary = source.index("runtime_started = True", active)
+        acceptance = source.index("if options.verify:", boundary)
+        handler = source.index("if runtime_started and backup_dir is not None:", acceptance)
+        rollback = source.index("rollback_succeeded = False", handler)
+        self.assertLess(boundary, acceptance)
+        self.assertLess(acceptance, handler)
+        self.assertLess(handler, rollback)
+        self.assertIn("post-start-acceptance-warning.txt", source)
+        self.assertIn("code and database were left in place for repair", source)
+
     def test_verified_code_only_adopt_warns_but_does_not_block_existing_placeholder(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

@@ -31,7 +31,6 @@ def preserved(relative: Path) -> bool:
         or parts[0].startswith(".venv")
         or parts[0] == ".env"
         or parts[0].startswith(".env.")
-        or "__pycache__" in parts
     ):
         return True
     name = parts[-1]

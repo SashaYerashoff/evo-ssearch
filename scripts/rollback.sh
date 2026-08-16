@@ -303,13 +303,6 @@ if [[ "${RESTORE_DB}" == true ]]; then
 
   if [[ -n "${PG_DSN}" ]]; then
     DB_REVISION="$(cat "${BACKUP_DIR}/database_revision.txt" 2>/dev/null || true)"
-    CURRENT_DB_REVISION="$(psql --no-psqlrc --tuples-only --no-align --dbname="${PG_DSN}" \
-      --command='SELECT version_num FROM public.alembic_version LIMIT 1' 2>/dev/null \
-      | head -n 1 || true)"
-    if [[ "${DB_REVISION}" =~ ^[A-Za-z0-9_.-]+$ \
-       && "${CURRENT_DB_REVISION}" == "${DB_REVISION}" ]]; then
-      ok "database is already at the recorded pre-update revision; dump restore skipped"
-    else
     DB_SUPERUSER="$(psql --no-psqlrc --tuples-only --no-align --dbname="${PG_DSN}" \
       --command='SELECT rolsuper FROM pg_roles WHERE rolname = current_user' \
       | head -n 1)"
@@ -324,11 +317,21 @@ if [[ "${RESTORE_DB}" == true ]]; then
       "
       pg_restore --exit-on-error --dbname="${PG_DSN}" "${BACKUP_DIR}/postgres.dump"
       ok "restored complete PostgreSQL dump with original ownership"
+      if [[ "${DB_REVISION}" =~ ^[A-Za-z0-9_.-]+$ ]]; then
+        RESTORED_DB_REVISION="$(psql --no-psqlrc --tuples-only --no-align --dbname="${PG_DSN}" \
+          --command='SELECT version_num FROM public.alembic_version LIMIT 1' \
+          | head -n 1)"
+        [[ "${RESTORED_DB_REVISION}" == "${DB_REVISION}" ]] \
+          || die "Restored database revision ${RESTORED_DB_REVISION:-unknown} does not match recorded pre-update revision ${DB_REVISION}"
+        ok "verified restored database revision ${RESTORED_DB_REVISION}"
+      else
+        warn "recorded pre-update database revision is unavailable; dump contents were restored but revision could not be compared"
+      fi
     else
-      die "Database advanced beyond the recorded revision; exact dump restore requires a PostgreSQL superuser DSN"
-    fi
+      die "Exact dump restore requires a PostgreSQL superuser DSN"
     fi
   elif id postgres >/dev/null 2>&1; then
+    DB_REVISION="$(cat "${BACKUP_DIR}/database_revision.txt" 2>/dev/null || true)"
     run_as_user postgres psql --set ON_ERROR_STOP=on --dbname="${PG_DATABASE}" --command="
       DROP SCHEMA IF EXISTS agent CASCADE;
       DROP SCHEMA IF EXISTS archive CASCADE;
@@ -340,6 +343,17 @@ if [[ "${RESTORE_DB}" == true ]]; then
     run_as_user postgres pg_restore --exit-on-error \
       --dbname="${PG_DATABASE}" "${BACKUP_DIR}/postgres.dump"
     ok "restored complete PostgreSQL dump to local database ${PG_DATABASE}"
+    if [[ "${DB_REVISION}" =~ ^[A-Za-z0-9_.-]+$ ]]; then
+      RESTORED_DB_REVISION="$(run_as_user postgres psql --no-psqlrc --tuples-only --no-align \
+        --dbname="${PG_DATABASE}" \
+        --command='SELECT version_num FROM public.alembic_version LIMIT 1' \
+        | head -n 1)"
+      [[ "${RESTORED_DB_REVISION}" == "${DB_REVISION}" ]] \
+        || die "Restored database revision ${RESTORED_DB_REVISION:-unknown} does not match recorded pre-update revision ${DB_REVISION}"
+      ok "verified restored database revision ${RESTORED_DB_REVISION}"
+    else
+      warn "recorded pre-update database revision is unavailable; dump contents were restored but revision could not be compared"
+    fi
   else
     die "No DSN and no postgres OS user available for database restore"
   fi

@@ -109,6 +109,16 @@ class UpdateBundleTests(unittest.TestCase):
         self.assertIn("while (( SECONDS < READY_DEADLINE ))", SCRIPT)
         self.assertIn('"${BASE_URL}/ready?load=1"', SCRIPT)
 
+    def test_active_runtime_is_never_rolled_back_for_dependency_acceptance(self):
+        start = SCRIPT.index('systemctl_write start "${SERVICE_NAME}.service"')
+        disarm = SCRIPT.index("ROLLBACK_ARMED=false", start)
+        readiness = SCRIPT.index("READY_DEADLINE=$((SECONDS + 240))", start)
+        self.assertLess(start, disarm)
+        self.assertLess(disarm, readiness)
+        self.assertIn("automatic rollback disarmed before dependency checks", SCRIPT)
+        self.assertIn("leaving the new runtime and database in place for repair", SCRIPT)
+        self.assertIn("The updater did not roll back the running service or database", SCRIPT)
+
     def test_offline_install_and_rollback_allow_eager_embedder_cold_start(self):
         self.assertIn('"--timeout", "300"', OFFLINE_INSTALLER_SCRIPT)
         self.assertIn('--timeout 300', INSTALL_SCRIPT)
@@ -183,7 +193,7 @@ class UpdateBundleTests(unittest.TestCase):
         self.assertIn("PREUPGRADE_DEGRADED=true", SCRIPT)
         self.assertNotIn("restore readiness first", SCRIPT)
         self.assertIn("POST_UPDATE_DEGRADED=true", SCRIPT)
-        self.assertIn("matching the pre-update state", SCRIPT)
+        self.assertIn("post-start acceptance is degraded", SCRIPT)
 
     def test_dependency_import_preflight_gates_before_install_but_excludes_opencv(self):
         preflight = SCRIPT.index("Python dependency preflight (read-only)")
@@ -268,10 +278,12 @@ class UpdateBundleTests(unittest.TestCase):
 
     def test_manual_rollback_streams_custom_dump_and_removes_new_unit(self):
         self.assertIn('pg_restore --exit-on-error', ROLLBACK_SCRIPT)
-        self.assertIn('database is already at the recorded pre-update revision; dump restore skipped', ROLLBACK_SCRIPT)
+        self.assertNotIn('dump restore skipped', ROLLBACK_SCRIPT)
+        self.assertIn('verified restored database revision', ROLLBACK_SCRIPT)
+        self.assertIn('does not match recorded pre-update revision', ROLLBACK_SCRIPT)
         self.assertIn('DROP SCHEMA IF EXISTS archive CASCADE', ROLLBACK_SCRIPT)
         self.assertIn('DROP TABLE IF EXISTS public.alembic_version CASCADE', ROLLBACK_SCRIPT)
-        self.assertIn('exact dump restore requires a PostgreSQL superuser DSN', ROLLBACK_SCRIPT)
+        self.assertIn('Exact dump restore requires a PostgreSQL superuser DSN', ROLLBACK_SCRIPT)
         self.assertIn('restored complete PostgreSQL dump with original ownership', ROLLBACK_SCRIPT)
         self.assertIn('UNIT_PREEXISTED="$(read_state_var unit_preexisted)"', ROLLBACK_SCRIPT)
         self.assertIn('removed service unit created by the failed installation', ROLLBACK_SCRIPT)
@@ -342,6 +354,8 @@ class UpdateBundleTests(unittest.TestCase):
                 handle.add(snapshot_root, arcname="app")
             (app / "old.py").write_text("changed\n", encoding="utf-8")
             (app / "new.py").write_text("new\n", encoding="utf-8")
+            (app / "__pycache__").mkdir()
+            (app / "__pycache__" / "old.cpython-314.pyc").write_bytes(b"stale bytecode")
             (app / "video").mkdir()
             (app / "video" / "evidence.mp4").write_bytes(b"evidence")
             (app / ".venv.broken-current").symlink_to("/mnt/current/eva-venv")
@@ -351,6 +365,7 @@ class UpdateBundleTests(unittest.TestCase):
             )
             self.assertEqual((app / "old.py").read_text(encoding="utf-8"), "old\n")
             self.assertFalse((app / "new.py").exists())
+            self.assertFalse((app / "__pycache__").exists())
             self.assertEqual((app / "video" / "evidence.mp4").read_bytes(), b"evidence")
             self.assertEqual((app / ".venv.broken-current").readlink(), Path("/mnt/current/eva-venv"))
             self.assertFalse((app / ".venv.broken-old").is_symlink())
