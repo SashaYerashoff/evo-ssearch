@@ -67,6 +67,7 @@ DEFAULT_UNIT_FILE = Path("/etc/systemd/system/eva-ai.service")
 DEFAULT_LOCK_FILE = Path("/run/lock/eva-ai-083-installer.lock")
 SIGLIP2_MODEL = "google/siglip2-base-patch16-224"
 SIGLIP2_REVISION = "75de2d55ec2d0b4efc50b3e9ad70dba96a7b2fa2"
+DEFAULT_RUNTIME_ROOT = Path("/var/lib/eva-ai")
 _LEGACY_OPENAI_CLIP_MODELS = frozenset(
     {
         "vit-b/32",
@@ -1427,9 +1428,18 @@ def _ensure_runtime_directories(
             raise InstallerError(
                 f"{key} must be a safe absolute runtime directory"
             )
-        path.mkdir(parents=True, exist_ok=True, mode=0o750)
-        os.chown(path, uid, gid)
-        os.chmod(path, 0o750)
+        managed_paths = [path]
+        if path == DEFAULT_RUNTIME_ROOT or DEFAULT_RUNTIME_ROOT in path.parents:
+            relative = path.relative_to(DEFAULT_RUNTIME_ROOT)
+            managed_paths = [DEFAULT_RUNTIME_ROOT]
+            current = DEFAULT_RUNTIME_ROOT
+            for part in relative.parts:
+                current /= part
+                managed_paths.append(current)
+        for managed_path in managed_paths:
+            managed_path.mkdir(parents=True, exist_ok=True, mode=0o750)
+            os.chown(managed_path, uid, gid)
+            os.chmod(managed_path, 0o750)
         created.append(path)
     return created
 
@@ -1705,12 +1715,16 @@ def apply_install(prepared: PreparedInstall) -> Path:
             _ensure_service_account(options, runner)
         options.app_dir.mkdir(parents=True, exist_ok=True)
         options.backup_root.mkdir(parents=True, exist_ok=True)
-        if not prepared.env.existing:
-            _ensure_runtime_directories(
-                prepared.values,
-                user=options.service_user,
-                group=options.service_group,
-            )
+        # Existing 0.8.1 environments receive a release-managed SigLIP cache
+        # during migration too.  Ensure both its leaf and the EVA-owned
+        # /var/lib/eva-ai ancestors are traversable by the service account;
+        # otherwise the checksummed model is present but runtime loading fails
+        # with a misleading embedding-model error.
+        _ensure_runtime_directories(
+            prepared.values,
+            user=options.service_user,
+            group=options.service_group,
+        )
         if not app_preexisted:
             uid = pwd.getpwnam(options.service_user).pw_uid
             gid = grp.getgrnam(options.service_group).gr_gid

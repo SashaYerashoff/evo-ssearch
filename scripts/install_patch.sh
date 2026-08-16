@@ -445,6 +445,21 @@ if [[ -d "${SIGLIP2_SOURCE}/blobs" && -d "${SIGLIP2_SOURCE}/snapshots" ]]; then
     die "EVOSSEARCH_MODEL_CACHE_DIR must be absolute for offline model install"
   fi
   SIGLIP2_TARGET="${MODEL_CACHE_DIR}/models--google--siglip2-base-patch16-224"
+  if [[ "${MODEL_CACHE_DIR}" == "/var/lib/eva-ai" \
+        || "${MODEL_CACHE_DIR}" == /var/lib/eva-ai/* ]]; then
+    managed_dir="/var/lib/eva-ai"
+    install -d -m 0750 -o "${APP_OWNER%%:*}" -g "${APP_OWNER##*:}" "${managed_dir}"
+    relative_cache_path="${MODEL_CACHE_DIR#/var/lib/eva-ai/}"
+    if [[ "${relative_cache_path}" != "${MODEL_CACHE_DIR}" \
+          && -n "${relative_cache_path}" ]]; then
+      IFS='/' read -ra managed_parts <<< "${relative_cache_path}"
+      for managed_part in "${managed_parts[@]}"; do
+        [[ -n "${managed_part}" ]] || continue
+        managed_dir="${managed_dir}/${managed_part}"
+        install -d -m 0750 -o "${APP_OWNER%%:*}" -g "${APP_OWNER##*:}" "${managed_dir}"
+      done
+    fi
+  fi
   install -d -m 0750 -o "${APP_OWNER%%:*}" -g "${APP_OWNER##*:}" "${MODEL_CACHE_DIR}" "${SIGLIP2_TARGET}"
   if command -v rsync >/dev/null 2>&1; then
     rsync -a "${SIGLIP2_SOURCE}/" "${SIGLIP2_TARGET}/"

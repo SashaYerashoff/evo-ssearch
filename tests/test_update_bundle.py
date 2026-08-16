@@ -301,6 +301,8 @@ class UpdateBundleTests(unittest.TestCase):
         self.assertIn('offline SigLIP2 model is missing from this bundle', SCRIPT)
         self.assertIn('sha256sum -c SHA256SUMS', SCRIPT)
         self.assertIn('sha256sum -c SHA256SUMS', INSTALL_SCRIPT)
+        self.assertIn('managed_dir="/var/lib/eva-ai"', INSTALL_SCRIPT)
+        self.assertIn('install -d -m 0750 -o "${APP_OWNER%%:*}"', INSTALL_SCRIPT)
         self.assertIn('SHA256SUMS', BUILD_SCRIPT)
 
     def test_all_code_snapshots_exclude_runtime_private_and_large_trees(self):

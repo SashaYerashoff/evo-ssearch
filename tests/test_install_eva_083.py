@@ -331,6 +331,40 @@ class OfflineInstallerUnitTests(unittest.TestCase):
                 self.assertTrue(path.is_dir())
                 self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o750)
 
+    def test_managed_runtime_root_ancestors_are_owned_and_traversable(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            managed_root = Path(tmp) / "var/lib/eva-ai"
+            cache = managed_root / "models/huggingface"
+            # Reproduce an existing root-created appliance directory which
+            # blocks the non-root service before it can reach the model cache.
+            managed_root.mkdir(parents=True, mode=0o700)
+            identity = type("Identity", (), {"pw_uid": 1234})()
+            group = type("Group", (), {"gr_gid": 1235})()
+            with (
+                patch.object(installer, "DEFAULT_RUNTIME_ROOT", managed_root),
+                patch.object(installer.pwd, "getpwnam", return_value=identity),
+                patch.object(installer.grp, "getgrnam", return_value=group),
+                patch.object(installer.os, "chown") as chown,
+            ):
+                created = installer._ensure_runtime_directories(
+                    {"EVOSSEARCH_MODEL_CACHE_DIR": str(cache)},
+                    user="eva",
+                    group="eva",
+                )
+
+            self.assertEqual(created, [cache])
+            expected = [
+                managed_root,
+                managed_root / "models",
+                cache,
+            ]
+            self.assertEqual(
+                [call.args[0] for call in chown.call_args_list],
+                expected,
+            )
+            for path in expected:
+                self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o750)
+
     def test_preinstall_file_backup_preserves_owner_and_group(self):
         with tempfile.TemporaryDirectory() as tmp:
             source = Path(tmp) / "eva-ai.env"
@@ -832,6 +866,7 @@ class OfflineInstallerUnitTests(unittest.TestCase):
 
             with (
                 patch.object(installer.os, "geteuid", return_value=0),
+                patch.object(installer, "_ensure_runtime_directories"),
                 patch.object(
                     installer.CommandRunner,
                     "run",
