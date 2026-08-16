@@ -262,6 +262,10 @@ class OfflineInstallerUnitTests(unittest.TestCase):
                 prepared.inference_policy_hash,
                 installer.inference_policy_fingerprint(existing),
             )
+            self.assertTrue(any(
+                action.phase == "inference" and "external agent/VLM" in action.description
+                for action in prepared.actions
+            ))
             self.assertFalse(any(
                 finding.level == "FAIL" and "inference policy" in finding.message
                 for finding in prepared.findings

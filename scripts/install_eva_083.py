@@ -1236,7 +1236,7 @@ def build_plan(prepared: PreparedInstall) -> list[PlanAction]:
         PlanAction(
             "inference",
             (
-                "preserve the complete existing EVA inference policy; abort and roll back on "
+                "preserve the complete existing external agent/VLM inference policy; abort and roll back on "
                 "any endpoint/model/context/queue/GPU change"
                 if prepared.inference_policy_hash is not None
                 else "create the reviewed inference policy for a fresh installation"
