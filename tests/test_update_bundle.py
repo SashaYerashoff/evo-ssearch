@@ -211,6 +211,11 @@ class UpdateBundleTests(unittest.TestCase):
         self.assertIn('"${BUNDLE_DIR}/update.sh"', BUILD_SCRIPT)
         self.assertIn('chmod 0755 "${BUNDLE_DIR}/update.sh"', BUILD_SCRIPT)
 
+    def test_builder_uses_parallel_fast_compression_with_portable_fallback(self):
+        self.assertIn('COMPRESS_PROGRAM="pigz -1"', BUILD_SCRIPT)
+        self.assertIn('COMPRESS_PROGRAM="gzip -1"', BUILD_SCRIPT)
+        self.assertIn('--use-compress-program="${COMPRESS_PROGRAM}"', BUILD_SCRIPT)
+
     def test_runtime_video_exclude_is_root_scoped_and_tracked_source_is_complete(self):
         self.assertIn('"--exclude=/video/"', BUILD_SCRIPT)
         self.assertNotIn('"--exclude=video"', BUILD_SCRIPT)

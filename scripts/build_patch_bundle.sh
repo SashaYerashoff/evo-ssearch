@@ -420,7 +420,14 @@ fi
 } > "${BUNDLE_DIR}/manifest.txt"
 
 ARCHIVE_PATH="${OUTPUT_DIR}/${BUNDLE_NAME}.tar.gz"
-tar -czf "${ARCHIVE_PATH}" -C "${TMP_DIR}" "${BUNDLE_NAME}"
+if command -v pigz >/dev/null 2>&1; then
+  COMPRESS_PROGRAM="pigz -1"
+else
+  COMPRESS_PROGRAM="gzip -1"
+fi
+log "Compressing bundle with ${COMPRESS_PROGRAM}"
+tar --use-compress-program="${COMPRESS_PROGRAM}" -cf "${ARCHIVE_PATH}" \
+  -C "${TMP_DIR}" "${BUNDLE_NAME}"
 
 if command -v sha256sum >/dev/null 2>&1; then
   (cd "${OUTPUT_DIR}" && sha256sum "${BUNDLE_NAME}.tar.gz" > "${BUNDLE_NAME}.tar.gz.sha256")
