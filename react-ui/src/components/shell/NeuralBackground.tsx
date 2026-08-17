@@ -68,12 +68,14 @@ const AURORA_COLORS = [CYAN, VIOLET, BLUE, [120, 150, 245]] as const
 const AURORA_N = 5
 const AURORA_SPEED = 0.05  // fraction of a lissajous cycle per second-ish — extremely slow
 const AURORA_ALPHA = 0.08  // per-blob opacity (normal blending — overlaps stay bounded)
-// This is ambient, very slow motion. Painting full-screen radial gradients at the
-// monitor refresh rate needlessly competes with local CUDA inference on demo hosts
-// where the display and VLM share a small GPU. Twelve frames per second remains
-// fluid enough for this slow ambient layer while leaving substantially more compositor time.
-const PAINT_INTERVAL_MS = 83
-const AURORA_REFRESH_MS = 750
+// Keep motion visually continuous without painting at the monitor refresh rate.
+// The mesh/walkers run at 30 fps; the very soft aurora is rasterized into its tiny
+// low-resolution buffer at 15 fps.  The old 12 fps / 1.3 fps split made the large
+// light fields visibly jump even though the rest of the console remained responsive.
+export const NEURAL_BACKGROUND_TIMING = {
+  paintIntervalMs: 32,
+  auroraRefreshMs: 60,
+} as const
 const AURORA_BUFFER_SCALE = 0.16
 const CANVAS_RENDER_SCALE = 0.5
 
@@ -258,7 +260,7 @@ export function NeuralBackground({ noAnim = false }: { noAnim?: boolean }) {
     }
 
     function draw(now: number) {
-      if (!still && last && now - last < PAINT_INTERVAL_MS) {
+      if (!still && last && now - last < NEURAL_BACKGROUND_TIMING.paintIntervalMs) {
         raf = requestAnimationFrame(draw)
         return
       }
@@ -271,7 +273,7 @@ export function NeuralBackground({ noAnim = false }: { noAnim?: boolean }) {
       // The aurora moves over minutes, not frames. Render it into a small cached
       // buffer and scale the bitmap instead of rasterizing five full-screen radial
       // gradients on every animation tick.
-      if (now - lastAuroraPaint >= AURORA_REFRESH_MS) paintAuroras(time)
+      if (now - lastAuroraPaint >= NEURAL_BACKGROUND_TIMING.auroraRefreshMs) paintAuroras(time)
       c2.drawImage(auroraCanvas, 0, 0, w, h)
 
       // wander the neurons a touch (topology stays; wires just breathe)
