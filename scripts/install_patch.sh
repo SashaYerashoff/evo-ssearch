@@ -200,6 +200,14 @@ run_as_user() {
   fi
 }
 
+run_pg_dsn() {
+  local dsn="$1"
+  shift
+  [[ -f "${SCRIPT_DIR}/pg_with_dsn.py" ]] \
+    || die "PostgreSQL DSN wrapper is missing: ${SCRIPT_DIR}/pg_with_dsn.py"
+  EVA_PG_CONNECT_DSN="${dsn}" python3 "${SCRIPT_DIR}/pg_with_dsn.py" -- "$@"
+}
+
 timestamp="$(date +%Y%m%d-%H%M%S)"
 BACKUP_DIR="${BACKUP_ROOT}/patch-${timestamp}"
 install -d -m 0700 "${BACKUP_DIR}"
@@ -297,10 +305,10 @@ if [[ "${SKIP_PG_DUMP}" != true ]]; then
     fi
 
     if [[ -n "${PG_DSN}" ]]; then
-      if pg_dump --dbname="${PG_DSN}" --format=custom --file="${BACKUP_DIR}/postgres.dump"; then
+      if run_pg_dsn "${PG_DSN}" pg_dump --format=custom --file="${BACKUP_DIR}/postgres.dump"; then
         PG_DUMP_CREATED=true
         ok "created PostgreSQL dump from env DSN"
-        DB_REVISION="$(psql --no-psqlrc --tuples-only --no-align --dbname="${PG_DSN}" \
+        DB_REVISION="$(run_pg_dsn "${PG_DSN}" psql --no-psqlrc --tuples-only --no-align \
           --command='SELECT version_num FROM public.alembic_version LIMIT 1' 2>/dev/null \
           | head -n 1 || true)"
         if [[ "${DB_REVISION}" =~ ^[A-Za-z0-9_.-]+$ ]]; then

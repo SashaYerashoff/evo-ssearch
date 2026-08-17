@@ -42,6 +42,10 @@ from urllib.request import (
 
 SCRIPT_PATH = Path(__file__).resolve()
 REPO_ROOT = SCRIPT_PATH.parent.parent
+if str(SCRIPT_PATH.parent) not in sys.path:
+    sys.path.insert(0, str(SCRIPT_PATH.parent))
+
+from pg_with_dsn import DsnError, postgres_environment
 
 
 def _expected_version() -> str:
@@ -1594,23 +1598,27 @@ def _verify_migration_capability(
         BEGIN;
         SELECT version_num FROM public.alembic_version LIMIT 1;
         UPDATE public.alembic_version SET version_num = version_num;
+        SET LOCAL row_security = off;
         DO $eva_row_visibility$
+        DECLARE
+            protected record;
         BEGIN
-            IF EXISTS (
+            FOR protected IN
                 SELECT 1
+                     , namespace.nspname AS schema_name
+                     , relation.relname AS table_name
                 FROM pg_class relation
                 JOIN pg_namespace namespace ON namespace.oid = relation.relnamespace
                 WHERE namespace.nspname = ANY(ARRAY['agent', 'archive', 'audit', 'iam', 'jobs'])
                   AND relation.relkind IN ('r', 'p')
                   AND relation.relforcerowsecurity
-            ) AND NOT EXISTS (
-                SELECT 1
-                FROM pg_roles
-                WHERE pg_has_role(current_user, oid, 'USAGE')
-                  AND (rolbypassrls OR rolsuper)
-            ) THEN
-                RAISE EXCEPTION 'migration identity cannot bypass FORCE ROW LEVEL SECURITY; the preservation guard would certify success without reading a single tenant row';
-            END IF;
+            LOOP
+                EXECUTE format(
+                    'SELECT 1 FROM %I.%I LIMIT 1',
+                    protected.schema_name,
+                    protected.table_name
+                );
+            END LOOP;
         END
         $eva_row_visibility$;
         SET LOCAL ROLE eva_owner;
@@ -1643,13 +1651,18 @@ def _verify_migration_capability(
         ROLLBACK;
     """
     try:
+        postgres_env = postgres_environment(migration_dsn, os.environ)
+    except DsnError as exc:
+        raise InstallerError(
+            "privileged migration DSN cannot be represented safely for libpq"
+        ) from exc
+    try:
         runner.run((
             "psql",
             "--no-psqlrc",
             "--set", "ON_ERROR_STOP=1",
-            "--dbname", migration_dsn,
             "--command", sql,
-        ))
+        ), env=postgres_env)
     except InstallerError as exc:
         raise InstallerError(
             "privileged migration DSN cannot update public.alembic_version, "

@@ -164,6 +164,13 @@ run_as_user() {
   fi
 }
 
+run_pg_dsn() {
+  local dsn="$1"
+  shift
+  [[ -f "${SCRIPT_DIR}/pg_with_dsn.py" ]] || return 127
+  EVA_PG_CONNECT_DSN="${dsn}" python3 "${SCRIPT_DIR}/pg_with_dsn.py" -- "$@"
+}
+
 redact_value() {
   local key="$1"
   local value="$2"
@@ -366,8 +373,8 @@ fi
 if [[ -n "${PG_DSN}" ]]; then
   ok "database DSN present in env"
   if command -v psql >/dev/null 2>&1; then
-    schema="$(psql "${PG_DSN}" -Atc "select version_num from alembic_version limit 1" 2>/dev/null || true)"
-    db_size="$(psql "${PG_DSN}" -Atc "select pg_size_pretty(pg_database_size(current_database()))" 2>/dev/null || true)"
+    schema="$(run_pg_dsn "${PG_DSN}" psql -Atc "select version_num from alembic_version limit 1" 2>/dev/null || true)"
+    db_size="$(run_pg_dsn "${PG_DSN}" psql -Atc "select pg_size_pretty(pg_database_size(current_database()))" 2>/dev/null || true)"
   fi
 elif id postgres >/dev/null 2>&1; then
   ok "postgres OS user exists for local database fallback"

@@ -21,8 +21,8 @@ SPEC.loader.exec_module(guard)
 class _Cursor:
     """Answer only the catalogue probes the visibility gate issues."""
 
-    def __init__(self, *, can_bypass: bool, force_rls: list[tuple[str, str]]) -> None:
-        self._can_bypass = can_bypass
+    def __init__(self, *, can_read_unfiltered: bool, force_rls: list[tuple[str, str]]) -> None:
+        self._can_read_unfiltered = can_read_unfiltered
         self._force_rls = force_rls
         self._rows: list[tuple[object, ...]] = []
 
@@ -33,10 +33,14 @@ class _Cursor:
         return False
 
     def execute(self, statement: str, params: object = None) -> None:
-        if "rolbypassrls" in statement and "EXISTS" in statement:
-            self._rows = [(self._can_bypass,)]
+        if not isinstance(statement, str):
+            if not self._can_read_unfiltered:
+                raise PermissionError("query would be affected by row-level security")
+            self._rows = [(1,)]
         elif "relforcerowsecurity" in statement:
             self._rows = list(self._force_rls)
+        elif "SET LOCAL row_security = off" in statement:
+            self._rows = []
         else:  # pragma: no cover - the gate must run before anything else
             raise AssertionError(f"unexpected query before visibility gate: {statement}")
 
@@ -48,26 +52,34 @@ class _Cursor:
 
 
 class _Connection:
-    def __init__(self, *, can_bypass: bool, force_rls: list[tuple[str, str]]) -> None:
-        self._can_bypass = can_bypass
+    def __init__(
+        self,
+        *,
+        can_read_unfiltered: bool,
+        force_rls: list[tuple[str, str]],
+    ) -> None:
+        self._can_read_unfiltered = can_read_unfiltered
         self._force_rls = force_rls
 
     def cursor(self, name: str | None = None) -> _Cursor:
-        return _Cursor(can_bypass=self._can_bypass, force_rls=self._force_rls)
+        return _Cursor(
+            can_read_unfiltered=self._can_read_unfiltered,
+            force_rls=self._force_rls,
+        )
 
 
 PROTECTED = [("archive", "detections"), ("iam", "users"), ("archive", "probes")]
 
 
 def test_guard_refuses_when_forced_rls_hides_every_protected_row():
-    connection = _Connection(can_bypass=False, force_rls=PROTECTED)
+    connection = _Connection(can_read_unfiltered=False, force_rls=PROTECTED)
 
     with pytest.raises(guard.PreservationError, match="FORCE ROW LEVEL SECURITY"):
         guard.assert_row_visibility(connection)
 
 
 def test_capture_refuses_before_reading_anything_when_blind():
-    connection = _Connection(can_bypass=False, force_rls=PROTECTED)
+    connection = _Connection(can_read_unfiltered=False, force_rls=PROTECTED)
 
     # _Cursor raises AssertionError on any non-catalogue query, so this proves
     # the gate runs before a single count(*) is issued.
@@ -75,14 +87,14 @@ def test_capture_refuses_before_reading_anything_when_blind():
         guard.capture(connection)
 
 
-def test_guard_allows_a_bypassrls_migration_identity():
-    connection = _Connection(can_bypass=True, force_rls=PROTECTED)
+def test_guard_allows_an_identity_with_effective_unfiltered_access():
+    connection = _Connection(can_read_unfiltered=True, force_rls=PROTECTED)
 
     guard.assert_row_visibility(connection)
 
 
 def test_guard_allows_a_database_without_forced_row_security():
-    connection = _Connection(can_bypass=False, force_rls=[])
+    connection = _Connection(can_read_unfiltered=False, force_rls=[])
 
     guard.assert_row_visibility(connection)
 

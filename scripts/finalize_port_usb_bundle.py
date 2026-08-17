@@ -60,6 +60,7 @@ def main() -> int:
         "repo/react-ui/dist/index.html",
         "repo/requirements-cuda.txt",
         "repo/scripts/database_preservation_guard.py",
+        "repo/scripts/pg_with_dsn.py",
         "repo/migrations/versions/20260801_0011_incidents.py",
         "repo/migrations/versions/20260805_0012_incident_temporal_memory.py",
         "repo/migrations/versions/20260805_0013_archive_source_channel_page_index.py",

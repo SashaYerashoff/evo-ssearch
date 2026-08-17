@@ -180,6 +180,14 @@ run_as_user() {
   fi
 }
 
+run_pg_dsn() {
+  local dsn="$1"
+  shift
+  [[ -f "${SCRIPT_DIR}/pg_with_dsn.py" ]] \
+    || die "PostgreSQL DSN wrapper is missing: ${SCRIPT_DIR}/pg_with_dsn.py"
+  EVA_PG_CONNECT_DSN="${dsn}" python3 "${SCRIPT_DIR}/pg_with_dsn.py" -- "$@"
+}
+
 if service_exists; then
   log "Stopping ${SERVICE_NAME}"
   "${SYSTEMCTL[@]}" stop "${SERVICE_NAME}.service" || true
@@ -303,11 +311,11 @@ if [[ "${RESTORE_DB}" == true ]]; then
 
   if [[ -n "${PG_DSN}" ]]; then
     DB_REVISION="$(cat "${BACKUP_DIR}/database_revision.txt" 2>/dev/null || true)"
-    DB_SUPERUSER="$(psql --no-psqlrc --tuples-only --no-align --dbname="${PG_DSN}" \
+    DB_SUPERUSER="$(run_pg_dsn "${PG_DSN}" psql --no-psqlrc --tuples-only --no-align \
       --command='SELECT rolsuper FROM pg_roles WHERE rolname = current_user' \
       | head -n 1)"
     if [[ "${DB_SUPERUSER}" == "t" ]]; then
-      psql --no-psqlrc --set ON_ERROR_STOP=on --dbname="${PG_DSN}" --command="
+      run_pg_dsn "${PG_DSN}" psql --no-psqlrc --set ON_ERROR_STOP=on --command="
         DROP SCHEMA IF EXISTS agent CASCADE;
         DROP SCHEMA IF EXISTS archive CASCADE;
         DROP SCHEMA IF EXISTS audit CASCADE;
@@ -315,10 +323,10 @@ if [[ "${RESTORE_DB}" == true ]]; then
         DROP SCHEMA IF EXISTS jobs CASCADE;
         DROP TABLE IF EXISTS public.alembic_version CASCADE;
       "
-      pg_restore --exit-on-error --dbname="${PG_DSN}" "${BACKUP_DIR}/postgres.dump"
+      run_pg_dsn "${PG_DSN}" pg_restore --exit-on-error "${BACKUP_DIR}/postgres.dump"
       ok "restored complete PostgreSQL dump with original ownership"
       if [[ "${DB_REVISION}" =~ ^[A-Za-z0-9_.-]+$ ]]; then
-        RESTORED_DB_REVISION="$(psql --no-psqlrc --tuples-only --no-align --dbname="${PG_DSN}" \
+        RESTORED_DB_REVISION="$(run_pg_dsn "${PG_DSN}" psql --no-psqlrc --tuples-only --no-align \
           --command='SELECT version_num FROM public.alembic_version LIMIT 1' \
           | head -n 1)"
         [[ "${RESTORED_DB_REVISION}" == "${DB_REVISION}" ]] \

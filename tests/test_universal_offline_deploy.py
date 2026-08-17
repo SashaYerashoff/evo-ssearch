@@ -70,6 +70,7 @@ def test_common_bundle_verification_catches_corruption_before_either_path(tmp_pa
         bundle / "repo" / "react-ui" / "dist" / "index.html",
         bundle / "repo" / "requirements-cuda.txt",
         bundle / "repo" / "scripts" / "database_preservation_guard.py",
+        bundle / "repo" / "scripts" / "pg_with_dsn.py",
         bundle / "repo" / "migrations" / "versions" / "20260801_0011_incidents.py",
         bundle / "repo" / "migrations" / "versions" / "20260805_0012_incident_temporal_memory.py",
         bundle / "repo" / "migrations" / "versions" / "20260805_0013_archive_source_channel_page_index.py",

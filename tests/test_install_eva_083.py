@@ -100,6 +100,7 @@ def make_source(root: Path) -> Path:
         "scripts/verify_patch.sh": "#!/bin/sh\nexit 0\n",
         "scripts/rollback.sh": "#!/bin/sh\nexit 0\n",
         "scripts/database_preservation_guard.py": "#!/usr/bin/env python3\n",
+        "scripts/pg_with_dsn.py": "#!/usr/bin/env python3\n",
         "scripts/install_assets/eva-ai.service.in": (
             "[Service]\nUser=@SERVICE_USER@\nGroup=@SERVICE_GROUP@\n"
             "WorkingDirectory=@APP_DIR@\nEnvironmentFile=@ENV_FILE@\n"
@@ -947,10 +948,11 @@ class OfflineInstallerUnitTests(unittest.TestCase):
             self.assertFalse((root / "backups").exists())
 
     def test_migration_capability_check_rolls_back_noop_revision_update(self):
-        runner = type("Runner", (), {"commands": []})()
+        runner = type("Runner", (), {"commands": [], "environments": []})()
 
-        def run(command, **_kwargs):
+        def run(command, **kwargs):
             runner.commands.append([str(item) for item in command])
+            runner.environments.append(dict(kwargs.get("env") or {}))
             return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
 
         runner.run = run
@@ -960,13 +962,35 @@ class OfflineInstallerUnitTests(unittest.TestCase):
         )
 
         command = runner.commands[0]
+        environment = runner.environments[0]
         sql = command[command.index("--command") + 1]
+        self.assertNotIn("--dbname", command)
+        self.assertNotIn("postgresql://migrator:secret@db.internal/eva", command)
+        self.assertEqual(environment["PGDATABASE"], "eva")
+        self.assertEqual(environment["PGUSER"], "migrator")
+        self.assertEqual(environment["PGPASSWORD"], "secret")
+        self.assertEqual(environment["PGHOST"], "db.internal")
+        self.assertNotIn("EVA_INSTALL_MIGRATION_DSN", environment)
         self.assertIn("SELECT version_num FROM public.alembic_version", sql)
         self.assertIn("UPDATE public.alembic_version SET version_num = version_num", sql)
+        self.assertIn("SET LOCAL row_security = off", sql)
+        self.assertIn("relation.relforcerowsecurity", sql)
+        self.assertIn("SELECT 1 FROM %I.%I LIMIT 1", sql)
         self.assertIn("SET LOCAL ROLE eva_owner", sql)
         self.assertIn("EVA schemas are absent or are not owned by eva_owner", sql)
         self.assertIn("CREATE TABLE archive.__eva_migration_preflight", sql)
         self.assertIn("ROLLBACK", sql)
+
+    def test_privileged_database_dsn_is_never_passed_in_postgres_argv(self):
+        for relative in (
+            "scripts/install_patch.sh",
+            "scripts/preflight_patch.sh",
+            "scripts/rollback.sh",
+        ):
+            source = (ROOT / relative).read_text(encoding="utf-8")
+            self.assertNotIn('--dbname="${PG_DSN}"', source, relative)
+            self.assertNotIn('psql "${PG_DSN}"', source, relative)
+            self.assertIn('EVA_PG_CONNECT_DSN="${dsn}"', source, relative)
 
     def test_apply_staging_failure_restores_preexisting_env_without_backup_snapshot(self):
         with tempfile.TemporaryDirectory() as tmp:

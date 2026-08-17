@@ -276,21 +276,6 @@ def _capture_table(
     return result
 
 
-def _can_bypass_row_security(connection: psycopg.Connection[Any]) -> bool:
-    with connection.cursor() as cursor:
-        cursor.execute(
-            """
-            SELECT EXISTS (
-                SELECT 1
-                  FROM pg_roles
-                 WHERE pg_has_role(current_user, oid, 'USAGE')
-                   AND (rolbypassrls OR rolsuper)
-            )
-            """
-        )
-        return bool(cursor.fetchone()[0])
-
-
 def _force_rls_tables(connection: psycopg.Connection[Any]) -> list[str]:
     with connection.cursor() as cursor:
         cursor.execute(
@@ -319,18 +304,32 @@ def assert_row_visibility(connection: psycopg.Connection[Any]) -> None:
     never checked.  A silent false negative here is worse than no guard at all.
     """
 
-    if _can_bypass_row_security(connection):
-        return
     blind = _force_rls_tables(connection)
     if not blind:
         return
-    raise PreservationError(
-        f"{len(blind)} EVA table(s) enforce FORCE ROW LEVEL SECURITY and this "
-        "connection cannot bypass it, so every protected row reads as absent "
-        f"(for example {', '.join(blind[:3])}). Capturing now would certify "
-        "preservation without inspecting a single tenant row. Re-run with a "
-        "BYPASSRLS or superuser migration identity."
-    )
+    try:
+        with connection.cursor() as cursor:
+            # ``row_security=off`` does not bypass RLS. PostgreSQL instead
+            # raises an error whenever the current effective identity would
+            # have rows filtered by a policy. This probes the capability that
+            # capture actually needs and avoids treating membership in a role
+            # carrying a non-inherited BYPASSRLS attribute as visibility.
+            cursor.execute("SET LOCAL row_security = off")
+            for qualified in blind:
+                schema, table = qualified.split(".", 1)
+                cursor.execute(
+                    sql.SQL("SELECT 1 FROM {} LIMIT 1").format(
+                        _table_identifier(schema, table)
+                    )
+                )
+    except Exception as exc:
+        raise PreservationError(
+            f"{len(blind)} EVA table(s) enforce FORCE ROW LEVEL SECURITY and "
+            "this connection cannot prove unfiltered access to them "
+            f"(for example {', '.join(blind[:3])}). Capturing now could "
+            "certify preservation without inspecting tenant rows. Re-run "
+            "with an effective BYPASSRLS or superuser migration identity."
+        ) from exc
 
 
 def capture(
