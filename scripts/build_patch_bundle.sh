@@ -266,7 +266,7 @@ fi
 mkdir -p "${SNAPSHOT_DIR}/react-ui/dist"
 cp -a "${REPO_ROOT}/react-ui/dist/." "${SNAPSHOT_DIR}/react-ui/dist/"
 
-for script_name in install_patch.sh install_media_runtime.sh restore_code_snapshot.py verify_patch.sh rollback.sh set_site_ips.sh client_diagnostics.sh preflight_patch.sh; do
+for script_name in install_patch.sh install_media_runtime.sh restore_code_snapshot.py verify_patch.sh rollback.sh set_site_ips.sh client_diagnostics.sh preflight_patch.sh pg_with_dsn.py; do
   if [[ -f "${REPO_ROOT}/scripts/${script_name}" ]]; then
     cp "${REPO_ROOT}/scripts/${script_name}" "${BUNDLE_DIR}/scripts/${script_name}"
     chmod 0755 "${BUNDLE_DIR}/scripts/${script_name}"
