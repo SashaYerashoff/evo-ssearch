@@ -1727,6 +1727,8 @@
 .vid-tab.on { border-color: var(--mon-line); color: var(--vid-accent); background: var(--accent-soft); }
 .vid-prompt-area { width: 100%; background: var(--void-tile); border: 1px solid var(--line-2); border-radius: 10px; color: var(--text); padding: 11px; outline: none; font-size: 13px; line-height: 1.5; resize: vertical; font-family: var(--mono); }
 .vid-prompt-area:focus { border-color: var(--mon-line); }
+.vid-prompt-loading { min-height: 282px; display: flex; align-items: center; justify-content: center; gap: 10px; color: var(--text-mut); font-size: 12px; border: 1px solid var(--line-2); border-radius: 10px; background: var(--void-tile); }
+.vid-prompt-loading .spinner { width: 16px; height: 16px; }
 .vid-bookmark-row { display: flex; align-items: flex-end; gap: 16px; margin-top: 12px; }
 
 /* ===== Settings modal ===== */

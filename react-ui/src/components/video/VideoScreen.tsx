@@ -384,6 +384,7 @@ export function VideoScreen({
   navigation,
   channels,
   drive,
+  onDriveHandled,
   reviewOverlayOpen = false,
   onReloadChannels,
   canCapture,
@@ -397,6 +398,7 @@ export function VideoScreen({
   navigation?: ReactNode
   channels: Channel[]
   drive?: ConsoleDrive | null
+  onDriveHandled?: (seq: number) => void
   reviewOverlayOpen?: boolean
   onReloadChannels?: () => Promise<void> | void
   canCapture: boolean
@@ -456,6 +458,7 @@ export function VideoScreen({
   const livePreviewImageRef = useRef<HTMLImageElement>(null)
   const livePreviewVideoRef = useRef<HTMLVideoElement>(null)
   const hydratedSettingsKeyRef = useRef<string | null>(null)
+  const handledDriveSeqRef = useRef<number | null>(null)
 
   const releasePreviewMedia = useCallback(() => {
     const modelImage = modelPreviewRef.current
@@ -623,8 +626,11 @@ export function VideoScreen({
   }, [activeTab, loadLmCatalog])
   useEffect(() => {
     if (!drive || drive.effect.target !== 'video') return
+    if (handledDriveSeqRef.current === drive.seq) return
     const { action, payload } = drive.effect
     const nextChannel = Number(payload.channel_id)
+    if (Number.isInteger(nextChannel) && channels.length === 0) return
+    handledDriveSeqRef.current = drive.seq
     const validNextChannel = Number.isInteger(nextChannel) && channels.some((channel) => channel.id === nextChannel)
       ? nextChannel
       : null
@@ -652,7 +658,8 @@ export function VideoScreen({
     }
     if (action === 'open_prompt_settings' && canManagePrompts) setPromptOpen(true)
     if (action === 'show_channels' || action === 'show_restore_status') void loadStreams()
-  }, [drive?.seq, channels, canManagePrompts, loadStreams])
+    onDriveHandled?.(drive.seq)
+  }, [drive?.seq, channels, canManagePrompts, loadStreams, onDriveHandled])
   useEffect(() => {
     setReviewChannelId((current) => (
       current != null && channels.some((channel) => channel.id === current)

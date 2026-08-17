@@ -1,4 +1,9 @@
+from pathlib import Path
+
 from agent_ui_effects import derive_agent_ui_effects
+
+
+ROOT = Path(__file__).resolve().parents[1]
 
 
 def test_archive_result_projects_closed_filter_effect():
@@ -96,3 +101,25 @@ def test_explicit_video_period_projects_depth_with_resolved_bounds():
     assert effect["payload"]["depth"] == "L1"
     assert effect["payload"]["since_ms"] == 100_000
     assert effect["payload"]["until_ms"] == 200_000
+
+
+def test_react_consumes_video_drive_once_instead_of_replaying_it_on_catalog_refresh():
+    app_source = (ROOT / "react-ui" / "src" / "App.tsx").read_text(encoding="utf-8")
+    video_source = (
+        ROOT / "react-ui" / "src" / "components" / "video" / "VideoScreen.tsx"
+    ).read_text(encoding="utf-8")
+
+    assert "setVideoDrive((current) => current?.seq === seq ? null : current)" in app_source
+    assert "handledDriveSeqRef.current === drive.seq" in video_source
+    assert "handledDriveSeqRef.current = drive.seq" in video_source
+    assert "onDriveHandled?.(drive.seq)" in video_source
+
+
+def test_prompt_editor_cannot_overwrite_saved_configuration_before_loading_finishes():
+    source = (
+        ROOT / "react-ui" / "src" / "components" / "video" / "PromptSettingsModal.tsx"
+    ).read_text(encoding="utf-8")
+
+    assert "Loading saved prompts and alerts" in source
+    assert "disabled={busy || !loaded || !!loadErr}" in source
+    assert "if (!alive) return" in source

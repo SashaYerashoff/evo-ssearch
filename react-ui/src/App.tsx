@@ -179,6 +179,9 @@ export default function App() {
     const agent = busy ? 'working' : 'idle'
     setStatus((current) => current.agent === agent ? current : { ...current, agent })
   }, [])
+  const handleVideoDriveHandled = useCallback((seq: number) => {
+    setVideoDrive((current) => current?.seq === seq ? null : current)
+  }, [])
   const handleOpenParentAlert = useCallback(async (probe: Probe) => {
     const parentAlertId = String(probe.parent_alert_id || '').trim()
     const channelId = Number(probe.channel_id)
@@ -458,6 +461,7 @@ export default function App() {
               navigation={navigation()}
               channels={channels}
               drive={videoDrive}
+              onDriveHandled={handleVideoDriveHandled}
               reviewOverlayOpen={!!summaryReview}
               onReloadChannels={refreshChannels}
               canCapture={hasPermission(user, PERMISSION.captureManage)}

@@ -21,11 +21,27 @@ export function PromptSettingsModal({
   const [tab, setTab] = useState('stream')
   const [busy, setBusy] = useState(false)
   const [err, setErr] = useState<string | null>(null)
+  const [loadErr, setLoadErr] = useState<string | null>(null)
   const [loaded, setLoaded] = useState(false)
   const tabs = canCreateBookmarks ? TABS : TABS.filter((item) => item.key !== 'json')
 
   useEffect(() => {
-    videoApi.getPromptSettings(channelId).then((d) => { setS({ ...d, rollup_prompts: d.rollup_prompts || {} }); setLoaded(true) }).catch(() => setLoaded(true))
+    let alive = true
+    setLoaded(false)
+    setLoadErr(null)
+    setS({ rollup_prompts: {} })
+    videoApi.getPromptSettings(channelId)
+      .then((d) => {
+        if (!alive) return
+        setS({ ...d, rollup_prompts: d.rollup_prompts || {} })
+        setLoaded(true)
+      })
+      .catch((error: any) => {
+        if (!alive) return
+        setLoadErr(error?.message || 'Saved prompts and alerts could not be loaded.')
+        setLoaded(true)
+      })
+    return () => { alive = false }
   }, [channelId])
 
   const getVal = () => {
@@ -62,9 +78,15 @@ export function PromptSettingsModal({
           <div className="vid-tabs">
             {tabs.map((t) => <button key={t.key} className={`vid-tab ${tab === t.key ? 'on' : ''}`} onClick={() => setTab(t.key)}>{t.label}</button>)}
           </div>
-          <textarea className="vid-prompt-area" value={getVal()} onChange={(e) => setVal(e.target.value)}
-            placeholder={loaded ? 'Prompt for this layer…' : 'Loading…'} rows={12} />
-          {canCreateBookmarks && <div className="vid-bookmark-row">
+          {!loaded ? (
+            <div className="vid-prompt-loading" role="status"><span className="spinner" /> Loading saved prompts and alerts…</div>
+          ) : loadErr ? (
+            <div className="chat-error" role="alert">{loadErr} Close this window and try again; nothing was overwritten.</div>
+          ) : (
+            <textarea className="vid-prompt-area" value={getVal()} onChange={(e) => setVal(e.target.value)}
+              placeholder="Prompt for this layer…" rows={12} />
+          )}
+          {loaded && !loadErr && canCreateBookmarks && <div className="vid-bookmark-row">
             <label className="mon-check"><input type="checkbox" checked={!!s.bookmark_enabled} onChange={(e) => setS({ ...s, bookmark_enabled: e.target.checked })} /> Make bookmarks on alerts</label>
             <div className="wfield" style={{ maxWidth: 150 }}><label>Cooldown (s)</label>
               <input type="number" step="0.5" min="0" value={s.bookmark_cooldown_sec ?? 8} onChange={(e) => setS({ ...s, bookmark_cooldown_sec: Number(e.target.value) })} />
@@ -73,7 +95,7 @@ export function PromptSettingsModal({
           {err && <div className="chat-error">{err}</div>}
           <div className="mon-modal-actions">
             <button className="mon-btn" onClick={onClose}>Close</button>
-            <button className="mon-btn accent" disabled={busy} onClick={save}><IconDeviceFloppy size={15} /> Save</button>
+            <button className="mon-btn accent" disabled={busy || !loaded || !!loadErr} onClick={save}><IconDeviceFloppy size={15} /> Save</button>
           </div>
         </div>
       </div>
