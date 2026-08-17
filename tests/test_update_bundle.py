@@ -13,9 +13,17 @@ ROLLBACK_SCRIPT = (ROOT / "scripts" / "rollback.sh").read_text(encoding="utf-8")
 INSTALL_SCRIPT = (ROOT / "scripts" / "install_patch.sh").read_text(encoding="utf-8")
 VERIFY_SCRIPT = (ROOT / "scripts" / "verify_patch.sh").read_text(encoding="utf-8")
 OFFLINE_INSTALLER_SCRIPT = (ROOT / "scripts" / "install_eva_083.py").read_text(encoding="utf-8")
+PREFLIGHT_SCRIPT = (ROOT / "scripts" / "preflight_patch.sh").read_text(encoding="utf-8")
 
 
 class UpdateBundleTests(unittest.TestCase):
+    def test_preflight_resolves_postgres_wrapper_relative_to_its_own_script(self):
+        script_dir = 'SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"'
+        wrapper_use = 'python3 "${SCRIPT_DIR}/pg_with_dsn.py"'
+        self.assertIn(script_dir, PREFLIGHT_SCRIPT)
+        self.assertIn(wrapper_use, PREFLIGHT_SCRIPT)
+        self.assertLess(PREFLIGHT_SCRIPT.index(script_dir), PREFLIGHT_SCRIPT.index(wrapper_use))
+
     def test_shell_parses_and_help_is_safe(self):
         subprocess.run(["bash", "-n", str(SCRIPT_PATH)], check=True)
         completed = subprocess.run(

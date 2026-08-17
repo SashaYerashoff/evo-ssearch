@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 APP_DIR="${EVA_APP_DIR:-/opt/eva-ai/evo-ssearch}"
 ENV_FILE="${EVA_ENV_FILE:-/etc/eva-ai/eva-ai.env}"
 SERVICE_NAME="${EVA_SERVICE_NAME:-eva-ai}"
