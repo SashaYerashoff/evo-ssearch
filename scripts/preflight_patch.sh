@@ -357,6 +357,7 @@ fi
 
 print_header "PostgreSQL"
 check_command pg_dump
+check_command pg_restore
 check_command psql
 PG_DSN="$(read_env_var EVA_DATABASE_DSN "${ENV_FILE}")"
 if [[ -z "${PG_DSN}" ]]; then

@@ -520,6 +520,7 @@ def prepare_env_values(
             "EVOSSEARCH_PRODUCTION_CLIP_MODEL": SIGLIP2_MODEL,
             "EVOSSEARCH_CLIP_MODEL": SIGLIP2_MODEL,
             "EVOSSEARCH_CLIP_MODEL_REVISION": SIGLIP2_REVISION,
+            "EVOSSEARCH_CLIP_DEVICE": "cuda",
             "EVOSSEARCH_GUNICORN_WORKERS": "1",
             "EVOSSEARCH_GUNICORN_THREADS": "8",
             "EVOSSEARCH_LUXRIOT_LIVE_MEDIA_MAX_SECONDS": "120",
@@ -577,9 +578,35 @@ def prepare_env_values(
             "EVOSSEARCH_PRODUCTION_CLIP_MODEL": SIGLIP2_MODEL,
             "EVOSSEARCH_CLIP_MODEL": SIGLIP2_MODEL,
             "EVOSSEARCH_CLIP_MODEL_REVISION": SIGLIP2_REVISION,
+            "EVOSSEARCH_CLIP_DEVICE": "cuda",
             "EVOSSEARCH_EMBEDDER_FALLBACK_ENABLED": "false",
+            # The 0.8.7 operator probe contract is a continuous one-Hz
+            # semantic stream.  Older site environments do not contain these
+            # coordinates because the feature did not exist yet.  Append the
+            # release defaults without replacing an administrator's explicit
+            # attention policy.
+            "EVOSSEARCH_LUXRIOT_ATTENTION_SCHEDULER_ENABLED": "true",
+            "EVOSSEARCH_LUXRIOT_ATTENTION_EPISODE_DISPATCH_ENABLED": "false",
+            "EVOSSEARCH_LUXRIOT_ATTENTION_EMBED_ALL_CHANNELS": "true",
+            "EVOSSEARCH_LUXRIOT_ATTENTION_EMBEDDING_CADENCE_MS": "1000",
+            "EVOSSEARCH_LUXRIOT_ATTENTION_STORAGE_ENABLED": "true",
+            "EVOSSEARCH_SEMANTIC_SNAPSHOT_ARCHIVE_ENABLED": "true",
+            "EVOSSEARCH_PROBE_REALTIME_BOOKMARK_ENABLED": "true",
         }.items():
             add_missing(key, value)
+        # SigLIP2 is no longer an optional experimental sidecar in this
+        # release.  A preserved 0.8.1 "light runtime" value must not make the
+        # updater report success while probes are silently disconnected.
+        for key in (
+            "EVOSSEARCH_EMBEDDER_REQUIRED",
+            "EVOSSEARCH_EXPERIMENTAL_EMBEDDERS_ENABLED",
+        ):
+            if str(values.get(key) or "").strip().lower() != "true":
+                values[key] = "true"
+                updates[key] = "true"
+        if str(values.get("EVOSSEARCH_CLIP_DEVICE") or "").strip().lower() == "auto":
+            values["EVOSSEARCH_CLIP_DEVICE"] = "cuda"
+            updates["EVOSSEARCH_CLIP_DEVICE"] = "cuda"
     if legacy_clip_migration:
         for key in ("EVOSSEARCH_PRODUCTION_CLIP_MODEL", "EVOSSEARCH_CLIP_MODEL"):
             current = str(values.get(key) or "").strip()
@@ -894,6 +921,15 @@ def _siglip2_runtime_findings(
     model = str(values.get("EVOSSEARCH_CLIP_MODEL") or "").strip().lower()
     if "siglip2" not in model:
         return []
+    clip_device = str(
+        values.get("EVOSSEARCH_CLIP_DEVICE") or "cuda"
+    ).strip().lower()
+    if not clip_device.startswith("cuda"):
+        return [Finding(
+            "FAIL",
+            "release-managed SigLIP2 requires EVOSSEARCH_CLIP_DEVICE=cuda; "
+            f"found {clip_device or 'unset'}",
+        )]
     python = options.app_dir / ".venv" / "bin" / "python"
     if not python.is_file() or not os.access(python, os.X_OK):
         return []
@@ -906,7 +942,8 @@ def _siglip2_runtime_findings(
                 "v=version('transformers'); "
                 "parts=tuple(int(x) for x in re.findall(r'\\d+', v)[:2]); "
                 "assert parts >= (4,52), v; "
-                "assert importlib.util.find_spec('transformers.models.siglip2') is not None"
+                "assert importlib.util.find_spec('transformers.models.siglip2') is not None; "
+                "import torch; assert torch.cuda.is_available(), torch.__version__"
             ),
         ),
         stdout=subprocess.DEVNULL,
@@ -925,6 +962,14 @@ def _siglip2_runtime_findings(
         database_requirements = options.source_dir / "requirements-db.txt"
         if database_requirements.is_file():
             requirement_files.append(database_requirements)
+        cuda_requirements = options.source_dir / "requirements-cuda.txt"
+        if not cuda_requirements.is_file():
+            return [Finding(
+                "FAIL",
+                "target venv has no CUDA-capable torch and the bundle has no "
+                "reviewed requirements-cuda.txt repair contract",
+            )]
+        requirement_files.append(cuda_requirements)
         common_args = [
             "--dry-run",
             "--no-index",
@@ -960,7 +1005,8 @@ def _siglip2_runtime_findings(
             if resolution.returncode == 0:
                 return [Finding(
                     "OK",
-                    "target venv needs the SigLIP2 dependency upgrade; bundled wheelhouse resolves all Python requirements offline",
+                    "target venv needs the SigLIP2 CUDA runtime repair; bundled "
+                    "wheelhouse resolves all Python requirements offline",
                 )]
             detail_rows = [
                 row.strip()
@@ -972,10 +1018,10 @@ def _siglip2_runtime_findings(
         detail = errors[-1] if errors else "no compatible pip/uv resolver is available"
         return [Finding(
             "FAIL",
-            "target venv cannot load SigLIP2 and bundled wheelhouse resolution failed: "
+            "target venv cannot provide CUDA SigLIP2 and bundled wheelhouse resolution failed: "
             + detail,
         )]
-    return [Finding("OK", "target venv supports the SigLIP2 runtime contract")]
+    return [Finding("OK", "target venv supports the SigLIP2 CUDA runtime contract")]
 
 
 def _media_runtime_findings(bundle_dir: Path) -> list[Finding]:
@@ -1250,6 +1296,8 @@ def collect_preflight(
             add("FAIL", f"user {options.service_user!r} is absent and useradd is unavailable")
     if options.migrate and shutil.which("pg_dump") is None:
         add("FAIL", "pg_dump is required before migrations; no unsafe skip is provided")
+    if options.migrate and shutil.which("pg_restore") is None:
+        add("FAIL", "pg_restore is required to validate the pre-migration dump")
     if options.migrate and shutil.which("psql") is None:
         add("FAIL", "psql is required to prove migration-table access before apply")
     if options.dry_run:
@@ -1546,6 +1594,25 @@ def _verify_migration_capability(
         BEGIN;
         SELECT version_num FROM public.alembic_version LIMIT 1;
         UPDATE public.alembic_version SET version_num = version_num;
+        DO $eva_row_visibility$
+        BEGIN
+            IF EXISTS (
+                SELECT 1
+                FROM pg_class relation
+                JOIN pg_namespace namespace ON namespace.oid = relation.relnamespace
+                WHERE namespace.nspname = ANY(ARRAY['agent', 'archive', 'audit', 'iam', 'jobs'])
+                  AND relation.relkind IN ('r', 'p')
+                  AND relation.relforcerowsecurity
+            ) AND NOT EXISTS (
+                SELECT 1
+                FROM pg_roles
+                WHERE pg_has_role(current_user, oid, 'USAGE')
+                  AND (rolbypassrls OR rolsuper)
+            ) THEN
+                RAISE EXCEPTION 'migration identity cannot bypass FORCE ROW LEVEL SECURITY; the preservation guard would certify success without reading a single tenant row';
+            END IF;
+        END
+        $eva_row_visibility$;
         SET LOCAL ROLE eva_owner;
         DO $eva_preflight$
         DECLARE
@@ -1586,8 +1653,8 @@ def _verify_migration_capability(
     except InstallerError as exc:
         raise InstallerError(
             "privileged migration DSN cannot update public.alembic_version, "
-            "SET ROLE eva_owner, or modify EVA-owned schemas; live files and "
-            "service were not changed"
+            "see rows behind FORCE ROW LEVEL SECURITY, SET ROLE eva_owner, or "
+            "modify EVA-owned schemas; live files and service were not changed"
         ) from exc
 
 
@@ -1633,9 +1700,16 @@ def _automatic_rollback(
                 check=False,
             )
         return False
+    # Only claim what this invocation actually restored: --restore-db is passed
+    # for migrating updates alone, and a code-only rollback leaves the database
+    # untouched by design.
+    restored = (
+        "previous code, configuration and database"
+        if options.migrate
+        else "previous code and configuration (database was not part of this rollback)"
+    )
     print(
-        "AUTOMATIC ROLLBACK COMPLETE: previous code, configuration and database "
-        f"were restored from {backup_dir}",
+        f"AUTOMATIC ROLLBACK COMPLETE: {restored} were restored from {backup_dir}",
         file=sys.stderr,
     )
     return True
@@ -1664,6 +1738,37 @@ def _latest_backup_marker(backup_root: Path) -> str:
         return str(Path(raw).resolve(strict=False)) if raw else ""
     except OSError:
         return ""
+
+
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(4 * 1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _validate_database_backup(backup_dir: Path, runner: CommandRunner) -> Path:
+    """Prove the quiescent pre-migration dump is present and self-consistent."""
+
+    dump = backup_dir / "postgres.dump"
+    checksum = backup_dir / "postgres.dump.sha256"
+    if not dump.is_file() or dump.stat().st_size <= 0:
+        raise InstallerError(
+            "PostgreSQL backup is absent; refusing to run migrations. "
+            "Fix pg_dump/permissions and retry."
+        )
+    if not checksum.is_file():
+        raise InstallerError(
+            "PostgreSQL backup checksum is absent; refusing to run migrations."
+        )
+    row = checksum.read_text(encoding="utf-8").strip().split()
+    if len(row) != 2 or row[1] != "postgres.dump" or not re.fullmatch(r"[0-9a-fA-F]{64}", row[0]):
+        raise InstallerError("PostgreSQL backup checksum manifest is invalid")
+    if _sha256_file(dump) != row[0].lower():
+        raise InstallerError("PostgreSQL backup checksum verification failed")
+    runner.run(("pg_restore", "--list", "--file=/dev/null", dump))
+    return dump
 
 
 def _venv_has_healthy_opencv(python: Path) -> bool:
@@ -1845,7 +1950,7 @@ def apply_install(prepared: PreparedInstall) -> Path:
         if migration_dsn:
             install_env["EVA_PATCH_PG_DSN"] = migration_dsn
         install_patch = options.source_dir / "scripts" / "install_patch.sh"
-        runner.run((
+        install_command: list[str | Path] = [
             install_patch,
             "--bundle-dir", options.bundle_dir,
             "--source-dir", options.source_dir,
@@ -1856,7 +1961,10 @@ def apply_install(prepared: PreparedInstall) -> Path:
             "--backup-root", options.backup_root,
             "--no-start",
             "--no-verify",
-        ), env=install_env)
+        ]
+        if options.migrate:
+            install_command.append("--require-pg-dump")
+        runner.run(install_command, env=install_env)
         backup_dir = _latest_backup(options.backup_root)
         if prepared.inference_policy_hash is not None:
             _assert_inference_policy_file(
@@ -1887,16 +1995,28 @@ def apply_install(prepared: PreparedInstall) -> Path:
         _install_media_runtime(prepared, runner)
 
         if options.migrate:
-            db_dump = backup_dir / "postgres.dump"
-            if not db_dump.is_file() or db_dump.stat().st_size <= 0:
-                raise InstallerError(
-                    "PostgreSQL backup is absent; refusing to run migrations. "
-                    "Fix pg_dump/permissions and retry."
-                )
+            _validate_database_backup(backup_dir, runner)
             alembic = options.app_dir / ".venv" / "bin" / "alembic"
             if not alembic.is_file():
                 raise InstallerError(f"Alembic is missing after dependency setup: {alembic}")
             migration_env = _migration_environment(prepared)
+            preservation_guard = options.app_dir / "scripts" / "database_preservation_guard.py"
+            if not preservation_guard.is_file():
+                raise InstallerError(
+                    "database preservation guard is absent; refusing to run migrations"
+                )
+            preservation_manifest = backup_dir / "database-preservation.json"
+            runner.run(
+                (
+                    venv_python,
+                    preservation_guard,
+                    "capture",
+                    "--output",
+                    preservation_manifest,
+                ),
+                cwd=options.app_dir,
+                env=migration_env,
+            )
             runner.run((alembic, "current"), cwd=options.app_dir, env=migration_env)
             runner.run((alembic, "upgrade", "head"), cwd=options.app_dir, env=migration_env)
             current = runner.run((alembic, "current"), cwd=options.app_dir, env=migration_env)
@@ -1904,6 +2024,17 @@ def apply_install(prepared: PreparedInstall) -> Path:
                 raise InstallerError(
                     f"Alembic current did not report expected schema {EXPECTED_SCHEMA}"
                 )
+            runner.run(
+                (
+                    venv_python,
+                    preservation_guard,
+                    "verify",
+                    "--input",
+                    preservation_manifest,
+                ),
+                cwd=options.app_dir,
+                env=migration_env,
+            )
 
         if options.start:
             runner.run(("systemctl", "enable", options.service_name + ".service"))
@@ -1978,6 +2109,17 @@ def apply_install(prepared: PreparedInstall) -> Path:
             options.unit_file.unlink(missing_ok=True)
             subprocess.run(
                 ("systemctl", "daemon-reload"),
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                check=False,
+            )
+        if backup_dir is None and unit_preexisted and options.start:
+            # install_patch now quiesces writers before a required pg_dump. If
+            # that dump fails before LATEST is armed, the code/database are
+            # unchanged; restore the staged env above and bring the old service
+            # back instead of leaving the site dark.
+            subprocess.run(
+                ("systemctl", "start", options.service_name + ".service"),
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
                 check=False,

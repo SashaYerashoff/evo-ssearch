@@ -143,7 +143,119 @@ check_endpoint() {
 }
 
 check_endpoint "health" "/health" || RESULT=1
-check_endpoint "ready" "/ready" || RESULT=1
+check_endpoint "ready" "/ready?load=1" || RESULT=1
+
+check_embedder_contract() {
+  local body code
+  body="$(mktemp)"
+  code="$(curl "${CURL_OPTS[@]}" -o "${body}" -w '%{http_code}' \
+    "${BASE_URL}/ready?load=1" 2>/tmp/eva-patch-curl.err || true)"
+  if [[ "${code}" != "200" ]]; then
+    fail "could not inspect the loaded embedder contract (HTTP ${code:-000})"
+    rm -f "${body}" /tmp/eva-patch-curl.err
+    return 1
+  fi
+  if ! python3 - "${body}" <<'PY'
+import json
+import sys
+
+payload = json.load(open(sys.argv[1], encoding="utf-8"))
+embedder = payload.get("checks", {}).get("embedder", {})
+backend = str(embedder.get("backend") or "").casefold()
+model = str(embedder.get("clip_model") or "").casefold()
+if "siglip2" in backend or "siglip2" in model:
+    assert embedder.get("ok") is True, embedder
+    device = str(embedder.get("device") or "").casefold()
+    assert device.startswith("cuda"), embedder
+PY
+  then
+    fail "release-managed SigLIP2 is not healthy on CUDA"
+    sed -n '1,8p' "${body}" >&2
+    rm -f "${body}" /tmp/eva-patch-curl.err
+    return 1
+  fi
+  rm -f "${body}" /tmp/eva-patch-curl.err
+  ok "loaded embedder contract is healthy on its required device"
+}
+
+check_embedder_contract || RESULT=1
+
+check_operator_semantic_contract() {
+  local body code deadline rc detail
+  body="$(mktemp)"
+  deadline=$((SECONDS + TIMEOUT_SECONDS))
+  while true; do
+    code="$(curl "${CURL_OPTS[@]}" -o "${body}" -w '%{http_code}' \
+      "${BASE_URL}/ready?load=1" 2>/tmp/eva-patch-curl.err || true)"
+    if [[ "${code}" == "200" ]]; then
+      if detail="$(python3 - "${body}" <<'PY'
+import json
+import sys
+
+payload = json.load(open(sys.argv[1], encoding="utf-8"))
+checks = payload.get("checks", {})
+attention = checks.get("attention", {})
+scheduler = attention.get("scheduler", {})
+archive = attention.get("semantic_snapshot_archive", {})
+
+if scheduler.get("enabled") is not True:
+    raise AssertionError("attention scheduler is disabled")
+if archive.get("started") is not True or archive.get("worker_alive") is not True:
+    raise AssertionError("semantic snapshot archive worker is not alive")
+if archive.get("accepting") is not True:
+    raise AssertionError("semantic snapshot archive is not accepting frames")
+
+desired = int((checks.get("luxriot_restore", {}) or {}).get("desired_count") or 0)
+if desired <= 0:
+    print("configured; no desired live stream requires a runtime sample")
+    raise SystemExit(0)
+
+captures = attention.get("capture_runtime") or []
+dispatches = sum(
+    int(item.get("capture_apex_probe_dispatch_count") or 0)
+    for item in captures
+    if isinstance(item, dict)
+)
+counters = archive.get("counters", {}) or {}
+accepted = int(counters.get("accepted_total") or 0)
+persisted = int(counters.get("persisted_total") or 0)
+if dispatches <= 0 or accepted <= 0 or persisted <= 0:
+    print(
+        "waiting for one durable semantic sample "
+        f"(dispatches={dispatches}, accepted={accepted}, persisted={persisted})"
+    )
+    raise SystemExit(2)
+print(
+    "live one-Hz semantic path is flowing "
+    f"(dispatches={dispatches}, accepted={accepted}, persisted={persisted})"
+)
+PY
+)"; then
+        rc=0
+      else
+        rc=$?
+      fi
+      if [[ "${rc}" -eq 0 ]]; then
+        rm -f "${body}" /tmp/eva-patch-curl.err
+        ok "operator semantic contract: ${detail}"
+        return 0
+      fi
+      if [[ "${rc}" -ne 2 ]]; then
+        fail "operator semantic contract is broken: ${detail}"
+        rm -f "${body}" /tmp/eva-patch-curl.err
+        return 1
+      fi
+    fi
+    if (( SECONDS >= deadline )); then
+      fail "operator semantic path did not produce a durable sample: ${detail:-HTTP ${code:-000}}"
+      rm -f "${body}" /tmp/eva-patch-curl.err
+      return 1
+    fi
+    sleep 2
+  done
+}
+
+check_operator_semantic_contract || RESULT=1
 
 check_react_ui() {
   local body code asset asset_code

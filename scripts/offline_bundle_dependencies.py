@@ -210,6 +210,7 @@ def _requirements_fingerprints(repo_root: Path, bundle: Path) -> dict[str, str]:
     paths = {
         "requirements.txt": repo_root / "requirements.txt",
         "requirements-db.txt": repo_root / "requirements-db.txt",
+        "requirements-cuda.txt": repo_root / "requirements-cuda.txt",
         "constraints-port-4070s.txt": bundle / "constraints-port-4070s.txt",
     }
     missing = [name for name, path in paths.items() if not path.is_file()]
@@ -250,6 +251,8 @@ def _resolve_with_pip(bundle: Path, repo_root: Path, python: str) -> None:
             str(repo_root / "requirements.txt"),
             "-r",
             str(repo_root / "requirements-db.txt"),
+            "-r",
+            str(repo_root / "requirements-cuda.txt"),
             "vllm==0.25.0",
         ]
         completed = subprocess.run(

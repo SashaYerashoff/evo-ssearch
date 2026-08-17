@@ -305,6 +305,9 @@ if [[ "${INCLUDE_WHEELHOUSE}" == true ]]; then
     if [[ -f "${REPO_ROOT}/requirements-db.txt" ]]; then
       "${PIP_PYTHON}" -m pip download --dest "${BUNDLE_DIR}/wheelhouse" -r "${REPO_ROOT}/requirements-db.txt"
     fi
+    if [[ -f "${REPO_ROOT}/requirements-cuda.txt" ]]; then
+      "${PIP_PYTHON}" -m pip download --dest "${BUNDLE_DIR}/wheelhouse" -r "${REPO_ROOT}/requirements-cuda.txt"
+    fi
   fi
   {
     printf 'created_at=%s\n' "$(date -Is)"
@@ -314,7 +317,7 @@ if [[ "${INCLUDE_WHEELHOUSE}" == true ]]; then
     elif [[ -x "${PYTHON_BIN}" ]]; then
       "${PYTHON_BIN}" --version 2>&1 | sed 's/^/python_version=/'
     fi
-    printf 'requirements=requirements.txt requirements-db.txt\n'
+    printf 'requirements=requirements.txt requirements-db.txt requirements-cuda.txt\n'
     if [[ -n "${WHEELHOUSE_DIR}" ]]; then
       printf 'wheelhouse_source_dir=%s\n' "${WHEELHOUSE_DIR}"
     fi

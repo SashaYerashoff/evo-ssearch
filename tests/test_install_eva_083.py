@@ -89,6 +89,7 @@ def make_source(root: Path) -> Path:
         "run_prod.sh": "#!/bin/sh\n",
         "wsgi.py": "app = None\n",
         "requirements.txt": "example==1\n",
+        "requirements-cuda.txt": "torch==2.11.0\n",
         "alembic.ini": "[alembic]\n",
         "static/js/app.js": "// static\n",
         "templates/index.html": "<!doctype html>\n",
@@ -98,6 +99,7 @@ def make_source(root: Path) -> Path:
         "scripts/install_media_runtime.sh": "#!/bin/sh\nexit 0\n",
         "scripts/verify_patch.sh": "#!/bin/sh\nexit 0\n",
         "scripts/rollback.sh": "#!/bin/sh\nexit 0\n",
+        "scripts/database_preservation_guard.py": "#!/usr/bin/env python3\n",
         "scripts/install_assets/eva-ai.service.in": (
             "[Service]\nUser=@SERVICE_USER@\nGroup=@SERVICE_GROUP@\n"
             "WorkingDirectory=@APP_DIR@\nEnvironmentFile=@ENV_FILE@\n"
@@ -178,7 +180,7 @@ class OfflineInstallerUnitTests(unittest.TestCase):
                 )
 
         self.assertEqual([(item.level, item.message) for item in findings], [
-            ("OK", "target venv supports the SigLIP2 runtime contract"),
+            ("OK", "target venv supports the SigLIP2 CUDA runtime contract"),
         ])
         self.assertEqual(run.call_count, 1)
 
@@ -478,7 +480,17 @@ class OfflineInstallerUnitTests(unittest.TestCase):
                 "EVOSSEARCH_PRODUCTION_CLIP_MODEL": "google/siglip2-base-patch16-224",
                 "EVOSSEARCH_CLIP_MODEL": "google/siglip2-base-patch16-224",
                 "EVOSSEARCH_CLIP_MODEL_REVISION": "75de2d55ec2d0b4efc50b3e9ad70dba96a7b2fa2",
+                "EVOSSEARCH_CLIP_DEVICE": "cuda",
                 "EVOSSEARCH_EMBEDDER_FALLBACK_ENABLED": "false",
+                "EVOSSEARCH_LUXRIOT_ATTENTION_SCHEDULER_ENABLED": "true",
+                "EVOSSEARCH_LUXRIOT_ATTENTION_EPISODE_DISPATCH_ENABLED": "false",
+                "EVOSSEARCH_LUXRIOT_ATTENTION_EMBED_ALL_CHANNELS": "true",
+                "EVOSSEARCH_LUXRIOT_ATTENTION_EMBEDDING_CADENCE_MS": "1000",
+                "EVOSSEARCH_LUXRIOT_ATTENTION_STORAGE_ENABLED": "true",
+                "EVOSSEARCH_SEMANTIC_SNAPSHOT_ARCHIVE_ENABLED": "true",
+                "EVOSSEARCH_PROBE_REALTIME_BOOKMARK_ENABLED": "true",
+                "EVOSSEARCH_EMBEDDER_REQUIRED": "true",
+                "EVOSSEARCH_EXPERIMENTAL_EMBEDDERS_ENABLED": "true",
             },
         )
         self.assertEqual(values["EVOSSEARCH_APP_VERSION"], installer.EXPECTED_VERSION)
@@ -562,6 +574,43 @@ class OfflineInstallerUnitTests(unittest.TestCase):
         self.assertEqual(
             installer.inference_policy_fingerprint(projected),
             installer.inference_policy_fingerprint(existing),
+        )
+
+    def test_siglip_upgrade_enables_continuous_operator_semantic_path(self):
+        existing = dict(COMPLETE_ENV)
+        existing.update({
+            "EVOSSEARCH_EMBEDDER_REQUIRED": "false",
+            "EVOSSEARCH_EXPERIMENTAL_EMBEDDERS_ENABLED": "false",
+            # An explicit site policy stays authoritative; only missing
+            # attention coordinates receive release defaults.
+            "EVOSSEARCH_LUXRIOT_ATTENTION_EPISODE_DISPATCH_ENABLED": "true",
+        })
+        raw = env_text(existing)
+        resolution = installer.EnvResolution(Path("/x/.env"), Path("/x/.env"), raw, existing)
+
+        values, updates, missing = installer.prepare_env_values(
+            resolution,
+            environ={},
+            non_interactive=True,
+        )
+
+        self.assertEqual(missing, [])
+        self.assertEqual(values["EVOSSEARCH_EMBEDDER_REQUIRED"], "true")
+        self.assertEqual(values["EVOSSEARCH_EXPERIMENTAL_EMBEDDERS_ENABLED"], "true")
+        self.assertEqual(values["EVOSSEARCH_CLIP_DEVICE"], "cuda")
+        self.assertEqual(values["EVOSSEARCH_LUXRIOT_ATTENTION_SCHEDULER_ENABLED"], "true")
+        self.assertEqual(values["EVOSSEARCH_LUXRIOT_ATTENTION_EMBED_ALL_CHANNELS"], "true")
+        self.assertEqual(values["EVOSSEARCH_LUXRIOT_ATTENTION_STORAGE_ENABLED"], "true")
+        self.assertEqual(values["EVOSSEARCH_SEMANTIC_SNAPSHOT_ARCHIVE_ENABLED"], "true")
+        self.assertEqual(values["EVOSSEARCH_PROBE_REALTIME_BOOKMARK_ENABLED"], "true")
+        self.assertEqual(
+            values["EVOSSEARCH_LUXRIOT_ATTENTION_EPISODE_DISPATCH_ENABLED"],
+            "true",
+        )
+        self.assertEqual(updates["EVOSSEARCH_EMBEDDER_REQUIRED"], "true")
+        self.assertNotIn(
+            "EVOSSEARCH_LUXRIOT_ATTENTION_EPISODE_DISPATCH_ENABLED",
+            updates,
         )
 
     def test_siglip_bundle_checksum_corruption_is_a_preflight_failure(self):

@@ -63,6 +63,7 @@ def _bundle(tmp_path: Path) -> Path:
     _wheel(wheelhouse / "demo-1.0-py3-none-any.whl")
     (repo / "requirements.txt").write_text("demo==1.0\n", encoding="utf-8")
     (repo / "requirements-db.txt").write_text("", encoding="utf-8")
+    (repo / "requirements-cuda.txt").write_text("", encoding="utf-8")
     (bundle / "constraints-port-4070s.txt").write_text("demo==1.0\n", encoding="utf-8")
     return bundle
 
