@@ -137,8 +137,12 @@ non-empty `postgres.dump` is mandatory before `upgrade head`; there is no unsafe
 Before modifying files, stopping the service, or applying a migration, the
 installer opens a transaction using the migration identity and verifies that it
 can read and perform a no-op update of `public.alembic_version`, then rolls the
-transaction back. A role missing schema/table privileges therefore fails while
-the live installation is still untouched.
+transaction back. It also executes `SET LOCAL row_security=off` and proves that
+every `FORCE ROW LEVEL SECURITY` table remains readable. This prevents a
+tenant-filtered migration login from producing a false all-zero preservation
+manifest. The normal full-site migration identity must therefore be a
+superuser or have `BYPASSRLS`; a role missing this capability fails while the
+live installation is still untouched.
 
 `EVA_DATABASE_DSN` is intentionally a least-privilege, non-DDL API login. The
 installer never falls back to it for `pg_dump` or Alembic. With migrations
@@ -166,6 +170,11 @@ unset EVA_INSTALL_MIGRATION_DSN
 
 `--no-migrate` exists for an explicitly reviewed code-only deployment. It is
 not the normal installation path, but it does not require a migration DSN.
+
+PostgreSQL subprocesses receive parsed libpq parameters through their process
+environment. The privileged DSN is never placed in the `psql`, `pg_dump` or
+`pg_restore` command line and is therefore not exposed through
+`/proc/<pid>/cmdline`.
 
 ## 5. Apply the reviewed plan
 
@@ -197,11 +206,14 @@ The apply path is idempotent:
 - Alembic `upgrade head` is safe to repeat;
 - systemd `enable`/`restart` is safe to repeat.
 
-If a failure occurs after the backup is created, the installer automatically
-invokes the recorded rollback: database, code, configuration, and unit are
-restored, followed by the service state that existed before the update. If that
-rollback itself cannot complete, the installer prints the exact backup path and
-manual recovery command instead of reporting a false success.
+If a failure occurs after the backup is created but before the new service is
+active, the installer automatically invokes the recorded rollback: database,
+code, configuration, and unit are restored, followed by the service state that
+existed before the update. Once the new service has become active, a later
+readiness, SigLIP warm-up or dependency acceptance failure is reported without
+automatic database rollback. This preserves rows written by the migrated
+runtime and hands the operator the exact backup path and explicit manual
+recovery command instead of silently replacing the live database.
 
 Apply is serialized by a nonblocking lock at
 `/run/lock/eva-ai-083-installer.lock` (override with `--lock-file`). A second

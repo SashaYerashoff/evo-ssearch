@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib.util
+import hashlib
 import io
 import json
 import shutil
@@ -20,6 +21,15 @@ assert SPEC and SPEC.loader
 installer = importlib.util.module_from_spec(SPEC)
 sys.modules[SPEC.name] = installer
 SPEC.loader.exec_module(installer)
+
+FINALIZER_SPEC = importlib.util.spec_from_file_location(
+    "finalize_port_usb_bundle",
+    ROOT / "scripts" / "finalize_port_usb_bundle.py",
+)
+assert FINALIZER_SPEC and FINALIZER_SPEC.loader
+finalizer = importlib.util.module_from_spec(FINALIZER_SPEC)
+sys.modules[FINALIZER_SPEC.name] = finalizer
+FINALIZER_SPEC.loader.exec_module(finalizer)
 
 
 def test_fresh_entrypoint_reads_manifest_before_rendering_target(tmp_path, capsys):
@@ -72,6 +82,12 @@ def test_usb_builder_builds_react_for_node_free_runtime():
     ):
         assert local_only_pattern in builder
 
+    universal_builder = (ROOT / "scripts" / "build_universal_usb_bundle.sh").read_text(
+        encoding="utf-8"
+    )
+    assert "EVA_UNIVERSAL_UPDATE_SEED" in universal_builder
+    assert "stale updates exist in staging" in universal_builder
+
 
 def test_port_profile_shares_bounded_gpu_with_siglip2():
     assert installer.PORT_ENV["CUDA_VISIBLE_DEVICES"] == "0"
@@ -107,6 +123,61 @@ def test_port_payload_requires_maritime_runtime_and_react_assets():
     assert '"format": 2' in finalizer
     assert '"installation_modes": ["fresh", "update", "report"]' in finalizer
     assert '"offline-dependencies.json"' in finalizer
+    assert '"update_packages": update_packages' in finalizer
+    assert "Update archive checksum mismatch" in finalizer
+
+
+def test_finalizer_binds_standalone_update_pack_into_release_manifest(tmp_path):
+    package = tmp_path / "updates" / "georgia-d725c87"
+    bundle_name = "eva-ai-georgia-upgrade-d725c87"
+    expanded = package / bundle_name
+    archive = package / f"{bundle_name}.tar.gz"
+    archive.parent.mkdir(parents=True)
+    archive.write_bytes(b"immutable update archive")
+    archive_digest = hashlib.sha256(archive.read_bytes()).hexdigest()
+    (package / f"{archive.name}.sha256").write_text(
+        f"{archive_digest}  {archive.name}\n",
+        encoding="utf-8",
+    )
+    (package / "START_GEORGIA_REHEARSAL.sh").write_text(
+        "#!/usr/bin/env bash\n",
+        encoding="utf-8",
+    )
+    (expanded / "repo" / "scripts").mkdir(parents=True)
+    (expanded / "manifest.txt").write_text(
+        "\n".join(
+            (
+                f"bundle_name={bundle_name}",
+                "version=β 0.8.7",
+                f"git_commit={'d' * 40}",
+                "working_tree_status=clean",
+            )
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    for filename in ("database_preservation_guard.py", "pg_with_dsn.py"):
+        (expanded / "repo" / "scripts" / filename).write_text(
+            "# safety payload\n",
+            encoding="utf-8",
+        )
+
+    packages, critical = finalizer.bundled_update_packages(tmp_path)
+
+    assert packages == [
+        {
+            "name": "georgia-d725c87",
+            "bundle_name": bundle_name,
+            "version": "β 0.8.7",
+            "git_commit": "d" * 40,
+            "archive": f"updates/georgia-d725c87/{bundle_name}.tar.gz",
+            "archive_sha256": archive_digest,
+            "checksum": f"updates/georgia-d725c87/{bundle_name}.tar.gz.sha256",
+            "expanded_manifest": f"updates/georgia-d725c87/{bundle_name}/manifest.txt",
+            "launchers": ["updates/georgia-d725c87/START_GEORGIA_REHEARSAL.sh"],
+        }
+    ]
+    assert f"updates/georgia-d725c87/{bundle_name}/repo/scripts/pg_with_dsn.py" in critical
 
 
 def test_predeploy_gate_runs_react_tests_and_production_build():

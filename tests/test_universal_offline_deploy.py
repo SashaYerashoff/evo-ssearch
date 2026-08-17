@@ -106,6 +106,62 @@ def test_common_bundle_verification_catches_corruption_before_either_path(tmp_pa
         raise AssertionError("corrupted critical file was accepted")
 
 
+def test_common_bundle_verification_requires_update_pack_identity_in_critical_map(tmp_path):
+    bundle = tmp_path / "bundle"
+    critical_file = bundle / "repo" / "VERSION"
+    required_files = (
+        bundle / "SOURCE_REVISION.json",
+        bundle / "START_EVA_AI.sh",
+        bundle / "eva_offline_deploy.py",
+        bundle / "offline_bundle_dependencies.py",
+        bundle / "offline-dependencies.json",
+        bundle / "install_port_appliance.py",
+        bundle / "migration-plans" / "0006-to-0013.sql",
+        bundle / "apt" / "Packages.gz",
+        bundle / "repo" / "react-ui" / "dist" / "index.html",
+        bundle / "repo" / "requirements-cuda.txt",
+        bundle / "repo" / "scripts" / "database_preservation_guard.py",
+        bundle / "repo" / "scripts" / "pg_with_dsn.py",
+        bundle / "repo" / "migrations" / "versions" / "20260801_0011_incidents.py",
+        bundle / "repo" / "migrations" / "versions" / "20260805_0012_incident_temporal_memory.py",
+        bundle / "repo" / "migrations" / "versions" / "20260805_0013_archive_source_channel_page_index.py",
+    )
+    for path in (*required_files, critical_file):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("payload\n", encoding="utf-8")
+    (bundle / "wheelhouse").mkdir()
+    digest = hashlib.sha256(critical_file.read_bytes()).hexdigest()
+    (bundle / "manifest.json").write_text(
+        json.dumps(
+            {
+                "format": 2,
+                "release_flavor": deploy.EXPECTED_FLAVOR,
+                "schema_head": deploy.EXPECTED_SCHEMA,
+                "installation_modes": ["fresh", "update", "report"],
+                "critical_sha256": {"repo/VERSION": digest},
+                "update_packages": [
+                    {
+                        "name": "georgia",
+                        "archive": "updates/georgia/update.tar.gz",
+                        "archive_sha256": "a" * 64,
+                        "checksum": "updates/georgia/update.tar.gz.sha256",
+                        "expanded_manifest": "updates/georgia/update/manifest.txt",
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    with patch.object(deploy, "verify_dependencies"):
+        try:
+            deploy._verify_bundle(bundle)
+        except deploy.DeployError as exc:
+            assert "has no critical archive" in str(exc)
+        else:
+            raise AssertionError("unbound update package was accepted")
+
+
 def test_fresh_child_receives_content_bound_preflight_stamp(tmp_path):
     bundle = tmp_path / "bundle"
     bundle.mkdir()

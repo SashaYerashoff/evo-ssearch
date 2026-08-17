@@ -57,10 +57,12 @@ The same secret-free report is saved as:
 ```
 
 The update backup and exact rollback command are printed by the installer and
-stored under `/var/backups/eva-ai`. If apply fails after a backup was created,
-the updater automatically restores the previous code, environment and database.
-Do not delete a backup until operators have checked live streams and archive
-search.
+stored under `/var/backups/eva-ai`. A failure before the new service becomes
+active triggers automatic rollback. Once the migrated service is active, a
+later SigLIP warm-up or dependency acceptance failure is reported for in-place
+repair and does **not** automatically restore an older database over new rows.
+Do not run the printed manual rollback or delete a backup until operators have
+checked live streams, users, probes and archive search.
 
 ## Georgia profile
 
@@ -69,6 +71,13 @@ routing, Luxriot credentials, tenant IDs or retention settings. This is the
 expected path for the Georgia deployment with external VLM servers and many
 channels. The post-update stream check compares the site with its own live
 pre-update baseline rather than assuming an eight-channel appliance.
+
+When the release manifest declares a client-specific pack under `updates/`, it
+is a separately checksummed updater and can be handed to that client without
+the fresh-install models. Follow the `START_HERE_*.md` in that update pack. The
+universal manifest binds the updater archive, checksum, expanded manifest,
+launcher and database-safety scripts; an untracked or stale `updates/` folder
+is not a releasable build.
 
 The accepted React console is enabled by the release. The legacy console is
 still available for emergency diagnosis at `https://SERVER/?ui=legacy`.

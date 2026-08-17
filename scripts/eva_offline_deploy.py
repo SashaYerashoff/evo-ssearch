@@ -164,6 +164,24 @@ def _verify_bundle(root: Path) -> None:
     critical = manifest.get("critical_sha256")
     if not isinstance(critical, dict) or not critical:
         raise DeployError("Bundle manifest has no critical checksums")
+    update_packages = manifest.get("update_packages") or []
+    if not isinstance(update_packages, list):
+        raise DeployError("Bundle update_packages must be a list")
+    for package in update_packages:
+        if not isinstance(package, dict):
+            raise DeployError("Bundle contains an invalid update package declaration")
+        for field in ("archive", "checksum", "expanded_manifest"):
+            relative = str(package.get(field) or "").strip()
+            if not relative or relative not in critical:
+                raise DeployError(
+                    f"Bundled update {package.get('name') or '[unnamed]'} has no critical {field}"
+                )
+        archive = str(package["archive"])
+        declared_digest = str(package.get("archive_sha256") or "").strip().lower()
+        if declared_digest != str(critical.get(archive) or "").strip().lower():
+            raise DeployError(
+                f"Bundled update {package.get('name') or '[unnamed]'} archive identity mismatch"
+            )
     resolved_root = root.resolve()
     for relative, expected in critical.items():
         candidate = (root / str(relative)).resolve()

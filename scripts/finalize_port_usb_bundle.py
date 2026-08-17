@@ -9,6 +9,7 @@ import json
 import re
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Any
 
 from offline_bundle_dependencies import DependencyError, verify_manifest
 
@@ -19,6 +20,98 @@ def digest(path: Path) -> str:
         for block in iter(lambda: handle.read(8 * 1024 * 1024), b""):
             hasher.update(block)
     return hasher.hexdigest()
+
+
+def _key_value_manifest(path: Path) -> dict[str, str]:
+    values: dict[str, str] = {}
+    for raw in path.read_text(encoding="utf-8").splitlines():
+        key, separator, value = raw.partition("=")
+        if separator and key.strip():
+            values[key.strip()] = value.strip()
+    return values
+
+
+def bundled_update_packages(root: Path) -> tuple[list[dict[str, Any]], list[str]]:
+    """Validate optional standalone update packs and return critical paths.
+
+    A universal USB may carry client-specific update packs beside the generic
+    fresh/update engine.  Treating updates/ as an untracked convenience folder
+    allowed a stale or partially copied updater to survive a new installer
+    build.  Every present pack is now content-bound into the universal manifest.
+    """
+
+    updates_root = root / "updates"
+    if not updates_root.exists():
+        return [], []
+    if not updates_root.is_dir():
+        raise SystemExit("Invalid updates payload: updates/ is not a directory")
+
+    packages: list[dict[str, Any]] = []
+    critical: list[str] = []
+    for package_dir in sorted(path for path in updates_root.iterdir() if path.is_dir()):
+        archives = sorted(package_dir.glob("*.tar.gz"))
+        if len(archives) != 1:
+            raise SystemExit(
+                f"Update pack {package_dir.name} must contain exactly one .tar.gz archive"
+            )
+        archive = archives[0]
+        checksum = Path(f"{archive}.sha256")
+        if not checksum.is_file():
+            raise SystemExit(f"Update checksum is missing: {checksum.relative_to(root)}")
+        checksum_fields = checksum.read_text(encoding="utf-8").strip().split()
+        if len(checksum_fields) < 2:
+            raise SystemExit(f"Invalid update checksum file: {checksum.relative_to(root)}")
+        expected_digest = checksum_fields[0].lower()
+        expected_name = checksum_fields[-1].lstrip("*")
+        if expected_name != archive.name or not re.fullmatch(r"[0-9a-f]{64}", expected_digest):
+            raise SystemExit(f"Invalid update checksum contract: {checksum.relative_to(root)}")
+        actual_digest = digest(archive)
+        if actual_digest != expected_digest:
+            raise SystemExit(f"Update archive checksum mismatch: {archive.relative_to(root)}")
+
+        bundle_name = archive.name.removesuffix(".tar.gz")
+        expanded = package_dir / bundle_name
+        expanded_manifest = expanded / "manifest.txt"
+        if not expanded_manifest.is_file():
+            raise SystemExit(
+                f"Expanded update manifest is missing: {expanded_manifest.relative_to(root)}"
+            )
+        update_manifest = _key_value_manifest(expanded_manifest)
+        if update_manifest.get("bundle_name") != bundle_name:
+            raise SystemExit(f"Expanded update identity mismatch: {expanded_manifest.relative_to(root)}")
+        if update_manifest.get("working_tree_status") != "clean":
+            raise SystemExit(f"Update pack was not built from a clean tree: {package_dir.name}")
+        commit = str(update_manifest.get("git_commit") or "").strip()
+        if not re.fullmatch(r"[0-9a-f]{40}", commit):
+            raise SystemExit(f"Update pack has an invalid git commit: {package_dir.name}")
+
+        safety_files = (
+            expanded / "repo" / "scripts" / "database_preservation_guard.py",
+            expanded / "repo" / "scripts" / "pg_with_dsn.py",
+        )
+        for path in safety_files:
+            if not path.is_file():
+                raise SystemExit(f"Update data-safety payload is missing: {path.relative_to(root)}")
+        launchers = sorted(package_dir.glob("START*.sh"))
+        if not launchers:
+            raise SystemExit(f"Update pack has no START*.sh launcher: {package_dir.name}")
+
+        package_critical = [archive, checksum, expanded_manifest, *safety_files, *launchers]
+        critical.extend(str(path.relative_to(root)) for path in package_critical)
+        packages.append(
+            {
+                "name": package_dir.name,
+                "bundle_name": bundle_name,
+                "version": update_manifest.get("version"),
+                "git_commit": commit,
+                "archive": str(archive.relative_to(root)),
+                "archive_sha256": actual_digest,
+                "checksum": str(checksum.relative_to(root)),
+                "expanded_manifest": str(expanded_manifest.relative_to(root)),
+                "launchers": [str(path.relative_to(root)) for path in launchers],
+            }
+        )
+    return packages, critical
 
 
 def main() -> int:
@@ -47,6 +140,7 @@ def main() -> int:
         dependency_manifest = verify_manifest(root, repo_root=root / "repo")
     except DependencyError as exc:
         raise SystemExit(f"Offline dependencies are not releasable: {exc}") from exc
+    update_packages, update_critical_files = bundled_update_packages(root)
     version_match = re.search(r"\d+(?:\.\d+)+", version)
     if version_match is None:
         raise SystemExit(f"Cannot derive a Debian version from {version!r}")
@@ -94,6 +188,7 @@ def main() -> int:
             "installer-deb/"
             f"eva-ai-appliance-installer_{debian_version}_amd64.deb"
         ),
+        *update_critical_files,
     )
     files = sorted(path for path in root.rglob("*") if path.is_file())
     if not files:
@@ -133,6 +228,7 @@ def main() -> int:
         "payload_bytes": payload_bytes,
         "minimum_free_bytes": max(45 * 1024**3, payload_bytes + 25 * 1024**3),
         "installation_modes": ["fresh", "update", "report"],
+        "update_packages": update_packages,
         "offline_dependencies": {
             "manifest": "offline-dependencies.json",
             "apt_artifacts": len(dependency_manifest["apt"]["artifacts"]),

@@ -5,6 +5,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 STAGING_ROOT="${1:-/mnt/eva-llamacpp-lab/universal-usb-staging}"
 DEPENDENCY_SEED="${EVA_UNIVERSAL_DEPENDENCY_SEED:-/mnt/eva-llamacpp-lab/universal-usb-staging}"
+UPDATE_SEED="${EVA_UNIVERSAL_UPDATE_SEED:-}"
 ALEMBIC_BIN="${EVA_UNIVERSAL_ALEMBIC_BIN:-}"
 
 if [[ -z "${ALEMBIC_BIN}" ]]; then
@@ -53,6 +54,27 @@ if [[ "$(readlink -f "${DEPENDENCY_SEED}")" != "$(readlink -f "${STAGING_ROOT}")
 fi
 
 "${SCRIPT_DIR}/build_port_usb_bundle.sh" "${STAGING_ROOT}"
+
+# Optional field update packs are release artifacts in their own right.  They
+# must be supplied explicitly for every build so an old updater cannot survive
+# unnoticed in a reused staging directory.
+if [[ -n "${UPDATE_SEED}" ]]; then
+  if [[ ! -d "${UPDATE_SEED}" ]]; then
+    printf 'ERROR: update seed is not a directory: %s\n' "${UPDATE_SEED}" >&2
+    exit 1
+  fi
+  if [[ "$(readlink -f "${UPDATE_SEED}")" == "$(readlink -f "${STAGING_ROOT}/updates")" ]]; then
+    printf 'ERROR: update seed must not be the staging updates directory itself.\n' >&2
+    exit 1
+  fi
+  mkdir -p "${STAGING_ROOT}/updates"
+  rsync -a --delete "${UPDATE_SEED}/" "${STAGING_ROOT}/updates/"
+elif [[ -d "${STAGING_ROOT}/updates" ]] \
+  && find "${STAGING_ROOT}/updates" -mindepth 1 -print -quit | grep -q .; then
+  printf 'ERROR: stale updates exist in staging, but EVA_UNIVERSAL_UPDATE_SEED is unset.\n' >&2
+  printf 'Set it to a reviewed updates/ seed or build into a clean staging directory.\n' >&2
+  exit 1
+fi
 
 python3 "${SCRIPT_DIR}/offline_bundle_dependencies.py" \
   "${STAGING_ROOT}" \
