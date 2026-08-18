@@ -494,6 +494,36 @@ class OfflineInstallerUnitTests(unittest.TestCase):
             for path in expected:
                 self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o750)
 
+    def test_runtime_env_is_private_and_traversable_by_service_identity(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            config_dir = Path(tmp) / "etc/eva-ai"
+            config_dir.mkdir(parents=True, mode=0o700)
+            env_file = config_dir / "eva-ai.env"
+            env_file.write_text("SECRET=value\n", encoding="utf-8")
+            identity = type("Identity", (), {"pw_uid": 1234})()
+            group = type("Group", (), {"gr_gid": 1235})()
+            original_owner = config_dir.stat().st_uid
+            with (
+                patch.object(installer.pwd, "getpwnam", return_value=identity),
+                patch.object(installer.grp, "getgrnam", return_value=group),
+                patch.object(installer.os, "chown") as chown,
+            ):
+                installer._ensure_runtime_env_access(
+                    env_file,
+                    user="eva",
+                    group="eva",
+                )
+
+            self.assertEqual(stat.S_IMODE(config_dir.stat().st_mode), 0o750)
+            self.assertEqual(stat.S_IMODE(env_file.stat().st_mode), 0o600)
+            self.assertEqual(
+                chown.call_args_list,
+                [
+                    unittest.mock.call(config_dir, original_owner, 1235),
+                    unittest.mock.call(env_file, 1234, 1235),
+                ],
+            )
+
     def test_preinstall_file_backup_preserves_owner_and_group(self):
         with tempfile.TemporaryDirectory() as tmp:
             source = Path(tmp) / "eva-ai.env"
@@ -639,6 +669,7 @@ class OfflineInstallerUnitTests(unittest.TestCase):
         existing.update({
             "EVOSSEARCH_EMBEDDER_REQUIRED": "false",
             "EVOSSEARCH_EXPERIMENTAL_EMBEDDERS_ENABLED": "false",
+            "EVOSSEARCH_CLIP_DEVICE": "auto",
             # An explicit site policy stays authoritative; only missing
             # attention coordinates receive release defaults.
             "EVOSSEARCH_LUXRIOT_ATTENTION_EPISODE_DISPATCH_ENABLED": "true",
@@ -651,11 +682,16 @@ class OfflineInstallerUnitTests(unittest.TestCase):
             environ={},
             non_interactive=True,
         )
+        rendered = installer.render_env_update(raw, updates)
+        projected = installer.parse_env_text(rendered)
 
         self.assertEqual(missing, [])
         self.assertEqual(values["EVOSSEARCH_EMBEDDER_REQUIRED"], "true")
         self.assertEqual(values["EVOSSEARCH_EXPERIMENTAL_EMBEDDERS_ENABLED"], "true")
         self.assertEqual(values["EVOSSEARCH_CLIP_DEVICE"], "cuda")
+        self.assertEqual(projected["EVOSSEARCH_EMBEDDER_REQUIRED"], "true")
+        self.assertEqual(projected["EVOSSEARCH_EXPERIMENTAL_EMBEDDERS_ENABLED"], "true")
+        self.assertEqual(projected["EVOSSEARCH_CLIP_DEVICE"], "cuda")
         self.assertEqual(values["EVOSSEARCH_LUXRIOT_ATTENTION_SCHEDULER_ENABLED"], "true")
         self.assertEqual(values["EVOSSEARCH_LUXRIOT_ATTENTION_EMBED_ALL_CHANNELS"], "true")
         self.assertEqual(values["EVOSSEARCH_LUXRIOT_ATTENTION_STORAGE_ENABLED"], "true")
@@ -1064,6 +1100,15 @@ class OfflineInstallerUnitTests(unittest.TestCase):
             self.assertNotIn('--dbname="${PG_DSN}"', source, relative)
             self.assertNotIn('psql "${PG_DSN}"', source, relative)
             self.assertIn('EVA_PG_CONNECT_DSN="${dsn}"', source, relative)
+
+    def test_post_update_verifier_uses_public_ready_contract(self):
+        source = (ROOT / "scripts/verify_patch.sh").read_text(encoding="utf-8")
+
+        self.assertNotIn("/ready?load=1", source)
+        self.assertIn('check_endpoint "ready" "/ready"', source)
+        self.assertIn('embedder.get("required") is True', source)
+        self.assertIn('attention.get("required") is True', source)
+        self.assertNotIn("semantic_snapshot_archive", source)
 
     def test_apply_staging_failure_restores_preexisting_env_without_backup_snapshot(self):
         with tempfile.TemporaryDirectory() as tmp:

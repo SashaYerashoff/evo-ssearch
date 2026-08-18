@@ -96,6 +96,13 @@ _INSTALLER_MANAGED_ENV_KEYS = frozenset(
         "EVOSSEARCH_PRODUCTION_CLIP_MODEL",
         "EVOSSEARCH_CLIP_MODEL",
         "EVOSSEARCH_CLIP_MODEL_REVISION",
+        # These runtime gates are part of the same release-owned SigLIP2
+        # migration.  prepare_env_values only updates them after ruling out a
+        # site-selected embedding model, so legacy false/auto values must be
+        # replaceable instead of surviving as disconnected probe settings.
+        "EVOSSEARCH_CLIP_DEVICE",
+        "EVOSSEARCH_EMBEDDER_REQUIRED",
+        "EVOSSEARCH_EXPERIMENTAL_EMBEDDERS_ENABLED",
         "EVOSSEARCH_EMBEDDER_FALLBACK_ENABLED",
         "EVOSSEARCH_PROBE_POS_FLOOR_DEFAULT",
         "EVOSSEARCH_PROBE_MARGIN_DEFAULT",
@@ -1589,6 +1596,26 @@ def _ensure_runtime_directories(
     return created
 
 
+def _ensure_runtime_env_access(path: Path, *, user: str, group: str) -> None:
+    """Keep secrets private while making a legacy env readable by its service."""
+
+    if not path.is_file():
+        raise InstallerError(f"Runtime environment file is missing: {path}")
+    uid = pwd.getpwnam(user).pw_uid
+    gid = grp.getgrnam(group).gr_gid
+    parent = path.parent
+    parent_stat = parent.stat()
+    # Preserve the legacy administrator owner while granting only the selected
+    # service group enough access to traverse the configuration directory.
+    os.chown(parent, parent_stat.st_uid, gid)
+    os.chmod(parent, 0o750)
+    # The EVA process reads this file during config bootstrap and may persist
+    # reviewed Settings changes.  No account except the service identity (and
+    # root) should be able to read the embedded credentials.
+    os.chown(path, uid, gid)
+    os.chmod(path, 0o600)
+
+
 def _backup_file(path: Path) -> Path | None:
     if not path.is_file():
         return None
@@ -2076,6 +2103,11 @@ def apply_install(prepared: PreparedInstall) -> Path:
                 env=migration_env,
             )
 
+        _ensure_runtime_env_access(
+            prepared.env.target,
+            user=options.service_user,
+            group=options.service_group,
+        )
         if options.start:
             runner.run(("systemctl", "enable", options.service_name + ".service"))
             runner.run(("systemctl", "restart", options.service_name + ".service"))

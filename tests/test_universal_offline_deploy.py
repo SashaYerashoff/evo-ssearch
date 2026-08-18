@@ -292,6 +292,28 @@ def test_report_evaluation_requires_react_schema_evo_and_inference():
     assert assessment == {"status": "PASS", "failures": [], "warnings": []}
 
 
+def test_report_maps_database_uri_to_libpq_environment_without_argv_secret():
+    dsn = "postgresql://reporter:secret@db.internal:5433/eva?sslmode=require"
+    with patch.object(
+        report,
+        "_command",
+        return_value={"ok": True, "stdout": report.EXPECTED_SCHEMA, "stderr": ""},
+    ) as command:
+        result = report._psql(dsn, "SELECT version_num FROM alembic_version")
+
+    assert result["ok"] is True
+    argv = command.call_args.args[0]
+    environment = command.call_args.kwargs["env"]
+    assert dsn not in argv
+    assert dsn not in environment.values()
+    assert environment["PGHOST"] == "db.internal"
+    assert environment["PGPORT"] == "5433"
+    assert environment["PGDATABASE"] == "eva"
+    assert environment["PGUSER"] == "reporter"
+    assert environment["PGPASSWORD"] == "secret"
+    assert environment["PGSSLMODE"] == "require"
+
+
 def test_report_fails_when_previously_active_streams_do_not_resume():
     payload = {
         "eva": {

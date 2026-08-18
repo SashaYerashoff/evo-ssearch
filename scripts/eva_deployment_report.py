@@ -9,6 +9,7 @@ import os
 import platform
 import re
 import subprocess
+import sys
 import time
 import urllib.error
 import urllib.request
@@ -16,6 +17,12 @@ import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Mapping, Sequence
+
+SCRIPT_DIR = Path(__file__).resolve().parent
+if str(SCRIPT_DIR) not in sys.path:
+    sys.path.insert(0, str(SCRIPT_DIR))
+
+from pg_with_dsn import DsnError, postgres_environment
 
 
 EXPECTED_SCHEMA = "20260805_0013"
@@ -148,8 +155,10 @@ def _db_dsn(values: Mapping[str, str]) -> str:
 def _psql(dsn: str, sql: str) -> dict[str, Any]:
     if not dsn:
         return {"ok": False, "error": "database DSN unavailable"}
-    env = dict(os.environ)
-    env["PGDATABASE"] = dsn
+    try:
+        env = postgres_environment(dsn, os.environ)
+    except DsnError as exc:
+        return {"ok": False, "error": f"invalid database DSN: {exc}"}
     env["PGCONNECT_TIMEOUT"] = "8"
     result = _command(("psql", "-X", "-A", "-t", "-F", "\t", "-c", sql), env=env, timeout=20)
     if not result.get("ok"):
