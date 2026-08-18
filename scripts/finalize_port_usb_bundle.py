@@ -50,6 +50,40 @@ def _key_value_manifest(path: Path) -> dict[str, str]:
     return values
 
 
+def verify_siglip2_checksum_manifest(root: Path) -> int:
+    """Fail closed unless the packaged SigLIP2 cache is content-complete."""
+
+    cache_root = root / "models" / "huggingface"
+    checksum_path = cache_root / "SHA256SUMS"
+    if not checksum_path.is_file():
+        raise SystemExit("SigLIP2 checksum manifest is missing: models/huggingface/SHA256SUMS")
+    try:
+        cache_root_resolved = cache_root.resolve(strict=True)
+        checked = 0
+        for raw_line in checksum_path.read_text(encoding="utf-8").splitlines():
+            line = raw_line.strip()
+            if not line:
+                continue
+            match = re.fullmatch(r"([0-9a-fA-F]{64})\s+\*?(.+)", line)
+            if match is None:
+                raise ValueError("contains an invalid row")
+            expected, relative = match.groups()
+            candidate = cache_root / relative
+            resolved = candidate.resolve(strict=True)
+            if cache_root_resolved != resolved and cache_root_resolved not in resolved.parents:
+                raise ValueError(f"path escapes model cache: {relative}")
+            if not candidate.is_file():
+                raise ValueError(f"path is not a file: {relative}")
+            if digest(candidate).lower() != expected.lower():
+                raise ValueError(f"checksum mismatch: {relative}")
+            checked += 1
+        if checked == 0:
+            raise ValueError("is empty")
+    except (OSError, RuntimeError, ValueError) as exc:
+        raise SystemExit(f"Invalid SigLIP2 checksum manifest: {exc}") from exc
+    return checked
+
+
 def bundled_update_packages(root: Path) -> tuple[list[dict[str, Any]], list[str]]:
     """Validate optional standalone update packs and return critical paths.
 
@@ -213,6 +247,7 @@ def main() -> int:
     target_os_release = str(dependency_manifest["target"].get("os_release") or "")
     target_os_label = str(dependency_manifest["target"].get("os") or "")
     local_vllm_mode = str(dependency_manifest["pip_resolution"].get("vllm") or "")
+    verify_siglip2_checksum_manifest(root)
     update_packages, update_critical_files = bundled_update_packages(root)
     container_runtime, container_critical_files = spark_runtime_payload(root, architecture)
     spark_model_critical_files = (
@@ -254,6 +289,7 @@ def main() -> int:
         "offline_bundle_dependencies.py",
         "offline-dependencies.json",
         "START_EVA_AI.sh",
+        "models/huggingface/SHA256SUMS",
         *(("migration-plans/0006-to-0013.sql",) if release_flavor == "universal-offline" else ()),
         (
             "models/huggingface/models--google--siglip2-base-patch16-224/"

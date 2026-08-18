@@ -205,6 +205,18 @@ rsync -a --delete --delete-excluded \
 stage_tree_payload \
     "${SIGLIP2_CACHE_REPO}" \
     "${STAGING_ROOT}/models/huggingface/models--google--siglip2-base-patch16-224"
+SIGLIP2_CACHE_TARGET="${STAGING_ROOT}/models/huggingface"
+(
+    cd "${SIGLIP2_CACHE_TARGET}"
+    find models--google--siglip2-base-patch16-224 -type f -print0 \
+        | sort -z \
+        | xargs -0 -r sha256sum > SHA256SUMS
+    if [[ ! -s SHA256SUMS ]]; then
+        echo "ERROR: staged SigLIP2 cache produced an empty SHA256SUMS." >&2
+        exit 1
+    fi
+    sha256sum -c SHA256SUMS >/dev/null
+)
 if [[ "${TARGET_ARCHITECTURE}" == "amd64" ]]; then
     rsync -a "${CLIP_WEIGHT}" "${STAGING_ROOT}/models/clip/ViT-B-32.pt"
     rsync -a --delete "${MODEL_VLM}/" "${STAGING_ROOT}/models/qwen3-vl-4b-awq/"

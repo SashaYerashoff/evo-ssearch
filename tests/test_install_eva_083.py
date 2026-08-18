@@ -630,6 +630,22 @@ class OfflineInstallerUnitTests(unittest.TestCase):
             for finding in findings
         ))
 
+    def test_siglip_bundle_missing_checksum_manifest_is_a_preflight_failure(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cache_root = Path(tmp) / "models" / "huggingface"
+            make_siglip_cache(cache_root)
+            (cache_root / "SHA256SUMS").unlink()
+
+            findings = installer._siglip2_cache_findings(
+                cache_root,
+                installer.SIGLIP2_REVISION,
+            )
+
+        self.assertTrue(any(
+            finding.level == "FAIL" and "SHA256SUMS is missing" in finding.message
+            for finding in findings
+        ))
+
     def test_legacy_adopt_disables_unconfigured_archive_retention(self):
         existing = dict(COMPLETE_ENV)
         existing.pop("EVOSSEARCH_ARCHIVE_RETENTION_ENABLED")

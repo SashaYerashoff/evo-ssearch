@@ -91,6 +91,9 @@ def test_usb_builder_builds_react_for_node_free_runtime():
     assert 'EXPECTED_BRANCH="${EVA_PORT_EXPECTED_BRANCH:-feature/maritime-port-specs}"' in builder
     assert "port client bundle requires a clean committed working tree" in builder
     assert "SOURCE_REVISION.json" in builder
+    assert 'SIGLIP2_CACHE_TARGET="${STAGING_ROOT}/models/huggingface"' in builder
+    assert "xargs -0 -r sha256sum > SHA256SUMS" in builder
+    assert "sha256sum -c SHA256SUMS" in builder
     for local_only_pattern in (
         "--exclude='.env*'",
         "--exclude='.venv*'",
@@ -146,6 +149,35 @@ def test_port_payload_requires_maritime_runtime_and_react_assets():
     assert '"offline-dependencies.json"' in finalizer
     assert '"update_packages": update_packages' in finalizer
     assert "Update archive checksum mismatch" in finalizer
+    assert '"models/huggingface/SHA256SUMS"' in finalizer
+
+
+def test_finalizer_verifies_packaged_siglip2_checksum_manifest(tmp_path):
+    cache_root = tmp_path / "models" / "huggingface"
+    payload = (
+        cache_root
+        / "models--google--siglip2-base-patch16-224"
+        / "blobs"
+        / "model"
+    )
+    payload.parent.mkdir(parents=True)
+    payload.write_bytes(b"siglip2-test-weights")
+    relative = payload.relative_to(cache_root)
+    expected = hashlib.sha256(payload.read_bytes()).hexdigest()
+    checksum = cache_root / "SHA256SUMS"
+    checksum.write_text(f"{expected}  {relative}\n", encoding="utf-8")
+
+    assert finalizer.verify_siglip2_checksum_manifest(tmp_path) == 1
+
+    payload.write_bytes(b"corrupted")
+    finalizer.digest.cache_clear()
+    with pytest.raises(SystemExit, match="checksum mismatch"):
+        finalizer.verify_siglip2_checksum_manifest(tmp_path)
+
+
+def test_finalizer_rejects_missing_siglip2_checksum_manifest(tmp_path):
+    with pytest.raises(SystemExit, match="checksum manifest is missing"):
+        finalizer.verify_siglip2_checksum_manifest(tmp_path)
 
 
 def test_finalizer_binds_standalone_update_pack_into_release_manifest(tmp_path):
