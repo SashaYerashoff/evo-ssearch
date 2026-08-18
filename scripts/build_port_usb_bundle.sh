@@ -18,10 +18,45 @@ RELEASE_FLAVOR="${EVA_PORT_RELEASE_FLAVOR:-ventspils-maritime-client}"
 TARGET_ARCHITECTURE="${EVA_PORT_ARCHITECTURE:-amd64}"
 SPARK_RUNTIME_ARCHIVE="${EVA_SPARK_RUNTIME_ARCHIVE:-}"
 SPARK_RUNTIME_ARCHIVE_NAME="eva-spark-runtime-0.8.7-arm64.tar.zst"
+STAGING_HARDLINKS="${EVA_PORT_STAGING_HARDLINKS:-0}"
 SOURCE_BRANCH="$(git -C "${REPO_ROOT}" branch --show-current)"
 SOURCE_COMMIT="$(git -C "${REPO_ROOT}" rev-parse HEAD)"
 SOURCE_DIRTY="$(git -C "${REPO_ROOT}" status --porcelain --untracked-files=normal)"
 WORKTREE_CLEAN=true
+
+case "${STAGING_HARDLINKS}" in
+    0|1) ;;
+    *)
+        echo "ERROR: EVA_PORT_STAGING_HARDLINKS must be 0 or 1." >&2
+        exit 1
+        ;;
+esac
+
+stage_tree_payload() {
+    local source="$1"
+    local destination="$2"
+    if [[ "${STAGING_HARDLINKS}" == "1" ]] \
+        && [[ "$(stat -c '%d' "${source}")" == "$(stat -c '%d' "$(dirname "${destination}")")" ]]; then
+        rm -rf "${destination}"
+        mkdir -p "${destination}"
+        cp -al "${source}/." "${destination}/"
+        printf 'Hard-linked immutable staging payload: %s\n' "${destination}"
+        return
+    fi
+    rsync -a --delete "${source}/" "${destination}/"
+}
+
+stage_file_payload() {
+    local source="$1"
+    local destination="$2"
+    if [[ "${STAGING_HARDLINKS}" == "1" ]] \
+        && [[ "$(stat -c '%d' "${source}")" == "$(stat -c '%d' "$(dirname "${destination}")")" ]]; then
+        ln -f "${source}" "${destination}"
+        printf 'Hard-linked immutable staging payload: %s\n' "${destination}"
+        return
+    fi
+    rsync -a --info=progress2 "${source}" "${destination}"
+}
 
 case "${TARGET_ARCHITECTURE}" in
     amd64)
@@ -155,9 +190,9 @@ rsync -a --delete --delete-excluded \
     --exclude='docs/*.pdf' \
     "${REPO_ROOT}/" "${STAGING_ROOT}/repo/"
 
-rsync -a --delete \
-    "${SIGLIP2_CACHE_REPO}/" \
-    "${STAGING_ROOT}/models/huggingface/models--google--siglip2-base-patch16-224/"
+stage_tree_payload \
+    "${SIGLIP2_CACHE_REPO}" \
+    "${STAGING_ROOT}/models/huggingface/models--google--siglip2-base-patch16-224"
 if [[ "${TARGET_ARCHITECTURE}" == "amd64" ]]; then
     rsync -a "${CLIP_WEIGHT}" "${STAGING_ROOT}/models/clip/ViT-B-32.pt"
     rsync -a --delete "${MODEL_VLM}/" "${STAGING_ROOT}/models/qwen3-vl-4b-awq/"
@@ -179,9 +214,16 @@ else
         "${STAGING_ROOT}/llama.cpp" \
         "${STAGING_ROOT}/models/clip"
     mkdir -p "${STAGING_ROOT}/models/qwen3-vl-4b"
-    rsync -a --delete --exclude=.cache \
-        "${MODEL_VLM_SPARK}/" \
-        "${STAGING_ROOT}/models/qwen3-vl-4b/"
+    if [[ "${STAGING_HARDLINKS}" == "1" ]]; then
+        stage_tree_payload \
+            "${MODEL_VLM_SPARK}" \
+            "${STAGING_ROOT}/models/qwen3-vl-4b"
+        rm -rf "${STAGING_ROOT}/models/qwen3-vl-4b/.cache"
+    else
+        rsync -a --delete --exclude=.cache \
+            "${MODEL_VLM_SPARK}/" \
+            "${STAGING_ROOT}/models/qwen3-vl-4b/"
+    fi
     install -p -m 0644 \
         "${PROFILE_DIR}/runtime-container.json" \
         "${STAGING_ROOT}/runtime-container.json"
@@ -192,7 +234,7 @@ else
         echo "Set EVA_SPARK_RUNTIME_ARCHIVE=/path/to/eva-spark-runtime.tar.zst." >&2
         exit 1
     fi
-    rsync -a --info=progress2 \
+    stage_file_payload \
         "${SPARK_RUNTIME_ARCHIVE}" \
         "${STAGING_ROOT}/container/${SPARK_RUNTIME_ARCHIVE_NAME}"
 fi
