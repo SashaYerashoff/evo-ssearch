@@ -934,6 +934,33 @@ def _siglip2_runtime_findings(
             "release-managed SigLIP2 requires EVOSSEARCH_CLIP_DEVICE=cuda; "
             f"found {clip_device or 'unset'}",
         )]
+    visible_devices = str(values.get("CUDA_VISIBLE_DEVICES") or "").strip().lower()
+    if visible_devices in {"-1", "none", "void"}:
+        return [Finding(
+            "FAIL",
+            "release-managed SigLIP2 cannot start while CUDA_VISIBLE_DEVICES "
+            f"hides every GPU ({visible_devices}); select a reviewed GPU before apply",
+        )]
+    nvidia_smi = shutil.which("nvidia-smi")
+    if not nvidia_smi:
+        return [Finding(
+            "FAIL",
+            "release-managed SigLIP2 requires a working NVIDIA driver, but "
+            "nvidia-smi is unavailable; repair the host driver before apply",
+        )]
+    driver_probe = subprocess.run(
+        (nvidia_smi, "--query-gpu=index", "--format=csv,noheader"),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        text=True,
+        check=False,
+    )
+    if driver_probe.returncode != 0 or not driver_probe.stdout.strip():
+        return [Finding(
+            "FAIL",
+            "release-managed SigLIP2 requires a working NVIDIA driver, but "
+            "nvidia-smi found no usable GPU; repair the host driver before apply",
+        )]
     python = options.app_dir / ".venv" / "bin" / "python"
     if not python.is_file() or not os.access(python, os.X_OK):
         return []

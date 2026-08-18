@@ -170,11 +170,21 @@ class OfflineInstallerUnitTests(unittest.TestCase):
             root = Path(temp)
             source = make_source(root)
             options = make_options(root, source, env_file=None)
-            with patch.object(
-                installer.subprocess,
-                "run",
-                return_value=subprocess.CompletedProcess([], 0),
-            ) as run:
+            with (
+                patch.object(
+                    installer.shutil,
+                    "which",
+                    side_effect=lambda name: "/usr/bin/nvidia-smi" if name == "nvidia-smi" else None,
+                ),
+                patch.object(
+                    installer.subprocess,
+                    "run",
+                    side_effect=(
+                        subprocess.CompletedProcess([], 0, stdout="0\n"),
+                        subprocess.CompletedProcess([], 0),
+                    ),
+                ) as run,
+            ):
                 findings = installer._siglip2_runtime_findings(
                     options,
                     {"EVOSSEARCH_CLIP_MODEL": installer.SIGLIP2_MODEL},
@@ -183,7 +193,7 @@ class OfflineInstallerUnitTests(unittest.TestCase):
         self.assertEqual([(item.level, item.message) for item in findings], [
             ("OK", "target venv supports the SigLIP2 CUDA runtime contract"),
         ])
-        self.assertEqual(run.call_count, 1)
+        self.assertEqual(run.call_count, 2)
 
     def test_siglip_runtime_accepts_a_resolvable_offline_wheelhouse(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -194,11 +204,16 @@ class OfflineInstallerUnitTests(unittest.TestCase):
             wheelhouse.mkdir()
             (wheelhouse / "transformers-5.0-py3-none-any.whl").write_bytes(b"wheel")
             with (
-                patch.object(installer.shutil, "which", return_value=None),
+                patch.object(
+                    installer.shutil,
+                    "which",
+                    side_effect=lambda name: "/usr/bin/nvidia-smi" if name == "nvidia-smi" else None,
+                ),
                 patch.object(
                     installer.subprocess,
                     "run",
                     side_effect=(
+                        subprocess.CompletedProcess([], 0, stdout="0\n"),
                         subprocess.CompletedProcess([], 1),
                         subprocess.CompletedProcess([], 0, stdout="Would install transformers"),
                     ),
@@ -211,8 +226,8 @@ class OfflineInstallerUnitTests(unittest.TestCase):
 
         self.assertEqual(findings[0].level, "OK")
         self.assertIn("wheelhouse resolves all Python requirements offline", findings[0].message)
-        self.assertEqual(run.call_count, 2)
-        resolution_command = run.call_args_list[1].args[0]
+        self.assertEqual(run.call_count, 3)
+        resolution_command = run.call_args_list[2].args[0]
         self.assertIn("--dry-run", resolution_command)
         self.assertIn("--no-index", resolution_command)
 
@@ -221,10 +236,16 @@ class OfflineInstallerUnitTests(unittest.TestCase):
             root = Path(temp)
             source = make_source(root)
             options = make_options(root, source, env_file=None)
-            with patch.object(
-                installer.subprocess,
-                "run",
-                return_value=subprocess.CompletedProcess([], 1),
+            with (
+                patch.object(installer.shutil, "which", return_value="/usr/bin/nvidia-smi"),
+                patch.object(
+                    installer.subprocess,
+                    "run",
+                    side_effect=(
+                        subprocess.CompletedProcess([], 0, stdout="0\n"),
+                        subprocess.CompletedProcess([], 1),
+                    ),
+                ),
             ):
                 findings = installer._siglip2_runtime_findings(
                     options,
@@ -233,6 +254,42 @@ class OfflineInstallerUnitTests(unittest.TestCase):
 
         self.assertEqual(findings[0].level, "FAIL")
         self.assertIn("bundle has no wheelhouse", findings[0].message)
+
+    def test_siglip_runtime_rejects_hidden_gpu_before_dependency_repair(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            source = make_source(root)
+            options = make_options(root, source, env_file=None)
+            with patch.object(installer.subprocess, "run") as run:
+                findings = installer._siglip2_runtime_findings(
+                    options,
+                    {
+                        "EVOSSEARCH_CLIP_MODEL": installer.SIGLIP2_MODEL,
+                        "CUDA_VISIBLE_DEVICES": "-1",
+                    },
+                )
+
+        self.assertEqual(findings[0].level, "FAIL")
+        self.assertIn("hides every GPU", findings[0].message)
+        run.assert_not_called()
+
+    def test_siglip_runtime_rejects_missing_nvidia_driver_before_dependency_repair(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            source = make_source(root)
+            options = make_options(root, source, env_file=None)
+            with (
+                patch.object(installer.shutil, "which", return_value=None),
+                patch.object(installer.subprocess, "run") as run,
+            ):
+                findings = installer._siglip2_runtime_findings(
+                    options,
+                    {"EVOSSEARCH_CLIP_MODEL": installer.SIGLIP2_MODEL},
+                )
+
+        self.assertEqual(findings[0].level, "FAIL")
+        self.assertIn("nvidia-smi is unavailable", findings[0].message)
+        run.assert_not_called()
 
     def test_discovers_existing_app_dotenv_before_source_and_preserves_target(self):
         with tempfile.TemporaryDirectory() as tmp:
