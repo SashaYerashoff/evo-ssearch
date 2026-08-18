@@ -7,6 +7,15 @@ STAGING_ROOT="${1:-/mnt/eva-llamacpp-lab/universal-usb-staging}"
 DEPENDENCY_SEED="${EVA_UNIVERSAL_DEPENDENCY_SEED:-/mnt/eva-llamacpp-lab/universal-usb-staging}"
 UPDATE_SEED="${EVA_UNIVERSAL_UPDATE_SEED:-}"
 ALEMBIC_BIN="${EVA_UNIVERSAL_ALEMBIC_BIN:-}"
+TARGET_ARCHITECTURE="${EVA_PORT_ARCHITECTURE:-amd64}"
+
+case "${TARGET_ARCHITECTURE}" in
+  amd64|arm64) ;;
+  *)
+    printf 'ERROR: unsupported EVA_PORT_ARCHITECTURE=%s\n' "${TARGET_ARCHITECTURE}" >&2
+    exit 1
+    ;;
+esac
 
 if [[ -z "${ALEMBIC_BIN}" ]]; then
   for candidate in \
@@ -40,7 +49,7 @@ export EVA_PORT_RELEASE_FLAVOR="universal-offline"
 
 if [[ ! -f "${DEPENDENCY_SEED}/apt/Packages.gz" || ! -d "${DEPENDENCY_SEED}/wheelhouse" ]]; then
   printf 'ERROR: dependency seed is incomplete: %s\n' "${DEPENDENCY_SEED}" >&2
-  printf 'Set EVA_UNIVERSAL_DEPENDENCY_SEED to a reviewed Ubuntu 24.04 amd64 cache.\n' >&2
+  printf 'Set EVA_UNIVERSAL_DEPENDENCY_SEED to a reviewed Ubuntu 24.04 %s cache.\n' "${TARGET_ARCHITECTURE}" >&2
   exit 1
 fi
 
@@ -76,11 +85,17 @@ elif [[ -d "${STAGING_ROOT}/updates" ]] \
   exit 1
 fi
 
-python3 "${SCRIPT_DIR}/offline_bundle_dependencies.py" \
-  "${STAGING_ROOT}" \
-  --repo-root "${STAGING_ROOT}/repo" \
-  --write-manifest \
+DEPENDENCY_ARGS=(
+  "${STAGING_ROOT}"
+  --repo-root "${STAGING_ROOT}/repo"
+  --write-manifest
   --resolve
+  --architecture "${TARGET_ARCHITECTURE}"
+)
+if [[ "${TARGET_ARCHITECTURE}" == "arm64" ]]; then
+  DEPENDENCY_ARGS+=(--external-vllm)
+fi
+python3 "${SCRIPT_DIR}/offline_bundle_dependencies.py" "${DEPENDENCY_ARGS[@]}"
 
 mkdir -p "${STAGING_ROOT}/migration-plans"
 EVA_DATABASE_DSN='postgresql://offline-validation/unused' \

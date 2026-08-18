@@ -7,13 +7,32 @@ import argparse
 import hashlib
 import json
 import re
+import subprocess
 from datetime import datetime, timezone
+from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
 from offline_bundle_dependencies import DependencyError, verify_manifest
 
 
+SPARK_RUNTIME_BASE_IMAGE = "nvcr.io/nvidia/vllm:26.07-py3"
+SPARK_RUNTIME_BASE_MANIFEST_DIGEST = (
+    "sha256:1de8e6bfdb4c81c1f31a806cc9b13b5c6352714a7cec87f4d24964bcc91159b2"
+)
+SPARK_RUNTIME_BASE_IMAGE_ID = (
+    "sha256:4c704f1343c7cb3aa7ea5cc57cab5fa1ed1a2160daf4f57d1e0c06fc1e2c7dbb"
+)
+SPARK_RUNTIME_IMAGE = "eva-ai/spark-runtime:0.8.7-arm64"
+SPARK_RUNTIME_IMAGE_ID = (
+    "sha256:ba6215522cd13772339e1160b4aff21c6f54d92aa0cbd031a4c8c29585d9080d"
+)
+SPARK_RUNTIME_ARCHIVE = "container/eva-spark-runtime-0.8.7-arm64.tar.zst"
+SPARK_VLM_REPO = "Qwen/Qwen3-VL-4B-Instruct"
+SPARK_VLM_REVISION = "ebb281ec70b05090aa6165b016eac8ec08e71b17"
+
+
+@lru_cache(maxsize=None)
 def digest(path: Path) -> str:
     hasher = hashlib.sha256()
     with path.open("rb") as handle:
@@ -114,6 +133,56 @@ def bundled_update_packages(root: Path) -> tuple[list[dict[str, Any]], list[str]
     return packages, critical
 
 
+def spark_runtime_payload(root: Path, architecture: str) -> tuple[dict[str, Any] | None, list[str]]:
+    if architecture != "arm64":
+        return None, []
+    contract_path = root / "runtime-container.json"
+    try:
+        contract = json.loads(contract_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise SystemExit(f"Invalid Spark runtime contract: {exc}") from exc
+    expected = {
+        "format": 1,
+        "engine": "docker",
+        "base_image": SPARK_RUNTIME_BASE_IMAGE,
+        "base_manifest_digest": SPARK_RUNTIME_BASE_MANIFEST_DIGEST,
+        "base_image_id": SPARK_RUNTIME_BASE_IMAGE_ID,
+        "image": SPARK_RUNTIME_IMAGE,
+        "image_id": SPARK_RUNTIME_IMAGE_ID,
+        "platform": "linux/arm64",
+        "model": SPARK_VLM_REPO,
+        "model_revision": SPARK_VLM_REVISION,
+        "weight_quantization": "online-fp8-w8a8",
+        "kv_cache_dtype": "bfloat16",
+        "vision_attention_dtype": "bfloat16",
+    }
+    if contract != expected:
+        raise SystemExit("Spark runtime contract does not match the pinned release image.")
+    critical = ["runtime-container.json"]
+    archive = root / SPARK_RUNTIME_ARCHIVE
+    if not archive.is_file():
+        raise SystemExit(
+            "ARM64 release is incomplete: the pinned NGC runtime archive is missing."
+        )
+    archive_manifest = subprocess.run(
+        ("tar", "--zstd", "-xOf", archive, "manifest.json"),
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+    if archive_manifest.returncode or SPARK_RUNTIME_IMAGE_ID.removeprefix("sha256:") not in (
+        archive_manifest.stdout
+    ):
+        raise SystemExit(
+            "Spark runtime archive does not contain the pinned ARM64 image ID."
+        )
+    contract["archive"] = SPARK_RUNTIME_ARCHIVE
+    contract["archive_sha256"] = digest(archive)
+    critical.append(SPARK_RUNTIME_ARCHIVE)
+    return contract, critical
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("bundle", type=Path)
@@ -140,7 +209,22 @@ def main() -> int:
         dependency_manifest = verify_manifest(root, repo_root=root / "repo")
     except DependencyError as exc:
         raise SystemExit(f"Offline dependencies are not releasable: {exc}") from exc
+    architecture = str(dependency_manifest["target"]["architecture"])
     update_packages, update_critical_files = bundled_update_packages(root)
+    container_runtime, container_critical_files = spark_runtime_payload(root, architecture)
+    spark_model_critical_files = (
+        [
+            str(path.relative_to(root))
+            for path in sorted((root / "models" / "qwen3-vl-4b").rglob("*"))
+            if path.is_file()
+        ]
+        if architecture == "arm64"
+        else []
+    )
+    if architecture == "arm64" and not any(
+        path.endswith(".safetensors") for path in spark_model_critical_files
+    ):
+        raise SystemExit("ARM64 release has no Qwen3-VL-4B safetensors payload.")
     version_match = re.search(r"\d+(?:\.\d+)+", version)
     if version_match is None:
         raise SystemExit(f"Cannot derive a Debian version from {version!r}")
@@ -151,6 +235,11 @@ def main() -> int:
         "repo/camera_scene.py",
         "repo/maritime_profiles.py",
         "repo/docs/maritime_port_profile.md",
+        *(
+            ("repo/deployment/spark_gb10/FACTORY_ACCEPTANCE.md",)
+            if architecture == "arm64"
+            else ()
+        ),
         "repo/react-ui/dist/index.html",
         "repo/requirements-cuda.txt",
         "repo/scripts/database_preservation_guard.py",
@@ -163,9 +252,6 @@ def main() -> int:
         "offline-dependencies.json",
         "START_EVA_AI.sh",
         *(("migration-plans/0006-to-0013.sql",) if release_flavor == "universal-offline" else ()),
-        "models/qwen3-vl-4b-awq/model.safetensors",
-        "models/qwen3.5-9b-mtp/Qwen3.5-9B-Q4_K_M.gguf",
-        "models/clip/ViT-B-32.pt",
         (
             "models/huggingface/models--google--siglip2-base-patch16-224/"
             "snapshots/75de2d55ec2d0b4efc50b3e9ad70dba96a7b2fa2/"
@@ -186,8 +272,19 @@ def main() -> int:
         ),
         (
             "installer-deb/"
-            f"eva-ai-appliance-installer_{debian_version}_amd64.deb"
+            f"eva-ai-appliance-installer_{debian_version}_{architecture}.deb"
         ),
+        *(
+            (
+                "models/qwen3-vl-4b-awq/model.safetensors",
+                "models/qwen3.5-9b-mtp/Qwen3.5-9B-Q4_K_M.gguf",
+                "models/clip/ViT-B-32.pt",
+            )
+            if architecture == "amd64"
+            else ()
+        ),
+        *container_critical_files,
+        *spark_model_critical_files,
         *update_critical_files,
     )
     files = sorted(path for path in root.rglob("*") if path.is_file())
@@ -201,6 +298,15 @@ def main() -> int:
         critical[relative] = digest(path)
     payload_bytes = sum(path.stat().st_size for path in files)
     target = (
+        {
+            "os": "Ubuntu 24.04 LTS ARM64",
+            "gpu": "NVIDIA GB10 / Spark-class integrated CUDA GPU",
+            "cpu": "ARM64 vendor appliance platform",
+            "ram_gib": 120,
+            "channels": "site profile; bundled local Qwen3-VL-4B inference",
+        }
+        if architecture == "arm64"
+        else
         {
             "os": "Ubuntu 24.04 LTS amd64",
             "gpu": "NVIDIA RTX 4070 Super / RTX 5070 Ti or newer (12+ GB VRAM)",
@@ -226,7 +332,11 @@ def main() -> int:
         "created_at": datetime.now(timezone.utc).isoformat(),
         "target": target,
         "payload_bytes": payload_bytes,
-        "minimum_free_bytes": max(45 * 1024**3, payload_bytes + 25 * 1024**3),
+        "minimum_free_bytes": (
+            max(70 * 1024**3, payload_bytes + 35 * 1024**3)
+            if architecture == "arm64"
+            else max(45 * 1024**3, payload_bytes + 25 * 1024**3)
+        ),
         "installation_modes": ["fresh", "update", "report"],
         "update_packages": update_packages,
         "offline_dependencies": {
@@ -235,13 +345,26 @@ def main() -> int:
             "wheels": len(dependency_manifest["wheelhouse"]["artifacts"]),
             "target": dependency_manifest["target"],
         },
+        **({"container_runtime": container_runtime} if container_runtime else {}),
         "critical_sha256": critical,
         "models": {
-            "live_vlm": "Qwen3-VL-4B-Instruct AWQ / vLLM 0.25.0",
-            "deep_review": "Qwen3.5-9B-MTP Q4_K_M / llama.cpp CPU",
+            "live_vlm": (
+                "Qwen3-VL-4B-Instruct online FP8 / pinned NGC vLLM container"
+                if architecture == "arm64"
+                else "Qwen3-VL-4B-Instruct AWQ / vLLM 0.25.0"
+            ),
+            "deep_review": (
+                "external endpoint or disabled"
+                if architecture == "arm64"
+                else "Qwen3.5-9B-MTP Q4_K_M / llama.cpp CPU"
+            ),
             "semantic_index": (
-                "Google SigLIP2 base patch16 224 FP16 / shared CUDA; "
-                "OpenAI CLIP ViT-B/32 retained for comparison"
+                "Google SigLIP2 base patch16 224 FP16 / shared CUDA"
+                + (
+                    "; OpenAI CLIP ViT-B/32 retained for comparison"
+                    if architecture == "amd64"
+                    else ""
+                )
             ),
         },
     }
@@ -259,8 +382,12 @@ def main() -> int:
                 f"version={version}",
                 "working_tree_status=clean",
                 "wheelhouse=included",
-                "media_runtime=included",
-                "media_runtime_platform=linux-x86_64",
+                (
+                    "media_runtime=pinned-ngc-container"
+                    if architecture == "arm64"
+                    else "media_runtime=system-apt"
+                ),
+                f"media_runtime_platform=linux-{'arm64' if architecture == 'arm64' else 'x86_64'}",
                 f"schema_head={manifest['schema_head']}",
                 f"release_flavor={release_flavor}",
             )

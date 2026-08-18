@@ -1,0 +1,10 @@
+# Python packages owned by EVA on Ubuntu 24.04 ARM64.
+#
+# torch and torchvision are deliberately absent. NVIDIA's Spark host image
+# owns the CUDA-enabled pair; the installer validates them before mutation and
+# creates EVA's venv with access to the vendor system packages.
+setuptools==80.10.2
+transformers==5.13.1
+numpy==2.3.5
+opencv-python-headless==5.0.0.93
+pillow==12.3.0

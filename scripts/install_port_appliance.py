@@ -15,6 +15,7 @@ import hashlib
 import json
 import os
 import platform
+import pwd
 import re
 import secrets
 import shlex
@@ -57,6 +58,20 @@ DEFAULT_DEEP_URL = "http://127.0.0.1:1236/v1"
 DEFAULT_DEEP_MODEL = "qwen3.5-9b-mtp"
 DEFAULT_SIGLIP2_MODEL = "google/siglip2-base-patch16-224"
 DEFAULT_SIGLIP2_REVISION = "75de2d55ec2d0b4efc50b3e9ad70dba96a7b2fa2"
+SPARK_RUNTIME_BASE_IMAGE = "nvcr.io/nvidia/vllm:26.07-py3"
+SPARK_RUNTIME_BASE_MANIFEST_DIGEST = (
+    "sha256:1de8e6bfdb4c81c1f31a806cc9b13b5c6352714a7cec87f4d24964bcc91159b2"
+)
+SPARK_RUNTIME_BASE_IMAGE_ID = (
+    "sha256:4c704f1343c7cb3aa7ea5cc57cab5fa1ed1a2160daf4f57d1e0c06fc1e2c7dbb"
+)
+SPARK_RUNTIME_IMAGE = "eva-ai/spark-runtime:0.8.7-arm64"
+SPARK_RUNTIME_IMAGE_ID = (
+    "sha256:ba6215522cd13772339e1160b4aff21c6f54d92aa0cbd031a4c8c29585d9080d"
+)
+SPARK_RUNTIME_CONTAINER_NAME = "eva-ai-app"
+SPARK_VLM_REPO = "Qwen/Qwen3-VL-4B-Instruct"
+SPARK_VLM_REVISION = "ebb281ec70b05090aa6165b016eac8ec08e71b17"
 MIN_FREE_GIB = 45
 PREFLIGHT_STAMP_ENV = "EVA_OFFLINE_BUNDLE_PREFLIGHT_SHA256"
 
@@ -130,7 +145,8 @@ PORT_ENV = {
     "EVOSSEARCH_LUXRIOT_ATTENTION_MAX_OUTSTANDING": "1",
     "EVOSSEARCH_LUXRIOT_ATTENTION_RING_SECONDS": "90",
     "EVOSSEARCH_LUXRIOT_ATTENTION_POSTROLL_SEC": "3",
-    "EVOSSEARCH_LUXRIOT_ATTENTION_MAX_VLM_FRAMES": "16",
+    # The bundled Qwen endpoint admits at most eight images per request.
+    "EVOSSEARCH_LUXRIOT_ATTENTION_MAX_VLM_FRAMES": "8",
     "EVOSSEARCH_LUXRIOT_CLIP_ASYNC_ENABLED": "true",
     "EVOSSEARCH_LUXRIOT_CLIP_ASYNC_WORKERS": "8",
     "EVOSSEARCH_LUXRIOT_CLIP_ASYNC_QUEUE_CAPACITY": "64",
@@ -539,11 +555,47 @@ def disk_free_gib(path: Path) -> float:
     return shutil.disk_usage(nearest_existing(path)).free / (1024**3)
 
 
-def validate_target_host(os_release: Path = Path("/etc/os-release")) -> None:
-    machine = platform.machine().lower()
-    if machine not in {"x86_64", "amd64"}:
+def normalize_architecture(value: str) -> str:
+    aliases = {
+        "x86_64": "amd64",
+        "amd64": "amd64",
+        "aarch64": "arm64",
+        "arm64": "arm64",
+    }
+    try:
+        return aliases[value.strip().lower()]
+    except KeyError as exc:
+        raise InstallError(f"Unsupported target architecture {value!r}.") from exc
+
+
+def bundle_architecture(manifest: Mapping) -> str:
+    dependencies = manifest.get("offline_dependencies")
+    if not isinstance(dependencies, Mapping):
+        raise InstallError("Bundle manifest has no offline dependency target.")
+    target = dependencies.get("target")
+    if not isinstance(target, Mapping):
+        raise InstallError("Bundle manifest has no dependency platform declaration.")
+    return normalize_architecture(str(target.get("architecture") or ""))
+
+
+def constraints_filename(architecture: str) -> str:
+    return (
+        "constraints-spark-gb10.txt"
+        if normalize_architecture(architecture) == "arm64"
+        else "constraints-port-4070s.txt"
+    )
+
+
+def validate_target_host(
+    manifest: Mapping | None = None,
+    os_release: Path = Path("/etc/os-release"),
+) -> None:
+    expected = bundle_architecture(manifest) if manifest is not None else "amd64"
+    detected = normalize_architecture(platform.machine())
+    if detected != expected:
         raise InstallError(
-            f"This bundle targets Ubuntu 24.04 amd64; detected architecture {machine!r}."
+            f"This bundle targets Ubuntu 24.04 {expected}; "
+            f"detected architecture {platform.machine()!r}."
         )
     values: dict[str, str] = {}
     if os_release.is_file():
@@ -556,6 +608,260 @@ def validate_target_host(os_release: Path = Path("/etc/os-release")) -> None:
             "This appliance bundle requires Ubuntu Server 24.04. "
             f"Detected {values.get('ID', 'unknown')} {values.get('VERSION_ID', 'unknown')}."
         )
+
+
+def spark_runtime_contract(manifest: Mapping) -> dict[str, str]:
+    """Return the immutable ARM runtime contract carried by the release."""
+
+    raw = manifest.get("container_runtime")
+    if not isinstance(raw, Mapping):
+        raise InstallError("Spark ARM64 bundle has no container runtime contract.")
+    expected = {
+        "engine": "docker",
+        "base_image": SPARK_RUNTIME_BASE_IMAGE,
+        "base_manifest_digest": SPARK_RUNTIME_BASE_MANIFEST_DIGEST,
+        "base_image_id": SPARK_RUNTIME_BASE_IMAGE_ID,
+        "image": SPARK_RUNTIME_IMAGE,
+        "image_id": SPARK_RUNTIME_IMAGE_ID,
+        "model": SPARK_VLM_REPO,
+        "model_revision": SPARK_VLM_REVISION,
+        "weight_quantization": "online-fp8-w8a8",
+        "kv_cache_dtype": "bfloat16",
+        "vision_attention_dtype": "bfloat16",
+    }
+    for key, value in expected.items():
+        if str(raw.get(key) or "") != value:
+            raise InstallError(
+                f"Spark runtime {key} does not match this installer: "
+                f"{raw.get(key)!r}."
+            )
+    result = {key: str(value) for key, value in expected.items()}
+    archive = str(raw.get("archive") or "").strip()
+    if archive:
+        candidate = Path(archive)
+        if candidate.is_absolute() or ".." in candidate.parts:
+            raise InstallError("Spark runtime archive path is unsafe.")
+        result["archive"] = archive
+    return result
+
+
+def _spark_image_present() -> bool:
+    if not shutil.which("docker"):
+        return False
+    completed = subprocess.run(
+        ("docker", "image", "inspect", SPARK_RUNTIME_IMAGE_ID),
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        check=False,
+    )
+    return completed.returncode == 0
+
+
+def validate_spark_container_runtime(
+    manifest: Mapping,
+    *,
+    run_gpu_probe: bool = True,
+) -> dict[str, object] | None:
+    """Validate the pinned NGC image without touching the vendor host Python."""
+
+    spark_runtime_contract(manifest)
+    if not shutil.which("docker"):
+        raise InstallError(
+            "Spark ARM64 requires the vendor Docker engine and NVIDIA container "
+            "integration; docker is not installed."
+        )
+    docker_info = subprocess.run(
+        ("docker", "info"),
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
+        text=True,
+        check=False,
+    )
+    if docker_info.returncode:
+        detail = (docker_info.stderr or "").strip().splitlines()
+        tail = detail[-1] if detail else f"exit {docker_info.returncode}"
+        raise InstallError(
+            "Spark ARM64 requires the vendor Docker daemon before EVA can load "
+            f"its offline runtime image: {tail}"
+        )
+    if not _spark_image_present():
+        return None
+    inspected = subprocess.run(
+        (
+            "docker",
+            "image",
+            "inspect",
+            "--format",
+            "{{.Architecture}}|{{.Id}}",
+            SPARK_RUNTIME_IMAGE_ID,
+        ),
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+    if inspected.returncode:
+        raise InstallError("Cannot inspect the pinned Spark runtime image.")
+    architecture, separator, image_id = inspected.stdout.strip().partition("|")
+    if separator != "|" or normalize_architecture(architecture) != "arm64":
+        raise InstallError(
+            f"Pinned Spark runtime has unexpected architecture {architecture!r}."
+        )
+    if image_id != SPARK_RUNTIME_IMAGE_ID:
+        raise InstallError(
+            f"Pinned Spark runtime image ID changed: {image_id or '[missing]'}."
+        )
+    if not run_gpu_probe:
+        return {"image_id": image_id, "architecture": architecture}
+
+    probe = """
+import json
+import shutil
+import subprocess
+import torch
+import torchvision
+import vllm
+ffmpeg = str(shutil.which("ffmpeg") or "")
+ffmpeg_returncode = (
+    subprocess.run(
+        (ffmpeg, "-version"),
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        check=False,
+    ).returncode
+    if ffmpeg
+    else -1
+)
+payload = {
+    "torch": str(torch.__version__),
+    "torchvision": str(torchvision.__version__),
+    "vllm": str(vllm.__version__),
+    "ffmpeg": ffmpeg,
+    "ffmpeg_returncode": int(ffmpeg_returncode),
+    "cuda_available": bool(torch.cuda.is_available()),
+    "cuda": str(torch.version.cuda or ""),
+    "device": str(torch.cuda.get_device_name(0)) if torch.cuda.is_available() else "",
+}
+print(json.dumps(payload, sort_keys=True))
+"""
+    completed = subprocess.run(
+        (
+            "docker",
+            "run",
+            "--rm",
+            "--gpus",
+            "all",
+            "--entrypoint",
+            "python3",
+            SPARK_RUNTIME_IMAGE_ID,
+            "-c",
+            probe,
+        ),
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+    if completed.returncode:
+        detail = (completed.stderr or completed.stdout).strip().splitlines()
+        tail = detail[-1] if detail else f"exit {completed.returncode}"
+        raise InstallError(f"Spark CUDA container probe failed: {tail}")
+    try:
+        payload = json.loads(completed.stdout.strip().splitlines()[-1])
+    except (IndexError, json.JSONDecodeError) as exc:
+        raise InstallError("Spark CUDA container probe returned invalid output.") from exc
+    if payload.get("cuda_available") is not True or not payload.get("device"):
+        raise InstallError(
+            "The pinned Spark container imports torch, but cannot see the GB10 GPU. "
+            "Repair NVIDIA Container Toolkit before installing EVA."
+        )
+    if not payload.get("ffmpeg") or payload.get("ffmpeg_returncode") != 0:
+        raise InstallError(
+            "The pinned Spark container cannot execute ffmpeg; refusing a runtime "
+            "that cannot decode EVA streams."
+        )
+    print(
+        "Spark container runtime ready: "
+        f"vLLM {payload.get('vllm')}, torch {payload.get('torch')}, "
+        f"CUDA {payload.get('cuda')}, "
+        f"device {payload.get('device')}."
+    )
+    return payload
+
+
+def ensure_spark_runtime(
+    bundle_root: Path,
+    manifest: Mapping,
+    runner: Runner,
+) -> None:
+    """Load the immutable ARM image when needed, then prove CUDA/media support."""
+
+    contract = spark_runtime_contract(manifest)
+    if _spark_image_present():
+        if runner.dry_run:
+            print(f"+ reuse pinned Spark runtime {SPARK_RUNTIME_IMAGE_ID}")
+            return
+        validate_spark_container_runtime(manifest)
+        return
+    archive_relative = contract.get("archive")
+    if not archive_relative:
+        raise InstallError(
+            "The pinned Spark runtime image is not loaded and this bundle has no "
+            "offline image archive. Use the complete factory ARM64 USB bundle."
+        )
+    archive = bundle_root / archive_relative
+    if not archive.is_file():
+        raise InstallError(f"Spark runtime archive is missing: {archive_relative}")
+    runner.run(("docker", "load", "--input", archive))
+    if runner.dry_run:
+        return
+    if not _spark_image_present():
+        raise InstallError(
+            "The Spark runtime archive loaded, but did not provide the pinned image ID."
+        )
+    validate_spark_container_runtime(manifest)
+
+
+def spark_docker_base(
+    answers: Answers,
+    *,
+    env_file: Path | None = None,
+    bundle_root: Path | None = None,
+    name: str | None = None,
+    remove: bool = True,
+    gpu: bool = True,
+    user: str | None = None,
+) -> tuple[str | Path, ...]:
+    """Build the common, bounded Docker invocation for Spark appliance tasks."""
+
+    command: list[str | Path] = ["docker", "run"]
+    if remove:
+        command.append("--rm")
+    if name:
+        command.extend(("--name", name))
+    command.extend(("--network", "host", "--ipc", "host"))
+    if gpu:
+        command.extend(("--gpus", "all"))
+    if user:
+        command.extend(("--user", user))
+    for root in (answers.install_root, answers.data_root, answers.config_root):
+        command.extend(
+            (
+                "--mount",
+                f"type=bind,src={root},dst={root}",
+            )
+        )
+    if bundle_root is not None:
+        command.extend(
+            (
+                "--mount",
+                f"type=bind,src={bundle_root},dst=/eva-bundle,readonly",
+            )
+        )
+    if env_file is not None:
+        command.extend(("--env-file", env_file))
+    command.extend(("--workdir", answers.install_root / "app"))
+    return tuple(command)
 
 
 def evo_reachable(url: str) -> tuple[bool, str]:
@@ -589,7 +895,8 @@ def read_manifest(bundle_root: Path) -> dict:
 
 
 def verify_critical_payload(bundle_root: Path, manifest: Mapping) -> None:
-    required = (
+    architecture = bundle_architecture(manifest)
+    required = [
         "SOURCE_REVISION.json",
         "repo/VERSION",
         "repo/alembic.ini",
@@ -604,9 +911,6 @@ def verify_critical_payload(bundle_root: Path, manifest: Mapping) -> None:
         "offline_bundle_dependencies.py",
         "offline-dependencies.json",
         "apt/Packages.gz",
-        "models/qwen3-vl-4b-awq/model.safetensors",
-        "models/qwen3.5-9b-mtp/Qwen3.5-9B-Q4_K_M.gguf",
-        "models/clip/ViT-B-32.pt",
         (
             "models/huggingface/models--google--siglip2-base-patch16-224/"
             f"snapshots/{DEFAULT_SIGLIP2_REVISION}/model.safetensors"
@@ -623,8 +927,24 @@ def verify_critical_payload(bundle_root: Path, manifest: Mapping) -> None:
                 "tokenizer_config.json",
             )
         ),
-        "llama.cpp/CMakeLists.txt",
-    )
+    ]
+    if architecture == "amd64":
+        required.extend(
+            (
+                "models/qwen3-vl-4b-awq/model.safetensors",
+                "models/qwen3.5-9b-mtp/Qwen3.5-9B-Q4_K_M.gguf",
+                "models/clip/ViT-B-32.pt",
+                "llama.cpp/CMakeLists.txt",
+            )
+        )
+    else:
+        required.extend(
+            (
+                "runtime-container.json",
+                "models/qwen3-vl-4b/config.json",
+                "models/qwen3-vl-4b/tokenizer.json",
+            )
+        )
     missing = [item for item in required if not (bundle_root / item).exists()]
     if missing:
         raise InstallError("Offline payload is incomplete: " + ", ".join(missing))
@@ -695,7 +1015,13 @@ def database_exists() -> bool:
     return completed.returncode == 0 and completed.stdout.strip() == "1"
 
 
-def gather_answers(non_interactive: bool, args: argparse.Namespace) -> Answers:
+def gather_answers(
+    non_interactive: bool,
+    args: argparse.Namespace,
+    *,
+    architecture: str = "amd64",
+) -> Answers:
+    architecture = normalize_architecture(architecture)
     if non_interactive:
         if args.evo_password and args.evo_password_file:
             raise InstallError(
@@ -722,11 +1048,15 @@ def gather_answers(non_interactive: bool, args: argparse.Namespace) -> Answers:
                 "--no-deep-review cannot be combined with --external-deep-url"
             )
         root = Path(args.install_root or DEFAULT_ROOT)
-        local_deep = not bool(args.external_deep_url) and not args.no_deep_review
+        local_deep = bool(
+            architecture == "amd64"
+            and not args.external_deep_url
+            and not args.no_deep_review
+        )
         deep_url = (
-            ""
-            if args.no_deep_review
-            else _url(args.external_deep_url or DEFAULT_DEEP_URL)
+            _url(args.external_deep_url)
+            if args.external_deep_url
+            else DEFAULT_DEEP_URL if local_deep else ""
         )
         deep_model = (
             ""
@@ -788,8 +1118,14 @@ def gather_answers(non_interactive: bool, args: argparse.Namespace) -> Answers:
         config_root = Path(_prompt("Configuration root", str(DEFAULT_CONFIG)))
 
     print("\nInference placement:")
-    print("  Recommended local profile: NVIDIA GPU with 12+ GB VRAM, Qwen3-VL-4B AWQ/vLLM,")
-    print("  32K context, FP8 KV, 4 sequences, 4096 batched tokens, ~10 GB VRAM.")
+    if architecture == "arm64":
+        print(
+            "  Bundled Spark profile: Qwen3-VL-4B online FP8/vLLM, "
+            "32K context, 4 sequences, maximum 8 images/request."
+        )
+    else:
+        print("  Recommended local profile: NVIDIA GPU with 12+ GB VRAM, Qwen3-VL-4B AWQ/vLLM,")
+        print("  32K context, FP8 KV, 4 sequences, 4096 batched tokens, ~10 GB VRAM.")
     local_vlm = _yes_no("Install and run the VLM on this computer?", True)
     if local_vlm:
         vlm_url, vlm_model = DEFAULT_VLM_URL, DEFAULT_VLM_MODEL
@@ -797,9 +1133,12 @@ def gather_answers(non_interactive: bool, args: argparse.Namespace) -> Answers:
         vlm_url = _url(_prompt("External OpenAI-compatible VLM URL"))
         vlm_model = _prompt("External VLM model id", DEFAULT_VLM_MODEL)
 
-    local_deep = _yes_no(
-        "Install the CPU Qwen3.5-9B-MTP endpoint for preemptible L3 review?",
-        True,
+    local_deep = bool(
+        architecture == "amd64"
+        and _yes_no(
+            "Install the CPU Qwen3.5-9B-MTP endpoint for preemptible L3 review?",
+            True,
+        )
     )
     if local_deep:
         deep_url, deep_model = DEFAULT_DEEP_URL, DEFAULT_DEEP_MODEL
@@ -869,6 +1208,7 @@ def print_plan(
     db_exists: bool,
     schema: str | None,
     required_gib: float,
+    architecture: str = "amd64",
 ) -> None:
     print("\nInstallation plan")
     print(f"  EVA AI: {VERSION}, schema head {EXPECTED_SCHEMA}")
@@ -879,7 +1219,11 @@ def print_plan(
     print(
         "  VLM: "
         + (
-            "local Qwen3-VL-4B AWQ/vLLM on port 1234"
+            (
+                "local Qwen3-VL-4B online FP8/vLLM container on port 1234"
+                if normalize_architecture(architecture) == "arm64"
+                else "local Qwen3-VL-4B AWQ/vLLM on port 1234"
+            )
             if answers.local_vlm
             else f"external {answers.vlm_url}"
         )
@@ -964,6 +1308,21 @@ def render_env(values: Mapping[str, str]) -> str:
     ]
     for key in sorted(values):
         lines.append(f"{key}={_env_quote(str(values[key]))}")
+    return "\n".join(lines) + "\n"
+
+
+def render_container_env(values: Mapping[str, str]) -> str:
+    """Render Docker's literal env-file format without shell quoting."""
+
+    lines = [
+        "# EVA AI Spark container configuration.",
+        "# Generated by the universal offline installer; chmod 0600.",
+    ]
+    for key in sorted(values):
+        value = str(values[key])
+        if any(char in value for char in ("\n", "\r", "\x00")):
+            raise InstallError("A container configuration value is not one line.")
+        lines.append(f"{key}={value}")
     return "\n".join(lines) + "\n"
 
 
@@ -1140,6 +1499,11 @@ def quiesce_existing_runtime(runner: Runner) -> None:
 
     for service in ("eva-ai", "eva-vllm", "eva-deep-review"):
         runner.run(("systemctl", "stop", service), check=False)
+    if shutil.which("docker"):
+        runner.run(
+            ("docker", "rm", "-f", SPARK_RUNTIME_CONTAINER_NAME),
+            check=False,
+        )
 
 
 def backup_existing(
@@ -1200,7 +1564,13 @@ def backup_existing(
     return backup
 
 
-def sync_payload(bundle_root: Path, answers: Answers, runner: Runner) -> None:
+def sync_payload(
+    bundle_root: Path,
+    answers: Answers,
+    runner: Runner,
+    *,
+    architecture: str = "amd64",
+) -> None:
     app_dir = answers.install_root / "app"
     runner.run(("mkdir", "-p", app_dir))
     runner.run(
@@ -1216,13 +1586,18 @@ def sync_payload(bundle_root: Path, answers: Answers, runner: Runner) -> None:
         )
     )
     if answers.local_vlm:
+        vlm_directory = (
+            "qwen3-vl-4b"
+            if normalize_architecture(architecture) == "arm64"
+            else "qwen3-vl-4b-awq"
+        )
         runner.run(
             (
                 "rsync",
                 "-a",
                 "--delete",
-                str(bundle_root / "models" / "qwen3-vl-4b-awq") + "/",
-                str(answers.data_root / "models" / "qwen3-vl-4b-awq") + "/",
+                str(bundle_root / "models" / vlm_directory) + "/",
+                str(answers.data_root / "models" / vlm_directory) + "/",
             )
         )
     if answers.local_deep:
@@ -1235,15 +1610,16 @@ def sync_payload(bundle_root: Path, answers: Answers, runner: Runner) -> None:
                 str(answers.data_root / "models" / "qwen3.5-9b-mtp") + "/",
             )
         )
-    runner.run(
-        (
-            "install",
-            "-m",
-            "0644",
-            bundle_root / "models" / "clip" / "ViT-B-32.pt",
-            answers.data_root / "models" / "clip" / "ViT-B-32.pt",
+    if normalize_architecture(architecture) == "amd64":
+        runner.run(
+            (
+                "install",
+                "-m",
+                "0644",
+                bundle_root / "models" / "clip" / "ViT-B-32.pt",
+                answers.data_root / "models" / "clip" / "ViT-B-32.pt",
+            )
         )
-    )
     runner.run(
         (
             "rsync",
@@ -1266,34 +1642,97 @@ def sync_payload(bundle_root: Path, answers: Answers, runner: Runner) -> None:
     runner.run(("chown", "-R", "eva:eva", answers.install_root, answers.data_root))
 
 
-def install_python_envs(bundle_root: Path, answers: Answers, runner: Runner) -> None:
+def install_python_envs(
+    bundle_root: Path,
+    answers: Answers,
+    runner: Runner,
+    *,
+    architecture: str,
+) -> None:
     app_dir = answers.install_root / "app"
     app_python = app_dir / ".venv" / "bin" / "python"
-    if not app_python.exists() or runner.dry_run:
+    architecture = normalize_architecture(architecture)
+    if architecture == "arm64":
+        # Build the venv with the exact Python/CUDA image that will run EVA.
+        # The host Ubuntu intentionally does not own torch on Spark appliances.
+        runner.run(("rm", "-rf", app_dir / ".venv"))
+        runner.run(
+            (
+                *spark_docker_base(
+                    answers,
+                    bundle_root=bundle_root,
+                    gpu=False,
+                ),
+                "--entrypoint",
+                "python3",
+                SPARK_RUNTIME_IMAGE_ID,
+                "-m",
+                "venv",
+                "--system-site-packages",
+                app_dir / ".venv",
+            )
+        )
+    elif not app_python.exists() or runner.dry_run:
         runner.run(("python3", "-m", "venv", app_dir / ".venv"))
     common_pip = (
         "--no-index",
         "--find-links",
-        bundle_root / "wheelhouse",
-        "--constraint",
-        bundle_root / "constraints-port-4070s.txt",
-    )
-    runner.run(
         (
-            app_python,
-            "-m",
-            "pip",
-            "install",
-            *common_pip,
-            "-r",
-            app_dir / "requirements.txt",
-            "-r",
-            app_dir / "requirements-db.txt",
-        )
+            Path("/eva-bundle/wheelhouse")
+            if architecture == "arm64"
+            else bundle_root / "wheelhouse"
+        ),
+        "--constraint",
+        (
+            Path("/eva-bundle") / constraints_filename(architecture)
+            if architecture == "arm64"
+            else bundle_root / constraints_filename(architecture)
+        ),
     )
+    pip_command: tuple[str | Path, ...] = (
+        app_python,
+        "-m",
+        "pip",
+        "install",
+        *common_pip,
+        "-r",
+        app_dir / "requirements.txt",
+        "-r",
+        app_dir / "requirements-db.txt",
+    )
+    if architecture == "arm64":
+        pip_command = (
+            *spark_docker_base(
+                answers,
+                bundle_root=bundle_root,
+                gpu=False,
+            ),
+            "--entrypoint",
+            app_python,
+            SPARK_RUNTIME_IMAGE_ID,
+            *pip_command[1:],
+        )
+    runner.run(pip_command)
+    if architecture == "arm64":
+        runner.run(
+            (
+                *spark_docker_base(answers),
+                "--entrypoint",
+                app_python,
+                SPARK_RUNTIME_IMAGE_ID,
+                "-c",
+                (
+                    "import cv2,torch,torchvision; "
+                    "assert torch.cuda.is_available(); "
+                    "print('EVA Spark Python ready:', torch.__version__, "
+                    "torchvision.__version__, cv2.__version__, "
+                    "torch.cuda.get_device_name(0))"
+                ),
+            )
+        )
     vllm_dir = answers.install_root / "vllm"
     vllm_python = vllm_dir / ".venv" / "bin" / "python"
-    if answers.local_vlm:
+    if answers.local_vlm and architecture == "amd64":
         if not vllm_python.exists() or runner.dry_run:
             runner.run(("python3", "-m", "venv", vllm_dir / ".venv"))
         runner.run(
@@ -1315,6 +1754,7 @@ def prepare_database(
     *,
     db_was_present: bool,
     existing_env: Mapping[str, str],
+    architecture: str = "amd64",
 ) -> dict[str, str]:
     runner.run(("systemctl", "enable", "--now", "postgresql"))
     if not db_was_present:
@@ -1323,8 +1763,28 @@ def prepare_database(
     app_dir = answers.install_root / "app"
     migration_env = dict(os.environ)
     migration_env["EVA_DATABASE_DSN"] = "postgresql:///eva?host=/var/run/postgresql"
-    runner.run(
-        (
+    architecture = normalize_architecture(architecture)
+    if architecture == "arm64":
+        postgres_account = pwd.getpwnam("postgres")
+        postgres_user = f"{postgres_account.pw_uid}:{postgres_account.pw_gid}"
+        migration_command: tuple[str | Path, ...] = (
+            *spark_docker_base(
+                answers,
+                gpu=False,
+                user=postgres_user,
+            ),
+            "--mount",
+            "type=bind,src=/var/run/postgresql,dst=/var/run/postgresql",
+            "--env",
+            "EVA_DATABASE_DSN",
+            "--entrypoint",
+            app_dir / ".venv" / "bin" / "alembic",
+            SPARK_RUNTIME_IMAGE_ID,
+            "upgrade",
+            "head",
+        )
+    else:
+        migration_command = (
             "runuser",
             "--preserve-environment",
             "-u",
@@ -1333,7 +1793,9 @@ def prepare_database(
             app_dir / ".venv" / "bin" / "alembic",
             "upgrade",
             "head",
-        ),
+        )
+    runner.run(
+        migration_command,
         cwd=app_dir,
         env=migration_env,
     )
@@ -1351,8 +1813,27 @@ def prepare_database(
 
     role_env = dict(migration_env)
     role_env.update(passwords)
-    runner.run(
-        (
+    if architecture == "arm64":
+        role_command: tuple[str | Path, ...] = (
+            *spark_docker_base(
+                answers,
+                gpu=False,
+                user=postgres_user,
+            ),
+            "--mount",
+            "type=bind,src=/var/run/postgresql,dst=/var/run/postgresql",
+            *(
+                item
+                for key in ("EVA_DATABASE_DSN", *password_keys)
+                for item in ("--env", key)
+            ),
+            "--entrypoint",
+            app_dir / ".venv" / "bin" / "python",
+            SPARK_RUNTIME_IMAGE_ID,
+            "scripts/bootstrap_db_roles.py",
+        )
+    else:
+        role_command = (
             "runuser",
             "--preserve-environment",
             "-u",
@@ -1360,10 +1841,8 @@ def prepare_database(
             "--",
             app_dir / ".venv" / "bin" / "python",
             "scripts/bootstrap_db_roles.py",
-        ),
-        cwd=app_dir,
-        env=role_env,
-    )
+        )
+    runner.run(role_command, cwd=app_dir, env=role_env)
     return passwords
 
 
@@ -1532,20 +2011,39 @@ def render_runtime_env(
     return values
 
 
-def validate_runtime_config(answers: Answers, runner: Runner) -> None:
-    runner.run(
-        (
-            answers.install_root / "app" / ".venv" / "bin" / "python",
-            answers.install_root / "app" / "scripts" / "validate_appliance_config.py",
-            "--env-file",
-            answers.config_root / "eva-ai.env",
-        )
+def validate_runtime_config(
+    answers: Answers,
+    runner: Runner,
+    *,
+    architecture: str = "amd64",
+) -> None:
+    command: tuple[str | Path, ...] = (
+        answers.install_root / "app" / ".venv" / "bin" / "python",
+        answers.install_root / "app" / "scripts" / "validate_appliance_config.py",
+        "--env-file",
+        answers.config_root / "eva-ai.env",
     )
+    if normalize_architecture(architecture) == "arm64":
+        command = (
+            *spark_docker_base(answers, gpu=False),
+            "--entrypoint",
+            command[0],
+            SPARK_RUNTIME_IMAGE_ID,
+            *command[1:],
+        )
+    runner.run(command)
 
 
-def install_systemd_units(answers: Answers, runner: Runner) -> None:
+def install_systemd_units(
+    answers: Answers,
+    runner: Runner,
+    *,
+    architecture: str = "amd64",
+) -> None:
+    architecture = normalize_architecture(architecture)
     app_dir = answers.install_root / "app"
     env_file = answers.config_root / "eva-ai.env"
+    container_env_file = answers.config_root / "eva-ai.container.env"
     validate_config = app_dir / "scripts" / "validate_appliance_config.py"
     units: dict[Path, str] = {}
     local_vlm_dependencies = ""
@@ -1554,7 +2052,89 @@ def install_systemd_units(answers: Answers, runner: Runner) -> None:
             "After=eva-vllm.service\n"
             "Wants=eva-vllm.service\n"
         )
-    units[Path("/etc/systemd/system/eva-ai.service")] = f"""[Unit]
+    if architecture == "arm64":
+        try:
+            eva_account = pwd.getpwnam("eva")
+            container_user = f"{eva_account.pw_uid}:{eva_account.pw_gid}"
+        except KeyError as exc:
+            if not runner.dry_run:
+                raise InstallError("The eva service account was not created.") from exc
+            container_user = "EVA_UID:EVA_GID"
+        common = list(
+            spark_docker_base(
+                answers,
+                env_file=container_env_file,
+                user=container_user,
+            )
+        )
+        common[0] = "/usr/bin/docker"
+        config_command = shlex.join(
+            str(item)
+            for item in (
+                *common,
+                "--entrypoint",
+                app_dir / ".venv" / "bin" / "python",
+                SPARK_RUNTIME_IMAGE_ID,
+                validate_config,
+                "--from-environment",
+            )
+        )
+        wait_command = shlex.join(
+            str(item)
+            for item in (
+                *common,
+                "--entrypoint",
+                app_dir / ".venv" / "bin" / "python",
+                SPARK_RUNTIME_IMAGE_ID,
+                app_dir / "scripts" / "wait_openai_endpoint.py",
+                "--timeout",
+                "600",
+            )
+        )
+        service_base = list(
+            spark_docker_base(
+                answers,
+                env_file=container_env_file,
+                name=SPARK_RUNTIME_CONTAINER_NAME,
+                user=container_user,
+            )
+        )
+        service_base[0] = "/usr/bin/docker"
+        start_command = shlex.join(
+            str(item)
+            for item in (
+                *service_base,
+                "--entrypoint",
+                app_dir / "run_prod.sh",
+                SPARK_RUNTIME_IMAGE_ID,
+            )
+        )
+        units[Path("/etc/systemd/system/eva-ai.service")] = f"""[Unit]
+Description=EVA AI Spark ARM64 container appliance
+After=network-online.target postgresql.service docker.service
+Wants=network-online.target
+Requires=postgresql.service docker.service
+{local_vlm_dependencies}
+
+[Service]
+Type=simple
+ExecStartPre=-/usr/bin/docker rm -f {SPARK_RUNTIME_CONTAINER_NAME}
+ExecStartPre={config_command}
+ExecStartPre={wait_command}
+ExecStart={start_command}
+ExecStop=/usr/bin/docker stop -t 110 {SPARK_RUNTIME_CONTAINER_NAME}
+Restart=on-failure
+RestartSec=5
+TimeoutStartSec=660
+TimeoutStopSec=120
+KillMode=process
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target
+"""
+    else:
+        units[Path("/etc/systemd/system/eva-ai.service")] = f"""[Unit]
 Description=EVA AI single-node appliance
 After=network-online.target postgresql.service
 Wants=network-online.target
@@ -1584,9 +2164,89 @@ PrivateTmp=true
 WantedBy=multi-user.target
 """
     if answers.local_vlm:
-        model = answers.data_root / "models" / "qwen3-vl-4b-awq"
-        vllm = answers.install_root / "vllm" / ".venv" / "bin" / "vllm"
-        units[Path("/etc/systemd/system/eva-vllm.service")] = f"""[Unit]
+        if architecture == "arm64":
+            eva_account = pwd.getpwnam("eva")
+            container_user = f"{eva_account.pw_uid}:{eva_account.pw_gid}"
+            model = answers.data_root / "models" / "qwen3-vl-4b"
+            vllm_base = list(
+                spark_docker_base(
+                    answers,
+                    name="eva-vllm",
+                    user=container_user,
+                )
+            )
+            vllm_base[0] = "/usr/bin/docker"
+            vllm_command = shlex.join(
+                str(item)
+                for item in (
+                    *vllm_base,
+                    "--env",
+                    f"HF_HOME={answers.data_root}/models/huggingface",
+                    "--env",
+                    "HF_HUB_OFFLINE=1",
+                    "--env",
+                    "TRANSFORMERS_OFFLINE=1",
+                    "--env",
+                    "VLLM_USE_DEEP_GEMM=0",
+                    "--env",
+                    "PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True",
+                    "--env",
+                    f"HOME={answers.data_root}",
+                    "--entrypoint",
+                    "vllm",
+                    SPARK_RUNTIME_IMAGE_ID,
+                    "serve",
+                    model,
+                    "--served-model-name",
+                    answers.vlm_model,
+                    "--host",
+                    "127.0.0.1",
+                    "--port",
+                    "1234",
+                    "--max-model-len",
+                    "32768",
+                    "--gpu-memory-utilization",
+                    "0.55",
+                    "--max-num-seqs",
+                    "4",
+                    "--max-num-batched-tokens",
+                    "8192",
+                    "--quantization",
+                    "fp8",
+                    "--kv-cache-dtype",
+                    "auto",
+                    "--mm-processor-cache-gb",
+                    "0",
+                    "--limit-mm-per-prompt.image",
+                    "8",
+                    "--limit-mm-per-prompt.video",
+                    "0",
+                )
+            )
+            units[Path("/etc/systemd/system/eva-vllm.service")] = f"""[Unit]
+Description=EVA Qwen3-VL-4B FP8 vLLM on Spark ARM64
+After=network-online.target docker.service
+Wants=network-online.target
+Requires=docker.service
+
+[Service]
+Type=simple
+ExecStartPre=-/usr/bin/docker rm -f eva-vllm
+ExecStart={vllm_command}
+ExecStop=/usr/bin/docker stop -t 50 eva-vllm
+Restart=on-failure
+RestartSec=10
+TimeoutStartSec=900
+TimeoutStopSec=60
+KillMode=process
+
+[Install]
+WantedBy=multi-user.target
+"""
+        else:
+            model = answers.data_root / "models" / "qwen3-vl-4b-awq"
+            vllm = answers.install_root / "vllm" / ".venv" / "bin" / "vllm"
+            units[Path("/etc/systemd/system/eva-vllm.service")] = f"""[Unit]
 Description=EVA Qwen3-VL-4B AWQ vLLM
 After=network-online.target
 Wants=network-online.target
@@ -1616,7 +2276,45 @@ WantedBy=multi-user.target
         vision_state = answers.data_root / "state" / "vlm-vision-health.json"
         watchdog = app_dir / "scripts" / "vlm_vision_watchdog.py"
         python = app_dir / ".venv" / "bin" / "python"
-        units[Path("/etc/systemd/system/eva-vlm-vision-watchdog.service")] = f"""[Unit]
+        if architecture == "arm64":
+            watchdog_base = list(
+                spark_docker_base(
+                    answers,
+                    env_file=container_env_file,
+                    gpu=False,
+                    user=container_user,
+                )
+            )
+            watchdog_base[0] = "/usr/bin/docker"
+            watchdog_command = shlex.join(
+                str(item)
+                for item in (
+                    *watchdog_base,
+                    "--entrypoint",
+                    python,
+                    SPARK_RUNTIME_IMAGE_ID,
+                    watchdog,
+                    "--state-file",
+                    vision_state,
+                    "--failure-threshold",
+                    "2",
+                    "--timeout",
+                    "30",
+                )
+            )
+            units[Path("/etc/systemd/system/eva-vlm-vision-watchdog.service")] = f"""[Unit]
+Description=EVA content-aware VLM vision watchdog
+After=eva-vllm.service docker.service
+Requires=eva-vllm.service docker.service
+OnFailure=eva-vlm-vision-recover.service
+
+[Service]
+Type=oneshot
+ExecStart={watchdog_command}
+Nice=10
+"""
+        else:
+            units[Path("/etc/systemd/system/eva-vlm-vision-watchdog.service")] = f"""[Unit]
 Description=EVA content-aware VLM vision watchdog
 After=eva-vllm.service
 Requires=eva-vllm.service
@@ -1702,6 +2400,8 @@ WantedBy=multi-user.target
         runner.run(("rm", "-f", path))
     runner.run(("systemctl", "daemon-reload"))
     services = ["postgresql", "eva-ai"]
+    if normalize_architecture(architecture) == "arm64":
+        services.append("docker")
     if answers.local_vlm:
         services.append("eva-vllm")
         services.append("eva-vlm-vision-watchdog.timer")
@@ -1995,23 +2695,39 @@ def bootstrap_admin(
     answers: Answers,
     values: Mapping[str, str],
     runner: Runner,
+    *,
+    architecture: str = "amd64",
 ) -> None:
     env = dict(os.environ)
     env.update(values)
     env["EVA_BOOTSTRAP_ADMIN_PASSWORD"] = answers.admin_password
-    runner.run(
-        (
-            answers.install_root / "app" / ".venv" / "bin" / "python",
-            answers.install_root / "app" / "scripts" / "bootstrap_admin.py",
-            "--tenant-id",
-            values["EVOSSEARCH_AUTH_TENANT_ID"],
-            "--username",
-            answers.admin_username,
-            "--display-name",
-            answers.admin_display_name,
-        ),
-        env=env,
+    command: tuple[str | Path, ...] = (
+        answers.install_root / "app" / ".venv" / "bin" / "python",
+        answers.install_root / "app" / "scripts" / "bootstrap_admin.py",
+        "--tenant-id",
+        values["EVOSSEARCH_AUTH_TENANT_ID"],
+        "--username",
+        answers.admin_username,
+        "--display-name",
+        answers.admin_display_name,
     )
+    if normalize_architecture(architecture) == "arm64":
+        eva_account = pwd.getpwnam("eva")
+        command = (
+            *spark_docker_base(
+                answers,
+                env_file=answers.config_root / "eva-ai.container.env",
+                gpu=False,
+                user=f"{eva_account.pw_uid}:{eva_account.pw_gid}",
+            ),
+            "--env",
+            "EVA_BOOTSTRAP_ADMIN_PASSWORD",
+            "--entrypoint",
+            command[0],
+            SPARK_RUNTIME_IMAGE_ID,
+            *command[1:],
+        )
+    runner.run(command, env=env)
 
 
 def apply_install(
@@ -2033,6 +2749,8 @@ def apply_install(
         secrets_to_redact=(answers.evo_password, answers.admin_password),
     )
     journal.begin(bundle_root, answers)
+    manifest = read_manifest(bundle_root)
+    architecture = bundle_architecture(manifest)
     try:
         run_phase(
             journal,
@@ -2058,8 +2776,18 @@ def apply_install(
             "filesystem",
             lambda: ensure_accounts_and_dirs(answers, runner),
         )
+        if architecture == "arm64":
+            run_phase(
+                journal,
+                "spark_container_runtime",
+                lambda: ensure_spark_runtime(bundle_root, manifest, runner),
+            )
 
         def activate_gpu() -> None:
+            if architecture == "arm64":
+                # The container canary is stronger than host PCI/nvidia-smi
+                # heuristics on integrated GB10 systems.
+                return
             if not requires_local_nvidia(answers) or hardware.nvidia_ready:
                 return
             if not hardware.nvidia_pci:
@@ -2098,12 +2826,22 @@ def apply_install(
         run_phase(
             journal,
             "application_payload",
-            lambda: sync_payload(bundle_root, answers, runner),
+            lambda: sync_payload(
+                bundle_root,
+                answers,
+                runner,
+                architecture=architecture,
+            ),
         )
         run_phase(
             journal,
             "python_environments",
-            lambda: install_python_envs(bundle_root, answers, runner),
+            lambda: install_python_envs(
+                bundle_root,
+                answers,
+                runner,
+                architecture=architecture,
+            ),
         )
         run_phase(
             journal,
@@ -2118,6 +2856,7 @@ def apply_install(
                 runner,
                 db_was_present=db_was_present,
                 existing_env=existing_env,
+                architecture=architecture,
             ),
         )
         runner.add_secrets(passwords.values())
@@ -2127,19 +2866,40 @@ def apply_install(
         def write_configuration() -> None:
             if runner.dry_run:
                 print(f"+ write {env_file} (secrets redacted)")
+                if architecture == "arm64":
+                    print(
+                        f"+ write {answers.config_root / 'eva-ai.container.env'} "
+                        "(secrets redacted)"
+                    )
             else:
                 _atomic_write(env_file, render_env(values), 0o600)
+                if architecture == "arm64":
+                    container_values = dict(values)
+                    container_values["EVOSSEARCH_CONFIG_ENV_FILE"] = str(env_file)
+                    _atomic_write(
+                        answers.config_root / "eva-ai.container.env",
+                        render_container_env(container_values),
+                        0o600,
+                    )
 
         run_phase(journal, "configuration", write_configuration)
         run_phase(
             journal,
             "configuration_preflight",
-            lambda: validate_runtime_config(answers, runner),
+            lambda: validate_runtime_config(
+                answers,
+                runner,
+                architecture=architecture,
+            ),
         )
         run_phase(
             journal,
             "systemd_units",
-            lambda: install_systemd_units(answers, runner),
+            lambda: install_systemd_units(
+                answers,
+                runner,
+                architecture=architecture,
+            ),
         )
         run_phase(
             journal,
@@ -2149,7 +2909,12 @@ def apply_install(
         run_phase(
             journal,
             "administrator",
-            lambda: bootstrap_admin(answers, values, runner),
+            lambda: bootstrap_admin(
+                answers,
+                values,
+                runner,
+                architecture=architecture,
+            ),
         )
         run_phase(
             journal,
@@ -2233,9 +2998,20 @@ def main(argv: Sequence[str] | None = None) -> int:
                 if target.get(key) not in (None, "")
             )
         )
-        validate_target_host()
+        validate_target_host(manifest)
         verify_critical_payload(bundle_root, manifest)
-        answers = gather_answers(args.non_interactive, args)
+        architecture = bundle_architecture(manifest)
+        answers = gather_answers(
+            args.non_interactive,
+            args,
+            architecture=architecture,
+        )
+        if architecture == "arm64" and answers.local_deep:
+            raise InstallError(
+                "The compact Spark ARM64 bundle does not carry the x86 CPU llama.cpp "
+                "payload. Choose an external deep-review endpoint or pass "
+                "--no-deep-review."
+            )
         required_gib = max(
             MIN_FREE_GIB,
             float(manifest.get("minimum_free_bytes") or 0) / (1024**3),
@@ -2258,6 +3034,20 @@ def main(argv: Sequence[str] | None = None) -> int:
                 raise InstallError("Installation cancelled until Evo is reachable.")
 
         hardware = detect_hardware()
+        if architecture == "arm64":
+            runtime_probe = validate_spark_container_runtime(manifest)
+            if runtime_probe is None:
+                contract = spark_runtime_contract(manifest)
+                archive = contract.get("archive")
+                if not archive or not (bundle_root / archive).is_file():
+                    raise InstallError(
+                        "The pinned Spark runtime is not loaded and no verified "
+                        "offline runtime archive is available in this bundle."
+                    )
+                print(
+                    "Spark runtime image is not loaded yet; the verified offline "
+                    f"archive {archive} will be loaded after approval."
+                )
         db_present = database_exists()
         schema = current_schema() if db_present else None
         print_plan(
@@ -2266,8 +3056,9 @@ def main(argv: Sequence[str] | None = None) -> int:
             db_exists=db_present,
             schema=schema,
             required_gib=required_gib,
+            architecture=architecture,
         )
-        if requires_local_nvidia(answers) and not (
+        if architecture != "arm64" and requires_local_nvidia(answers) and not (
             hardware.nvidia_ready or hardware.nvidia_pci
         ):
             raise InstallError(

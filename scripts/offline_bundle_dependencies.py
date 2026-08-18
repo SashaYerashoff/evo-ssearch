@@ -18,6 +18,7 @@ import gzip
 import hashlib
 import json
 import os
+import platform
 import subprocess
 import sys
 import tempfile
@@ -29,11 +30,42 @@ from typing import Iterable, Mapping, Sequence
 
 MANIFEST_NAME = "offline-dependencies.json"
 MANIFEST_FORMAT = 1
-TARGET = {
-    "os": "Ubuntu 24.04 LTS",
-    "architecture": "amd64",
-    "python": "CPython 3.12",
-}
+SUPPORTED_ARCHITECTURES = {"amd64", "arm64"}
+
+
+def normalize_architecture(value: str) -> str:
+    normalized = value.strip().lower()
+    aliases = {
+        "x86_64": "amd64",
+        "amd64": "amd64",
+        "aarch64": "arm64",
+        "arm64": "arm64",
+    }
+    try:
+        return aliases[normalized]
+    except KeyError as exc:
+        raise DependencyError(f"Unsupported offline dependency architecture: {value!r}") from exc
+
+
+def dependency_target(architecture: str) -> dict[str, str]:
+    return {
+        "os": "Ubuntu 24.04 LTS",
+        "architecture": normalize_architecture(architecture),
+        "python": "CPython 3.12",
+    }
+
+
+def constraints_filename(architecture: str) -> str:
+    return (
+        "constraints-spark-gb10.txt"
+        if normalize_architecture(architecture) == "arm64"
+        else "constraints-port-4070s.txt"
+    )
+
+
+# Compatibility name for callers/tests which imported the original single
+# target constant. New bundles record their explicit architecture in-manifest.
+TARGET = dependency_target("amd64")
 
 
 class DependencyError(RuntimeError):
@@ -206,12 +238,47 @@ def _validate_wheels(bundle: Path) -> dict[str, object]:
     return {"artifacts": artifacts}
 
 
-def _requirements_fingerprints(repo_root: Path, bundle: Path) -> dict[str, str]:
+def _write_resolver_stub(directory: Path, name: str, version: str) -> Path:
+    """Create a resolver-only wheel representing a vendor-owned ARM package."""
+
+    normalized = name.replace("-", "_")
+    path = directory / f"{normalized}-{version}-py3-none-any.whl"
+    dist_info = f"{normalized}-{version}.dist-info"
+    with zipfile.ZipFile(path, "w") as archive:
+        archive.writestr(f"{normalized}/__init__.py", "")
+        archive.writestr(
+            f"{dist_info}/METADATA",
+            "\n".join(
+                (
+                    "Metadata-Version: 2.1",
+                    f"Name: {name}",
+                    f"Version: {version}",
+                    "Summary: resolver-only placeholder for vendor ARM runtime",
+                    "",
+                )
+            ),
+        )
+        archive.writestr(
+            f"{dist_info}/WHEEL",
+            "Wheel-Version: 1.0\nGenerator: eva-offline-resolver\n"
+            "Root-Is-Purelib: true\nTag: py3-none-any\n",
+        )
+        archive.writestr(f"{dist_info}/RECORD", "")
+    return path
+
+
+def _requirements_fingerprints(
+    repo_root: Path,
+    bundle: Path,
+    *,
+    architecture: str,
+) -> dict[str, str]:
+    constraints_name = constraints_filename(architecture)
     paths = {
         "requirements.txt": repo_root / "requirements.txt",
         "requirements-db.txt": repo_root / "requirements-db.txt",
         "requirements-cuda.txt": repo_root / "requirements-cuda.txt",
-        "constraints-port-4070s.txt": bundle / "constraints-port-4070s.txt",
+        constraints_name: bundle / constraints_name,
     }
     missing = [name for name, path in paths.items() if not path.is_file()]
     if missing:
@@ -219,30 +286,75 @@ def _requirements_fingerprints(repo_root: Path, bundle: Path) -> dict[str, str]:
     return {name: _digest(path) for name, path in paths.items()}
 
 
-def _resolve_with_pip(bundle: Path, repo_root: Path, python: str) -> None:
+def _resolve_with_pip(
+    bundle: Path,
+    repo_root: Path,
+    python: str,
+    *,
+    architecture: str,
+    include_vllm: bool,
+) -> None:
     """Prove that both EVA environments resolve without network access."""
 
     wheelhouse = bundle / "wheelhouse"
-    constraints = bundle / "constraints-port-4070s.txt"
-    base = [
-        python,
-        "-m",
-        "pip",
-        "install",
-        "--dry-run",
-        "--ignore-installed",
-        "--break-system-packages",
-        "--no-index",
-        "--find-links",
-        str(wheelhouse),
-        "--constraint",
-        str(constraints),
-        "--python-version",
-        "3.12",
-        "--only-binary=:all:",
-    ]
+    architecture = normalize_architecture(architecture)
+    declared_constraints = bundle / constraints_filename(architecture)
     with tempfile.TemporaryDirectory(prefix="eva-offline-resolve-") as temporary:
-        report_path = Path(temporary) / "pip-report.json"
+        temporary_root = Path(temporary)
+        report_path = temporary_root / "pip-report.json"
+        constraints = declared_constraints
+        extra_find_links: list[str] = []
+        if architecture == "arm64":
+            stubs = temporary_root / "vendor-runtime-stubs"
+            stubs.mkdir()
+            torch_stub = _write_resolver_stub(stubs, "torch", "2.11.0")
+            torchvision_stub = _write_resolver_stub(stubs, "torchvision", "0.26.0")
+            constraints = temporary_root / "resolver-constraints.txt"
+            constraints.write_text(
+                declared_constraints.read_text(encoding="utf-8")
+                + f"\ntorch @ {torch_stub.as_uri()}\n"
+                + f"torchvision @ {torchvision_stub.as_uri()}\n",
+                encoding="utf-8",
+            )
+            extra_find_links.extend(("--find-links", str(stubs)))
+        base = [
+            python,
+            "-m",
+            "pip",
+            "install",
+            "--dry-run",
+            "--break-system-packages",
+            "--no-index",
+            "--find-links",
+            str(wheelhouse),
+            *extra_find_links,
+            "--constraint",
+            str(constraints),
+            "--only-binary=:all:",
+        ]
+        if architecture == "amd64":
+            base.append("--ignore-installed")
+        if architecture == "arm64" and normalize_architecture(platform.machine()) != "arm64":
+            base.extend(
+                (
+                    "--platform",
+                    "manylinux_2_28_aarch64",
+                    "--platform",
+                    "manylinux_2_27_aarch64",
+                    "--platform",
+                    "manylinux2014_aarch64",
+                    "--platform",
+                    "manylinux_2_17_aarch64",
+                    "--implementation",
+                    "cp",
+                    "--python-version",
+                    "3.12",
+                    "--abi",
+                    "cp312",
+                )
+            )
+        else:
+            base.extend(("--python-version", "3.12"))
         command = [
             *base,
             "--report",
@@ -253,7 +365,7 @@ def _resolve_with_pip(bundle: Path, repo_root: Path, python: str) -> None:
             str(repo_root / "requirements-db.txt"),
             "-r",
             str(repo_root / "requirements-cuda.txt"),
-            "vllm==0.25.0",
+            *(("vllm==0.25.0",) if include_vllm else ()),
         ]
         completed = subprocess.run(
             command,
@@ -278,22 +390,46 @@ def build_manifest(
     repo_root: Path,
     resolve: bool = False,
     python: str = sys.executable,
+    architecture: str = "amd64",
+    include_vllm: bool | None = None,
 ) -> dict[str, object]:
+    architecture = normalize_architecture(architecture)
+    if include_vllm is None:
+        include_vllm = architecture == "amd64"
     apt = _validate_apt(bundle)
     wheels = _validate_wheels(bundle)
-    requirements = _requirements_fingerprints(repo_root, bundle)
+    requirements = _requirements_fingerprints(
+        repo_root,
+        bundle,
+        architecture=architecture,
+    )
     if resolve:
-        _resolve_with_pip(bundle, repo_root, python)
+        _resolve_with_pip(
+            bundle,
+            repo_root,
+            python,
+            architecture=architecture,
+            include_vllm=include_vllm,
+        )
     return {
         "format": MANIFEST_FORMAT,
         "created_at": datetime.now(timezone.utc).isoformat(),
-        "target": TARGET,
+        "target": dependency_target(architecture),
         "requirements_sha256": requirements,
         "apt": apt,
         "wheelhouse": wheels,
         "pip_resolution": {
             "target_python": "3.12",
-            "vllm": "0.25.0",
+            "vllm": (
+                "pinned-ngc-container"
+                if architecture == "arm64"
+                else "0.25.0" if include_vllm else "external"
+            ),
+            "container_packages": (
+                ["torch>=2.1.0", "torchvision>=0.16.0", "CUDA-enabled NVIDIA runtime"]
+                if architecture == "arm64"
+                else []
+            ),
             "verified": bool(resolve),
         },
     }
@@ -325,7 +461,14 @@ def verify_manifest(bundle: Path, *, repo_root: Path | None = None) -> dict[str,
         raise DependencyError(
             f"Unsupported offline dependency manifest format: {payload.get('format')!r}"
         )
-    if payload.get("target") != TARGET:
+    target = payload.get("target")
+    if not isinstance(target, Mapping):
+        raise DependencyError("Offline dependencies have no target platform")
+    try:
+        architecture = normalize_architecture(str(target.get("architecture") or ""))
+    except DependencyError as exc:
+        raise DependencyError("Offline dependencies target an unsupported architecture") from exc
+    if dict(target) != dependency_target(architecture):
         raise DependencyError("Offline dependencies target a different OS/Python platform")
     resolution = payload.get("pip_resolution")
     if not isinstance(resolution, Mapping) or resolution.get("verified") is not True:
@@ -346,7 +489,11 @@ def verify_manifest(bundle: Path, *, repo_root: Path | None = None) -> dict[str,
         if _digest(path) != str(artifact.get("sha256") or ""):
             raise DependencyError(f"Offline dependency artifact checksum mismatch: {relative}")
     if repo_root is not None:
-        current = _requirements_fingerprints(repo_root, bundle)
+        current = _requirements_fingerprints(
+            repo_root,
+            bundle,
+            architecture=architecture,
+        )
         if payload.get("requirements_sha256") != current:
             raise DependencyError(
                 "Wheelhouse was resolved for different requirements or constraints"
@@ -364,6 +511,16 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--verify-manifest", action="store_true")
     parser.add_argument("--resolve", action="store_true")
     parser.add_argument("--python", default=sys.executable)
+    parser.add_argument(
+        "--architecture",
+        default="amd64",
+        choices=sorted(SUPPORTED_ARCHITECTURES),
+    )
+    parser.add_argument(
+        "--external-vllm",
+        action="store_true",
+        help="Resolve the EVA application only; the target must provide its VLM endpoint.",
+    )
     return parser
 
 
@@ -380,6 +537,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                 repo_root=repo_root,
                 resolve=bool(args.resolve),
                 python=str(args.python),
+                architecture=str(args.architecture),
+                include_vllm=not bool(args.external_vllm),
             )
             if args.write_manifest:
                 (bundle / MANIFEST_NAME).write_text(

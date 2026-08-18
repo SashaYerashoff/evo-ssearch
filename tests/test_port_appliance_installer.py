@@ -9,6 +9,7 @@ import subprocess
 import sys
 from pathlib import Path
 from subprocess import CompletedProcess
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
@@ -98,6 +99,7 @@ def test_port_profile_shares_bounded_gpu_with_siglip2():
     assert installer.PORT_ENV["EVOSSEARCH_LUXRIOT_ATTENTION_EMBED_ALL_CHANNELS"] == "true"
     assert installer.PORT_ENV["EVOSSEARCH_LUXRIOT_ATTENTION_EMBEDDING_CADENCE_MS"] == "1000"
     assert installer.PORT_ENV["EVOSSEARCH_LUXRIOT_SUMMARY_MAX_BATCH_FRAMES"] == "16"
+    assert installer.PORT_ENV["EVOSSEARCH_LUXRIOT_ATTENTION_MAX_VLM_FRAMES"] == "8"
     assert installer.PORT_ENV["EVOSSEARCH_EMBEDDER_EAGER_LOAD"] == "true"
     assert installer.PORT_ENV["EVOSSEARCH_UI_MODE"] == "react"
 
@@ -659,3 +661,245 @@ def test_noninteractive_install_has_no_hidden_password_prompt(tmp_path):
     assert answers.quiet_enabled is True
     assert answers.quiet_start == "01:30"
     assert answers.quiet_end == "04:30"
+
+
+def _spark_manifest(archive: str = ""):
+    runtime = {
+        "engine": "docker",
+        "base_image": installer.SPARK_RUNTIME_BASE_IMAGE,
+        "base_manifest_digest": installer.SPARK_RUNTIME_BASE_MANIFEST_DIGEST,
+        "base_image_id": installer.SPARK_RUNTIME_BASE_IMAGE_ID,
+        "image": installer.SPARK_RUNTIME_IMAGE,
+        "image_id": installer.SPARK_RUNTIME_IMAGE_ID,
+        "model": installer.SPARK_VLM_REPO,
+        "model_revision": installer.SPARK_VLM_REVISION,
+        "weight_quantization": "online-fp8-w8a8",
+        "kv_cache_dtype": "bfloat16",
+        "vision_attention_dtype": "bfloat16",
+    }
+    if archive:
+        runtime["archive"] = archive
+    return {"container_runtime": runtime}
+
+
+def test_spark_runtime_contract_is_immutable_and_path_safe():
+    contract = installer.spark_runtime_contract(
+        _spark_manifest("container/eva-spark-runtime-0.8.7-arm64.tar.zst")
+    )
+    assert contract["image_id"] == installer.SPARK_RUNTIME_IMAGE_ID
+
+    changed = _spark_manifest()
+    changed["container_runtime"]["image"] = "nvcr.io/nvidia/vllm:latest"
+    with pytest.raises(installer.InstallError, match="does not match"):
+        installer.spark_runtime_contract(changed)
+
+    with pytest.raises(installer.InstallError, match="unsafe"):
+        installer.spark_runtime_contract(_spark_manifest("../runtime.tar"))
+
+
+def test_spark_python_environment_is_built_inside_pinned_container(tmp_path, capsys):
+    answers = installer.Answers(
+        install_root=tmp_path / "opt",
+        data_root=tmp_path / "data",
+        config_root=tmp_path / "etc",
+        evo_url="http://evo.local",
+        evo_username="operator",
+        evo_password="secret",
+        local_vlm=False,
+        local_deep=False,
+    )
+    installer.install_python_envs(
+        tmp_path / "bundle",
+        answers,
+        installer.Runner(dry_run=True),
+        architecture="arm64",
+    )
+    output = capsys.readouterr().out
+    assert "docker run --rm --network host --ipc host" in output
+    assert f"--entrypoint python3 {installer.SPARK_RUNTIME_IMAGE_ID}" in output
+    assert "venv --system-site-packages" in output
+    assert "/eva-bundle/wheelhouse" in output
+    assert "/eva-bundle/constraints-spark-gb10.txt" in output
+    assert "+ python3 -m venv" not in output
+
+
+def test_factory_spark_install_loads_bundled_runtime_before_canary(tmp_path):
+    archive_relative = "container/eva-spark-runtime-0.8.7-arm64.tar.zst"
+    archive = tmp_path / archive_relative
+    archive.parent.mkdir(parents=True)
+    archive.write_bytes(b"verified offline OCI image")
+    runner = installer.Runner(dry_run=False)
+
+    with (
+        patch.object(installer, "_spark_image_present", side_effect=[False, True]),
+        patch.object(installer, "validate_spark_container_runtime") as canary,
+        patch.object(runner, "run") as run,
+    ):
+        installer.ensure_spark_runtime(
+            tmp_path,
+            _spark_manifest(archive_relative),
+            runner,
+        )
+
+    run.assert_called_once_with(("docker", "load", "--input", archive))
+    canary.assert_called_once()
+
+
+def test_spark_systemd_uses_separate_pinned_gpu_container(tmp_path):
+    answers = installer.Answers(
+        install_root=tmp_path / "opt",
+        data_root=tmp_path / "data",
+        config_root=tmp_path / "etc",
+        evo_url="http://evo.local",
+        evo_username="operator",
+        evo_password="secret",
+        local_vlm=False,
+        local_deep=False,
+    )
+    written = {}
+
+    class RecordingRunner:
+        dry_run = False
+
+        def run(self, command, **_kwargs):
+            return CompletedProcess(command, 0, "", "")
+
+    def record(path, content, mode):
+        written[str(path)] = (content, mode)
+
+    account = SimpleNamespace(pw_uid=991, pw_gid=991)
+    with patch.object(installer.pwd, "getpwnam", return_value=account), patch.object(
+        installer, "_atomic_write", side_effect=record
+    ):
+        installer.install_systemd_units(
+            answers,
+            RecordingRunner(),
+            architecture="arm64",
+        )
+
+    unit, mode = written["/etc/systemd/system/eva-ai.service"]
+    assert mode == 0o644
+    assert "Requires=postgresql.service docker.service" in unit
+    assert f"--name {installer.SPARK_RUNTIME_CONTAINER_NAME}" in unit
+    assert f"--user 991:991" in unit
+    assert "--gpus all" in unit
+    assert installer.SPARK_RUNTIME_IMAGE_ID in unit
+    assert "eva-vllm.service" not in unit
+    assert f"docker stop -t 110 {installer.SPARK_RUNTIME_CONTAINER_NAME}" in unit
+
+
+def test_spark_systemd_installs_its_own_local_vlm(tmp_path):
+    answers = installer.Answers(
+        install_root=tmp_path / "opt",
+        data_root=tmp_path / "data",
+        config_root=tmp_path / "etc",
+        evo_url="http://evo.local",
+        evo_username="operator",
+        evo_password="secret",
+        local_vlm=True,
+        local_deep=False,
+    )
+    written = {}
+
+    class RecordingRunner:
+        dry_run = False
+
+        def run(self, command, **_kwargs):
+            return CompletedProcess(command, 0, "", "")
+
+    account = SimpleNamespace(pw_uid=991, pw_gid=991)
+    with patch.object(installer.pwd, "getpwnam", return_value=account), patch.object(
+        installer,
+        "_atomic_write",
+        side_effect=lambda path, content, mode: written.setdefault(
+            str(path), (content, mode)
+        ),
+    ):
+        installer.install_systemd_units(
+            answers,
+            RecordingRunner(),
+            architecture="arm64",
+        )
+
+    app_unit = written["/etc/systemd/system/eva-ai.service"][0]
+    vlm_unit = written["/etc/systemd/system/eva-vllm.service"][0]
+    assert "Wants=eva-vllm.service" in app_unit
+    assert "--name eva-vllm" in vlm_unit
+    assert installer.SPARK_RUNTIME_IMAGE_ID in vlm_unit
+    assert "/models/qwen3-vl-4b" in vlm_unit
+    assert "--quantization fp8" in vlm_unit
+    assert "--max-num-seqs 4" in vlm_unit
+    assert "--limit-mm-per-prompt.image 8" in vlm_unit
+    assert "VLLM_USE_DEEP_GEMM=0" in vlm_unit
+
+
+def test_spark_noninteractive_defaults_to_bundled_vlm_and_no_deep(tmp_path):
+    evo_secret = tmp_path / "evo.secret"
+    admin_secret = tmp_path / "admin.secret"
+    evo_secret.write_text("evo-password\n", encoding="utf-8")
+    admin_secret.write_text("long-admin-password\n", encoding="utf-8")
+    args = installer.build_parser().parse_args(
+        (
+            "--non-interactive",
+            "--evo-url",
+            "evo.local",
+            "--evo-username",
+            "operator",
+            "--evo-password-file",
+            str(evo_secret),
+            "--admin-password-file",
+            str(admin_secret),
+        )
+    )
+
+    answers = installer.gather_answers(True, args, architecture="arm64")
+
+    assert answers.local_vlm is True
+    assert answers.vlm_url == installer.DEFAULT_VLM_URL
+    assert answers.local_deep is False
+    assert answers.deep_url == ""
+
+
+def test_container_env_is_literal_not_shell_quoted():
+    rendered = installer.render_container_env(
+        {"A_URL": "http://127.0.0.1:8080/v1", "B_SECRET": "abc#123"}
+    )
+    assert "A_URL=http://127.0.0.1:8080/v1" in rendered
+    assert "B_SECRET=abc#123" in rendered
+    assert "'" not in rendered
+
+
+def test_finalizer_binds_required_spark_image_archive(tmp_path):
+    shutil.copy2(
+        ROOT / "deployment" / "spark_gb10" / "runtime-container.json",
+        tmp_path / "runtime-container.json",
+    )
+    archive = tmp_path / finalizer.SPARK_RUNTIME_ARCHIVE
+    archive.parent.mkdir()
+    archive.write_bytes(b"offline OCI archive")
+
+    archive_manifest = json.dumps(
+        [{"Config": installer.SPARK_RUNTIME_IMAGE_ID.removeprefix("sha256:")}]
+    )
+    with patch.object(
+        finalizer.subprocess,
+        "run",
+        return_value=CompletedProcess([], 0, archive_manifest, ""),
+    ):
+        runtime, critical = finalizer.spark_runtime_payload(tmp_path, "arm64")
+
+    assert runtime is not None
+    assert runtime["image_id"] == installer.SPARK_RUNTIME_IMAGE_ID
+    assert runtime["archive"] == finalizer.SPARK_RUNTIME_ARCHIVE
+    assert runtime["archive_sha256"] == hashlib.sha256(archive.read_bytes()).hexdigest()
+    assert finalizer.SPARK_RUNTIME_ARCHIVE in critical
+
+
+def test_finalizer_rejects_spark_bundle_without_runtime_archive(tmp_path):
+    shutil.copy2(
+        ROOT / "deployment" / "spark_gb10" / "runtime-container.json",
+        tmp_path / "runtime-container.json",
+    )
+
+    with pytest.raises(SystemExit, match="runtime archive is missing"):
+        finalizer.spark_runtime_payload(tmp_path, "arm64")
