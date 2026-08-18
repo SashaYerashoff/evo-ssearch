@@ -210,6 +210,9 @@ def main() -> int:
     except DependencyError as exc:
         raise SystemExit(f"Offline dependencies are not releasable: {exc}") from exc
     architecture = str(dependency_manifest["target"]["architecture"])
+    target_os_release = str(dependency_manifest["target"].get("os_release") or "")
+    target_os_label = str(dependency_manifest["target"].get("os") or "")
+    local_vllm_mode = str(dependency_manifest["pip_resolution"].get("vllm") or "")
     update_packages, update_critical_files = bundled_update_packages(root)
     container_runtime, container_critical_files = spark_runtime_payload(root, architecture)
     spark_model_critical_files = (
@@ -299,7 +302,7 @@ def main() -> int:
     payload_bytes = sum(path.stat().st_size for path in files)
     target = (
         {
-            "os": "Ubuntu 24.04 LTS ARM64",
+            "os": f"{target_os_label} ARM64",
             "gpu": "NVIDIA GB10 / Spark-class integrated CUDA GPU",
             "cpu": "ARM64 vendor appliance platform",
             "ram_gib": 120,
@@ -308,7 +311,7 @@ def main() -> int:
         if architecture == "arm64"
         else
         {
-            "os": "Ubuntu 24.04 LTS amd64",
+            "os": f"{target_os_label} amd64",
             "gpu": "NVIDIA RTX 4070 Super / RTX 5070 Ti or newer (12+ GB VRAM)",
             "cpu": "x86_64 with AVX2; 16+ logical CPUs recommended",
             "ram_gib": 64,
@@ -316,7 +319,7 @@ def main() -> int:
         }
         if release_flavor == "universal-offline"
         else {
-            "os": "Ubuntu Server 24.04 amd64",
+            "os": f"Ubuntu Server {target_os_release} amd64",
             "gpu": "NVIDIA GeForce RTX 4070 Super 12 GB",
             "cpu": "Intel Core i9 14th Gen",
             "ram_gib": 64,
@@ -344,6 +347,7 @@ def main() -> int:
             "apt_artifacts": len(dependency_manifest["apt"]["artifacts"]),
             "wheels": len(dependency_manifest["wheelhouse"]["artifacts"]),
             "target": dependency_manifest["target"],
+            "update_compatibility": dependency_manifest["update_compatibility"],
         },
         **({"container_runtime": container_runtime} if container_runtime else {}),
         "critical_sha256": critical,
@@ -351,7 +355,11 @@ def main() -> int:
             "live_vlm": (
                 "Qwen3-VL-4B-Instruct online FP8 / pinned NGC vLLM container"
                 if architecture == "arm64"
-                else "Qwen3-VL-4B-Instruct AWQ / vLLM 0.25.0"
+                else (
+                    "external OpenAI-compatible VLM endpoint required"
+                    if local_vllm_mode == "external"
+                    else "Qwen3-VL-4B-Instruct AWQ / vLLM 0.25.0"
+                )
             ),
             "deep_review": (
                 "external endpoint or disabled"

@@ -56,6 +56,25 @@ def test_fresh_entrypoint_reads_manifest_before_rendering_target(tmp_path, capsy
     assert "stop after entrypoint contract" in output.err
 
 
+def test_fresh_host_validation_uses_declared_ubuntu_release(tmp_path):
+    os_release = tmp_path / "os-release"
+    os_release.write_text('ID=ubuntu\nVERSION_ID="26.04"\n', encoding="utf-8")
+    manifest = {
+        "offline_dependencies": {
+            "target": {"architecture": "amd64", "os_release": "26.04"}
+        }
+    }
+    with patch.object(installer.platform, "machine", return_value="x86_64"):
+        installer.validate_target_host(manifest, os_release=os_release)
+
+    os_release.write_text('ID=ubuntu\nVERSION_ID="24.04"\n', encoding="utf-8")
+    with (
+        patch.object(installer.platform, "machine", return_value="x86_64"),
+        pytest.raises(installer.InstallError, match="requires Ubuntu Server 26.04"),
+    ):
+        installer.validate_target_host(manifest, os_release=os_release)
+
+
 def test_usb_builder_builds_react_for_node_free_runtime():
     builder = (ROOT / "scripts" / "build_port_usb_bundle.sh").read_text(
         encoding="utf-8"
@@ -661,6 +680,44 @@ def test_noninteractive_install_has_no_hidden_password_prompt(tmp_path):
     assert answers.quiet_enabled is True
     assert answers.quiet_start == "01:30"
     assert answers.quiet_end == "04:30"
+
+
+def test_bundle_local_vlm_capability_comes_from_dependency_contract(tmp_path):
+    manifest = tmp_path / "offline-dependencies.json"
+    manifest.write_text(
+        json.dumps({"pip_resolution": {"vllm": "external"}}),
+        encoding="utf-8",
+    )
+    assert installer.bundle_supports_local_vlm(tmp_path) is False
+
+    manifest.write_text(
+        json.dumps({"pip_resolution": {"vllm": "0.25.0"}}),
+        encoding="utf-8",
+    )
+    assert installer.bundle_supports_local_vlm(tmp_path) is True
+
+
+def test_noninteractive_external_only_bundle_rejects_implicit_local_vlm(tmp_path):
+    evo_secret = tmp_path / "evo.secret"
+    admin_secret = tmp_path / "admin.secret"
+    evo_secret.write_text("evo-password\n", encoding="utf-8")
+    admin_secret.write_text("long-admin-password\n", encoding="utf-8")
+    args = installer.build_parser().parse_args(
+        (
+            "--non-interactive",
+            "--evo-url",
+            "evo.local",
+            "--evo-username",
+            "operator",
+            "--evo-password-file",
+            str(evo_secret),
+            "--admin-password-file",
+            str(admin_secret),
+        )
+    )
+
+    with pytest.raises(installer.InstallError, match="requires --external-vlm-url"):
+        installer.gather_answers(True, args, local_vlm_available=False)
 
 
 def _spark_manifest(archive: str = ""):

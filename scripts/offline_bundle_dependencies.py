@@ -31,6 +31,11 @@ from typing import Iterable, Mapping, Sequence
 MANIFEST_NAME = "offline-dependencies.json"
 MANIFEST_FORMAT = 1
 SUPPORTED_ARCHITECTURES = {"amd64", "arm64"}
+SUPPORTED_OS_RELEASES = {
+    "24.04": "Ubuntu 24.04 LTS",
+    "26.04": "Ubuntu 26.04 LTS",
+}
+SUPPORTED_PYTHON_VERSIONS = {"3.12", "3.13", "3.14"}
 
 
 def normalize_architecture(value: str) -> str:
@@ -47,11 +52,43 @@ def normalize_architecture(value: str) -> str:
         raise DependencyError(f"Unsupported offline dependency architecture: {value!r}") from exc
 
 
-def dependency_target(architecture: str) -> dict[str, str]:
+def normalize_os_release(value: str) -> str:
+    normalized = value.strip()
+    if normalized not in SUPPORTED_OS_RELEASES:
+        raise DependencyError(f"Unsupported offline dependency OS release: {value!r}")
+    return normalized
+
+
+def normalize_python_versions(values: Sequence[str]) -> tuple[str, ...]:
+    normalized = tuple(dict.fromkeys(str(value).strip() for value in values if str(value).strip()))
+    unsupported = sorted(set(normalized) - SUPPORTED_PYTHON_VERSIONS)
+    if unsupported:
+        raise DependencyError(
+            "Unsupported offline dependency Python version(s): " + ", ".join(unsupported)
+        )
+    if not normalized:
+        raise DependencyError("At least one offline dependency Python version is required")
+    return normalized
+
+
+def normalize_python_version(value: str) -> str:
+    return normalize_python_versions((value,))[0]
+
+
+def default_python_for_os(os_release: str) -> str:
+    return "3.14" if normalize_os_release(os_release) == "26.04" else "3.12"
+
+
+def dependency_target(
+    architecture: str,
+    os_release: str = "24.04",
+) -> dict[str, str]:
+    os_release = normalize_os_release(os_release)
     return {
-        "os": "Ubuntu 24.04 LTS",
+        "os": SUPPORTED_OS_RELEASES[os_release],
+        "os_release": os_release,
         "architecture": normalize_architecture(architecture),
-        "python": "CPython 3.12",
+        "python": f"CPython {default_python_for_os(os_release)}",
     }
 
 
@@ -293,15 +330,27 @@ def _resolve_with_pip(
     *,
     architecture: str,
     include_vllm: bool,
+    python_versions: Sequence[str],
+    vllm_python_version: str | None = None,
 ) -> None:
     """Prove that both EVA environments resolve without network access."""
 
     wheelhouse = bundle / "wheelhouse"
     architecture = normalize_architecture(architecture)
     declared_constraints = bundle / constraints_filename(architecture)
+    python_versions = normalize_python_versions(python_versions)
+    if include_vllm:
+        vllm_python_version = normalize_python_version(
+            vllm_python_version or python_versions[0]
+        )
+        if vllm_python_version not in python_versions:
+            raise DependencyError(
+                "Local vLLM Python must be present in the update compatibility matrix"
+            )
+    if architecture == "arm64" and python_versions != ("3.12",):
+        raise DependencyError("Spark ARM64 dependency payload is pinned to CPython 3.12")
     with tempfile.TemporaryDirectory(prefix="eva-offline-resolve-") as temporary:
         temporary_root = Path(temporary)
-        report_path = temporary_root / "pip-report.json"
         constraints = declared_constraints
         extra_find_links: list[str] = []
         if architecture == "arm64":
@@ -317,71 +366,78 @@ def _resolve_with_pip(
                 encoding="utf-8",
             )
             extra_find_links.extend(("--find-links", str(stubs)))
-        base = [
-            python,
-            "-m",
-            "pip",
-            "install",
-            "--dry-run",
-            "--break-system-packages",
-            "--no-index",
-            "--find-links",
-            str(wheelhouse),
-            *extra_find_links,
-            "--constraint",
-            str(constraints),
-            "--only-binary=:all:",
-        ]
-        if architecture == "amd64":
-            base.append("--ignore-installed")
-        if architecture == "arm64" and normalize_architecture(platform.machine()) != "arm64":
-            base.extend(
-                (
-                    "--platform",
-                    "manylinux_2_28_aarch64",
-                    "--platform",
-                    "manylinux_2_27_aarch64",
-                    "--platform",
-                    "manylinux2014_aarch64",
-                    "--platform",
-                    "manylinux_2_17_aarch64",
-                    "--implementation",
-                    "cp",
-                    "--python-version",
-                    "3.12",
-                    "--abi",
-                    "cp312",
+        for python_version in python_versions:
+            report_path = temporary_root / f"pip-report-{python_version}.json"
+            base = [
+                python,
+                "-m",
+                "pip",
+                "install",
+                "--dry-run",
+                "--break-system-packages",
+                "--no-index",
+                "--find-links",
+                str(wheelhouse),
+                *extra_find_links,
+                "--constraint",
+                str(constraints),
+                "--only-binary=:all:",
+                "--python-version",
+                python_version,
+            ]
+            if architecture == "amd64":
+                base.append("--ignore-installed")
+            if architecture == "arm64" and normalize_architecture(platform.machine()) != "arm64":
+                base.extend(
+                    (
+                        "--platform",
+                        "manylinux_2_28_aarch64",
+                        "--platform",
+                        "manylinux_2_27_aarch64",
+                        "--platform",
+                        "manylinux2014_aarch64",
+                        "--platform",
+                        "manylinux_2_17_aarch64",
+                        "--implementation",
+                        "cp",
+                        "--abi",
+                        "cp312",
+                    )
                 )
+            command = [
+                *base,
+                "--report",
+                str(report_path),
+                "-r",
+                str(repo_root / "requirements.txt"),
+                "-r",
+                str(repo_root / "requirements-db.txt"),
+                "-r",
+                str(repo_root / "requirements-cuda.txt"),
+                *(
+                    ("vllm==0.25.0",)
+                    if include_vllm and python_version == vllm_python_version
+                    else ()
+                ),
+            ]
+            completed = subprocess.run(
+                command,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                env={**os.environ, "PIP_NO_INDEX": "1", "PIP_DISABLE_PIP_VERSION_CHECK": "1"},
+                check=False,
             )
-        else:
-            base.extend(("--python-version", "3.12"))
-        command = [
-            *base,
-            "--report",
-            str(report_path),
-            "-r",
-            str(repo_root / "requirements.txt"),
-            "-r",
-            str(repo_root / "requirements-db.txt"),
-            "-r",
-            str(repo_root / "requirements-cuda.txt"),
-            *(("vllm==0.25.0",) if include_vllm else ()),
-        ]
-        completed = subprocess.run(
-            command,
-            text=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            env={**os.environ, "PIP_NO_INDEX": "1", "PIP_DISABLE_PIP_VERSION_CHECK": "1"},
-            check=False,
-        )
-        if completed.returncode:
-            tail = "\n".join(completed.stdout.splitlines()[-30:])
-            raise DependencyError(
-                "Offline Python dependency resolution failed for CPython 3.12:\n" + tail
-            )
-        if not report_path.is_file():
-            raise DependencyError("pip completed without writing its offline resolution report")
+            if completed.returncode:
+                tail = "\n".join(completed.stdout.splitlines()[-30:])
+                raise DependencyError(
+                    f"Offline Python dependency resolution failed for CPython {python_version}:\n"
+                    + tail
+                )
+            if not report_path.is_file():
+                raise DependencyError(
+                    f"pip completed without writing its CPython {python_version} resolution report"
+                )
 
 
 def build_manifest(
@@ -392,8 +448,30 @@ def build_manifest(
     python: str = sys.executable,
     architecture: str = "amd64",
     include_vllm: bool | None = None,
+    target_os_release: str = "24.04",
+    update_os_releases: Sequence[str] | None = None,
+    update_python_versions: Sequence[str] | None = None,
 ) -> dict[str, object]:
     architecture = normalize_architecture(architecture)
+    target_os_release = normalize_os_release(target_os_release)
+    target_python = default_python_for_os(target_os_release)
+    if update_os_releases is None:
+        update_os_releases = (target_os_release,)
+    normalized_os_releases = tuple(
+        dict.fromkeys(normalize_os_release(value) for value in update_os_releases)
+    )
+    if target_os_release not in normalized_os_releases:
+        raise DependencyError("Fresh-install OS must also be present in update compatibility")
+    if update_python_versions is None:
+        update_python_versions = (target_python,)
+    normalized_python_versions = normalize_python_versions(update_python_versions)
+    if target_python not in normalized_python_versions:
+        raise DependencyError("Fresh-install Python must also be present in update compatibility")
+    if architecture == "arm64" and (
+        normalized_os_releases != ("24.04",)
+        or normalized_python_versions != ("3.12",)
+    ):
+        raise DependencyError("Spark ARM64 release remains pinned to Ubuntu 24.04 / CPython 3.12")
     if include_vllm is None:
         include_vllm = architecture == "amd64"
     apt = _validate_apt(bundle)
@@ -410,21 +488,29 @@ def build_manifest(
             python,
             architecture=architecture,
             include_vllm=include_vllm,
+            python_versions=normalized_python_versions,
+            vllm_python_version=target_python,
         )
     return {
         "format": MANIFEST_FORMAT,
         "created_at": datetime.now(timezone.utc).isoformat(),
-        "target": dependency_target(architecture),
+        "target": dependency_target(architecture, target_os_release),
+        "update_compatibility": {
+            "os_releases": list(normalized_os_releases),
+            "python_versions": list(normalized_python_versions),
+        },
         "requirements_sha256": requirements,
         "apt": apt,
         "wheelhouse": wheels,
         "pip_resolution": {
-            "target_python": "3.12",
+            "target_python": target_python,
+            "target_pythons": list(normalized_python_versions),
             "vllm": (
                 "pinned-ngc-container"
                 if architecture == "arm64"
                 else "0.25.0" if include_vllm else "external"
             ),
+            "vllm_python": target_python if include_vllm and architecture == "amd64" else None,
             "container_packages": (
                 ["torch>=2.1.0", "torchvision>=0.16.0", "CUDA-enabled NVIDIA runtime"]
                 if architecture == "arm64"
@@ -468,11 +554,25 @@ def verify_manifest(bundle: Path, *, repo_root: Path | None = None) -> dict[str,
         architecture = normalize_architecture(str(target.get("architecture") or ""))
     except DependencyError as exc:
         raise DependencyError("Offline dependencies target an unsupported architecture") from exc
-    if dict(target) != dependency_target(architecture):
+    os_release = str(target.get("os_release") or "")
+    if dict(target) != dependency_target(architecture, os_release):
         raise DependencyError("Offline dependencies target a different OS/Python platform")
+    compatibility = payload.get("update_compatibility")
+    if not isinstance(compatibility, Mapping):
+        raise DependencyError("Offline dependencies have no update compatibility matrix")
+    os_releases = tuple(str(value) for value in compatibility.get("os_releases") or ())
+    python_versions = tuple(str(value) for value in compatibility.get("python_versions") or ())
+    normalized_os_releases = tuple(normalize_os_release(value) for value in os_releases)
+    normalized_python_versions = normalize_python_versions(python_versions)
+    if os_release not in normalized_os_releases:
+        raise DependencyError("Fresh-install OS is absent from update compatibility")
+    if default_python_for_os(os_release) not in normalized_python_versions:
+        raise DependencyError("Fresh-install Python is absent from update compatibility")
     resolution = payload.get("pip_resolution")
     if not isinstance(resolution, Mapping) or resolution.get("verified") is not True:
         raise DependencyError("Wheelhouse was not proven by the offline pip resolver")
+    if list(normalized_python_versions) != list(resolution.get("target_pythons") or ()):
+        raise DependencyError("Wheelhouse resolver coverage differs from update compatibility")
 
     seen: set[str] = set()
     for artifact in _iter_artifacts(payload):
@@ -521,6 +621,24 @@ def _parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Resolve the EVA application only; the target must provide its VLM endpoint.",
     )
+    parser.add_argument(
+        "--target-os-release",
+        default="24.04",
+        choices=sorted(SUPPORTED_OS_RELEASES),
+        help="Fresh-install Ubuntu release carried by apt/.",
+    )
+    parser.add_argument(
+        "--update-os-release",
+        action="append",
+        choices=sorted(SUPPORTED_OS_RELEASES),
+        help="Ubuntu release accepted for in-place updates; repeat as needed.",
+    )
+    parser.add_argument(
+        "--update-python-version",
+        action="append",
+        choices=sorted(SUPPORTED_PYTHON_VERSIONS),
+        help="Existing venv Python accepted for updates; repeat as needed.",
+    )
     return parser
 
 
@@ -539,6 +657,9 @@ def main(argv: Sequence[str] | None = None) -> int:
                 python=str(args.python),
                 architecture=str(args.architecture),
                 include_vllm=not bool(args.external_vllm),
+                target_os_release=str(args.target_os_release),
+                update_os_releases=args.update_os_release,
+                update_python_versions=args.update_python_version,
             )
             if args.write_manifest:
                 (bundle / MANIFEST_NAME).write_text(

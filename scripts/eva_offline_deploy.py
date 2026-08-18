@@ -20,7 +20,9 @@ import getpass
 import hashlib
 import json
 import os
+import platform
 import pwd
+import re
 import shlex
 import subprocess
 import sys
@@ -283,6 +285,86 @@ def detect_existing(service: str = DEFAULT_SERVICE) -> ExistingDeployment | None
     )
 
 
+def _host_os_release(path: Path = Path("/etc/os-release")) -> tuple[str, str]:
+    values: dict[str, str] = {}
+    if path.is_file():
+        for line in path.read_text(encoding="utf-8").splitlines():
+            key, separator, raw = line.partition("=")
+            if separator:
+                values[key] = raw.strip().strip("\"'")
+    return str(values.get("ID") or ""), str(values.get("VERSION_ID") or "")
+
+
+def _deployment_python_version(deployment: ExistingDeployment) -> str:
+    python = deployment.app_dir / ".venv" / "bin" / "python"
+    if not python.is_file():
+        raise DeployError(f"Existing EVA venv Python is missing: {python}")
+    completed = subprocess.run(
+        (str(python), "-c", "import sys; print(f'{sys.version_info[0]}.{sys.version_info[1]}')"),
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+    version = completed.stdout.strip()
+    if completed.returncode or not re.fullmatch(r"\d+\.\d+", version):
+        raise DeployError(f"Existing EVA venv Python could not be identified: {python}")
+    return version
+
+
+def _assert_update_compatibility(
+    bundle_root: Path,
+    deployment: ExistingDeployment,
+    *,
+    os_release_path: Path = Path("/etc/os-release"),
+) -> None:
+    manifest_path = bundle_root / "offline-dependencies.json"
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise DeployError(f"Offline dependency compatibility manifest is invalid: {exc}") from exc
+    compatibility = manifest.get("update_compatibility")
+    if not isinstance(compatibility, Mapping):
+        raise DeployError(
+            "This bundle does not declare an update OS/Python compatibility matrix"
+        )
+    target = manifest.get("target")
+    if not isinstance(target, Mapping):
+        raise DeployError("Offline dependency target is missing")
+    architecture = str(target.get("architecture") or "").strip()
+    detected_architecture = {
+        "x86_64": "amd64",
+        "amd64": "amd64",
+        "aarch64": "arm64",
+        "arm64": "arm64",
+    }.get(platform.machine().strip().lower(), platform.machine().strip().lower())
+    if architecture != detected_architecture:
+        raise DeployError(
+            f"Bundle architecture {architecture or '[missing]'} does not match host "
+            f"{detected_architecture or '[unknown]'}"
+        )
+    os_id, os_release = _host_os_release(os_release_path)
+    supported_os = {str(value) for value in compatibility.get("os_releases") or ()}
+    if os_id != "ubuntu" or os_release not in supported_os:
+        raise DeployError(
+            f"Existing EVA host is {os_id or 'unknown'} {os_release or 'unknown'}; "
+            "this update supports Ubuntu " + ", ".join(sorted(supported_os))
+        )
+    python_version = _deployment_python_version(deployment)
+    supported_python = {
+        str(value) for value in compatibility.get("python_versions") or ()
+    }
+    if python_version not in supported_python:
+        raise DeployError(
+            f"Existing EVA venv uses CPython {python_version}; this update carries wheels for "
+            + ", ".join(f"CPython {value}" for value in sorted(supported_python))
+        )
+    print(
+        "Update compatibility: "
+        f"Ubuntu {os_release} {detected_architecture}, CPython {python_version}"
+    )
+
+
 def _require_root() -> None:
     if os.geteuid() != 0:
         raise DeployError("Run this entry point with sudo so backups and system services are protected")
@@ -347,6 +429,7 @@ def _update(
     verify_luxriot_credential: bool = False,
 ) -> None:
     _require_root()
+    _assert_update_compatibility(bundle_root, deployment)
     source = bundle_root / "repo"
     installer = source / "scripts" / "install_eva_083.py"
     if not installer.is_file():

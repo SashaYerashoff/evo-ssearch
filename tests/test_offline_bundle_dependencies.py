@@ -4,9 +4,11 @@ import gzip
 import hashlib
 import importlib.util
 import json
+import subprocess
 import sys
 import zipfile
 from pathlib import Path
+from unittest.mock import patch
 
 import pytest
 
@@ -110,3 +112,69 @@ def test_build_rejects_stale_unindexed_deb(tmp_path):
 
     with pytest.raises(dependencies.DependencyError, match="absent from Packages.gz"):
         dependencies.build_manifest(bundle, repo_root=bundle / "repo")
+
+
+def test_x64_manifest_records_multi_python_update_compatibility(tmp_path):
+    bundle = _bundle(tmp_path)
+    payload = dependencies.build_manifest(
+        bundle,
+        repo_root=bundle / "repo",
+        target_os_release="26.04",
+        update_os_releases=("24.04", "26.04"),
+        update_python_versions=("3.12", "3.13", "3.14"),
+    )
+
+    assert payload["target"] == {
+        "os": "Ubuntu 26.04 LTS",
+        "os_release": "26.04",
+        "architecture": "amd64",
+        "python": "CPython 3.14",
+    }
+    assert payload["update_compatibility"] == {
+        "os_releases": ["24.04", "26.04"],
+        "python_versions": ["3.12", "3.13", "3.14"],
+    }
+    assert payload["pip_resolution"]["target_pythons"] == ["3.12", "3.13", "3.14"]
+
+
+def test_arm_manifest_rejects_x64_multi_python_matrix(tmp_path):
+    bundle = _bundle(tmp_path)
+    (bundle / "constraints-port-4070s.txt").replace(
+        bundle / "constraints-spark-gb10.txt"
+    )
+
+    with pytest.raises(dependencies.DependencyError, match="Spark ARM64"):
+        dependencies.build_manifest(
+            bundle,
+            repo_root=bundle / "repo",
+            architecture="arm64",
+            update_python_versions=("3.12", "3.14"),
+        )
+
+
+def test_multi_python_resolver_checks_vllm_only_on_its_runtime_abi(tmp_path):
+    bundle = _bundle(tmp_path)
+    commands: list[list[str]] = []
+
+    def fake_run(command, **_kwargs):
+        command = [str(value) for value in command]
+        commands.append(command)
+        report = Path(command[command.index("--report") + 1])
+        report.write_text("{}\n", encoding="utf-8")
+        return subprocess.CompletedProcess(command, 0, stdout="")
+
+    with patch.object(dependencies.subprocess, "run", side_effect=fake_run):
+        dependencies._resolve_with_pip(
+            bundle,
+            bundle / "repo",
+            sys.executable,
+            architecture="amd64",
+            include_vllm=True,
+            python_versions=("3.12", "3.13", "3.14"),
+            vllm_python_version="3.12",
+        )
+
+    assert len(commands) == 3
+    assert "vllm==0.25.0" in commands[0]
+    assert "vllm==0.25.0" not in commands[1]
+    assert "vllm==0.25.0" not in commands[2]

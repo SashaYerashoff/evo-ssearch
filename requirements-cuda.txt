@@ -1,4 +1,4 @@
-# Release-managed SigLIP2 GPU runtime for Ubuntu 24.04 x86_64 appliances.
+# Release-managed SigLIP2 GPU runtime for Ubuntu 24.04/26.04 x86_64 appliances.
 # ARM64 Spark appliances use the CUDA-enabled PyTorch supplied by the pinned
 # NVIDIA container image; PyPI's generic ARM dependency graph does not carry the matching
 # cuDNN payload. Keep the x86 pair aligned with the reviewed offline wheelhouse

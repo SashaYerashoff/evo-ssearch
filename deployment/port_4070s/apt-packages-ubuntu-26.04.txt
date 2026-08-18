@@ -1,0 +1,38 @@
+# EVA AI application and offline installation
+ca-certificates
+curl
+ffmpeg
+jq
+nginx
+openssl
+postgresql
+python3
+python3-dev
+python3-pip
+python3-venv
+rsync
+tzdata
+
+# CPU llama.cpp build
+build-essential
+cmake
+ninja-build
+pkg-config
+
+# NVIDIA / CUDA 13 runtime driver
+linux-generic
+nvidia-driver-590-open
+pciutils
+
+# Intel QSV and camera/media diagnostics
+intel-media-va-driver-non-free
+vainfo
+v4l-utils
+libva-drm2
+
+# Field diagnostics and host maintenance
+htop
+nvme-cli
+smartmontools
+ufw
+usbutils

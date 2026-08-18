@@ -16,6 +16,7 @@ REACT_UI_ROOT="${REPO_ROOT}/react-ui"
 EXPECTED_BRANCH="${EVA_PORT_EXPECTED_BRANCH:-feature/maritime-port-specs}"
 RELEASE_FLAVOR="${EVA_PORT_RELEASE_FLAVOR:-ventspils-maritime-client}"
 TARGET_ARCHITECTURE="${EVA_PORT_ARCHITECTURE:-amd64}"
+TARGET_OS_RELEASE="${EVA_PORT_OS_RELEASE:-24.04}"
 SPARK_RUNTIME_ARCHIVE="${EVA_SPARK_RUNTIME_ARCHIVE:-}"
 SPARK_RUNTIME_ARCHIVE_NAME="eva-spark-runtime-0.8.7-arm64.tar.zst"
 STAGING_HARDLINKS="${EVA_PORT_STAGING_HARDLINKS:-0}"
@@ -74,6 +75,17 @@ case "${TARGET_ARCHITECTURE}" in
         exit 1
         ;;
 esac
+case "${TARGET_OS_RELEASE}" in
+    24.04|26.04) ;;
+    *)
+        echo "ERROR: unsupported EVA_PORT_OS_RELEASE=${TARGET_OS_RELEASE}" >&2
+        exit 1
+        ;;
+esac
+if [[ "${TARGET_ARCHITECTURE}" == "arm64" && "${TARGET_OS_RELEASE}" != "24.04" ]]; then
+    echo "ERROR: Spark ARM64 remains pinned to Ubuntu 24.04." >&2
+    exit 1
+fi
 
 if [[ "${SOURCE_BRANCH}" != "${EXPECTED_BRANCH}" && "${EVA_PORT_ALLOW_OTHER_BRANCH:-0}" != "1" ]]; then
     echo "ERROR: port client bundle must be built from ${EXPECTED_BRANCH}; current branch is ${SOURCE_BRANCH}." >&2
@@ -265,7 +277,7 @@ else
         "${STAGING_ROOT}/START_HERE.txt"
 fi
 install -p -m 0644 \
-    "${PROFILE_DIR}/apt-packages-ubuntu-24.04.txt" \
+    "${PROFILE_DIR}/apt-packages-ubuntu-${TARGET_OS_RELEASE}.txt" \
     "${STAGING_ROOT}/apt/package-names.txt"
 install -p -m 0644 \
     "${REPO_ROOT}/deployment/port_4070s/REPOSITORY_BACKUP.txt" \

@@ -8,6 +8,7 @@ DEPENDENCY_SEED="${EVA_UNIVERSAL_DEPENDENCY_SEED:-/mnt/eva-llamacpp-lab/universa
 UPDATE_SEED="${EVA_UNIVERSAL_UPDATE_SEED:-}"
 ALEMBIC_BIN="${EVA_UNIVERSAL_ALEMBIC_BIN:-}"
 TARGET_ARCHITECTURE="${EVA_PORT_ARCHITECTURE:-amd64}"
+TARGET_OS_RELEASE="${EVA_PORT_OS_RELEASE:-24.04}"
 
 case "${TARGET_ARCHITECTURE}" in
   amd64|arm64) ;;
@@ -16,6 +17,17 @@ case "${TARGET_ARCHITECTURE}" in
     exit 1
     ;;
 esac
+case "${TARGET_OS_RELEASE}" in
+  24.04|26.04) ;;
+  *)
+    printf 'ERROR: unsupported EVA_PORT_OS_RELEASE=%s\n' "${TARGET_OS_RELEASE}" >&2
+    exit 1
+    ;;
+esac
+if [[ "${TARGET_ARCHITECTURE}" == "arm64" && "${TARGET_OS_RELEASE}" != "24.04" ]]; then
+  printf 'ERROR: Spark ARM64 remains pinned to Ubuntu 24.04.\n' >&2
+  exit 1
+fi
 
 if [[ -z "${ALEMBIC_BIN}" ]]; then
   for candidate in \
@@ -49,7 +61,8 @@ export EVA_PORT_RELEASE_FLAVOR="universal-offline"
 
 if [[ ! -f "${DEPENDENCY_SEED}/apt/Packages.gz" || ! -d "${DEPENDENCY_SEED}/wheelhouse" ]]; then
   printf 'ERROR: dependency seed is incomplete: %s\n' "${DEPENDENCY_SEED}" >&2
-  printf 'Set EVA_UNIVERSAL_DEPENDENCY_SEED to a reviewed Ubuntu 24.04 %s cache.\n' "${TARGET_ARCHITECTURE}" >&2
+  printf 'Set EVA_UNIVERSAL_DEPENDENCY_SEED to a reviewed Ubuntu %s %s cache.\n' \
+    "${TARGET_OS_RELEASE}" "${TARGET_ARCHITECTURE}" >&2
   exit 1
 fi
 
@@ -91,9 +104,30 @@ DEPENDENCY_ARGS=(
   --write-manifest
   --resolve
   --architecture "${TARGET_ARCHITECTURE}"
+  --target-os-release "${TARGET_OS_RELEASE}"
 )
 if [[ "${TARGET_ARCHITECTURE}" == "arm64" ]]; then
-  DEPENDENCY_ARGS+=(--external-vllm)
+  DEPENDENCY_ARGS+=(
+    --external-vllm
+    --update-os-release 24.04
+    --update-python-version 3.12
+  )
+else
+  DEPENDENCY_ARGS+=(
+    --update-os-release 24.04
+    --update-os-release 26.04
+    --update-python-version 3.12
+    --update-python-version 3.13
+    --update-python-version 3.14
+  )
+  # Ubuntu 26.04 ships Python 3.14 only.  EVA itself is supported there, but
+  # the reviewed local vLLM 0.25/CUDA 13.0 runtime is still pinned to CPython
+  # 3.12.  A 26.04 fresh-install artifact therefore requires an external VLM
+  # until that inference runtime is containerized or gains a coherent 3.14
+  # wheel graph.  Updates never replace an existing inference service.
+  if [[ "${TARGET_OS_RELEASE}" == "26.04" ]]; then
+    DEPENDENCY_ARGS+=(--external-vllm)
+  fi
 fi
 python3 "${SCRIPT_DIR}/offline_bundle_dependencies.py" "${DEPENDENCY_ARGS[@]}"
 

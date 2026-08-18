@@ -578,6 +578,19 @@ def bundle_architecture(manifest: Mapping) -> str:
     return normalize_architecture(str(target.get("architecture") or ""))
 
 
+def bundle_os_release(manifest: Mapping) -> str:
+    dependencies = manifest.get("offline_dependencies")
+    if not isinstance(dependencies, Mapping):
+        raise InstallError("Bundle manifest has no offline dependency target.")
+    target = dependencies.get("target")
+    if not isinstance(target, Mapping):
+        raise InstallError("Bundle manifest has no dependency platform declaration.")
+    release = str(target.get("os_release") or "").strip()
+    if release not in {"24.04", "26.04"}:
+        raise InstallError(f"Bundle has unsupported Ubuntu target {release or '[missing]'!r}.")
+    return release
+
+
 def constraints_filename(architecture: str) -> str:
     return (
         "constraints-spark-gb10.txt"
@@ -591,10 +604,11 @@ def validate_target_host(
     os_release: Path = Path("/etc/os-release"),
 ) -> None:
     expected = bundle_architecture(manifest) if manifest is not None else "amd64"
+    expected_os = bundle_os_release(manifest) if manifest is not None else "24.04"
     detected = normalize_architecture(platform.machine())
     if detected != expected:
         raise InstallError(
-            f"This bundle targets Ubuntu 24.04 {expected}; "
+            f"This bundle targets Ubuntu {expected_os} {expected}; "
             f"detected architecture {platform.machine()!r}."
         )
     values: dict[str, str] = {}
@@ -603,9 +617,9 @@ def validate_target_host(
             key, separator, raw = line.partition("=")
             if separator:
                 values[key] = raw.strip().strip("\"'")
-    if values.get("ID") != "ubuntu" or values.get("VERSION_ID") != "24.04":
+    if values.get("ID") != "ubuntu" or values.get("VERSION_ID") != expected_os:
         raise InstallError(
-            "This appliance bundle requires Ubuntu Server 24.04. "
+            f"This appliance bundle requires Ubuntu Server {expected_os}. "
             f"Detected {values.get('ID', 'unknown')} {values.get('VERSION_ID', 'unknown')}."
         )
 
@@ -894,6 +908,18 @@ def read_manifest(bundle_root: Path) -> dict:
     return payload
 
 
+def bundle_supports_local_vlm(bundle_root: Path) -> bool:
+    path = bundle_root / "offline-dependencies.json"
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise InstallError(f"Offline dependency manifest is invalid: {exc}") from exc
+    resolution = payload.get("pip_resolution")
+    if not isinstance(resolution, Mapping):
+        raise InstallError("Offline dependency manifest has no pip_resolution contract")
+    return str(resolution.get("vllm") or "").strip().lower() != "external"
+
+
 def verify_critical_payload(bundle_root: Path, manifest: Mapping) -> None:
     architecture = bundle_architecture(manifest)
     required = [
@@ -1020,6 +1046,7 @@ def gather_answers(
     args: argparse.Namespace,
     *,
     architecture: str = "amd64",
+    local_vlm_available: bool = True,
 ) -> Answers:
     architecture = normalize_architecture(architecture)
     if non_interactive:
@@ -1075,6 +1102,11 @@ def gather_answers(
             or not _valid_clock(args.quiet_window_end)
         ):
             raise InstallError("Quiet-window times must use valid HH:MM values.")
+        if not local_vlm_available and not args.external_vlm_url:
+            raise InstallError(
+                "This OS/Python release bundle requires --external-vlm-url and "
+                "--external-vlm-model; it deliberately carries no compatible local vLLM runtime."
+            )
         answers = Answers(
             install_root=root,
             data_root=Path(args.data_root or DEFAULT_DATA),
@@ -1123,10 +1155,18 @@ def gather_answers(
             "  Bundled Spark profile: Qwen3-VL-4B online FP8/vLLM, "
             "32K context, 4 sequences, maximum 8 images/request."
         )
-    else:
+    elif local_vlm_available:
         print("  Recommended local profile: NVIDIA GPU with 12+ GB VRAM, Qwen3-VL-4B AWQ/vLLM,")
         print("  32K context, FP8 KV, 4 sequences, 4096 batched tokens, ~10 GB VRAM.")
-    local_vlm = _yes_no("Install and run the VLM on this computer?", True)
+    else:
+        print(
+            "  This bundle supports EVA on the detected OS/Python, but its reviewed "
+            "local vLLM runtime is unavailable. Configure an external VLM endpoint."
+        )
+    local_vlm = bool(
+        local_vlm_available
+        and _yes_no("Install and run the VLM on this computer?", True)
+    )
     if local_vlm:
         vlm_url, vlm_model = DEFAULT_VLM_URL, DEFAULT_VLM_MODEL
     else:
@@ -3005,6 +3045,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             args.non_interactive,
             args,
             architecture=architecture,
+            local_vlm_available=bundle_supports_local_vlm(bundle_root),
         )
         if architecture == "arm64" and answers.local_deep:
             raise InstallError(

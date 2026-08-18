@@ -7,6 +7,8 @@ import sys
 from pathlib import Path
 from unittest.mock import patch
 
+import pytest
+
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -53,6 +55,83 @@ def test_auto_detection_prefers_systemd_working_directory_and_environment(tmp_pa
 def test_auto_detection_returns_fresh_when_no_unit_or_install():
     with patch.object(deploy, "_systemd_property", return_value=""):
         assert deploy.detect_existing() is None
+
+
+def test_update_compatibility_accepts_ubuntu_26_python_314(tmp_path):
+    bundle = tmp_path / "bundle"
+    bundle.mkdir()
+    (bundle / "offline-dependencies.json").write_text(
+        json.dumps(
+            {
+                "target": {"architecture": "amd64"},
+                "update_compatibility": {
+                    "os_releases": ["24.04", "26.04"],
+                    "python_versions": ["3.12", "3.13", "3.14"],
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    os_release = tmp_path / "os-release"
+    os_release.write_text('ID=ubuntu\nVERSION_ID="26.04"\n', encoding="utf-8")
+    deployment = deploy.ExistingDeployment(
+        service="eva-ai",
+        app_dir=tmp_path / "app",
+        env_file=tmp_path / "eva-ai.env",
+        unit_file=tmp_path / "eva-ai.service",
+        service_user="eva",
+        service_group="eva",
+        base_url="http://127.0.0.1:5000",
+    )
+
+    with (
+        patch.object(deploy.platform, "machine", return_value="x86_64"),
+        patch.object(deploy, "_deployment_python_version", return_value="3.14"),
+    ):
+        deploy._assert_update_compatibility(
+            bundle,
+            deployment,
+            os_release_path=os_release,
+        )
+
+
+def test_update_compatibility_rejects_unbundled_python_before_mutation(tmp_path):
+    bundle = tmp_path / "bundle"
+    bundle.mkdir()
+    (bundle / "offline-dependencies.json").write_text(
+        json.dumps(
+            {
+                "target": {"architecture": "amd64"},
+                "update_compatibility": {
+                    "os_releases": ["24.04", "26.04"],
+                    "python_versions": ["3.12", "3.13"],
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    os_release = tmp_path / "os-release"
+    os_release.write_text("ID=ubuntu\nVERSION_ID=24.04\n", encoding="utf-8")
+    deployment = deploy.ExistingDeployment(
+        service="eva-ai",
+        app_dir=tmp_path / "app",
+        env_file=tmp_path / "eva-ai.env",
+        unit_file=tmp_path / "eva-ai.service",
+        service_user="eva",
+        service_group="eva",
+        base_url="http://127.0.0.1:5000",
+    )
+
+    with (
+        patch.object(deploy.platform, "machine", return_value="x86_64"),
+        patch.object(deploy, "_deployment_python_version", return_value="3.14"),
+        pytest.raises(deploy.DeployError, match="CPython 3.14"),
+    ):
+        deploy._assert_update_compatibility(
+            bundle,
+            deployment,
+            os_release_path=os_release,
+        )
 
 
 def test_common_bundle_verification_catches_corruption_before_either_path(tmp_path):
@@ -314,10 +393,11 @@ def test_update_runs_reviewed_dry_run_then_apply_without_rewriting_site_profiles
     with (
         patch.object(deploy.os, "geteuid", return_value=0),
         patch.object(deploy, "DEFAULT_REPORT_ROOT", tmp_path / "reports"),
-        patch.object(deploy, "DEFAULT_BACKUP_ROOT", tmp_path / "backups"),
-        patch.object(deploy, "_run", side_effect=capture_run),
-        patch.object(deploy, "_report"),
-    ):
+            patch.object(deploy, "DEFAULT_BACKUP_ROOT", tmp_path / "backups"),
+            patch.object(deploy, "_run", side_effect=capture_run),
+            patch.object(deploy, "_report"),
+            patch.object(deploy, "_assert_update_compatibility"),
+        ):
         deploy._update(bundle, deployment, assume_yes=True, wait_streams=0)
 
     installer_commands = [row for row in commands if str(installer) in row]
@@ -363,17 +443,18 @@ def test_update_forwards_explicit_live_evo_credential_verification(tmp_path):
     with (
         patch.object(deploy.os, "geteuid", return_value=0),
         patch.object(deploy, "DEFAULT_REPORT_ROOT", tmp_path / "reports"),
-        patch.object(deploy, "DEFAULT_BACKUP_ROOT", tmp_path / "backups"),
-        patch.object(deploy, "_run", side_effect=capture_run),
-        patch.object(deploy, "_report"),
-    ):
-        deploy._update(
+            patch.object(deploy, "DEFAULT_BACKUP_ROOT", tmp_path / "backups"),
+            patch.object(deploy, "_run", side_effect=capture_run),
+            patch.object(deploy, "_report"),
+            patch.object(deploy, "_assert_update_compatibility"),
+        ):
+            deploy._update(
             bundle,
             deployment,
             assume_yes=True,
             wait_streams=0,
             verify_luxriot_credential=True,
-        )
+            )
 
     installer_commands = [row for row in commands if str(installer) in row]
     assert len(installer_commands) == 2
