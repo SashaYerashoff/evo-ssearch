@@ -1092,6 +1092,35 @@ def test_spark_systemd_uses_separate_pinned_gpu_container(tmp_path):
     assert installer.SPARK_RUNTIME_IMAGE_ID in unit
     assert "eva-vllm.service" not in unit
     assert f"docker stop -t 110 {installer.SPARK_RUNTIME_CONTAINER_NAME}" in unit
+    assert "eva-ai.container.env" not in unit
+    assert f"EVOSSEARCH_CONFIG_ENV_FILE={tmp_path / 'etc' / 'eva-ai.env'}" in unit
+    assert f"HOME={tmp_path / 'data'}" in unit
+    assert f"{tmp_path / 'opt' / 'app' / 'scripts' / 'exec_with_env.py'}" in unit
+    assert f"--env-file {tmp_path / 'etc' / 'eva-ai.env'}" in unit
+
+
+def test_appliance_config_directory_is_private_but_service_writable(tmp_path):
+    answers = installer.Answers(
+        install_root=tmp_path / "opt",
+        data_root=tmp_path / "data",
+        config_root=tmp_path / "etc",
+        evo_url="http://evo.local",
+        evo_username="operator",
+        evo_password="secret",
+    )
+    calls = []
+
+    class RecordingRunner:
+        dry_run = True
+
+        def run(self, command, **_kwargs):
+            calls.append(tuple(str(item) for item in command))
+            return CompletedProcess(command, 0, "", "")
+
+    installer.ensure_accounts_and_dirs(answers, RecordingRunner())
+
+    assert ("chown", "root:eva", str(answers.config_root)) in calls
+    assert ("chmod", "0770", str(answers.config_root)) in calls
 
 
 def test_spark_systemd_installs_its_own_local_vlm(tmp_path):

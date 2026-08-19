@@ -1565,8 +1565,13 @@ def ensure_accounts_and_dirs(answers: Answers, runner: Runner) -> None:
     )
     runner.run(("mkdir", "-p", *directories))
     runner.run(("chown", "-R", "eva:eva", answers.install_root, answers.data_root))
+    # EVA reads this file on every start and the privileged Settings workflow
+    # atomically replaces it.  The service group therefore needs traversal and
+    # directory write access without exposing credentials to other users.
+    runner.run(("chown", "root:eva", answers.config_root))
     runner.run(("chmod", "0755", answers.install_root))
-    runner.run(("chmod", "0750", answers.data_root, answers.config_root))
+    runner.run(("chmod", "0750", answers.data_root))
+    runner.run(("chmod", "0770", answers.config_root))
 
 
 def quiesce_existing_runtime(runner: Runner) -> None:
@@ -2122,8 +2127,8 @@ def install_systemd_units(
     architecture = normalize_architecture(architecture)
     app_dir = answers.install_root / "app"
     env_file = answers.config_root / "eva-ai.env"
-    container_env_file = answers.config_root / "eva-ai.container.env"
     validate_config = app_dir / "scripts" / "validate_appliance_config.py"
+    exec_with_env = app_dir / "scripts" / "exec_with_env.py"
     units: dict[Path, str] = {}
     local_vlm_dependencies = ""
     if answers.local_vlm:
@@ -2139,13 +2144,7 @@ def install_systemd_units(
             if not runner.dry_run:
                 raise InstallError("The eva service account was not created.") from exc
             container_user = "EVA_UID:EVA_GID"
-        common = list(
-            spark_docker_base(
-                answers,
-                env_file=container_env_file,
-                user=container_user,
-            )
-        )
+        common = list(spark_docker_base(answers, user=container_user))
         common[0] = "/usr/bin/docker"
         config_command = shlex.join(
             str(item)
@@ -2155,16 +2154,24 @@ def install_systemd_units(
                 app_dir / ".venv" / "bin" / "python",
                 SPARK_RUNTIME_IMAGE_ID,
                 validate_config,
-                "--from-environment",
+                "--env-file",
+                env_file,
             )
         )
         wait_command = shlex.join(
             str(item)
             for item in (
                 *common,
+                "--env",
+                f"HOME={answers.data_root}",
                 "--entrypoint",
                 app_dir / ".venv" / "bin" / "python",
                 SPARK_RUNTIME_IMAGE_ID,
+                exec_with_env,
+                "--env-file",
+                env_file,
+                "--",
+                app_dir / ".venv" / "bin" / "python",
                 app_dir / "scripts" / "wait_openai_endpoint.py",
                 "--timeout",
                 "600",
@@ -2173,7 +2180,6 @@ def install_systemd_units(
         service_base = list(
             spark_docker_base(
                 answers,
-                env_file=container_env_file,
                 name=SPARK_RUNTIME_CONTAINER_NAME,
                 user=container_user,
             )
@@ -2183,9 +2189,18 @@ def install_systemd_units(
             str(item)
             for item in (
                 *service_base,
+                "--env",
+                f"EVOSSEARCH_CONFIG_ENV_FILE={env_file}",
+                "--env",
+                f"HOME={answers.data_root}",
                 "--entrypoint",
-                app_dir / "run_prod.sh",
+                app_dir / ".venv" / "bin" / "python",
                 SPARK_RUNTIME_IMAGE_ID,
+                exec_with_env,
+                "--env-file",
+                env_file,
+                "--",
+                app_dir / "run_prod.sh",
             )
         )
         units[Path("/etc/systemd/system/eva-ai.service")] = f"""[Unit]
@@ -2359,7 +2374,6 @@ WantedBy=multi-user.target
             watchdog_base = list(
                 spark_docker_base(
                     answers,
-                    env_file=container_env_file,
                     gpu=False,
                     user=container_user,
                 )
@@ -2369,9 +2383,18 @@ WantedBy=multi-user.target
                 str(item)
                 for item in (
                     *watchdog_base,
+                    "--env",
+                    f"EVOSSEARCH_CONFIG_ENV_FILE={env_file}",
+                    "--env",
+                    f"HOME={answers.data_root}",
                     "--entrypoint",
                     python,
                     SPARK_RUNTIME_IMAGE_ID,
+                    exec_with_env,
+                    "--env-file",
+                    env_file,
+                    "--",
+                    python,
                     watchdog,
                     "--state-file",
                     vision_state,
@@ -2775,12 +2798,32 @@ def start_and_verify(answers: Answers, runner: Runner) -> None:
     runner.run(("systemctl", "restart", "eva-ai"))
     if runner.dry_run:
         return
-    _wait_for_json_endpoint(
-        "http://127.0.0.1:5000/ready",
-        label="EVA and required dependencies",
-        timeout_sec=300,
-        expected_status="ready",
-    )
+    try:
+        _wait_for_json_endpoint(
+            "http://127.0.0.1:5000/ready",
+            label="EVA and required dependencies",
+            timeout_sec=300,
+            expected_status="ready",
+        )
+    except InstallError:
+        print("\nEVA readiness diagnostics (secrets omitted):", file=sys.stderr)
+        runner.run(
+            ("systemctl", "--no-pager", "--full", "status", "eva-ai"),
+            check=False,
+        )
+        runner.run(
+            (
+                "journalctl",
+                "-u",
+                "eva-ai",
+                "-b",
+                "--no-pager",
+                "-n",
+                "160",
+            ),
+            check=False,
+        )
+        raise
 
 
 def bootstrap_admin(
@@ -2965,9 +3008,13 @@ def apply_install(
                     )
             else:
                 _atomic_write(env_file, render_env(values), 0o600)
+                eva_group = pwd.getpwnam("eva").pw_gid
+                os.chown(env_file, 0, eva_group)
+                os.chmod(env_file, 0o660)
                 if architecture == "arm64":
                     container_values = dict(values)
                     container_values["EVOSSEARCH_CONFIG_ENV_FILE"] = str(env_file)
+                    container_values["HOME"] = str(answers.data_root)
                     _atomic_write(
                         answers.config_root / "eva-ai.container.env",
                         render_container_env(container_values),
