@@ -943,6 +943,57 @@ def test_factory_spark_install_loads_bundled_runtime_before_canary(tmp_path):
     canary.assert_called_once()
 
 
+def test_spark_database_migration_names_postgres_role_inside_container(tmp_path):
+    answers = installer.Answers(
+        install_root=tmp_path / "opt",
+        data_root=tmp_path / "data",
+        config_root=tmp_path / "etc",
+        evo_url="http://evo.local",
+        evo_username="operator",
+        evo_password="secret",
+        local_vlm=True,
+        local_deep=False,
+    )
+    calls = []
+
+    class RecordingRunner:
+        dry_run = False
+
+        def run(self, command, **kwargs):
+            calls.append((tuple(str(item) for item in command), kwargs))
+            return CompletedProcess(command, 0, "", "")
+
+    existing = {
+        "EVA_MIGRATOR_PASSWORD": "migrator",
+        "EVA_API_PASSWORD": "api",
+        "EVA_AUDIT_PASSWORD": "audit",
+        "EVA_WORKER_PASSWORD": "worker",
+        "EVA_BACKUP_PASSWORD": "backup",
+    }
+    account = SimpleNamespace(pw_uid=128, pw_gid=127)
+    with patch.object(installer.pwd, "getpwnam", return_value=account):
+        installer.prepare_database(
+            answers,
+            RecordingRunner(),
+            db_was_present=True,
+            existing_env=existing,
+            architecture="arm64",
+        )
+
+    container_calls = [
+        (command, kwargs)
+        for command, kwargs in calls
+        if command and command[0] == "docker"
+    ]
+    assert len(container_calls) == 2
+    for command, kwargs in container_calls:
+        assert "--user" in command
+        assert command[command.index("--user") + 1] == "128:127"
+        assert kwargs["env"]["EVA_DATABASE_DSN"] == (
+            "postgresql://postgres@/eva?host=/var/run/postgresql"
+        )
+
+
 def test_spark_systemd_uses_separate_pinned_gpu_container(tmp_path):
     answers = installer.Answers(
         install_root=tmp_path / "opt",

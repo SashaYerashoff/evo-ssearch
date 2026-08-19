@@ -75,6 +75,9 @@ SPARK_VLM_REPO = "Qwen/Qwen3-VL-4B-Instruct"
 SPARK_VLM_REVISION = "ebb281ec70b05090aa6165b016eac8ec08e71b17"
 SPARK_NUMPY_VERSION = "2.1.0"
 SPARK_PIP_CONSTRAINT = "/etc/pip/constraint.txt"
+LOCAL_POSTGRES_MIGRATION_DSN = (
+    "postgresql://postgres@/eva?host=/var/run/postgresql"
+)
 MIN_FREE_GIB = 45
 PREFLIGHT_STAMP_ENV = "EVA_OFFLINE_BUNDLE_PREFLIGHT_SHA256"
 
@@ -1834,7 +1837,11 @@ def prepare_database(
 
     app_dir = answers.install_root / "app"
     migration_env = dict(os.environ)
-    migration_env["EVA_DATABASE_DSN"] = "postgresql:///eva?host=/var/run/postgresql"
+    # ARM migrations run with the host postgres UID for socket peer auth, but
+    # that numeric UID is not present in the pinned NVIDIA image's /etc/passwd.
+    # Name the database role explicitly so libpq never calls getpwuid() inside
+    # the container before connecting to the host socket.
+    migration_env["EVA_DATABASE_DSN"] = LOCAL_POSTGRES_MIGRATION_DSN
     architecture = normalize_architecture(architecture)
     if architecture == "arm64":
         postgres_account = pwd.getpwnam("postgres")
