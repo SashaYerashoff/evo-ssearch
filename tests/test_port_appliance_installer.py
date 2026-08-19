@@ -189,6 +189,17 @@ def test_finalizer_rejects_missing_siglip2_checksum_manifest(tmp_path):
         finalizer.verify_siglip2_checksum_manifest(tmp_path)
 
 
+def test_release_manifest_reports_siglip_precision_truthfully():
+    arm_description = finalizer.semantic_index_description("arm64")
+    amd_description = finalizer.semantic_index_description("amd64")
+
+    assert "FP32" in arm_description
+    assert "GB10" in arm_description
+    assert "FP16" not in arm_description
+    assert "FP16" in amd_description
+    assert "OpenAI CLIP" in amd_description
+
+
 def test_finalizer_binds_standalone_update_pack_into_release_manifest(tmp_path):
     package = tmp_path / "updates" / "georgia-d725c87"
     bundle_name = "eva-ai-georgia-upgrade-d725c87"

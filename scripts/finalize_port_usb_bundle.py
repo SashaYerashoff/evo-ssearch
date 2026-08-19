@@ -36,6 +36,17 @@ SPARK_SIGLIP_DTYPE = "float32"
 SPARK_FFMPEG_BIN = "/usr/local/bin/eva-ffmpeg"
 
 
+def semantic_index_description(architecture: str) -> str:
+    """Describe the packaged embedder without lying about its runtime precision."""
+
+    if architecture == "arm64":
+        return "Google SigLIP2 base patch16 224 FP32 / NVIDIA GB10 CUDA"
+    return (
+        "Google SigLIP2 base patch16 224 FP16 / shared CUDA; "
+        "OpenAI CLIP ViT-B/32 retained for comparison"
+    )
+
+
 @lru_cache(maxsize=None)
 def digest(path: Path) -> str:
     hasher = hashlib.sha256()
@@ -411,14 +422,7 @@ def main() -> int:
                 if architecture == "arm64"
                 else "Qwen3.5-9B-MTP Q4_K_M / llama.cpp CPU"
             ),
-            "semantic_index": (
-                "Google SigLIP2 base patch16 224 FP16 / shared CUDA"
-                + (
-                    "; OpenAI CLIP ViT-B/32 retained for comparison"
-                    if architecture == "amd64"
-                    else ""
-                )
-            ),
+            "semantic_index": semantic_index_description(architecture),
         },
     }
     (root / "manifest.json").write_text(
