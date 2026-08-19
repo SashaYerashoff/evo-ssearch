@@ -2720,16 +2720,29 @@ def _verify_vlm_vision(base_url: str, model: str, *, timeout_sec: int = 90) -> N
             "VLM text endpoint is ready, but the required vision smoke test failed: "
             f"{type(exc).__name__}: {exc}"
         ) from exc
-    normalized = " ".join(content.upper().replace(",", " ").split())
-    if "7391" not in normalized or not all(
-        color in normalized for color in ("RED", "GREEN", "BLUE")
-    ):
+    normalized_tokens = re.findall(r"[A-Z0-9]+", content.upper())
+    if normalized_tokens[:2] == ["VISION", "OK"]:
+        normalized_tokens = normalized_tokens[2:]
+    observed_code = normalized_tokens[0] if normalized_tokens else ""
+    observed_colors = normalized_tokens[1:4]
+    # OCR is advisory here, just as it is in the recurring runtime vision
+    # watchdog.  Small VLMs can drop or confuse one seven-segment-style glyph
+    # while still proving that the image encoder is healthy.  Ordered colours
+    # are the actual gate; the watchdog subsequently uses a fresh random colour
+    # permutation and consecutive failures to detect stale visual features.
+    if observed_colors != ["RED", "GREEN", "BLUE"]:
         raise InstallError(
             "VLM responded to an image but did not perceive the control frame. "
-            f"Expected code 7391 and RED/GREEN/BLUE; received {content!r}. "
+            f"Expected RED/GREEN/BLUE in order; received {content!r}. "
             "Check the multimodal encoder/attention backend before starting EVA."
         )
-    print("VLM vision smoke passed: code 7391, RED/GREEN/BLUE.")
+    if observed_code == "7391":
+        print("VLM vision smoke passed: code 7391, RED/GREEN/BLUE.")
+    else:
+        print(
+            "VLM vision smoke passed: RED/GREEN/BLUE; "
+            f"advisory OCR expected 7391, observed {observed_code or '<missing>'}."
+        )
 
 
 def start_and_verify(answers: Answers, runner: Runner) -> None:

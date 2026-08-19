@@ -333,12 +333,69 @@ def test_vision_smoke_png_and_response_contract():
         )
 
 
+def test_vision_smoke_accepts_imperfect_advisory_ocr(capsys):
+    response = {
+        "choices": [
+            {
+                "message": {
+                    "content": "VISION_OK 731 RED GREEN BLUE",
+                }
+            }
+        ]
+    }
+
+    class FakeResponse(io.BytesIO):
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+    with patch.object(
+        installer.urllib.request,
+        "urlopen",
+        return_value=FakeResponse(json.dumps(response).encode()),
+    ):
+        installer._verify_vlm_vision("http://vlm.local/v1", "vlm-test")
+
+    output = capsys.readouterr().out
+    assert "vision smoke passed" in output.lower()
+    assert "expected 7391, observed 731" in output
+
+
 def test_vision_smoke_rejects_text_only_hallucination():
     response = {
         "choices": [
             {
                 "message": {
                     "content": "VISION_OK 1234 RED BLUE",
+                }
+            }
+        ]
+    }
+
+    class FakeResponse(io.BytesIO):
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+    with patch.object(
+        installer.urllib.request,
+        "urlopen",
+        return_value=FakeResponse(json.dumps(response).encode()),
+    ):
+        with pytest.raises(installer.InstallError, match="did not perceive"):
+            installer._verify_vlm_vision("http://vlm.local/v1", "vlm-test")
+
+
+def test_vision_smoke_rejects_wrong_colour_order():
+    response = {
+        "choices": [
+            {
+                "message": {
+                    "content": "VISION_OK 7391 BLUE GREEN RED",
                 }
             }
         ]
