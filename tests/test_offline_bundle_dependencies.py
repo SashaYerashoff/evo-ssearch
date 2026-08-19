@@ -152,6 +152,36 @@ def test_arm_manifest_rejects_x64_multi_python_matrix(tmp_path):
         )
 
 
+def test_arm_resolver_models_vendor_numpy_constraint(tmp_path):
+    bundle = _bundle(tmp_path)
+    (bundle / "constraints-port-4070s.txt").replace(
+        bundle / "constraints-spark-gb10.txt"
+    )
+    seen_constraints = ""
+
+    def fake_run(command, **_kwargs):
+        nonlocal seen_constraints
+        command = [str(value) for value in command]
+        constraints = Path(command[command.index("--constraint") + 1])
+        seen_constraints = constraints.read_text(encoding="utf-8")
+        report = Path(command[command.index("--report") + 1])
+        report.write_text("{}\n", encoding="utf-8")
+        return subprocess.CompletedProcess(command, 0, stdout="")
+
+    with patch.object(dependencies.subprocess, "run", side_effect=fake_run):
+        dependencies._resolve_with_pip(
+            bundle,
+            bundle / "repo",
+            sys.executable,
+            architecture="arm64",
+            include_vllm=False,
+            python_versions=("3.12",),
+        )
+
+    assert "numpy @ file:" in seen_constraints
+    assert dependencies.SPARK_VENDOR_RUNTIME_PACKAGES["numpy"] == "2.1.0"
+
+
 def test_multi_python_resolver_checks_vllm_only_on_its_runtime_abi(tmp_path):
     bundle = _bundle(tmp_path)
     commands: list[list[str]] = []

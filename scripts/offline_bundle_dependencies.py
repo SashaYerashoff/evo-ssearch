@@ -31,6 +31,11 @@ from typing import Iterable, Mapping, Sequence
 MANIFEST_NAME = "offline-dependencies.json"
 MANIFEST_FORMAT = 1
 SUPPORTED_ARCHITECTURES = {"amd64", "arm64"}
+SPARK_VENDOR_RUNTIME_PACKAGES = {
+    "numpy": "2.1.0",
+    "torch": "2.11.0",
+    "torchvision": "0.26.0",
+}
 SUPPORTED_OS_RELEASES = {
     "24.04": "Ubuntu 24.04 LTS",
     "26.04": "Ubuntu 26.04 LTS",
@@ -356,13 +361,19 @@ def _resolve_with_pip(
         if architecture == "arm64":
             stubs = temporary_root / "vendor-runtime-stubs"
             stubs.mkdir()
-            torch_stub = _write_resolver_stub(stubs, "torch", "2.11.0")
-            torchvision_stub = _write_resolver_stub(stubs, "torchvision", "0.26.0")
+            vendor_stubs = {
+                package: _write_resolver_stub(stubs, package, version)
+                for package, version in SPARK_VENDOR_RUNTIME_PACKAGES.items()
+            }
             constraints = temporary_root / "resolver-constraints.txt"
             constraints.write_text(
                 declared_constraints.read_text(encoding="utf-8")
-                + f"\ntorch @ {torch_stub.as_uri()}\n"
-                + f"torchvision @ {torchvision_stub.as_uri()}\n",
+                + "\n"
+                + "\n".join(
+                    f"{package} @ {path.as_uri()}"
+                    for package, path in sorted(vendor_stubs.items())
+                )
+                + "\n",
                 encoding="utf-8",
             )
             extra_find_links.extend(("--find-links", str(stubs)))
@@ -512,7 +523,12 @@ def build_manifest(
             ),
             "vllm_python": target_python if include_vllm and architecture == "amd64" else None,
             "container_packages": (
-                ["torch>=2.1.0", "torchvision>=0.16.0", "CUDA-enabled NVIDIA runtime"]
+                [
+                    "numpy==2.1.0",
+                    "torch>=2.1.0",
+                    "torchvision>=0.16.0",
+                    "CUDA-enabled NVIDIA runtime",
+                ]
                 if architecture == "arm64"
                 else []
             ),

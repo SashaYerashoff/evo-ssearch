@@ -43,8 +43,8 @@ assert spec and spec.loader
 module = importlib.util.module_from_spec(spec)
 sys.modules[spec.name] = module
 spec.loader.exec_module(module)
-module._write_resolver_stub(output, "torch", "2.11.0")
-module._write_resolver_stub(output, "torchvision", "0.26.0")
+for package, version in module.SPARK_VENDOR_RUNTIME_PACKAGES.items():
+    module._write_resolver_stub(output, package, version)
 PY
 
 RESOLVER_CONSTRAINTS="${TEMP_ROOT}/resolver-constraints.txt"
@@ -58,9 +58,11 @@ from pathlib import Path
 declared, stubs, output = map(Path, sys.argv[1:])
 torch = next(stubs.glob("torch-*.whl"))
 torchvision = next(stubs.glob("torchvision-*.whl"))
+numpy = next(stubs.glob("numpy-*.whl"))
 output.write_text(
     declared.read_text(encoding="utf-8")
-    + f"\ntorch @ {torch.as_uri()}\n"
+    + f"\nnumpy @ {numpy.as_uri()}\n"
+    + f"torch @ {torch.as_uri()}\n"
     + f"torchvision @ {torchvision.as_uri()}\n",
     encoding="utf-8",
 )
@@ -85,12 +87,13 @@ PY
 # Resolver stubs prove the dependency graph while representing packages owned
 # by the pinned NVIDIA container. They must never enter the installable payload.
 rm -f \
+  "${OUTPUT_ROOT}/wheelhouse/numpy-2.1.0-py3-none-any.whl" \
   "${OUTPUT_ROOT}/wheelhouse/torch-2.11.0-py3-none-any.whl" \
   "${OUTPUT_ROOT}/wheelhouse/torchvision-0.26.0-py3-none-any.whl"
 if find "${OUTPUT_ROOT}/wheelhouse" -maxdepth 1 -type f \
-    \( -iname 'torch-*.whl' -o -iname 'torchvision-*.whl' -o -iname 'vllm-*.whl' \) \
+    \( -iname 'numpy-*.whl' -o -iname 'torch-*.whl' -o -iname 'torchvision-*.whl' -o -iname 'vllm-*.whl' \) \
     -print -quit | grep -q .; then
-  printf 'ERROR: vendor-owned torch/vLLM wheel leaked into ARM wheelhouse.\n' >&2
+  printf 'ERROR: vendor-owned NumPy/torch/vLLM wheel leaked into ARM wheelhouse.\n' >&2
   exit 1
 fi
 

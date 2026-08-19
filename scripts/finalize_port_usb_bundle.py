@@ -30,6 +30,8 @@ SPARK_RUNTIME_IMAGE_ID = (
 SPARK_RUNTIME_ARCHIVE = "container/eva-spark-runtime-0.8.7-arm64.tar.zst"
 SPARK_VLM_REPO = "Qwen/Qwen3-VL-4B-Instruct"
 SPARK_VLM_REVISION = "ebb281ec70b05090aa6165b016eac8ec08e71b17"
+SPARK_NUMPY_VERSION = "2.1.0"
+SPARK_PIP_CONSTRAINT = "/etc/pip/constraint.txt"
 
 
 @lru_cache(maxsize=None)
@@ -186,6 +188,8 @@ def spark_runtime_payload(root: Path, architecture: str) -> tuple[dict[str, Any]
         "platform": "linux/arm64",
         "model": SPARK_VLM_REPO,
         "model_revision": SPARK_VLM_REVISION,
+        "numpy": SPARK_NUMPY_VERSION,
+        "pip_constraint": SPARK_PIP_CONSTRAINT,
         "weight_quantization": "online-fp8-w8a8",
         "kv_cache_dtype": "bfloat16",
         "vision_attention_dtype": "bfloat16",

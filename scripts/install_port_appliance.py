@@ -35,6 +35,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Iterable, Mapping, Sequence
 from urllib.parse import urlsplit
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 
 SCRIPT_DIR = Path(__file__).resolve().parent
@@ -72,6 +73,8 @@ SPARK_RUNTIME_IMAGE_ID = (
 SPARK_RUNTIME_CONTAINER_NAME = "eva-ai-app"
 SPARK_VLM_REPO = "Qwen/Qwen3-VL-4B-Instruct"
 SPARK_VLM_REVISION = "ebb281ec70b05090aa6165b016eac8ec08e71b17"
+SPARK_NUMPY_VERSION = "2.1.0"
+SPARK_PIP_CONSTRAINT = "/etc/pip/constraint.txt"
 MIN_FREE_GIB = 45
 PREFLIGHT_STAMP_ENV = "EVA_OFFLINE_BUNDLE_PREFLIGHT_SHA256"
 
@@ -498,6 +501,18 @@ def _url(value: str) -> str:
     return text.rstrip("/")
 
 
+def _timezone_name(value: str) -> str:
+    text = str(value or "").strip()
+    try:
+        ZoneInfo(text)
+    except (ValueError, ZoneInfoNotFoundError) as exc:
+        raise InstallError(
+            f"Unknown site timezone {text or '[empty]'!r}; use an IANA name "
+            "such as Europe/Riga."
+        ) from exc
+    return text
+
+
 def detect_hardware() -> Hardware:
     gpu_lines: list[str] = []
     if shutil.which("nvidia-smi"):
@@ -639,6 +654,8 @@ def spark_runtime_contract(manifest: Mapping) -> dict[str, str]:
         "image_id": SPARK_RUNTIME_IMAGE_ID,
         "model": SPARK_VLM_REPO,
         "model_revision": SPARK_VLM_REVISION,
+        "numpy": SPARK_NUMPY_VERSION,
+        "pip_constraint": SPARK_PIP_CONSTRAINT,
         "weight_quantization": "online-fp8-w8a8",
         "kv_cache_dtype": "bfloat16",
         "vision_attention_dtype": "bfloat16",
@@ -730,8 +747,10 @@ def validate_spark_container_runtime(
 
     probe = """
 import json
+import os
 import shutil
 import subprocess
+import numpy
 import torch
 import torchvision
 import vllm
@@ -747,6 +766,8 @@ ffmpeg_returncode = (
     else -1
 )
 payload = {
+    "numpy": str(numpy.__version__),
+    "pip_constraint": str(os.environ.get("PIP_CONSTRAINT") or ""),
     "torch": str(torch.__version__),
     "torchvision": str(torchvision.__version__),
     "vllm": str(vllm.__version__),
@@ -794,9 +815,20 @@ print(json.dumps(payload, sort_keys=True))
             "The pinned Spark container cannot execute ffmpeg; refusing a runtime "
             "that cannot decode EVA streams."
         )
+    if payload.get("numpy") != SPARK_NUMPY_VERSION:
+        raise InstallError(
+            "The pinned Spark container has incompatible NumPy "
+            f"{payload.get('numpy')!r}; expected {SPARK_NUMPY_VERSION}."
+        )
+    if payload.get("pip_constraint") != SPARK_PIP_CONSTRAINT:
+        raise InstallError(
+            "The pinned Spark container has an unexpected pip constraint file "
+            f"{payload.get('pip_constraint')!r}; expected {SPARK_PIP_CONSTRAINT}."
+        )
     print(
         "Spark container runtime ready: "
         f"vLLM {payload.get('vllm')}, torch {payload.get('torch')}, "
+        f"NumPy {payload.get('numpy')}, "
         f"CUDA {payload.get('cuda')}, "
         f"device {payload.get('device')}."
     )
@@ -1120,7 +1152,7 @@ def gather_answers(
             local_deep=local_deep,
             deep_url=deep_url,
             deep_model=deep_model,
-            timezone=args.timezone or "Europe/Riga",
+            timezone=_timezone_name(args.timezone or "Europe/Riga"),
             quiet_enabled=quiet_enabled,
             quiet_start=args.quiet_window_start or "01:00",
             quiet_end=args.quiet_window_end or "05:00",
@@ -1194,7 +1226,7 @@ def gather_answers(
             else ""
         )
 
-    timezone_name = _prompt("Site timezone", "Europe/Riga")
+    timezone_name = _timezone_name(_prompt("Site timezone", "Europe/Riga"))
     quiet_enabled = bool(deep_url) and _yes_no(
         "Configure a quiet window for 9B consolidation now?",
         False,

@@ -32,6 +32,15 @@ finalizer = importlib.util.module_from_spec(FINALIZER_SPEC)
 sys.modules[FINALIZER_SPEC.name] = finalizer
 FINALIZER_SPEC.loader.exec_module(finalizer)
 
+DEPENDENCIES_SPEC = importlib.util.spec_from_file_location(
+    "offline_bundle_dependencies",
+    ROOT / "scripts" / "offline_bundle_dependencies.py",
+)
+assert DEPENDENCIES_SPEC and DEPENDENCIES_SPEC.loader
+dependencies = importlib.util.module_from_spec(DEPENDENCIES_SPEC)
+sys.modules[DEPENDENCIES_SPEC.name] = dependencies
+DEPENDENCIES_SPEC.loader.exec_module(dependencies)
+
 
 def test_fresh_entrypoint_reads_manifest_before_rendering_target(tmp_path, capsys):
     manifest = {
@@ -762,6 +771,8 @@ def _spark_manifest(archive: str = ""):
         "image_id": installer.SPARK_RUNTIME_IMAGE_ID,
         "model": installer.SPARK_VLM_REPO,
         "model_revision": installer.SPARK_VLM_REVISION,
+        "numpy": installer.SPARK_NUMPY_VERSION,
+        "pip_constraint": installer.SPARK_PIP_CONSTRAINT,
         "weight_quantization": "online-fp8-w8a8",
         "kv_cache_dtype": "bfloat16",
         "vision_attention_dtype": "bfloat16",
@@ -784,6 +795,104 @@ def test_spark_runtime_contract_is_immutable_and_path_safe():
 
     with pytest.raises(installer.InstallError, match="unsafe"):
         installer.spark_runtime_contract(_spark_manifest("../runtime.tar"))
+
+
+def test_spark_vendor_numpy_contract_is_consistent_across_release_inputs():
+    runtime = json.loads(
+        (
+            ROOT / "deployment" / "spark_gb10" / "runtime-container.json"
+        ).read_text(encoding="utf-8")
+    )
+    constraints = (
+        ROOT / "deployment" / "spark_gb10" / "constraints-spark-gb10.txt"
+    ).read_text(encoding="utf-8")
+
+    assert runtime["numpy"] == installer.SPARK_NUMPY_VERSION
+    assert runtime["numpy"] == finalizer.SPARK_NUMPY_VERSION
+    assert runtime["numpy"] == dependencies.SPARK_VENDOR_RUNTIME_PACKAGES["numpy"]
+    assert runtime["pip_constraint"] == installer.SPARK_PIP_CONSTRAINT
+    assert runtime["pip_constraint"] == finalizer.SPARK_PIP_CONSTRAINT
+    assert f"numpy=={runtime['numpy']}" in constraints.splitlines()
+
+
+def test_spark_runtime_probe_binds_vendor_numpy_and_pip_constraint():
+    payload = {
+        "numpy": installer.SPARK_NUMPY_VERSION,
+        "pip_constraint": installer.SPARK_PIP_CONSTRAINT,
+        "torch": "2.13.0a0+nv26.07",
+        "torchvision": "0.28.0a0+nv26.07",
+        "vllm": "0.24.0.dev",
+        "ffmpeg": "/usr/bin/ffmpeg",
+        "ffmpeg_returncode": 0,
+        "cuda_available": True,
+        "cuda": "13.3",
+        "device": "NVIDIA GB10",
+    }
+    responses = [
+        CompletedProcess([], 0, "", ""),
+        CompletedProcess(
+            [],
+            0,
+            f"arm64|{installer.SPARK_RUNTIME_IMAGE_ID}\n",
+            "",
+        ),
+        CompletedProcess([], 0, json.dumps(payload) + "\n", ""),
+    ]
+    with (
+        patch.object(installer.shutil, "which", return_value="/usr/bin/docker"),
+        patch.object(installer, "_spark_image_present", return_value=True),
+        patch.object(installer.subprocess, "run", side_effect=responses),
+    ):
+        result = installer.validate_spark_container_runtime(_spark_manifest())
+
+    assert result is not None
+    assert result["numpy"] == "2.1.0"
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "message"),
+    (
+        ("numpy", "2.3.5", "incompatible NumPy"),
+        ("pip_constraint", "", "unexpected pip constraint"),
+    ),
+)
+def test_spark_runtime_probe_rejects_vendor_dependency_drift(field, value, message):
+    payload = {
+        "numpy": installer.SPARK_NUMPY_VERSION,
+        "pip_constraint": installer.SPARK_PIP_CONSTRAINT,
+        "torch": "2.13.0a0+nv26.07",
+        "torchvision": "0.28.0a0+nv26.07",
+        "vllm": "0.24.0.dev",
+        "ffmpeg": "/usr/bin/ffmpeg",
+        "ffmpeg_returncode": 0,
+        "cuda_available": True,
+        "cuda": "13.3",
+        "device": "NVIDIA GB10",
+    }
+    payload[field] = value
+    responses = [
+        CompletedProcess([], 0, "", ""),
+        CompletedProcess(
+            [],
+            0,
+            f"arm64|{installer.SPARK_RUNTIME_IMAGE_ID}\n",
+            "",
+        ),
+        CompletedProcess([], 0, json.dumps(payload) + "\n", ""),
+    ]
+    with (
+        patch.object(installer.shutil, "which", return_value="/usr/bin/docker"),
+        patch.object(installer, "_spark_image_present", return_value=True),
+        patch.object(installer.subprocess, "run", side_effect=responses),
+        pytest.raises(installer.InstallError, match=message),
+    ):
+        installer.validate_spark_container_runtime(_spark_manifest())
+
+
+def test_site_timezone_requires_iana_name():
+    assert installer._timezone_name("Europe/Riga") == "Europe/Riga"
+    with pytest.raises(installer.InstallError, match="IANA name"):
+        installer._timezone_name("Riga")
 
 
 def test_spark_python_environment_is_built_inside_pinned_container(tmp_path, capsys):

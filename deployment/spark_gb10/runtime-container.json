@@ -9,6 +9,8 @@
   "platform": "linux/arm64",
   "model": "Qwen/Qwen3-VL-4B-Instruct",
   "model_revision": "ebb281ec70b05090aa6165b016eac8ec08e71b17",
+  "numpy": "2.1.0",
+  "pip_constraint": "/etc/pip/constraint.txt",
   "weight_quantization": "online-fp8-w8a8",
   "kv_cache_dtype": "bfloat16",
   "vision_attention_dtype": "bfloat16"
