@@ -57,6 +57,91 @@ def test_auto_detection_returns_fresh_when_no_unit_or_install():
         assert deploy.detect_existing() is None
 
 
+def test_auto_detection_resumes_journaled_incomplete_fresh_install(tmp_path, capsys):
+    install_root = tmp_path / "eva-ai"
+    app = install_root / "app"
+    app.mkdir(parents=True)
+    (app / "VERSION").write_text("β 0.8.7\n", encoding="utf-8")
+    state = tmp_path / "install-state.json"
+    state.write_text(
+        json.dumps(
+            {
+                "format": 1,
+                "status": "failed",
+                "failed_phase": "python_environments",
+                "target": {"install_root": str(install_root)},
+            }
+        ),
+        encoding="utf-8",
+    )
+    properties = {
+        "LoadState": "not-found",
+        "WorkingDirectory": str(app),
+    }
+
+    with patch.object(
+        deploy,
+        "_systemd_property",
+        side_effect=lambda _service, key: properties.get(key, ""),
+    ):
+        assert deploy.detect_existing(installer_state=state) is None
+
+    assert "resuming INSTALL mode" in capsys.readouterr().out
+
+
+def test_auto_detection_does_not_trust_unjournaled_app_without_env(tmp_path):
+    app = tmp_path / "eva-ai" / "app"
+    app.mkdir(parents=True)
+    (app / "VERSION").write_text("β 0.8.7\n", encoding="utf-8")
+    missing_state = tmp_path / "missing-install-state.json"
+    properties = {
+        "LoadState": "not-found",
+        "WorkingDirectory": str(app),
+    }
+
+    with (
+        patch.object(
+            deploy,
+            "_systemd_property",
+            side_effect=lambda _service, key: properties.get(key, ""),
+        ),
+        pytest.raises(deploy.DeployError, match="environment file was not found"),
+    ):
+        deploy.detect_existing(installer_state=missing_state)
+
+
+def test_auto_detection_does_not_hide_loaded_service_with_failed_journal(tmp_path):
+    app = tmp_path / "eva-ai" / "app"
+    app.mkdir(parents=True)
+    (app / "VERSION").write_text("β 0.8.7\n", encoding="utf-8")
+    state = tmp_path / "install-state.json"
+    state.write_text(
+        json.dumps(
+            {
+                "format": 1,
+                "status": "failed",
+                "target": {"install_root": str(app.parent)},
+            }
+        ),
+        encoding="utf-8",
+    )
+    properties = {
+        "LoadState": "loaded",
+        "WorkingDirectory": str(app),
+        "EnvironmentFiles": "",
+    }
+
+    with (
+        patch.object(
+            deploy,
+            "_systemd_property",
+            side_effect=lambda _service, key: properties.get(key, ""),
+        ),
+        pytest.raises(deploy.DeployError, match="environment file was not found"),
+    ):
+        deploy.detect_existing(installer_state=state)
+
+
 def test_update_compatibility_accepts_ubuntu_26_python_314(tmp_path):
     bundle = tmp_path / "bundle"
     bundle.mkdir()

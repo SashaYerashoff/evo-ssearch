@@ -40,6 +40,7 @@ from offline_bundle_dependencies import DependencyError, verify_manifest as veri
 
 DEFAULT_BACKUP_ROOT = Path("/var/backups/eva-ai")
 DEFAULT_REPORT_ROOT = Path("/var/lib/eva-ai-installer")
+DEFAULT_INSTALLER_STATE = DEFAULT_REPORT_ROOT / "install-state.json"
 DEFAULT_SERVICE = "eva-ai"
 EXPECTED_SCHEMA = "20260805_0013"
 EXPECTED_FLAVOR = "universal-offline"
@@ -234,7 +235,37 @@ def _environment_file_from_systemd(service: str) -> Path | None:
     return None
 
 
-def detect_existing(service: str = DEFAULT_SERVICE) -> ExistingDeployment | None:
+def _is_incomplete_fresh_install(
+    app_dir: Path,
+    *,
+    service_load_state: str,
+    state_path: Path = DEFAULT_INSTALLER_STATE,
+) -> bool:
+    """Recognize only installer-owned, pre-systemd fresh-install residue."""
+
+    if service_load_state == "loaded" or not state_path.is_file():
+        return False
+    try:
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return False
+    if state.get("format") != 1 or state.get("status") not in {"running", "failed"}:
+        return False
+    target = state.get("target")
+    if not isinstance(target, Mapping):
+        return False
+    install_root_text = str(target.get("install_root") or "").strip()
+    if not install_root_text:
+        return False
+    install_root = Path(install_root_text)
+    return app_dir in {install_root / "app", install_root / "evo-ssearch"}
+
+
+def detect_existing(
+    service: str = DEFAULT_SERVICE,
+    *,
+    installer_state: Path = DEFAULT_INSTALLER_STATE,
+) -> ExistingDeployment | None:
     load_state = _systemd_property(service, "LoadState")
     working_directory = _systemd_property(service, "WorkingDirectory")
     app_candidates = [
@@ -252,6 +283,16 @@ def detect_existing(service: str = DEFAULT_SERVICE) -> ExistingDeployment | None
         raise DeployError(
             f"{service}.service exists, but its EVA WorkingDirectory could not be identified"
         )
+    if _is_incomplete_fresh_install(
+        app_dir,
+        service_load_state=load_state,
+        state_path=installer_state,
+    ):
+        print(
+            "Incomplete fresh installation detected from the installer journal; "
+            "resuming INSTALL mode."
+        )
+        return None
     env_file = _environment_file_from_systemd(service)
     if env_file is None:
         env_file = next(
