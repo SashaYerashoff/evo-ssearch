@@ -232,6 +232,12 @@ class Config:
         os.getenv('EVOSSEARCH_CLIP_DEVICE', 'auto').strip().lower()
         or 'auto'
     )
+    CLIP_DTYPE = (
+        os.getenv('EVOSSEARCH_CLIP_DTYPE', 'auto').strip().lower()
+        or 'auto'
+    )
+    if CLIP_DTYPE not in {'auto', 'float16', 'bfloat16', 'float32'}:
+        CLIP_DTYPE = 'auto'
     CLIP_MODEL = os.getenv('EVOSSEARCH_CLIP_MODEL', PRODUCTION_CLIP_MODEL).strip() or PRODUCTION_CLIP_MODEL
     CLIP_MODEL_REVISION = os.getenv(
         'EVOSSEARCH_CLIP_MODEL_REVISION',

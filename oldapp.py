@@ -203,6 +203,7 @@ clip_backend_kind = "openai_clip"
 clip_runtime_model = ""
 clip_runtime_revision = ""
 clip_runtime_device = device
+clip_runtime_dtype = ""
 clip_runtime_generation = ""
 _clip_module: Optional[Any] = None
 _clip_init_lock = RLock()
@@ -1737,7 +1738,7 @@ def init_clip() -> None:
 
 def _init_clip_locked() -> None:
     """Load the CLIP-like model lazily for embedding extraction."""
-    global clip_model, clip_preprocess, clip_processor, clip_backend_kind, clip_runtime_model, clip_runtime_revision, clip_runtime_device
+    global clip_model, clip_preprocess, clip_processor, clip_backend_kind, clip_runtime_model, clip_runtime_revision, clip_runtime_device, clip_runtime_dtype
     if clip_model is not None:
         if clip_backend_kind == "openai_clip" and clip_preprocess is not None:
             return
@@ -1764,6 +1765,7 @@ def _init_clip_locked() -> None:
                 or ""
             ).strip()
             clip_runtime_device = preferred_device
+            clip_runtime_dtype = _loaded_model_dtype(model_obj, preferred_device)
             _begin_clip_runtime_generation()
             return
         except Exception as exc:
@@ -1802,6 +1804,7 @@ def _init_clip_locked() -> None:
             clip_runtime_model = fallback_model
             clip_runtime_revision = ""
             clip_runtime_device = fallback_device
+            clip_runtime_dtype = ""
             _begin_clip_runtime_generation()
             if fallback_error is not None:
                 print(f"CLIP fallback recovered on {fallback_device} after initial failure: {fallback_error}")
@@ -1826,6 +1829,7 @@ def _init_clip_locked() -> None:
     clip_runtime_model = requested_model
     clip_runtime_revision = ""
     clip_runtime_device = fallback_device
+    clip_runtime_dtype = ""
     _begin_clip_runtime_generation()
     if initial_error is not None:
         print(f"CLIP model '{requested_model}' loaded on {fallback_device} after retry: {initial_error}")
@@ -1915,6 +1919,38 @@ def _load_openai_clip_model(model_name: str, target_device: str) -> Tuple[torch.
     return cast(torch.nn.Module, model), preprocess
 
 
+def _siglip_model_dtype(target_device: str) -> Optional[torch.dtype]:
+    configured = str(getattr(config, "CLIP_DTYPE", "auto") or "auto").strip().lower()
+    supported = {
+        "float16": torch.float16,
+        "bfloat16": torch.bfloat16,
+        "float32": torch.float32,
+    }
+    if configured in supported:
+        return supported[configured]
+    if configured != "auto":
+        raise RuntimeError(
+            "EVOSSEARCH_CLIP_DTYPE must be auto, float16, bfloat16 or float32"
+        )
+    if str(target_device).startswith("cuda"):
+        return torch.float16
+    return None
+
+
+def _torch_dtype_name(dtype: Optional[torch.dtype]) -> str:
+    return str(dtype or "").removeprefix("torch.")
+
+
+def _loaded_model_dtype(model: torch.nn.Module, target_device: str) -> str:
+    try:
+        parameter = next(model.parameters())
+    except (AttributeError, StopIteration, TypeError):
+        parameter = None
+    if isinstance(parameter, torch.Tensor):
+        return _torch_dtype_name(parameter.dtype)
+    return _torch_dtype_name(_siglip_model_dtype(target_device)) or "float32"
+
+
 def _load_siglip2_clip_model(model_name: str, target_device: str) -> Tuple[torch.nn.Module, Any]:
     local_only = bool(getattr(config, "OFFLINE_MODE", True))
     revision = str(getattr(config, "CLIP_MODEL_REVISION", "") or "").strip()
@@ -1930,8 +1966,9 @@ def _load_siglip2_clip_model(model_name: str, target_device: str) -> Tuple[torch
     if revision:
         model_kwargs["revision"] = revision
         processor_kwargs["revision"] = revision
-    if str(target_device).startswith("cuda"):
-        model_kwargs["dtype"] = torch.float16
+    model_dtype = _siglip_model_dtype(target_device)
+    if model_dtype is not None:
+        model_kwargs["dtype"] = model_dtype
     model = AutoModel.from_pretrained(
         model_name,
         **model_kwargs,
@@ -1949,9 +1986,21 @@ def _normalize_l2_embeddings(features: torch.Tensor) -> torch.Tensor:
     return features / features.norm(dim=-1, keepdim=True).clamp_min(1e-12)
 
 
+def _siglip_embedding_contract(dtype: str = "") -> str:
+    # Existing x86 deployments use the original FP16 contract. Spark/GB10
+    # needs FP32 because its pinned NVIDIA Torch/cuDNN runtime has no
+    # executable FP16/BF16 engine for SigLIP2's patch Conv2d. Keep that
+    # precision in the durable identity so probe thresholds and archive
+    # vectors are never silently mixed across materially different paths.
+    normalized = str(dtype or "").strip().lower()
+    if normalized and normalized not in {"auto", "float16"}:
+        return f"siglip2-torchvision-lower64-v1-{normalized}"
+    return "siglip2-torchvision-lower64-v1"
+
+
 def _clip_embedding_contract_locked() -> str:
     if clip_backend_kind == "siglip2":
-        return "siglip2-torchvision-lower64-v1"
+        return _siglip_embedding_contract(clip_runtime_dtype)
     return "openai-clip-default-v1"
 
 
@@ -2809,7 +2858,7 @@ def ensure_embedder_loaded(embedder: Optional[str] = None) -> None:
 
 def reset_embedder_runtime_state() -> None:
     """Clear loaded embedding backends so they can be re-initialized."""
-    global clip_model, clip_preprocess, clip_processor, clip_backend_kind, clip_runtime_model, clip_runtime_revision, clip_runtime_device, _clip_resetting, _live_clip_batcher, dino_encoder
+    global clip_model, clip_preprocess, clip_processor, clip_backend_kind, clip_runtime_model, clip_runtime_revision, clip_runtime_device, clip_runtime_dtype, _clip_resetting, _live_clip_batcher, dino_encoder
     with _clip_reset_lock:
         with _live_clip_batcher_lock:
             _clip_resetting = True
@@ -2831,6 +2880,7 @@ def reset_embedder_runtime_state() -> None:
                 clip_runtime_model = ""
                 clip_runtime_revision = ""
                 clip_runtime_device = device
+                clip_runtime_dtype = ""
                 _clear_clip_runtime_generation()
                 dino_encoder = None
                 manager = globals().get("probe_manager")
@@ -3227,6 +3277,9 @@ def _probe_embedding_calibration_state(probe: Mapping[str, Any]) -> str:
             'backend': 'siglip2',
             'model': expected_model,
             'revision': str(config.CLIP_MODEL_REVISION or '').strip(),
+            'contract': _siglip_embedding_contract(
+                str(getattr(config, 'CLIP_DTYPE', 'auto') or 'auto')
+            ),
         },
         stored_space,
         allow_legacy_openai_clip=False,
@@ -3255,6 +3308,7 @@ def _build_index_metadata(embedder: str, additional: Optional[Dict[str, Any]] = 
                 "library": library,
                 "backend": clip_backend_kind,
                 "device": clip_runtime_device,
+                "dtype": clip_runtime_dtype or None,
                 "revision": clip_runtime_revision or None,
                 "embedding_space": embedding_space,
                 "embedding_fingerprint": embedding_space.get("fingerprint"),
@@ -7917,6 +7971,7 @@ def _embedder_loaded_state() -> Dict[str, Any]:
         clip_model=clip_runtime_model or None,
         backend=clip_backend_kind if clip_model is not None else None,
         device=clip_runtime_device if clip_model is not None else None,
+        dtype=clip_runtime_dtype if clip_model is not None else None,
         native_thread_limit=_EVA_NATIVE_THREAD_LIMIT,
         torch_intraop_threads=int(torch.get_num_threads()),
         torch_interop_threads=int(torch.get_num_interop_threads()),
@@ -20335,6 +20390,7 @@ def probes_bench():
                 for sample in samples
             ],
             "device": clip_runtime_device,
+            "dtype": clip_runtime_dtype or None,
             "device_name": device_name,
             "cuda_visible_devices": str(os.getenv('CUDA_VISIBLE_DEVICES') or ''),
             "backend": clip_backend_kind,
@@ -20974,6 +21030,7 @@ def _runtime_env_map() -> Dict[str, str]:
         "EVOSSEARCH_DEBUG": _bool_to_env(config.DEBUG),
         "EVOSSEARCH_EMBEDDER": str(config.EMBEDDER),
         "EVOSSEARCH_CLIP_MODEL": str(config.CLIP_MODEL),
+        "EVOSSEARCH_CLIP_DTYPE": str(config.CLIP_DTYPE),
         "EVOSSEARCH_DINO_MODEL": str(config.DINO_MODEL),
         "EVOSSEARCH_EMB_DIM_DINO": str(config.EMB_DIM_DINO),
         "EVOSSEARCH_DINO_WEIGHTS_PATH": str(config.DINO_WEIGHTS_PATH),

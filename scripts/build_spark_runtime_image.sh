@@ -40,7 +40,6 @@ else
     TEMP_ROOT="$(mktemp -d /mnt/eva-llamacpp-lab/eva-spark-runtime.XXXXXX)"
 fi
 DIND_CONTAINER="eva-spark-runtime-build-dind-$$"
-BASE_INSPECT_CONTAINER="eva-spark-runtime-base-inspect"
 BUILD_SUCCEEDED=false
 cleanup() {
     status=$?
@@ -59,7 +58,11 @@ cleanup() {
 }
 trap cleanup EXIT
 
-mkdir -p "${TEMP_ROOT}/context/rootfs" "${TEMP_ROOT}/debs" "${TEMP_ROOT}/apt"
+mkdir -p \
+    "${TEMP_ROOT}/context/rootfs/opt/eva-ffmpeg" \
+    "${TEMP_ROOT}/context/rootfs/usr/local/bin" \
+    "${TEMP_ROOT}/debs" \
+    "${TEMP_ROOT}/apt"
 mkdir -p "${TEMP_ROOT}/docker-data"
 docker run --detach --privileged \
     --name "${DIND_CONTAINER}" \
@@ -94,23 +97,7 @@ if [[ "${actual_base_config_id}" != "${BASE_IMAGE_ID}" ]]; then
     exit 1
 fi
 
-if [[ ! -s "${TEMP_ROOT}/apt/status" ]]; then
-    docker exec "${DIND_CONTAINER}" \
-        docker rm -f "${BASE_INSPECT_CONTAINER}" >/dev/null 2>&1 || true
-    docker exec "${DIND_CONTAINER}" \
-        docker create \
-            --platform linux/arm64 \
-            --name "${BASE_INSPECT_CONTAINER}" \
-            --entrypoint /bin/true \
-            "${base_reference}" >/dev/null
-    docker exec "${DIND_CONTAINER}" \
-        docker cp "${BASE_INSPECT_CONTAINER}:/var/lib/dpkg/status" - \
-        | tar -xOf - > "${TEMP_ROOT}/apt/status"
-    docker exec "${DIND_CONTAINER}" \
-        docker rm "${BASE_INSPECT_CONTAINER}" >/dev/null
-fi
-
-if [[ ! -x "${TEMP_ROOT}/context/rootfs/usr/bin/ffmpeg" ]]; then
+if [[ ! -x "${TEMP_ROOT}/context/rootfs/opt/eva-ffmpeg/usr/bin/ffmpeg" ]]; then
     docker run --rm \
         --platform linux/amd64 \
         --env "HOST_UID=$(id -u)" \
@@ -119,7 +106,11 @@ if [[ ! -x "${TEMP_ROOT}/context/rootfs/usr/bin/ffmpeg" ]]; then
         --mount "type=bind,src=${TEMP_ROOT}/debs,dst=/out" \
         ubuntu:24.04 \
         bash -Eeuc '
-            mkdir -p /work/etc/apt /work/lists/partial /work/cache/archives/partial
+            mkdir -p \
+              /work/etc/apt \
+              /work/lists/partial \
+              /work/cache/archives/partial \
+              /work/state
             printf "%s\n" \
               "deb [trusted=yes] http://ports.ubuntu.com/ubuntu-ports noble main universe multiverse restricted" \
               "deb [trusted=yes] http://ports.ubuntu.com/ubuntu-ports noble-updates main universe multiverse restricted" \
@@ -130,15 +121,16 @@ if [[ ! -x "${TEMP_ROOT}/context/rootfs/usr/bin/ffmpeg" ]]; then
               -o APT::Architectures::=arm64
               -o Dir::Etc::sourcelist=/work/etc/apt/sources.list
               -o Dir::Etc::sourceparts=-
-              -o Dir::State::status=/work/status
+              -o Dir::State::status=/work/state/status
               -o Dir::State::lists=/work/lists
               -o Dir::Cache=/work/cache
               -o Acquire::Languages=none
               -o Acquire::Retries=3
             )
+            : > /work/state/status
             apt-get "${apt_options[@]}" update
             apt-get "${apt_options[@]}" \
-              --download-only --no-install-recommends --no-upgrade -y install ffmpeg
+              --download-only --no-install-recommends -y install ffmpeg
             cp /work/cache/archives/*.deb /out/
             chown -R "${HOST_UID}:${HOST_GID}" /work /out
         '
@@ -150,14 +142,23 @@ if [[ ! -x "${TEMP_ROOT}/context/rootfs/usr/bin/ffmpeg" ]]; then
                 "${package}" "${package_architecture}" >&2
             exit 1
         fi
-        dpkg-deb --extract "${package}" "${TEMP_ROOT}/context/rootfs"
+        dpkg-deb --extract \
+            "${package}" \
+            "${TEMP_ROOT}/context/rootfs/opt/eva-ffmpeg"
     done < <(find "${TEMP_ROOT}/debs" -maxdepth 1 -type f -name '*.deb' -print0)
 fi
 
-if [[ ! -x "${TEMP_ROOT}/context/rootfs/usr/bin/ffmpeg" ]]; then
-    printf 'ERROR: resolved runtime layer does not contain /usr/bin/ffmpeg\n' >&2
+if [[ ! -x "${TEMP_ROOT}/context/rootfs/opt/eva-ffmpeg/usr/bin/ffmpeg" ]]; then
+    printf 'ERROR: isolated runtime layer does not contain ffmpeg\n' >&2
     exit 1
 fi
+if [[ ! -x "${TEMP_ROOT}/context/rootfs/opt/eva-ffmpeg/usr/lib/ld-linux-aarch64.so.1" ]]; then
+    printf 'ERROR: isolated runtime layer does not contain its ARM64 loader\n' >&2
+    exit 1
+fi
+install -m 0755 \
+    "${REPO_ROOT}/deployment/spark_gb10/runtime-image/eva-ffmpeg" \
+    "${TEMP_ROOT}/context/rootfs/usr/local/bin/eva-ffmpeg"
 
 find "${TEMP_ROOT}/context/rootfs" -exec touch -h -d '@0' {} +
 install -m 0644 \

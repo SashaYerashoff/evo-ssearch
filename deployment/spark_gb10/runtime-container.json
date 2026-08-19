@@ -5,7 +5,7 @@
   "base_manifest_digest": "sha256:1de8e6bfdb4c81c1f31a806cc9b13b5c6352714a7cec87f4d24964bcc91159b2",
   "base_image_id": "sha256:4c704f1343c7cb3aa7ea5cc57cab5fa1ed1a2160daf4f57d1e0c06fc1e2c7dbb",
   "image": "eva-ai/spark-runtime:0.8.7-arm64",
-  "image_id": "sha256:ba6215522cd13772339e1160b4aff21c6f54d92aa0cbd031a4c8c29585d9080d",
+  "image_id": "sha256:5f79999e8001200efe1bacff71758a1ac459c83707f4ddab74311996863e17ba",
   "platform": "linux/arm64",
   "model": "Qwen/Qwen3-VL-4B-Instruct",
   "model_revision": "ebb281ec70b05090aa6165b016eac8ec08e71b17",
@@ -13,5 +13,8 @@
   "pip_constraint": "/etc/pip/constraint.txt",
   "weight_quantization": "online-fp8-w8a8",
   "kv_cache_dtype": "bfloat16",
-  "vision_attention_dtype": "bfloat16"
+  "vision_attention_dtype": "bfloat16",
+  "siglip_dtype": "float32",
+  "ffmpeg_bin": "/usr/local/bin/eva-ffmpeg",
+  "ffmpeg_h264_decoder": "required"
 }

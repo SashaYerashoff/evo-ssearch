@@ -25,7 +25,8 @@ Acceptance gates:
 1. The installer completes with the network disconnected except for the Evo
    LAN endpoint.
 2. The pinned OCI archive loads from the USB; the runtime and application
-   canaries collectively prove CUDA, torchvision, OpenCV and ffmpeg.
+   canaries collectively prove CUDA, torchvision, OpenCV, an executable FP32
+   SigLIP2 patch convolution and H.264 decoding through the isolated ffmpeg.
 3. `eva-vllm.service` starts the bundled Qwen model on `127.0.0.1:1234`, and
    the installer's synthetic image smoke test returns the expected code and
    colors.

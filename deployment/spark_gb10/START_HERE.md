@@ -13,7 +13,8 @@ The installer preserves that vendor stack. It does not install an Ubuntu HWE
 kernel or a desktop NVIDIA driver. EVA and local SigLIP2 run in a separate
 container based on the immutable ARM64 image
 `eva-ai/spark-runtime:0.8.7-arm64`, derived from the pinned NVIDIA
-`nvcr.io/nvidia/vllm:26.07-py3` base with the offline ffmpeg runtime added. The
+`nvcr.io/nvidia/vllm:26.07-py3` base with an isolated offline Ubuntu 24.04
+ffmpeg/H.264 runtime added. The
 VLM endpoint remains a separate service.
 The USB always carries and verifies that image offline. Factory acceptance is
 performed with no EVA image or model preloaded in Docker; an exact matching
@@ -24,7 +25,8 @@ Before installation, the launcher verifies:
 - `aarch64` / `arm64` and Ubuntu 24.04;
 - the offline ARM64 APT repository and Python wheelhouse;
 - the bundled ARM64 runtime archive and its exact pinned image identity;
-- CUDA-enabled `torch`, `torchvision`, OpenCV and `ffmpeg` inside that image;
+- CUDA-enabled `torch`, `torchvision`, OpenCV and H.264-capable `ffmpeg` inside
+  that image;
 - a visible NVIDIA device through `docker run --gpus all`;
 - the selected VLM model and a real image-understanding smoke test.
 

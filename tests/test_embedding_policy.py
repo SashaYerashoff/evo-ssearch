@@ -36,6 +36,7 @@ class EmbeddingPolicyTests(unittest.TestCase):
                 False,
             ),
             "CLIP_DEVICE": getattr(config, "CLIP_DEVICE", "auto"),
+            "CLIP_DTYPE": getattr(config, "CLIP_DTYPE", "auto"),
             "CLIP_MODEL": config.CLIP_MODEL,
             "CLIP_MODEL_REVISION": getattr(config, "CLIP_MODEL_REVISION", ""),
             "CLIP_RUNTIME_AUTO_RECOVERY_ENABLED": getattr(
@@ -66,6 +67,7 @@ class EmbeddingPolicyTests(unittest.TestCase):
         config.SETTINGS_LOCAL_ONLY = True
         config.EMBEDDER_FALLBACK_ENABLED = False
         config.CLIP_DEVICE = "auto"
+        config.CLIP_DTYPE = "auto"
 
     def tearDown(self) -> None:
         oldapp.reset_embedder_runtime_state()
@@ -228,6 +230,37 @@ class EmbeddingPolicyTests(unittest.TestCase):
         )
         self.assertTrue(load_processor.call_args.kwargs["local_files_only"])
         self.assertEqual(load_processor.call_args.kwargs["backend"], "torchvision")
+
+    def test_siglip_loader_honors_explicit_float32_cuda_contract(self) -> None:
+        config.CLIP_DTYPE = "float32"
+        model = Mock()
+        model.to.return_value = model
+        with (
+            patch("oldapp.AutoModel.from_pretrained", return_value=model) as load_model,
+            patch("oldapp.AutoProcessor.from_pretrained", return_value=Mock()),
+        ):
+            oldapp._load_siglip2_clip_model("local/siglip", "cuda")
+
+        self.assertIs(load_model.call_args.kwargs["dtype"], oldapp.torch.float32)
+
+    def test_siglip_float32_precision_is_part_of_durable_contract(self) -> None:
+        with (
+            patch.object(oldapp, "clip_backend_kind", "siglip2"),
+            patch.object(oldapp, "clip_runtime_dtype", "float32"),
+        ):
+            self.assertEqual(
+                oldapp._clip_embedding_contract_locked(),
+                "siglip2-torchvision-lower64-v1-float32",
+            )
+
+        with (
+            patch.object(oldapp, "clip_backend_kind", "siglip2"),
+            patch.object(oldapp, "clip_runtime_dtype", "float16"),
+        ):
+            self.assertEqual(
+                oldapp._clip_embedding_contract_locked(),
+                "siglip2-torchvision-lower64-v1",
+            )
 
     def test_siglip_transformers_five_pooler_contract_and_dimension(self) -> None:
         pooled = oldapp.torch.ones((2, 768), dtype=oldapp.torch.float32)

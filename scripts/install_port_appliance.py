@@ -68,13 +68,15 @@ SPARK_RUNTIME_BASE_IMAGE_ID = (
 )
 SPARK_RUNTIME_IMAGE = "eva-ai/spark-runtime:0.8.7-arm64"
 SPARK_RUNTIME_IMAGE_ID = (
-    "sha256:ba6215522cd13772339e1160b4aff21c6f54d92aa0cbd031a4c8c29585d9080d"
+    "sha256:5f79999e8001200efe1bacff71758a1ac459c83707f4ddab74311996863e17ba"
 )
 SPARK_RUNTIME_CONTAINER_NAME = "eva-ai-app"
 SPARK_VLM_REPO = "Qwen/Qwen3-VL-4B-Instruct"
 SPARK_VLM_REVISION = "ebb281ec70b05090aa6165b016eac8ec08e71b17"
 SPARK_NUMPY_VERSION = "2.1.0"
 SPARK_PIP_CONSTRAINT = "/etc/pip/constraint.txt"
+SPARK_SIGLIP_DTYPE = "float32"
+SPARK_FFMPEG_BIN = "/usr/local/bin/eva-ffmpeg"
 LOCAL_POSTGRES_MIGRATION_DSN = (
     "postgresql://postgres@/eva?host=/var/run/postgresql"
 )
@@ -662,6 +664,9 @@ def spark_runtime_contract(manifest: Mapping) -> dict[str, str]:
         "weight_quantization": "online-fp8-w8a8",
         "kv_cache_dtype": "bfloat16",
         "vision_attention_dtype": "bfloat16",
+        "siglip_dtype": SPARK_SIGLIP_DTYPE,
+        "ffmpeg_bin": SPARK_FFMPEG_BIN,
+        "ffmpeg_h264_decoder": "required",
     }
     for key, value in expected.items():
         if str(raw.get(key) or "") != value:
@@ -757,17 +762,27 @@ import numpy
 import torch
 import torchvision
 import vllm
-ffmpeg = str(shutil.which("ffmpeg") or "")
-ffmpeg_returncode = (
-    subprocess.run(
-        (ffmpeg, "-version"),
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-        check=False,
-    ).returncode
-    if ffmpeg
-    else -1
+ffmpeg = "/usr/local/bin/eva-ffmpeg"
+ffmpeg_probe = subprocess.run(
+    (ffmpeg, "-hide_banner", "-decoders"),
+    stdout=subprocess.PIPE,
+    stderr=subprocess.PIPE,
+    text=True,
+    check=False,
 )
+ffmpeg_decoders = str(ffmpeg_probe.stdout or "")
+ffmpeg_has_h264 = any(
+    line.split()[1:2] == ["h264"]
+    for line in ffmpeg_decoders.splitlines()
+)
+siglip_dtype = torch.float32
+conv = torch.nn.Conv2d(3, 768, kernel_size=16, stride=16).to(
+    "cuda", dtype=siglip_dtype
+)
+pixels = torch.zeros((1, 3, 224, 224), device="cuda", dtype=siglip_dtype)
+with torch.inference_mode():
+    conv_output = conv(pixels)
+torch.cuda.synchronize()
 payload = {
     "numpy": str(numpy.__version__),
     "pip_constraint": str(os.environ.get("PIP_CONSTRAINT") or ""),
@@ -775,7 +790,10 @@ payload = {
     "torchvision": str(torchvision.__version__),
     "vllm": str(vllm.__version__),
     "ffmpeg": ffmpeg,
-    "ffmpeg_returncode": int(ffmpeg_returncode),
+    "ffmpeg_returncode": int(ffmpeg_probe.returncode),
+    "ffmpeg_has_h264": bool(ffmpeg_has_h264),
+    "siglip_dtype": str(siglip_dtype).removeprefix("torch."),
+    "siglip_conv_shape": list(conv_output.shape),
     "cuda_available": bool(torch.cuda.is_available()),
     "cuda": str(torch.version.cuda or ""),
     "device": str(torch.cuda.get_device_name(0)) if torch.cuda.is_available() else "",
@@ -817,6 +835,18 @@ print(json.dumps(payload, sort_keys=True))
         raise InstallError(
             "The pinned Spark container cannot execute ffmpeg; refusing a runtime "
             "that cannot decode EVA streams."
+        )
+    if payload.get("ffmpeg") != SPARK_FFMPEG_BIN or payload.get("ffmpeg_has_h264") is not True:
+        raise InstallError(
+            "The pinned Spark media runtime does not expose the required H.264 "
+            "decoder; refusing a runtime that cannot decode EVA streams."
+        )
+    if payload.get("siglip_dtype") != SPARK_SIGLIP_DTYPE or payload.get(
+        "siglip_conv_shape"
+    ) != [1, 768, 14, 14]:
+        raise InstallError(
+            "The pinned Spark CUDA runtime cannot execute the accepted SigLIP2 "
+            f"{SPARK_SIGLIP_DTYPE} patch convolution."
         )
     if payload.get("numpy") != SPARK_NUMPY_VERSION:
         raise InstallError(
@@ -2007,6 +2037,8 @@ def render_runtime_env(
     answers: Answers,
     existing: Mapping[str, str],
     passwords: Mapping[str, str],
+    *,
+    architecture: str = "amd64",
 ) -> dict[str, str]:
     values = dict(PORT_ENV)
     values.update(
@@ -2065,6 +2097,9 @@ def render_runtime_env(
             "EVOSSEARCH_LUXRIOT_ROLLUP_L3_QUIET_WINDOW_END": answers.quiet_end,
         }
     )
+    if normalize_architecture(architecture) == "arm64":
+        values["EVOSSEARCH_CLIP_DTYPE"] = SPARK_SIGLIP_DTYPE
+        values["EVOSSEARCH_FFMPEG_BIN"] = SPARK_FFMPEG_BIN
     tenant_id = resolve_tenant_id(existing)
     for key in TENANT_ID_KEYS:
         values[key] = tenant_id
@@ -2996,7 +3031,12 @@ def apply_install(
         )
         runner.add_secrets(passwords.values())
         journal.add_secrets(passwords.values())
-        values = render_runtime_env(answers, existing_env, passwords)
+        values = render_runtime_env(
+            answers,
+            existing_env,
+            passwords,
+            architecture=architecture,
+        )
 
         def write_configuration() -> None:
             if runner.dry_run:

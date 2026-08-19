@@ -1,0 +1,16 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+runtime_root=/opt/eva-ffmpeg
+loader="${runtime_root}/usr/lib/ld-linux-aarch64.so.1"
+library_path="${runtime_root}/usr/lib/aarch64-linux-gnu:${runtime_root}/lib/aarch64-linux-gnu:${runtime_root}/usr/lib:${runtime_root}/lib"
+
+if [[ ! -x "${loader}" ]]; then
+    printf 'EVA ffmpeg runtime loader is missing: %s\n' "${loader}" >&2
+    exit 127
+fi
+
+exec "${loader}" \
+    --library-path "${library_path}" \
+    "${runtime_root}/usr/bin/ffmpeg" \
+    "$@"

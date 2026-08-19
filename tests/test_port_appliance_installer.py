@@ -656,6 +656,34 @@ def test_runtime_env_drops_legacy_token_and_repairs_partial_tenant_ids(tmp_path)
     assert {values[key] for key in installer.TENANT_ID_KEYS} == {tenant_id}
 
 
+def test_spark_runtime_env_pins_working_siglip_precision_and_ffmpeg(tmp_path):
+    answers = installer.Answers(
+        install_root=tmp_path / "opt",
+        data_root=tmp_path / "data",
+        config_root=tmp_path / "etc",
+        evo_url="http://evo.local",
+        evo_username="operator",
+        evo_password="secret",
+    )
+    passwords = {
+        "EVA_MIGRATOR_PASSWORD": "a" * 64,
+        "EVA_API_PASSWORD": "b" * 64,
+        "EVA_AUDIT_PASSWORD": "c" * 64,
+        "EVA_WORKER_PASSWORD": "d" * 64,
+        "EVA_BACKUP_PASSWORD": "e" * 64,
+    }
+
+    values = installer.render_runtime_env(
+        answers,
+        {},
+        passwords,
+        architecture="arm64",
+    )
+
+    assert values["EVOSSEARCH_CLIP_DTYPE"] == "float32"
+    assert values["EVOSSEARCH_FFMPEG_BIN"] == installer.SPARK_FFMPEG_BIN
+
+
 def test_runtime_env_refuses_conflicting_tenant_ids():
     with pytest.raises(installer.InstallError, match="tenant IDs disagree"):
         installer.resolve_tenant_id(
@@ -833,6 +861,9 @@ def _spark_manifest(archive: str = ""):
         "weight_quantization": "online-fp8-w8a8",
         "kv_cache_dtype": "bfloat16",
         "vision_attention_dtype": "bfloat16",
+        "siglip_dtype": installer.SPARK_SIGLIP_DTYPE,
+        "ffmpeg_bin": installer.SPARK_FFMPEG_BIN,
+        "ffmpeg_h264_decoder": "required",
     }
     if archive:
         runtime["archive"] = archive
@@ -879,8 +910,11 @@ def test_spark_runtime_probe_binds_vendor_numpy_and_pip_constraint():
         "torch": "2.13.0a0+nv26.07",
         "torchvision": "0.28.0a0+nv26.07",
         "vllm": "0.24.0.dev",
-        "ffmpeg": "/usr/bin/ffmpeg",
+        "ffmpeg": installer.SPARK_FFMPEG_BIN,
         "ffmpeg_returncode": 0,
+        "ffmpeg_has_h264": True,
+        "siglip_dtype": installer.SPARK_SIGLIP_DTYPE,
+        "siglip_conv_shape": [1, 768, 14, 14],
         "cuda_available": True,
         "cuda": "13.3",
         "device": "NVIDIA GB10",
@@ -920,8 +954,57 @@ def test_spark_runtime_probe_rejects_vendor_dependency_drift(field, value, messa
         "torch": "2.13.0a0+nv26.07",
         "torchvision": "0.28.0a0+nv26.07",
         "vllm": "0.24.0.dev",
-        "ffmpeg": "/usr/bin/ffmpeg",
+        "ffmpeg": installer.SPARK_FFMPEG_BIN,
         "ffmpeg_returncode": 0,
+        "ffmpeg_has_h264": True,
+        "siglip_dtype": installer.SPARK_SIGLIP_DTYPE,
+        "siglip_conv_shape": [1, 768, 14, 14],
+        "cuda_available": True,
+        "cuda": "13.3",
+        "device": "NVIDIA GB10",
+    }
+    payload[field] = value
+    responses = [
+        CompletedProcess([], 0, "", ""),
+        CompletedProcess(
+            [],
+            0,
+            f"arm64|{installer.SPARK_RUNTIME_IMAGE_ID}\n",
+            "",
+        ),
+        CompletedProcess([], 0, json.dumps(payload) + "\n", ""),
+    ]
+    with (
+        patch.object(installer.shutil, "which", return_value="/usr/bin/docker"),
+        patch.object(installer, "_spark_image_present", return_value=True),
+        patch.object(installer.subprocess, "run", side_effect=responses),
+        pytest.raises(installer.InstallError, match=message),
+    ):
+        installer.validate_spark_container_runtime(_spark_manifest())
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "message"),
+    (
+        ("ffmpeg_has_h264", False, "H.264 decoder"),
+        ("siglip_dtype", "float16", "SigLIP2 float32 patch convolution"),
+        ("siglip_conv_shape", [], "SigLIP2 float32 patch convolution"),
+    ),
+)
+def test_spark_runtime_probe_rejects_media_or_siglip_runtime_drift(
+    field, value, message
+):
+    payload = {
+        "numpy": installer.SPARK_NUMPY_VERSION,
+        "pip_constraint": installer.SPARK_PIP_CONSTRAINT,
+        "torch": "2.13.0a0+nv26.07",
+        "torchvision": "0.28.0a0+nv26.07",
+        "vllm": "0.24.0.dev",
+        "ffmpeg": installer.SPARK_FFMPEG_BIN,
+        "ffmpeg_returncode": 0,
+        "ffmpeg_has_h264": True,
+        "siglip_dtype": installer.SPARK_SIGLIP_DTYPE,
+        "siglip_conv_shape": [1, 768, 14, 14],
         "cuda_available": True,
         "cuda": "13.3",
         "device": "NVIDIA GB10",
