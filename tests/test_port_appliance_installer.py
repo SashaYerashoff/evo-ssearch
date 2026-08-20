@@ -161,7 +161,7 @@ def test_port_payload_requires_maritime_runtime_and_react_assets():
     assert '"START_EVA_AI.sh"' in finalizer
     assert '"manifest.txt"' in finalizer
     assert '"format": 2' in finalizer
-    assert '"installation_modes": ["fresh", "update", "report"]' in finalizer
+    assert '"installation_modes": ["fresh", "resume", "update", "report"]' in finalizer
     assert '"offline-dependencies.json"' in finalizer
     assert '"update_packages": update_packages' in finalizer
     assert "Update archive checksum mismatch" in finalizer

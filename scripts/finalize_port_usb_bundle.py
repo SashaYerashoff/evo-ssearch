@@ -452,7 +452,7 @@ def main() -> int:
             if architecture == "arm64"
             else max(45 * 1024**3, payload_bytes + 25 * 1024**3)
         ),
-        "installation_modes": ["fresh", "update", "report"],
+        "installation_modes": ["fresh", "resume", "update", "report"],
         "update_packages": update_packages,
         "offline_dependencies": {
             "manifest": "offline-dependencies.json",

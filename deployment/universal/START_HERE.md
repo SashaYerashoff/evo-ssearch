@@ -10,6 +10,10 @@ This USB supports two paths from the same entry point:
   external inference topology are preserved, PostgreSQL is backed up, Alembic
   migrations are applied through `20260805_0013`, the React UI is replaced,
   services are restarted, and previously active summary streams must resume.
+- **Resume** of an interrupted fresh installation: a durable `running` or
+  `failed` install journal takes precedence over partially written application
+  files and a loaded systemd unit. The target is not considered installed until
+  the fresh installer records `complete` after readiness verification.
 
 ## Start
 
@@ -21,12 +25,13 @@ sudo ./START_EVA_AI.sh
 
 The script first verifies the complete bundle (checksums, Ubuntu packages,
 Python wheels, models, React build and migration plan). It then detects whether
-EVA AI is already installed and prints `INSTALL` or `UPDATE` before changing
+EVA AI is already installed and prints `INSTALL`, `RESUME`, or `UPDATE` before changing
 anything. No internet or Git remote is used on the client. To force an explicit
 path:
 
 ```bash
 sudo ./START_EVA_AI.sh --mode install
+sudo ./START_EVA_AI.sh --mode resume
 sudo ./START_EVA_AI.sh --mode update
 ```
 

@@ -62,6 +62,20 @@ class ExistingDeployment:
     base_url: str
 
 
+@dataclass(frozen=True)
+class IncompleteFreshInstall:
+    install_root: Path
+    status: str
+    failed_phase: str
+
+
+@dataclass(frozen=True)
+class DeploymentDetection:
+    mode: str
+    existing: ExistingDeployment | None = None
+    incomplete: IncompleteFreshInstall | None = None
+
+
 def _run(
     argv: Sequence[str | Path],
     *,
@@ -162,8 +176,10 @@ def _verify_bundle(root: Path) -> None:
     if missing:
         raise DeployError("Offline payload is incomplete: " + ", ".join(missing))
     modes = manifest.get("installation_modes")
-    if modes != ["fresh", "update", "report"]:
-        raise DeployError("Bundle does not declare the complete fresh/update/report contract")
+    if modes != ["fresh", "resume", "update", "report"]:
+        raise DeployError(
+            "Bundle does not declare the complete fresh/resume/update/report contract"
+        )
     critical = manifest.get("critical_sha256")
     if not isinstance(critical, dict) or not critical:
         raise DeployError("Bundle manifest has no critical checksums")
@@ -235,37 +251,43 @@ def _environment_file_from_systemd(service: str) -> Path | None:
     return None
 
 
-def _is_incomplete_fresh_install(
-    app_dir: Path,
-    *,
-    service_load_state: str,
+def _incomplete_fresh_install(
     state_path: Path = DEFAULT_INSTALLER_STATE,
-) -> bool:
-    """Recognize only installer-owned, pre-systemd fresh-install residue."""
+) -> IncompleteFreshInstall | None:
+    """Read the durable receipt for an interrupted fresh installation.
 
-    if service_load_state == "loaded" or not state_path.is_file():
-        return False
+    A fresh install can fail after writing the application, configuration and
+    systemd unit.  A loaded unit therefore cannot turn a ``running``/``failed``
+    fresh-install receipt into an installed deployment.  ``complete`` is the
+    only journal state that closes the fresh-install transaction.
+    """
+
+    if not state_path.is_file():
+        return None
     try:
         state = json.loads(state_path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
-        return False
+        return None
     if state.get("format") != 1 or state.get("status") not in {"running", "failed"}:
-        return False
+        return None
     target = state.get("target")
     if not isinstance(target, Mapping):
-        return False
+        return None
     install_root_text = str(target.get("install_root") or "").strip()
     if not install_root_text:
-        return False
-    install_root = Path(install_root_text)
-    return app_dir in {install_root / "app", install_root / "evo-ssearch"}
+        return None
+    return IncompleteFreshInstall(
+        install_root=Path(install_root_text),
+        status=str(state["status"]),
+        failed_phase=str(state.get("failed_phase") or ""),
+    )
 
 
-def detect_existing(
+def detect_deployment(
     service: str = DEFAULT_SERVICE,
     *,
     installer_state: Path = DEFAULT_INSTALLER_STATE,
-) -> ExistingDeployment | None:
+) -> DeploymentDetection:
     load_state = _systemd_property(service, "LoadState")
     working_directory = _systemd_property(service, "WorkingDirectory")
     app_candidates = [
@@ -277,22 +299,29 @@ def detect_existing(
         (path for path in app_candidates if path.is_dir() and (path / "VERSION").is_file()),
         None,
     )
+    incomplete = _incomplete_fresh_install(installer_state)
+    if incomplete is not None:
+        installer_apps = {
+            incomplete.install_root / "app",
+            incomplete.install_root / "evo-ssearch",
+        }
+        working_path = Path(working_directory) if working_directory else None
+        if app_dir in installer_apps or (
+            app_dir is None
+            and (load_state != "loaded" or working_path in installer_apps)
+        ):
+            phase = f", failed phase {incomplete.failed_phase}" if incomplete.failed_phase else ""
+            print(
+                "Incomplete fresh installation detected from the installer journal "
+                f"({incomplete.status}{phase}); resuming INSTALL engine."
+            )
+            return DeploymentDetection(mode="resume", incomplete=incomplete)
     if load_state != "loaded" and app_dir is None:
-        return None
+        return DeploymentDetection(mode="install")
     if app_dir is None:
         raise DeployError(
             f"{service}.service exists, but its EVA WorkingDirectory could not be identified"
         )
-    if _is_incomplete_fresh_install(
-        app_dir,
-        service_load_state=load_state,
-        state_path=installer_state,
-    ):
-        print(
-            "Incomplete fresh installation detected from the installer journal; "
-            "resuming INSTALL mode."
-        )
-        return None
     env_file = _environment_file_from_systemd(service)
     if env_file is None:
         env_file = next(
@@ -315,15 +344,28 @@ def detect_existing(
     unit_file = Path(unit_file_raw or f"/etc/systemd/system/{service}.service")
     service_user = _systemd_property(service, "User") or "eva"
     service_group = _systemd_property(service, "Group") or service_user
-    return ExistingDeployment(
-        service=service,
-        app_dir=app_dir,
-        env_file=env_file,
-        unit_file=unit_file,
-        service_user=service_user,
-        service_group=service_group,
-        base_url=f"http://127.0.0.1:{port}",
+    return DeploymentDetection(
+        mode="update",
+        existing=ExistingDeployment(
+            service=service,
+            app_dir=app_dir,
+            env_file=env_file,
+            unit_file=unit_file,
+            service_user=service_user,
+            service_group=service_group,
+            base_url=f"http://127.0.0.1:{port}",
+        ),
     )
+
+
+def detect_existing(
+    service: str = DEFAULT_SERVICE,
+    *,
+    installer_state: Path = DEFAULT_INSTALLER_STATE,
+) -> ExistingDeployment | None:
+    """Compatibility wrapper for callers that only need an installed target."""
+
+    return detect_deployment(service, installer_state=installer_state).existing
 
 
 def _host_os_release(path: Path = Path("/etc/os-release")) -> tuple[str, str]:
@@ -596,7 +638,11 @@ def build_parser() -> argparse.ArgumentParser:
         description="Install or update EVA AI from one offline USB bundle."
     )
     parser.add_argument("--bundle-root", type=Path)
-    parser.add_argument("--mode", choices=("auto", "install", "update", "report"), default="auto")
+    parser.add_argument(
+        "--mode",
+        choices=("auto", "install", "resume", "update", "report"),
+        default="auto",
+    )
     parser.add_argument("--service", default=DEFAULT_SERVICE)
     parser.add_argument("--yes", action="store_true", help="Accept the final reviewed mutation plan.")
     parser.add_argument(
@@ -622,17 +668,26 @@ def main(argv: Sequence[str] | None = None) -> int:
     try:
         bundle_root = _bundle_root(args.bundle_root)
         _verify_bundle(bundle_root)
-        existing = detect_existing(args.service)
+        detection = detect_deployment(args.service)
+        existing = detection.existing
         selected_mode = args.mode
         if selected_mode == "auto":
-            selected_mode = "update" if existing is not None else "install"
+            selected_mode = detection.mode
         print("EVA AI UNIVERSAL OFFLINE DEPLOYMENT")
         print(f"Bundle: {bundle_root}")
         print(f"Mode:   {selected_mode.upper()}")
         if selected_mode == "install":
-            if existing is not None:
+            if detection.mode != "install":
                 raise DeployError(
-                    "Existing EVA was detected; use --mode update or remove the ambiguity explicitly"
+                    f"Target state is {detection.mode.upper()}, not a clean install; "
+                    f"use --mode {detection.mode} or remove the ambiguity explicitly"
+                )
+            _fresh(bundle_root, assume_yes=args.yes, passthrough=passthrough)
+        elif selected_mode == "resume":
+            if detection.mode != "resume":
+                raise DeployError(
+                    f"No interrupted fresh installation was detected; target state is "
+                    f"{detection.mode.upper()}"
                 )
             _fresh(bundle_root, assume_yes=args.yes, passthrough=passthrough)
         elif selected_mode == "update":
