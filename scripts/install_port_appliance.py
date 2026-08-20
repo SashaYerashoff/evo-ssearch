@@ -77,6 +77,9 @@ SPARK_NUMPY_VERSION = "2.1.0"
 SPARK_PIP_CONSTRAINT = "/etc/pip/constraint.txt"
 SPARK_SIGLIP_DTYPE = "float32"
 SPARK_FFMPEG_BIN = "/usr/local/bin/eva-ffmpeg"
+SPARK_FFMPEG_WRAPPER_RELATIVE = Path(
+    "deployment/spark_gb10/runtime-image/eva-ffmpeg"
+)
 X64_SIGLIP_DTYPE = "float16"
 X64_FFMPEG_BIN = "/usr/bin/ffmpeg"
 X64_VLLM_PYTHON_VERSION = "3.12.13"
@@ -735,6 +738,7 @@ def validate_spark_container_runtime(
     manifest: Mapping,
     *,
     run_gpu_probe: bool = True,
+    ffmpeg_wrapper: Path | None = None,
 ) -> dict[str, object] | None:
     """Validate the pinned NGC image without touching the vendor host Python."""
 
@@ -806,6 +810,7 @@ ffmpeg_probe = subprocess.run(
     check=False,
 )
 ffmpeg_decoders = str(ffmpeg_probe.stdout or "")
+ffmpeg_stderr = str(ffmpeg_probe.stderr or "").strip()
 ffmpeg_has_h264 = any(
     line.split()[1:2] == ["h264"]
     for line in ffmpeg_decoders.splitlines()
@@ -826,6 +831,7 @@ payload = {
     "vllm": str(vllm.__version__),
     "ffmpeg": ffmpeg,
     "ffmpeg_returncode": int(ffmpeg_probe.returncode),
+    "ffmpeg_stderr": ffmpeg_stderr[-1000:],
     "ffmpeg_has_h264": bool(ffmpeg_has_h264),
     "siglip_dtype": str(siglip_dtype).removeprefix("torch."),
     "siglip_conv_shape": list(conv_output.shape),
@@ -835,19 +841,34 @@ payload = {
 }
 print(json.dumps(payload, sort_keys=True))
 """
-    completed = subprocess.run(
+    probe_command: list[str | Path] = [
+        "docker",
+        "run",
+        "--rm",
+        "--gpus",
+        "all",
+    ]
+    if ffmpeg_wrapper is not None:
+        wrapper = ffmpeg_wrapper.resolve()
+        if not wrapper.is_file():
+            raise InstallError(f"Spark FFmpeg wrapper is missing: {wrapper}")
+        probe_command.extend(
+            (
+                "--mount",
+                f"type=bind,src={wrapper},dst={SPARK_FFMPEG_BIN},readonly",
+            )
+        )
+    probe_command.extend(
         (
-            "docker",
-            "run",
-            "--rm",
-            "--gpus",
-            "all",
             "--entrypoint",
             "python3",
             SPARK_RUNTIME_IMAGE_ID,
             "-c",
             probe,
-        ),
+        )
+    )
+    completed = subprocess.run(
+        tuple(str(item) for item in probe_command),
         text=True,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
@@ -867,9 +888,11 @@ print(json.dumps(payload, sort_keys=True))
             "Repair NVIDIA Container Toolkit before installing EVA."
         )
     if not payload.get("ffmpeg") or payload.get("ffmpeg_returncode") != 0:
+        detail = str(payload.get("ffmpeg_stderr") or "").strip()
         raise InstallError(
             "The pinned Spark container cannot execute ffmpeg; refusing a runtime "
             "that cannot decode EVA streams."
+            + (f" ffmpeg: {detail}" if detail else "")
         )
     if payload.get("ffmpeg") != SPARK_FFMPEG_BIN or payload.get("ffmpeg_has_h264") is not True:
         raise InstallError(
@@ -915,7 +938,10 @@ def ensure_spark_runtime(
         if runner.dry_run:
             print(f"+ reuse pinned Spark runtime {SPARK_RUNTIME_IMAGE_ID}")
             return
-        validate_spark_container_runtime(manifest)
+        validate_spark_container_runtime(
+            manifest,
+            ffmpeg_wrapper=bundle_root / "repo" / SPARK_FFMPEG_WRAPPER_RELATIVE,
+        )
         return
     archive_relative = contract.get("archive")
     if not archive_relative:
@@ -933,7 +959,10 @@ def ensure_spark_runtime(
         raise InstallError(
             "The Spark runtime archive loaded, but did not provide the pinned image ID."
         )
-    validate_spark_container_runtime(manifest)
+    validate_spark_container_runtime(
+        manifest,
+        ffmpeg_wrapper=bundle_root / "repo" / SPARK_FFMPEG_WRAPPER_RELATIVE,
+    )
 
 
 def spark_docker_base(
@@ -965,6 +994,13 @@ def spark_docker_base(
                 f"type=bind,src={root},dst={root}",
             )
         )
+    ffmpeg_wrapper = answers.install_root / "app" / SPARK_FFMPEG_WRAPPER_RELATIVE
+    command.extend(
+        (
+            "--mount",
+            f"type=bind,src={ffmpeg_wrapper},dst={SPARK_FFMPEG_BIN},readonly",
+        )
+    )
     if bundle_root is not None:
         command.extend(
             (
@@ -3424,7 +3460,12 @@ def main(argv: Sequence[str] | None = None) -> int:
 
         hardware = detect_hardware()
         if architecture == "arm64":
-            runtime_probe = validate_spark_container_runtime(manifest)
+            runtime_probe = validate_spark_container_runtime(
+                manifest,
+                ffmpeg_wrapper=(
+                    bundle_root / "repo" / SPARK_FFMPEG_WRAPPER_RELATIVE
+                ),
+            )
             if runtime_probe is None:
                 contract = spark_runtime_contract(manifest)
                 archive = contract.get("archive")

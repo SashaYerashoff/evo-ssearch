@@ -355,7 +355,9 @@ def test_update_compatibility_rejects_unbundled_python_before_mutation(tmp_path)
         )
 
 
-def test_common_bundle_verification_catches_corruption_before_either_path(tmp_path):
+def test_common_bundle_verification_catches_corruption_before_either_path(
+    tmp_path, capsys
+):
     bundle = tmp_path / "bundle"
     critical_file = bundle / "repo" / "VERSION"
     required_files = (
@@ -395,6 +397,10 @@ def test_common_bundle_verification_catches_corruption_before_either_path(tmp_pa
 
     with patch.object(deploy, "verify_dependencies"):
         deploy._verify_bundle(bundle)
+    output = capsys.readouterr().out
+    assert "Verifying offline bundle payload" in output
+    assert "payload verification 100%" in output
+    assert "Offline bundle payload verification: OK" in output
     critical_file.write_text("corrupted\n", encoding="utf-8")
 
     try:

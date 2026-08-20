@@ -202,16 +202,46 @@ def _verify_bundle(root: Path) -> None:
                 f"Bundled update {package.get('name') or '[unnamed]'} archive identity mismatch"
             )
     resolved_root = root.resolve()
+    critical_files: list[tuple[str, Path, str, int]] = []
     for relative, expected in critical.items():
         candidate = (root / str(relative)).resolve()
         if not candidate.is_relative_to(resolved_root) or not candidate.is_file():
             raise DeployError(f"Invalid critical payload path: {relative}")
+        critical_files.append(
+            (str(relative), candidate, str(expected), candidate.stat().st_size)
+        )
+
+    total_bytes = sum(size for _relative, _candidate, _expected, size in critical_files)
+    total_gib = total_bytes / (1024**3)
+    print(
+        "Verifying offline bundle payload: "
+        f"{len(critical_files)} files, {total_gib:.1f} GiB. "
+        "USB media can take several minutes.",
+        flush=True,
+    )
+    verified_bytes = 0
+    next_progress_percent = 5
+    for relative, candidate, expected, _size in critical_files:
         digest = hashlib.sha256()
         with candidate.open("rb") as handle:
             for block in iter(lambda: handle.read(8 * 1024 * 1024), b""):
                 digest.update(block)
-        if digest.hexdigest() != str(expected):
+                verified_bytes += len(block)
+                percent = (
+                    100
+                    if total_bytes == 0
+                    else min(100, int(verified_bytes * 100 / total_bytes))
+                )
+                if percent >= next_progress_percent:
+                    print(
+                        f"  payload verification {percent:3d}% "
+                        f"({verified_bytes / (1024**3):.1f}/{total_gib:.1f} GiB)",
+                        flush=True,
+                    )
+                    next_progress_percent = (percent // 5 + 1) * 5
+        if digest.hexdigest() != expected:
             raise DeployError(f"Checksum mismatch: {relative}")
+    print("Offline bundle payload verification: OK", flush=True)
     try:
         verify_dependencies(root, repo_root=root / "repo")
     except DependencyError as exc:

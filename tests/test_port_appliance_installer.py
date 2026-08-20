@@ -946,6 +946,15 @@ def test_spark_vendor_numpy_contract_is_consistent_across_release_inputs():
     assert f"numpy=={runtime['numpy']}" in constraints.splitlines()
 
 
+def test_spark_ffmpeg_wrapper_covers_nonstandard_dependency_directories():
+    wrapper = (
+        ROOT / "deployment" / "spark_gb10" / "runtime-image" / "eva-ffmpeg"
+    ).read_text(encoding="utf-8")
+
+    for directory in ("blas", "lapack", "pulseaudio"):
+        assert f"aarch64-linux-gnu/{directory}" in wrapper
+
+
 def test_spark_runtime_probe_binds_vendor_numpy_and_pip_constraint():
     payload = {
         "numpy": installer.SPARK_NUMPY_VERSION,
@@ -981,6 +990,51 @@ def test_spark_runtime_probe_binds_vendor_numpy_and_pip_constraint():
 
     assert result is not None
     assert result["numpy"] == "2.1.0"
+
+
+def test_spark_runtime_probe_overlays_release_ffmpeg_wrapper(tmp_path):
+    wrapper = tmp_path / "eva-ffmpeg"
+    wrapper.write_text("#!/bin/sh\n", encoding="utf-8")
+    payload = {
+        "numpy": installer.SPARK_NUMPY_VERSION,
+        "pip_constraint": installer.SPARK_PIP_CONSTRAINT,
+        "torch": "2.13.0a0+nv26.07",
+        "torchvision": "0.28.0a0+nv26.07",
+        "vllm": "0.24.0.dev",
+        "ffmpeg": installer.SPARK_FFMPEG_BIN,
+        "ffmpeg_returncode": 0,
+        "ffmpeg_has_h264": True,
+        "siglip_dtype": installer.SPARK_SIGLIP_DTYPE,
+        "siglip_conv_shape": [1, 768, 14, 14],
+        "cuda_available": True,
+        "cuda": "13.3",
+        "device": "NVIDIA GB10",
+    }
+    responses = [
+        CompletedProcess([], 0, "", ""),
+        CompletedProcess(
+            [],
+            0,
+            f"arm64|{installer.SPARK_RUNTIME_IMAGE_ID}\n",
+            "",
+        ),
+        CompletedProcess([], 0, json.dumps(payload) + "\n", ""),
+    ]
+    with (
+        patch.object(installer.shutil, "which", return_value="/usr/bin/docker"),
+        patch.object(installer, "_spark_image_present", return_value=True),
+        patch.object(installer.subprocess, "run", side_effect=responses) as run,
+    ):
+        installer.validate_spark_container_runtime(
+            _spark_manifest(), ffmpeg_wrapper=wrapper
+        )
+
+    probe_command = run.call_args_list[-1].args[0]
+    assert "--mount" in probe_command
+    assert (
+        f"type=bind,src={wrapper.resolve()},dst={installer.SPARK_FFMPEG_BIN},readonly"
+        in probe_command
+    )
 
 
 @pytest.mark.parametrize(
@@ -1068,6 +1122,42 @@ def test_spark_runtime_probe_rejects_media_or_siglip_runtime_drift(
         patch.object(installer, "_spark_image_present", return_value=True),
         patch.object(installer.subprocess, "run", side_effect=responses),
         pytest.raises(installer.InstallError, match=message),
+    ):
+        installer.validate_spark_container_runtime(_spark_manifest())
+
+
+def test_spark_runtime_probe_reports_ffmpeg_stderr():
+    payload = {
+        "numpy": installer.SPARK_NUMPY_VERSION,
+        "pip_constraint": installer.SPARK_PIP_CONSTRAINT,
+        "torch": "2.13.0a0+nv26.07",
+        "torchvision": "0.28.0a0+nv26.07",
+        "vllm": "0.24.0.dev",
+        "ffmpeg": installer.SPARK_FFMPEG_BIN,
+        "ffmpeg_returncode": 127,
+        "ffmpeg_stderr": "libexample.so: cannot open shared object file",
+        "ffmpeg_has_h264": False,
+        "siglip_dtype": installer.SPARK_SIGLIP_DTYPE,
+        "siglip_conv_shape": [1, 768, 14, 14],
+        "cuda_available": True,
+        "cuda": "13.3",
+        "device": "NVIDIA GB10",
+    }
+    responses = [
+        CompletedProcess([], 0, "", ""),
+        CompletedProcess(
+            [],
+            0,
+            f"arm64|{installer.SPARK_RUNTIME_IMAGE_ID}\n",
+            "",
+        ),
+        CompletedProcess([], 0, json.dumps(payload) + "\n", ""),
+    ]
+    with (
+        patch.object(installer.shutil, "which", return_value="/usr/bin/docker"),
+        patch.object(installer, "_spark_image_present", return_value=True),
+        patch.object(installer.subprocess, "run", side_effect=responses),
+        pytest.raises(installer.InstallError, match="libexample\\.so"),
     ):
         installer.validate_spark_container_runtime(_spark_manifest())
 
