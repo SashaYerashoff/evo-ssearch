@@ -253,7 +253,7 @@ class SecuritySmokeTests(unittest.TestCase):
         self.assertEqual(misconfigured["status"], "misconfigured")
         self.assertIn("STRICT_RUNTIME_ROLES", misconfigured["error"])
 
-    def test_secure_deployment_gate_checks_cookie_roots_and_placeholder_secrets(self) -> None:
+    def test_secure_deployment_gate_checks_cookie_roots_and_local_placeholder_secrets(self) -> None:
         config.SECURE_DEPLOYMENT_REQUIRED = True
         config.AUTH_COOKIE_SECURE = False
         config.ALLOWED_ROOTS = []
@@ -265,12 +265,28 @@ class SecuritySmokeTests(unittest.TestCase):
         self.assertFalse(result["ok"])
         self.assertTrue(result["required"])
         self.assertEqual(result["status"], "misconfigured")
-        self.assertGreaterEqual(len(result["issues"]), 4)
+        self.assertGreaterEqual(len(result["issues"]), 3)
         serialized = " ".join(result["issues"])
         self.assertIn("AUTH_COOKIE_SECURE", serialized)
         self.assertIn("ALLOWED_ROOTS", serialized)
         self.assertIn("ADMIN_TOKEN", serialized)
-        self.assertIn("LUXRIOT_PASSWORD", serialized)
+        self.assertNotIn("LUXRIOT_PASSWORD", serialized)
+        self.assertIn("LUXRIOT_PASSWORD", " ".join(result["warnings"]))
+
+    def test_external_evo_default_password_is_warning_not_readiness_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            config.SECURE_DEPLOYMENT_REQUIRED = True
+            config.AUTH_COOKIE_SECURE = True
+            config.ALLOWED_ROOTS = [tmp_dir]
+            config.ADMIN_TOKEN = ""
+            config.LUXRIOT_PASSWORD = "123"
+
+            result = oldapp._check_deployment_security_ready()
+
+        self.assertTrue(result["ok"], result)
+        self.assertEqual(result["status"], "ready")
+        self.assertEqual(result["issues"], [])
+        self.assertIn("LUXRIOT_PASSWORD", " ".join(result["warnings"]))
 
     def test_secure_deployment_gate_accepts_hardened_runtime_config(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:

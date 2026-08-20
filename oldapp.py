@@ -8229,7 +8229,10 @@ def _check_deployment_security_ready() -> Dict[str, Any]:
         issues.append("EVOSSEARCH_ADMIN_TOKEN is set but weak; rotate or unset under named auth")
     luxriot_password = str(getattr(config, "LUXRIOT_PASSWORD", "") or "")
     if _secret_is_obvious_placeholder(luxriot_password):
-        issues.append("EVOSSEARCH_LUXRIOT_PASSWORD is an obvious placeholder")
+        warnings.append(
+            "EVOSSEARCH_LUXRIOT_PASSWORD looks like a weak or default credential; "
+            "Evo owns that credential policy and connectivity is checked separately"
+        )
     elif _secret_is_weak(luxriot_password):
         warnings.append(
             "EVOSSEARCH_LUXRIOT_PASSWORD is shorter or less diverse than recommended; "
