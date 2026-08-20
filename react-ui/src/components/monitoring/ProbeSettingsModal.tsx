@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from 'react'
 import {
   IconX, IconPlus, IconTrash, IconPhoto, IconDeviceFloppy, IconVideoOff,
-  IconChevronRight, IconCrop, IconPlayerStop, IconBroadcast, IconAlertTriangle,
+  IconChevronRight, IconCrop, IconPlayerPlay, IconPlayerStop, IconBroadcast, IconAlertTriangle,
 } from '@tabler/icons-react'
 import type { Channel } from '../../api/types'
 import {
@@ -121,6 +121,7 @@ export function ProbeSettingsModal({ probe, channels, busy, canControlCapture, c
   const [patchAttention, setPatchAttention] = useState<PatchAttentionResult | null>(null)
   const [patchBusyKey, setPatchBusyKey] = useState<string | null>(null)
   const [patchError, setPatchError] = useState<string | null>(null)
+  const [captureBusy, setCaptureBusy] = useState(false)
   const previewBlobUrlRef = useRef<string | null>(null)
   const scoredFrameBlobUrlRef = useRef<string | null>(null)
   useEffect(() => {
@@ -289,6 +290,47 @@ export function ProbeSettingsModal({ probe, channels, busy, canControlCapture, c
     }
   }, [d.channel_id, d.id])
 
+  // The preview reads only EVA's captured-frame ring. An enabled saved probe,
+  // and especially a direct V4L2 source, must therefore own a capture session
+  // before the first preview/status poll. Previously the modal displayed a
+  // misleading "Stop stream" button while the backend was idle and waited
+  // forever for a frame that nobody was producing.
+  useEffect(() => {
+    const channelId = d.channel_id
+    const selectedChannel = channels.find((channel) => channel.id === channelId)
+    const directLocalSource = selectedChannel?.source === 'local_v4l2'
+    if (
+      !canControlCapture
+      || channelId == null
+      || !d.enabled
+      || (!d.id && !directLocalSource)
+    ) return
+    let disposed = false
+    setCaptureBusy(true)
+    void probesApi.startCapture(channelId, probe?.fps)
+      .then((response) => {
+        if (disposed) return
+        const state = response?.state || {}
+        setSt((current) => ({
+          ...current,
+          channel_id: channelId,
+          runtime_state: state.running === false ? 'idle' : 'running',
+          capture_error: null,
+        }))
+      })
+      .catch((error: any) => {
+        if (disposed) return
+        setSt((current) => ({
+          ...current,
+          channel_id: channelId,
+          runtime_state: 'idle',
+          capture_error: error?.message || 'Failed to start capture',
+        }))
+      })
+      .finally(() => { if (!disposed) setCaptureBusy(false) })
+    return () => { disposed = true }
+  }, [canControlCapture, channels, d.channel_id, d.enabled, d.id, probe?.fps])
+
   // ROI drawing on the preview
   const pvRef = useRef<HTMLDivElement>(null)
   const dragRef = useRef<{ x: number; y: number } | null>(null)
@@ -345,9 +387,44 @@ export function ProbeSettingsModal({ probe, channels, busy, canControlCapture, c
     }, canCreateBookmarks)
   }
 
+  async function startStream(channelId = d.channel_id) {
+    if (channelId == null || captureBusy) return
+    setCaptureBusy(true)
+    try {
+      const response = await probesApi.startCapture(channelId, probe?.fps)
+      const state = response?.state || {}
+      setSt((current) => ({
+        ...current,
+        channel_id: channelId,
+        runtime_state: state.running === false ? 'idle' : 'running',
+        capture_error: null,
+      }))
+    } catch (error: any) {
+      setSt((current) => ({
+        ...current,
+        channel_id: channelId,
+        runtime_state: 'idle',
+        capture_error: error?.message || 'Failed to start capture',
+      }))
+    } finally {
+      setCaptureBusy(false)
+    }
+  }
+
   async function stopStream() {
-    if (d.channel_id == null) return
-    try { await probesApi.stopCapture(d.channel_id); setSt({ channel_id: d.channel_id }) } catch { /* ignore */ }
+    if (d.channel_id == null || captureBusy) return
+    setCaptureBusy(true)
+    try {
+      await probesApi.stopCapture(d.channel_id)
+      setSt({ channel_id: d.channel_id, runtime_state: 'paused' })
+    } catch (error: any) {
+      setSt((current) => ({
+        ...current,
+        capture_error: error?.message || 'Failed to stop capture',
+      }))
+    } finally {
+      setCaptureBusy(false)
+    }
   }
 
   async function applyCast() {
@@ -422,8 +499,13 @@ export function ProbeSettingsModal({ probe, channels, busy, canControlCapture, c
     const saved = await onSave(buildInput())
     if (!saved) return
     setD((current) => ({ ...current, id: saved.id }))
+    if (canControlCapture && saved.enabled !== false && saved.channel_id != null) {
+      await startStream(saved.channel_id)
+    }
     setApplyMessage('Applied. Live P/N/M now follows the current stream.')
   }
+
+  const captureRunning = st.runtime_state === 'running'
 
   return (
     <div className="scrim" onClick={onClose}>
@@ -461,7 +543,17 @@ export function ProbeSettingsModal({ probe, channels, busy, canControlCapture, c
               <IconCrop size={14} /> ROI {d.roiOn ? 'ON' : 'OFF'}
             </button>
             <button className="mon-btn sm" disabled={!d.roi} onClick={() => set({ roi: null })}>Clear ROI</button>
-            {canControlCapture && <button className="mon-btn sm" onClick={stopStream}><IconPlayerStop size={14} /> Stop stream</button>}
+            {canControlCapture && (
+              <button
+                className={`mon-btn sm ${captureRunning ? '' : 'accent'}`}
+                disabled={captureBusy}
+                onClick={() => { void (captureRunning ? stopStream() : startStream()) }}
+              >
+                {captureRunning
+                  ? <><IconPlayerStop size={14} /> Stop stream</>
+                  : <><IconPlayerPlay size={14} /> {captureBusy ? 'Starting…' : 'Start stream'}</>}
+              </button>
+            )}
           </div>
 
           {techOpen && (

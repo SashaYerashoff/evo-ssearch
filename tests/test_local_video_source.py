@@ -14,7 +14,7 @@ from local_video_source import (
     LocalVideoSourceRegistry,
     parse_local_video_sources,
 )
-from luxriot_connector import LuxriotManager
+from luxriot_connector import LuxriotCaptureSession, LuxriotManager
 
 
 def _jpeg_bytes() -> bytes:
@@ -122,6 +122,22 @@ def test_manager_routes_only_configured_local_id_around_evo(monkeypatch):
 
     assert isinstance(manager.build_capture_client(900001), LocalVideoClient)
     assert manager.build_capture_client(112) is evo_client
+
+
+def test_local_capture_uses_continuous_live_segment_in_auto_mode():
+    manager = _manager()
+    session = LuxriotCaptureSession(
+        manager,
+        channel_id=900001,
+        batch_size=1,
+        prompt="",
+        interval_override=1.0,
+        summarization_enabled=False,
+        capture_kind="analytics",
+    )
+
+    assert session.capture_source_mode == "auto"
+    assert session._should_use_live_segment() is True
 
 
 def test_local_alert_is_retained_without_attempting_evo_bookmark(monkeypatch):

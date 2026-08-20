@@ -2022,6 +2022,13 @@ class LuxriotCaptureSession:
             return False
         if self.capture_source_mode == "live_segment":
             return True
+        # A V4L2 device is a stateful live source, not a snapshot endpoint.
+        # Reopening it for every probe sample resets many UVC sensors and makes
+        # their first (often grey or under-exposed) frame visible to operators
+        # and to the embedder.  Keep one bounded dense-capture process alive and
+        # share its selected frames with probes, previews, and summaries.
+        if self.manager.is_local_channel(self.channel_id):
+            return True
         with self.lock:
             slow_streak = int(self.snapshot_slow_streak)
             snapshot_count = int(self.snapshot_count)
