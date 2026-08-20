@@ -11,7 +11,7 @@ import tarfile
 from pathlib import Path
 from subprocess import CompletedProcess
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -1166,6 +1166,57 @@ def test_site_timezone_requires_iana_name():
     assert installer._timezone_name("Europe/Riga") == "Europe/Riga"
     with pytest.raises(installer.InstallError, match="IANA name"):
         installer._timezone_name("Riga")
+
+
+@pytest.mark.parametrize(
+    ("entered", "expected"),
+    (
+        ("192.168.1.100", "http://192.168.1.100:8080"),
+        ("evo.internal", "http://evo.internal:8080"),
+        ("192.168.1.100:8081", "http://192.168.1.100:8081"),
+        ("http://192.168.1.100", "http://192.168.1.100"),
+        ("https://evo.example.test", "https://evo.example.test"),
+    ),
+)
+def test_evo_url_defaults_only_bare_addresses_to_port_8080(entered, expected):
+    assert installer._evo_url(entered) == expected
+
+
+def test_evo_reachability_uses_authenticated_channels_endpoint():
+    response = MagicMock()
+    response.status = 200
+    response.__enter__.return_value = response
+    opener = MagicMock()
+    opener.open.return_value = response
+
+    with patch.object(installer.urllib.request, "build_opener", return_value=opener):
+        ok, detail = installer.evo_reachable(
+            "http://evo.test:8080", "operator", "not-printed"
+        )
+
+    assert ok is True
+    assert detail == "authenticated HTTP 200"
+    request = opener.open.call_args.args[0]
+    assert request.full_url == "http://evo.test:8080/channels?health=0"
+
+
+def test_evo_reachability_rejects_bad_credentials():
+    opener = MagicMock()
+    opener.open.side_effect = installer.urllib.error.HTTPError(
+        "http://evo.test:8080/channels?health=0",
+        401,
+        "Unauthorized",
+        {},
+        None,
+    )
+
+    with patch.object(installer.urllib.request, "build_opener", return_value=opener):
+        ok, detail = installer.evo_reachable(
+            "http://evo.test:8080", "operator", "wrong"
+        )
+
+    assert ok is False
+    assert detail == "credentials rejected with HTTP 401"
 
 
 def test_spark_python_environment_is_built_inside_pinned_container(tmp_path, capsys):

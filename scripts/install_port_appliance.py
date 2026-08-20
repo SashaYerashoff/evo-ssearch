@@ -34,7 +34,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Iterable, Mapping, Sequence
-from urllib.parse import urlsplit
+from urllib.parse import urlsplit, urlunsplit
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 
@@ -519,6 +519,33 @@ def _url(value: str) -> str:
     if parsed.username or parsed.password:
         raise InstallError("URLs containing embedded credentials are not supported.")
     return text.rstrip("/")
+
+
+def _evo_url(value: str) -> str:
+    """Normalize an Evo address; a bare host/IP uses Luxriot's port 8080."""
+
+    raw = str(value or "").strip()
+    explicit_scheme = "://" in raw
+    normalized = _url(raw)
+    parsed = urlsplit(normalized)
+    try:
+        explicit_port = parsed.port is not None
+    except ValueError as exc:
+        raise InstallError(f"Not a valid Evo address: {value!r}") from exc
+    if explicit_scheme or explicit_port:
+        return normalized
+    hostname = str(parsed.hostname or "")
+    if ":" in hostname:
+        hostname = f"[{hostname}]"
+    return urlunsplit(
+        (
+            parsed.scheme,
+            f"{hostname}:8080",
+            parsed.path,
+            parsed.query,
+            parsed.fragment,
+        )
+    ).rstrip("/")
 
 
 def _timezone_name(value: str) -> str:
@@ -1014,13 +1041,26 @@ def spark_docker_base(
     return tuple(command)
 
 
-def evo_reachable(url: str) -> tuple[bool, str]:
-    request = urllib.request.Request(url, method="GET")
+def evo_reachable(url: str, username: str, password: str) -> tuple[bool, str]:
+    endpoint = url.rstrip("/") + "/channels?health=0"
+    password_manager = urllib.request.HTTPPasswordMgrWithDefaultRealm()
+    password_manager.add_password(None, endpoint, username, password)
+    opener = urllib.request.build_opener(
+        urllib.request.HTTPDigestAuthHandler(password_manager)
+    )
+    request = urllib.request.Request(
+        endpoint,
+        headers={"Accept": "application/json"},
+        method="GET",
+    )
     try:
-        with urllib.request.urlopen(request, timeout=4) as response:
-            return True, f"HTTP {response.status}"
+        with opener.open(request, timeout=4) as response:
+            status = int(response.status)
+            return 200 <= status < 400, f"authenticated HTTP {status}"
     except urllib.error.HTTPError as exc:
-        return True, f"HTTP {exc.code}"
+        if exc.code in {401, 403}:
+            return False, f"credentials rejected with HTTP {exc.code}"
+        return False, f"HTTP {exc.code}"
     except (urllib.error.URLError, TimeoutError, OSError) as exc:
         return False, str(exc.reason if isinstance(exc, urllib.error.URLError) else exc)
 
@@ -1248,7 +1288,7 @@ def gather_answers(
             install_root=root,
             data_root=Path(args.data_root or DEFAULT_DATA),
             config_root=Path(args.config_root or DEFAULT_CONFIG),
-            evo_url=_url(args.evo_url),
+            evo_url=_evo_url(args.evo_url),
             evo_username=args.evo_username,
             evo_password=evo_password,
             local_vlm=not bool(args.external_vlm_url),
@@ -1269,7 +1309,9 @@ def gather_answers(
 
     print("\nConnect the Luxriot Evo server to the same network before continuing.")
     input("Press Enter when Evo is connected and you know its credentials...")
-    evo_url = _url(_prompt("Luxriot Evo IP address or URL"))
+    evo_url = _evo_url(
+        _prompt("Luxriot Evo IP address or URL (bare address uses port 8080)")
+    )
     evo_username = _prompt("Luxriot Evo username")
     evo_password = _prompt_secret("Luxriot Evo password")
 
@@ -2878,6 +2920,7 @@ def _wait_for_json_endpoint(
 ) -> dict:
     deadline = time.monotonic() + timeout_sec
     last_error = ""
+    next_report_at = time.monotonic()
     while time.monotonic() < deadline:
         try:
             with urllib.request.urlopen(url, timeout=8) as response:
@@ -2900,8 +2943,33 @@ def _wait_for_json_endpoint(
             else:
                 print(f"{label} ready.")
                 return payload
+        except urllib.error.HTTPError as exc:
+            try:
+                payload = json.loads(exc.read().decode("utf-8"))
+            except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+                payload = {}
+            checks = payload.get("checks") if isinstance(payload, Mapping) else None
+            required = payload.get("required") if isinstance(payload, Mapping) else None
+            if isinstance(checks, Mapping) and isinstance(required, list):
+                pending = [
+                    f"{name}={checks.get(name, {}).get('status', 'unknown')}"
+                    for name in required
+                    if isinstance(checks.get(name), Mapping)
+                    and not bool(checks[name].get("ok"))
+                ]
+                last_error = f"HTTP {exc.code}; pending " + ", ".join(pending)
+            else:
+                last_error = f"HTTP {exc.code}: {exc.reason}"
         except Exception as exc:  # bounded readiness retry
             last_error = f"{type(exc).__name__}: {exc}"
+        now = time.monotonic()
+        if now >= next_report_at:
+            remaining = max(0, int(deadline - now))
+            print(
+                f"Waiting for {label} ({remaining}s remaining): {last_error}",
+                flush=True,
+            )
+            next_report_at = now + 15
         time.sleep(3)
     raise InstallError(f"{label} did not become ready within {timeout_sec}s: {last_error}")
 
@@ -3452,11 +3520,18 @@ def main(argv: Sequence[str] | None = None) -> int:
                 f"only {free_gib:.1f} GiB is available."
             )
 
-        reachable, detail = evo_reachable(answers.evo_url)
-        print(f"Evo reachability: {'OK' if reachable else 'WARNING'} ({detail})")
-        if not reachable and not args.non_interactive:
-            if not _yes_no("Continue and configure Evo even though it is not reachable?", False):
-                raise InstallError("Installation cancelled until Evo is reachable.")
+        reachable, detail = evo_reachable(
+            answers.evo_url,
+            answers.evo_username,
+            answers.evo_password,
+        )
+        print(f"Evo authenticated preflight: {'OK' if reachable else 'FAILED'} ({detail})")
+        if not reachable:
+            raise InstallError(
+                "Evo must be reachable with the supplied credentials before EVA "
+                "installation can mutate this host. Correct the address/port or "
+                "credentials and rerun."
+            )
 
         hardware = detect_hardware()
         if architecture == "arm64":
