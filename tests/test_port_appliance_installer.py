@@ -104,6 +104,8 @@ def test_usb_builder_builds_react_for_node_free_runtime():
     assert 'SIGLIP2_CACHE_TARGET="${STAGING_ROOT}/models/huggingface"' in builder
     assert "EVA_X64_VLLM_PYTHON_ARCHIVE" in builder
     assert "cpython-3.12.13-linux-x86_64-gnu.tar.gz" in builder
+    assert 'stage_tree_payload \\\n        "${MODEL_VLM}"' in builder
+    assert 'stage_file_payload \\\n        "${MODEL_9B}/Qwen3.5-9B-Q4_K_M.gguf"' in builder
     assert "xargs -0 -r sha256sum > SHA256SUMS" in builder
     assert "sha256sum -c SHA256SUMS" in builder
     for local_only_pattern in (

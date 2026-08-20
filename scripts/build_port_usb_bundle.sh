@@ -222,8 +222,10 @@ SIGLIP2_CACHE_TARGET="${STAGING_ROOT}/models/huggingface"
 )
 if [[ "${TARGET_ARCHITECTURE}" == "amd64" ]]; then
     rsync -a "${CLIP_WEIGHT}" "${STAGING_ROOT}/models/clip/ViT-B-32.pt"
-    rsync -a --delete "${MODEL_VLM}/" "${STAGING_ROOT}/models/qwen3-vl-4b-awq/"
-    rsync -a \
+    stage_tree_payload \
+        "${MODEL_VLM}" \
+        "${STAGING_ROOT}/models/qwen3-vl-4b-awq"
+    stage_file_payload \
         "${MODEL_9B}/Qwen3.5-9B-Q4_K_M.gguf" \
         "${STAGING_ROOT}/models/qwen3.5-9b-mtp/Qwen3.5-9B-Q4_K_M.gguf"
     rsync -a --delete \
