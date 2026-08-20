@@ -1559,6 +1559,10 @@ def test_finalizer_binds_required_spark_image_archive(tmp_path):
     archive = tmp_path / finalizer.SPARK_RUNTIME_ARCHIVE
     archive.parent.mkdir()
     archive.write_bytes(b"offline OCI archive")
+    wrapper = tmp_path / finalizer.SPARK_FFMPEG_WRAPPER_RELATIVE
+    wrapper.parent.mkdir(parents=True)
+    wrapper.write_text("#!/bin/sh\n", encoding="utf-8")
+    wrapper.chmod(0o755)
 
     archive_manifest = json.dumps(
         [{"Config": installer.SPARK_RUNTIME_IMAGE_ID.removeprefix("sha256:")}]
@@ -1575,6 +1579,7 @@ def test_finalizer_binds_required_spark_image_archive(tmp_path):
     assert runtime["archive"] == finalizer.SPARK_RUNTIME_ARCHIVE
     assert runtime["archive_sha256"] == hashlib.sha256(archive.read_bytes()).hexdigest()
     assert finalizer.SPARK_RUNTIME_ARCHIVE in critical
+    assert finalizer.SPARK_FFMPEG_WRAPPER_RELATIVE in critical
 
 
 def test_finalizer_rejects_spark_bundle_without_runtime_archive(tmp_path):
@@ -1582,6 +1587,24 @@ def test_finalizer_rejects_spark_bundle_without_runtime_archive(tmp_path):
         ROOT / "deployment" / "spark_gb10" / "runtime-container.json",
         tmp_path / "runtime-container.json",
     )
+    wrapper = tmp_path / finalizer.SPARK_FFMPEG_WRAPPER_RELATIVE
+    wrapper.parent.mkdir(parents=True)
+    wrapper.write_text("#!/bin/sh\n", encoding="utf-8")
+    wrapper.chmod(0o755)
 
     with pytest.raises(SystemExit, match="runtime archive is missing"):
+        finalizer.spark_runtime_payload(tmp_path, "arm64")
+
+
+def test_finalizer_rejects_non_executable_spark_ffmpeg_wrapper(tmp_path):
+    shutil.copy2(
+        ROOT / "deployment" / "spark_gb10" / "runtime-container.json",
+        tmp_path / "runtime-container.json",
+    )
+    wrapper = tmp_path / finalizer.SPARK_FFMPEG_WRAPPER_RELATIVE
+    wrapper.parent.mkdir(parents=True)
+    wrapper.write_text("#!/bin/sh\n", encoding="utf-8")
+    wrapper.chmod(0o644)
+
+    with pytest.raises(SystemExit, match="not executable"):
         finalizer.spark_runtime_payload(tmp_path, "arm64")

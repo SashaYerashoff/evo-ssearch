@@ -35,6 +35,9 @@ SPARK_NUMPY_VERSION = "2.1.0"
 SPARK_PIP_CONSTRAINT = "/etc/pip/constraint.txt"
 SPARK_SIGLIP_DTYPE = "float32"
 SPARK_FFMPEG_BIN = "/usr/local/bin/eva-ffmpeg"
+SPARK_FFMPEG_WRAPPER_RELATIVE = (
+    "repo/deployment/spark_gb10/runtime-image/eva-ffmpeg"
+)
 X64_VLLM_PYTHON_VERSION = "3.12.13"
 X64_VLLM_PYTHON_DIRECTORY = "cpython-3.12.13-linux-x86_64-gnu"
 X64_VLLM_PYTHON_ARCHIVE = "python/cpython-3.12.13-linux-x86_64-gnu.tar.gz"
@@ -219,7 +222,13 @@ def spark_runtime_payload(root: Path, architecture: str) -> tuple[dict[str, Any]
     }
     if contract != expected:
         raise SystemExit("Spark runtime contract does not match the pinned release image.")
-    critical = ["runtime-container.json"]
+    wrapper = root / SPARK_FFMPEG_WRAPPER_RELATIVE
+    if not wrapper.is_file() or not (wrapper.stat().st_mode & 0o111):
+        raise SystemExit(
+            "ARM64 release is incomplete: the Spark FFmpeg wrapper is missing "
+            "or is not executable."
+        )
+    critical = ["runtime-container.json", SPARK_FFMPEG_WRAPPER_RELATIVE]
     archive = root / SPARK_RUNTIME_ARCHIVE
     if not archive.is_file():
         raise SystemExit(
