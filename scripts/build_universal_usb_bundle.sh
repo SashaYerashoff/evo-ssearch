@@ -119,15 +119,12 @@ else
     --update-python-version 3.12
     --update-python-version 3.13
     --update-python-version 3.14
+    --vllm-python-version 3.12
   )
-  # Ubuntu 26.04 ships Python 3.14 only.  EVA itself is supported there, but
-  # the reviewed local vLLM 0.25/CUDA 13.0 runtime is still pinned to CPython
-  # 3.12.  A 26.04 fresh-install artifact therefore requires an external VLM
-  # until that inference runtime is containerized or gains a coherent 3.14
-  # wheel graph.  Updates never replace an existing inference service.
-  if [[ "${TARGET_OS_RELEASE}" == "26.04" ]]; then
-    DEPENDENCY_ARGS+=(--external-vllm)
-  fi
+  # Ubuntu 26.04 ships Python 3.14, while the accepted local vLLM 0.25/CUDA
+  # graph remains pinned to CPython 3.12.  The x64 payload carries that compact
+  # standalone interpreter and builds vLLM from it; no external inference
+  # endpoint or target-host Python 3.12 package is required.
 fi
 python3 "${SCRIPT_DIR}/offline_bundle_dependencies.py" "${DEPENDENCY_ARGS[@]}"
 

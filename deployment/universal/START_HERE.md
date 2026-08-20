@@ -2,8 +2,10 @@
 
 This USB supports two paths from the same entry point:
 
-- **Fresh install** on Ubuntu 24.04 LTS: PostgreSQL, EVA AI, React UI, local
-  Qwen VLM inference, optional CPU deep review, SigLIP2, systemd and TLS.
+- **Fresh install** on the Ubuntu release declared by this x64 bundle (24.04
+  or 26.04 LTS): PostgreSQL, EVA AI, React UI, local Qwen VLM inference,
+  optional CPU deep review, SigLIP2, systemd and TLS. Do not bypass the OS
+  check or mix APT payloads from the other Ubuntu release.
 - **In-place update** of an existing EVA AI server: the site configuration and
   external inference topology are preserved, PostgreSQL is backed up, Alembic
   migrations are applied through `20260805_0013`, the React UI is replaced,
@@ -88,8 +90,12 @@ The fresh installer asks for the Evo URL and credentials, paths, local versus
 external inference, quiet-window deep review, timezone and first EVA
 administrator. The bundled local profile is intended for a modern NVIDIA GPU
 with at least 12 GB VRAM; RTX 5070 Ti is supported by the included open NVIDIA
-driver/CUDA/PyTorch payload. After installation, open the printed HTTPS URL and
-configure the required channels in EVA.
+driver/CUDA/PyTorch payload. On Ubuntu 26.04 the EVA application uses the
+system CPython 3.14, while local vLLM is created from the bundled pinned
+CPython 3.12 runtime. Both are installed offline on the target machine; no
+development workstation or external inference endpoint is required. After
+installation, open the printed HTTPS URL and configure the required channels
+in EVA.
 
 ## Diagnostics
 

@@ -122,6 +122,7 @@ def test_x64_manifest_records_multi_python_update_compatibility(tmp_path):
         target_os_release="26.04",
         update_os_releases=("24.04", "26.04"),
         update_python_versions=("3.12", "3.13", "3.14"),
+        vllm_python_version="3.12",
     )
 
     assert payload["target"] == {
@@ -135,6 +136,7 @@ def test_x64_manifest_records_multi_python_update_compatibility(tmp_path):
         "python_versions": ["3.12", "3.13", "3.14"],
     }
     assert payload["pip_resolution"]["target_pythons"] == ["3.12", "3.13", "3.14"]
+    assert payload["pip_resolution"]["vllm_python"] == "3.12"
 
 
 def test_arm_manifest_rejects_x64_multi_python_matrix(tmp_path):

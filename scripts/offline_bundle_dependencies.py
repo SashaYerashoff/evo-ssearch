@@ -459,6 +459,7 @@ def build_manifest(
     python: str = sys.executable,
     architecture: str = "amd64",
     include_vllm: bool | None = None,
+    vllm_python_version: str | None = None,
     target_os_release: str = "24.04",
     update_os_releases: Sequence[str] | None = None,
     update_python_versions: Sequence[str] | None = None,
@@ -485,6 +486,16 @@ def build_manifest(
         raise DependencyError("Spark ARM64 release remains pinned to Ubuntu 24.04 / CPython 3.12")
     if include_vllm is None:
         include_vllm = architecture == "amd64"
+    if include_vllm:
+        vllm_python_version = normalize_python_version(
+            vllm_python_version or target_python
+        )
+        if vllm_python_version not in normalized_python_versions:
+            raise DependencyError(
+                "Local vLLM Python must be present in update compatibility"
+            )
+    else:
+        vllm_python_version = None
     apt = _validate_apt(bundle)
     wheels = _validate_wheels(bundle)
     requirements = _requirements_fingerprints(
@@ -500,7 +511,7 @@ def build_manifest(
             architecture=architecture,
             include_vllm=include_vllm,
             python_versions=normalized_python_versions,
-            vllm_python_version=target_python,
+            vllm_python_version=vllm_python_version,
         )
     return {
         "format": MANIFEST_FORMAT,
@@ -521,7 +532,11 @@ def build_manifest(
                 if architecture == "arm64"
                 else "0.25.0" if include_vllm else "external"
             ),
-            "vllm_python": target_python if include_vllm and architecture == "amd64" else None,
+            "vllm_python": (
+                vllm_python_version
+                if include_vllm and architecture == "amd64"
+                else None
+            ),
             "container_packages": (
                 [
                     "numpy==2.1.0",
@@ -638,6 +653,14 @@ def _parser() -> argparse.ArgumentParser:
         help="Resolve the EVA application only; the target must provide its VLM endpoint.",
     )
     parser.add_argument(
+        "--vllm-python-version",
+        choices=sorted(SUPPORTED_PYTHON_VERSIONS),
+        help=(
+            "Pinned Python runtime used by local x64 vLLM; may differ from the "
+            "fresh host's system Python."
+        ),
+    )
+    parser.add_argument(
         "--target-os-release",
         default="24.04",
         choices=sorted(SUPPORTED_OS_RELEASES),
@@ -673,6 +696,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 python=str(args.python),
                 architecture=str(args.architecture),
                 include_vllm=not bool(args.external_vllm),
+                vllm_python_version=args.vllm_python_version,
                 target_os_release=str(args.target_os_release),
                 update_os_releases=args.update_os_release,
                 update_python_versions=args.update_python_version,

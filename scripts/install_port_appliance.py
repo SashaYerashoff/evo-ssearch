@@ -77,6 +77,16 @@ SPARK_NUMPY_VERSION = "2.1.0"
 SPARK_PIP_CONSTRAINT = "/etc/pip/constraint.txt"
 SPARK_SIGLIP_DTYPE = "float32"
 SPARK_FFMPEG_BIN = "/usr/local/bin/eva-ffmpeg"
+X64_SIGLIP_DTYPE = "float16"
+X64_FFMPEG_BIN = "/usr/bin/ffmpeg"
+X64_VLLM_PYTHON_VERSION = "3.12.13"
+X64_VLLM_PYTHON_DIRECTORY = "cpython-3.12.13-linux-x86_64-gnu"
+X64_VLLM_PYTHON_ARCHIVE = (
+    "python/cpython-3.12.13-linux-x86_64-gnu.tar.gz"
+)
+X64_VLLM_PYTHON_ARCHIVE_SHA256 = (
+    "22803d96bc57ce0645aff383b4ab5076f7d19ea5ece5b64583ca2448841ed261"
+)
 LOCAL_POSTGRES_MIGRATION_DSN = (
     "postgresql://postgres@/eva?host=/var/run/postgresql"
 )
@@ -108,8 +118,10 @@ PORT_ENV = {
     "EVOSSEARCH_PRODUCTION_CLIP_MODEL": DEFAULT_SIGLIP2_MODEL,
     "EVOSSEARCH_CLIP_MODEL": DEFAULT_SIGLIP2_MODEL,
     "EVOSSEARCH_CLIP_MODEL_REVISION": DEFAULT_SIGLIP2_REVISION,
+    "EVOSSEARCH_CLIP_DTYPE": X64_SIGLIP_DTYPE,
     "EVOSSEARCH_EXPERIMENTAL_EMBEDDERS_ENABLED": "true",
     "EVOSSEARCH_CLIP_DEVICE": "cuda",
+    "EVOSSEARCH_FFMPEG_BIN": X64_FFMPEG_BIN,
     "EVOSSEARCH_PROBE_POS_FLOOR_DEFAULT": "0.05",
     "EVOSSEARCH_PROBE_MARGIN_DEFAULT": "0.02",
     "EVOSSEARCH_DINO_SEGMENTS_ENABLED": "false",
@@ -684,6 +696,29 @@ def spark_runtime_contract(manifest: Mapping) -> dict[str, str]:
     return result
 
 
+def x64_python_runtime_contract(manifest: Mapping) -> dict[str, str]:
+    """Return the immutable interpreter contract used only by local x64 vLLM."""
+
+    raw = manifest.get("python_runtime")
+    if not isinstance(raw, Mapping):
+        raise InstallError("x64 bundle has no local vLLM Python runtime contract.")
+    expected = {
+        "implementation": "cpython",
+        "version": X64_VLLM_PYTHON_VERSION,
+        "platform": "linux/x86_64",
+        "directory": X64_VLLM_PYTHON_DIRECTORY,
+        "archive": X64_VLLM_PYTHON_ARCHIVE,
+        "archive_sha256": X64_VLLM_PYTHON_ARCHIVE_SHA256,
+    }
+    for key, value in expected.items():
+        if str(raw.get(key) or "") != value:
+            raise InstallError(
+                f"x64 vLLM Python runtime {key} does not match this installer: "
+                f"{raw.get(key)!r}."
+            )
+    return expected
+
+
 def _spark_image_present() -> bool:
     if not shutil.which("docker"):
         return False
@@ -1026,6 +1061,7 @@ def verify_critical_payload(bundle_root: Path, manifest: Mapping) -> None:
                 "models/qwen3.5-9b-mtp/Qwen3.5-9B-Q4_K_M.gguf",
                 "models/clip/ViT-B-32.pt",
                 "llama.cpp/CMakeLists.txt",
+                X64_VLLM_PYTHON_ARCHIVE,
             )
         )
     else:
@@ -1782,7 +1818,12 @@ def install_python_envs(
                 app_dir / ".venv",
             )
         )
-    elif not app_python.exists() or runner.dry_run:
+    else:
+        # A universal fresh/repair install must not inherit an environment made
+        # by a different host Python (notably 3.12 -> 3.14) or a prerelease
+        # dependency graph.  The complete wheelhouse is offline and the app
+        # payload deliberately excludes .venv, so rebuilding is deterministic.
+        runner.run(("rm", "-rf", app_dir / ".venv"))
         runner.run(("python3", "-m", "venv", app_dir / ".venv"))
     common_pip = (
         "--no-index",
@@ -1843,8 +1884,36 @@ def install_python_envs(
     vllm_dir = answers.install_root / "vllm"
     vllm_python = vllm_dir / ".venv" / "bin" / "python"
     if answers.local_vlm and architecture == "amd64":
-        if not vllm_python.exists() or runner.dry_run:
-            runner.run(("python3", "-m", "venv", vllm_dir / ".venv"))
+        manifest = read_manifest(bundle_root)
+        contract = x64_python_runtime_contract(manifest)
+        runtime_parent = answers.install_root / "python"
+        runtime_root = runtime_parent / contract["directory"]
+        runtime_python = runtime_root / "bin" / "python3.12"
+        runner.run(("rm", "-rf", runtime_root))
+        runner.run(("mkdir", "-p", runtime_parent))
+        runner.run(
+            (
+                "tar",
+                "-xzf",
+                bundle_root / contract["archive"],
+                "-C",
+                runtime_parent,
+            )
+        )
+        runner.run(
+            (
+                runtime_python,
+                "-c",
+                (
+                    "import platform,sys; "
+                    f"assert platform.python_version() == '{X64_VLLM_PYTHON_VERSION}'; "
+                    "assert sys.maxsize > 2**32; "
+                    "print('EVA local vLLM Python ready:', platform.python_version())"
+                ),
+            )
+        )
+        runner.run(("rm", "-rf", vllm_dir / ".venv"))
+        runner.run((runtime_python, "-m", "venv", vllm_dir / ".venv"))
         runner.run(
             (
                 vllm_python,
@@ -1853,6 +1922,19 @@ def install_python_envs(
                 "install",
                 *common_pip,
                 "vllm==0.25.0",
+            )
+        )
+        runner.run(
+            (
+                vllm_python,
+                "-c",
+                (
+                    "import torch,vllm; "
+                    "assert torch.cuda.is_available(), 'CUDA is unavailable to local vLLM'; "
+                    "assert str(vllm.__version__) == '0.25.0'; "
+                    "print('EVA local vLLM runtime ready:', vllm.__version__, "
+                    "torch.__version__, torch.cuda.get_device_name(0))"
+                ),
             )
         )
     runner.run(("chown", "-R", "eva:eva", answers.install_root))
@@ -2151,6 +2233,121 @@ def validate_runtime_config(
             *command[1:],
         )
     runner.run(command)
+
+
+def validate_operator_runtime(
+    answers: Answers,
+    runner: Runner,
+    *,
+    architecture: str = "amd64",
+) -> None:
+    """Prove the exact SigLIP and media path that the EVA service will use.
+
+    Import checks and ``torch.cuda.is_available()`` were too weak: the GB10
+    failure imported successfully and exposed CUDA, then failed on the first
+    patch convolution, while a second incomplete ffmpeg existed on PATH.  Run
+    one real image/text forward and inspect the configured decoder before a
+    freshly installed service is accepted.
+    """
+
+    architecture = normalize_architecture(architecture)
+    expected_dtype = (
+        SPARK_SIGLIP_DTYPE if architecture == "arm64" else X64_SIGLIP_DTYPE
+    )
+    app_dir = answers.install_root / "app"
+    app_python = app_dir / ".venv" / "bin" / "python"
+    probe = f"""
+import json
+import os
+import subprocess
+import numpy
+import oldapp
+
+ffmpeg = str(os.environ.get("EVOSSEARCH_FFMPEG_BIN") or "ffmpeg")
+media = subprocess.run(
+    (ffmpeg, "-hide_banner", "-decoders"),
+    stdout=subprocess.PIPE,
+    stderr=subprocess.PIPE,
+    text=True,
+    check=False,
+)
+has_h264 = any(
+    line.split()[1:2] == ["h264"]
+    for line in str(media.stdout or "").splitlines()
+)
+if media.returncode != 0:
+    detail = str(media.stderr or media.stdout).strip().splitlines()
+    raise RuntimeError(
+        f"configured ffmpeg {{ffmpeg!r}} failed: "
+        + (detail[-1] if detail else f"exit {{media.returncode}}")
+    )
+if not has_h264:
+    raise RuntimeError(f"configured ffmpeg {{ffmpeg!r}} has no H.264 decoder")
+
+oldapp.init_clip()
+image_vectors, text_vectors = oldapp._siglip_runtime_canary_vectors_locked()
+if oldapp.clip_backend_kind != "siglip2":
+    raise RuntimeError(f"unexpected semantic backend {{oldapp.clip_backend_kind!r}}")
+if not str(oldapp.clip_runtime_device).lower().startswith("cuda"):
+    raise RuntimeError(f"SigLIP2 is not on CUDA: {{oldapp.clip_runtime_device!r}}")
+if str(oldapp.clip_runtime_dtype) != {expected_dtype!r}:
+    raise RuntimeError(
+        f"SigLIP2 dtype {{oldapp.clip_runtime_dtype!r}} != {expected_dtype!r}"
+    )
+if image_vectors.shape[0] != 1 or text_vectors.shape[0] != 2:
+    raise RuntimeError(
+        f"unexpected SigLIP2 canary shapes {{image_vectors.shape}}, {{text_vectors.shape}}"
+    )
+if not numpy.isfinite(image_vectors).all() or not numpy.isfinite(text_vectors).all():
+    raise RuntimeError("SigLIP2 canary emitted non-finite vectors")
+print(json.dumps({{
+    "backend": oldapp.clip_backend_kind,
+    "model": oldapp.clip_runtime_model,
+    "device": oldapp.clip_runtime_device,
+    "dtype": oldapp.clip_runtime_dtype,
+    "image_shape": list(image_vectors.shape),
+    "text_shape": list(text_vectors.shape),
+    "ffmpeg": ffmpeg,
+    "h264": has_h264,
+}}, sort_keys=True))
+"""
+    command: tuple[str | Path, ...] = (
+        "runuser",
+        "-u",
+        "eva",
+        "--",
+        app_python,
+        app_dir / "scripts" / "exec_with_env.py",
+        "--env-file",
+        answers.config_root / "eva-ai.env",
+        "--",
+        app_python,
+        "-c",
+        probe,
+    )
+    cwd: Path | None = app_dir
+    if architecture == "arm64":
+        try:
+            eva_account = pwd.getpwnam("eva")
+            container_user = f"{eva_account.pw_uid}:{eva_account.pw_gid}"
+        except KeyError:
+            if not runner.dry_run:
+                raise InstallError("The eva service account was not created.")
+            container_user = "EVA_UID:EVA_GID"
+        command = (
+            *spark_docker_base(
+                answers,
+                env_file=answers.config_root / "eva-ai.container.env",
+                user=container_user,
+            ),
+            "--entrypoint",
+            app_python,
+            SPARK_RUNTIME_IMAGE_ID,
+            "-c",
+            probe,
+        )
+        cwd = None
+    runner.run(command, cwd=cwd)
 
 
 def install_systemd_units(
@@ -3073,6 +3270,15 @@ def apply_install(
         )
         run_phase(
             journal,
+            "operator_runtime_canary",
+            lambda: validate_operator_runtime(
+                answers,
+                runner,
+                architecture=architecture,
+            ),
+        )
+        run_phase(
+            journal,
             "systemd_units",
             lambda: install_systemd_units(
                 answers,
@@ -3180,11 +3386,14 @@ def main(argv: Sequence[str] | None = None) -> int:
         validate_target_host(manifest)
         verify_critical_payload(bundle_root, manifest)
         architecture = bundle_architecture(manifest)
+        local_vllm_available = bundle_supports_local_vlm(bundle_root)
+        if architecture == "amd64" and local_vllm_available:
+            x64_python_runtime_contract(manifest)
         answers = gather_answers(
             args.non_interactive,
             args,
             architecture=architecture,
-            local_vlm_available=bundle_supports_local_vlm(bundle_root),
+            local_vlm_available=local_vllm_available,
         )
         if architecture == "arm64" and answers.local_deep:
             raise InstallError(

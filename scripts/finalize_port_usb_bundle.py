@@ -8,6 +8,7 @@ import hashlib
 import json
 import re
 import subprocess
+import tarfile
 from datetime import datetime, timezone
 from functools import lru_cache
 from pathlib import Path
@@ -34,6 +35,12 @@ SPARK_NUMPY_VERSION = "2.1.0"
 SPARK_PIP_CONSTRAINT = "/etc/pip/constraint.txt"
 SPARK_SIGLIP_DTYPE = "float32"
 SPARK_FFMPEG_BIN = "/usr/local/bin/eva-ffmpeg"
+X64_VLLM_PYTHON_VERSION = "3.12.13"
+X64_VLLM_PYTHON_DIRECTORY = "cpython-3.12.13-linux-x86_64-gnu"
+X64_VLLM_PYTHON_ARCHIVE = "python/cpython-3.12.13-linux-x86_64-gnu.tar.gz"
+X64_VLLM_PYTHON_ARCHIVE_SHA256 = (
+    "22803d96bc57ce0645aff383b4ab5076f7d19ea5ece5b64583ca2448841ed261"
+)
 
 
 def semantic_index_description(architecture: str) -> str:
@@ -237,6 +244,50 @@ def spark_runtime_payload(root: Path, architecture: str) -> tuple[dict[str, Any]
     return contract, critical
 
 
+def x64_python_runtime_payload(
+    root: Path,
+    architecture: str,
+) -> tuple[dict[str, str] | None, list[str]]:
+    """Bind the standalone local-vLLM interpreter into an x64 release."""
+
+    if architecture != "amd64":
+        return None, []
+    archive = root / X64_VLLM_PYTHON_ARCHIVE
+    if not archive.is_file():
+        raise SystemExit(
+            "x64 release is incomplete: the local vLLM Python runtime is missing."
+        )
+    archive_digest = digest(archive)
+    if archive_digest != X64_VLLM_PYTHON_ARCHIVE_SHA256:
+        raise SystemExit(
+            "x64 local vLLM Python runtime checksum does not match the pinned release."
+        )
+    required = {
+        f"{X64_VLLM_PYTHON_DIRECTORY}/BUILD",
+        f"{X64_VLLM_PYTHON_DIRECTORY}/bin/python3.12",
+        f"{X64_VLLM_PYTHON_DIRECTORY}/lib/libpython3.12.so.1.0",
+    }
+    try:
+        with tarfile.open(archive, "r:gz") as payload:
+            names = {member.name.removeprefix("./") for member in payload.getmembers()}
+    except (OSError, tarfile.TarError) as exc:
+        raise SystemExit(f"Invalid x64 local vLLM Python runtime: {exc}") from exc
+    missing = sorted(required - names)
+    if missing:
+        raise SystemExit(
+            "x64 local vLLM Python runtime is incomplete: " + ", ".join(missing)
+        )
+    contract = {
+        "implementation": "cpython",
+        "version": X64_VLLM_PYTHON_VERSION,
+        "platform": "linux/x86_64",
+        "directory": X64_VLLM_PYTHON_DIRECTORY,
+        "archive": X64_VLLM_PYTHON_ARCHIVE,
+        "archive_sha256": archive_digest,
+    }
+    return contract, [X64_VLLM_PYTHON_ARCHIVE]
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("bundle", type=Path)
@@ -270,6 +321,10 @@ def main() -> int:
     verify_siglip2_checksum_manifest(root)
     update_packages, update_critical_files = bundled_update_packages(root)
     container_runtime, container_critical_files = spark_runtime_payload(root, architecture)
+    python_runtime, python_runtime_critical_files = x64_python_runtime_payload(
+        root,
+        architecture,
+    )
     spark_model_critical_files = (
         [
             str(path.relative_to(root))
@@ -343,6 +398,7 @@ def main() -> int:
             else ()
         ),
         *container_critical_files,
+        *python_runtime_critical_files,
         *spark_model_critical_files,
         *update_critical_files,
     )
@@ -406,6 +462,7 @@ def main() -> int:
             "update_compatibility": dependency_manifest["update_compatibility"],
         },
         **({"container_runtime": container_runtime} if container_runtime else {}),
+        **({"python_runtime": python_runtime} if python_runtime else {}),
         "critical_sha256": critical,
         "models": {
             "live_vlm": (

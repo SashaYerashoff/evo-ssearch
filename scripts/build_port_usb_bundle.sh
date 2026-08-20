@@ -19,6 +19,8 @@ TARGET_ARCHITECTURE="${EVA_PORT_ARCHITECTURE:-amd64}"
 TARGET_OS_RELEASE="${EVA_PORT_OS_RELEASE:-24.04}"
 SPARK_RUNTIME_ARCHIVE="${EVA_SPARK_RUNTIME_ARCHIVE:-}"
 SPARK_RUNTIME_ARCHIVE_NAME="eva-spark-runtime-0.8.7-arm64.tar.zst"
+X64_VLLM_PYTHON_ARCHIVE="${EVA_X64_VLLM_PYTHON_ARCHIVE:-/mnt/eva-llamacpp-lab/x64-vllm-runtime/cpython-3.12.13-linux-x86_64-gnu.tar.gz}"
+X64_VLLM_PYTHON_ARCHIVE_NAME="cpython-3.12.13-linux-x86_64-gnu.tar.gz"
 STAGING_HARDLINKS="${EVA_PORT_STAGING_HARDLINKS:-0}"
 SOURCE_BRANCH="$(git -C "${REPO_ROOT}" branch --show-current)"
 SOURCE_COMMIT="$(git -C "${REPO_ROOT}" rev-parse HEAD)"
@@ -115,6 +117,7 @@ if [[ "${TARGET_ARCHITECTURE}" == "amd64" ]]; then
         "${MODEL_VLM}/model.safetensors"
         "${MODEL_9B}/Qwen3.5-9B-Q4_K_M.gguf"
         "${LLAMA_SOURCE}/CMakeLists.txt"
+        "${X64_VLLM_PYTHON_ARCHIVE}"
     )
 else
     REQUIRED_PAYLOAD+=(
@@ -229,6 +232,11 @@ if [[ "${TARGET_ARCHITECTURE}" == "amd64" ]]; then
         --exclude=build-port-cpu \
         --exclude='*.o' \
         "${LLAMA_SOURCE}/" "${STAGING_ROOT}/llama.cpp/"
+    rm -rf "${STAGING_ROOT}/python"
+    mkdir -p "${STAGING_ROOT}/python"
+    stage_file_payload \
+        "${X64_VLLM_PYTHON_ARCHIVE}" \
+        "${STAGING_ROOT}/python/${X64_VLLM_PYTHON_ARCHIVE_NAME}"
     rm -rf "${STAGING_ROOT}/container"
     rm -rf "${STAGING_ROOT}/models/qwen3-vl-4b"
 else
@@ -236,7 +244,8 @@ else
         "${STAGING_ROOT}/models/qwen3-vl-4b-awq" \
         "${STAGING_ROOT}/models/qwen3.5-9b-mtp" \
         "${STAGING_ROOT}/llama.cpp" \
-        "${STAGING_ROOT}/models/clip"
+        "${STAGING_ROOT}/models/clip" \
+        "${STAGING_ROOT}/python"
     mkdir -p "${STAGING_ROOT}/models/qwen3-vl-4b"
     if [[ "${STAGING_HARDLINKS}" == "1" ]]; then
         stage_tree_payload \

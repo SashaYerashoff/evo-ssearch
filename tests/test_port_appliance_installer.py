@@ -7,6 +7,7 @@ import json
 import shutil
 import subprocess
 import sys
+import tarfile
 from pathlib import Path
 from subprocess import CompletedProcess
 from types import SimpleNamespace
@@ -101,6 +102,8 @@ def test_usb_builder_builds_react_for_node_free_runtime():
     assert "port client bundle requires a clean committed working tree" in builder
     assert "SOURCE_REVISION.json" in builder
     assert 'SIGLIP2_CACHE_TARGET="${STAGING_ROOT}/models/huggingface"' in builder
+    assert "EVA_X64_VLLM_PYTHON_ARCHIVE" in builder
+    assert "cpython-3.12.13-linux-x86_64-gnu.tar.gz" in builder
     assert "xargs -0 -r sha256sum > SHA256SUMS" in builder
     assert "sha256sum -c SHA256SUMS" in builder
     for local_only_pattern in (
@@ -118,6 +121,8 @@ def test_usb_builder_builds_react_for_node_free_runtime():
         encoding="utf-8"
     )
     assert "EVA_UNIVERSAL_UPDATE_SEED" in universal_builder
+    assert "--vllm-python-version 3.12" in universal_builder
+    assert "DEPENDENCY_ARGS+=(--external-vllm)" not in universal_builder
     assert "stale updates exist in staging" in universal_builder
 
 
@@ -126,6 +131,8 @@ def test_port_profile_shares_bounded_gpu_with_siglip2():
     assert installer.PORT_ENV["EVOSSEARCH_EMBEDDER"] == "clip"
     assert installer.PORT_ENV["EVOSSEARCH_CLIP_MODEL"] == "google/siglip2-base-patch16-224"
     assert installer.PORT_ENV["EVOSSEARCH_CLIP_DEVICE"] == "cuda"
+    assert installer.PORT_ENV["EVOSSEARCH_CLIP_DTYPE"] == "float16"
+    assert installer.PORT_ENV["EVOSSEARCH_FFMPEG_BIN"] == "/usr/bin/ffmpeg"
     assert installer.PORT_ENV["EVOSSEARCH_EXPERIMENTAL_EMBEDDERS_ENABLED"] == "true"
     assert installer.PORT_ENV["EVOSSEARCH_LUXRIOT_ATTENTION_EMBED_ALL_CHANNELS"] == "true"
     assert installer.PORT_ENV["EVOSSEARCH_LUXRIOT_ATTENTION_EMBEDDING_CADENCE_MS"] == "1000"
@@ -881,6 +888,31 @@ def _spark_manifest(archive: str = ""):
     return {"container_runtime": runtime}
 
 
+def _x64_python_manifest():
+    return {
+        "format": 2,
+        "version": installer.VERSION,
+        "python_runtime": {
+            "implementation": "cpython",
+            "version": installer.X64_VLLM_PYTHON_VERSION,
+            "platform": "linux/x86_64",
+            "directory": installer.X64_VLLM_PYTHON_DIRECTORY,
+            "archive": installer.X64_VLLM_PYTHON_ARCHIVE,
+            "archive_sha256": installer.X64_VLLM_PYTHON_ARCHIVE_SHA256,
+        }
+    }
+
+
+def test_x64_local_vllm_python_contract_is_immutable():
+    contract = installer.x64_python_runtime_contract(_x64_python_manifest())
+    assert contract["version"] == "3.12.13"
+
+    changed = _x64_python_manifest()
+    changed["python_runtime"]["version"] = "3.14.4"
+    with pytest.raises(installer.InstallError, match="does not match"):
+        installer.x64_python_runtime_contract(changed)
+
+
 def test_spark_runtime_contract_is_immutable_and_path_safe():
     contract = installer.spark_runtime_contract(
         _spark_manifest("container/eva-spark-runtime-0.8.7-arm64.tar.zst")
@@ -1070,6 +1102,137 @@ def test_spark_python_environment_is_built_inside_pinned_container(tmp_path, cap
     assert "/eva-bundle/wheelhouse" in output
     assert "/eva-bundle/constraints-spark-gb10.txt" in output
     assert "+ python3 -m venv" not in output
+
+
+def test_x64_python_environments_are_rebuilt_from_offline_payload(tmp_path, capsys):
+    answers = installer.Answers(
+        install_root=tmp_path / "opt",
+        data_root=tmp_path / "data",
+        config_root=tmp_path / "etc",
+        evo_url="http://evo.local",
+        evo_username="operator",
+        evo_password="secret",
+        local_vlm=True,
+        local_deep=False,
+    )
+
+    bundle = tmp_path / "bundle"
+    bundle.mkdir()
+    (bundle / "manifest.json").write_text(
+        json.dumps(_x64_python_manifest()),
+        encoding="utf-8",
+    )
+
+    installer.install_python_envs(
+        bundle,
+        answers,
+        installer.Runner(dry_run=True),
+        architecture="amd64",
+    )
+
+    output = capsys.readouterr().out
+    assert f"+ rm -rf {answers.install_root}/app/.venv" in output
+    assert f"+ python3 -m venv {answers.install_root}/app/.venv" in output
+    assert f"+ rm -rf {answers.install_root}/vllm/.venv" in output
+    runtime_python = (
+        answers.install_root
+        / "python"
+        / installer.X64_VLLM_PYTHON_DIRECTORY
+        / "bin"
+        / "python3.12"
+    )
+    assert f"+ {runtime_python} -m venv {answers.install_root}/vllm/.venv" in output
+    assert installer.X64_VLLM_PYTHON_ARCHIVE in output
+    assert "import torch,vllm" in output
+    assert "CUDA is unavailable to local vLLM" in output
+
+
+def test_x64_operator_runtime_canary_uses_service_env_and_real_forwards(tmp_path, capsys):
+    answers = installer.Answers(
+        install_root=tmp_path / "opt",
+        data_root=tmp_path / "data",
+        config_root=tmp_path / "etc",
+        evo_url="http://evo.local",
+        evo_username="operator",
+        evo_password="secret",
+        local_vlm=False,
+        local_deep=False,
+    )
+
+    installer.validate_operator_runtime(
+        answers,
+        installer.Runner(dry_run=True),
+        architecture="amd64",
+    )
+
+    output = capsys.readouterr().out
+    assert "runuser -u eva --" in output
+    assert "exec_with_env.py" in output
+    assert "oldapp.init_clip()" in output
+    assert "_siglip_runtime_canary_vectors_locked" in output
+    assert 'has no H.264 decoder' in output
+    assert "float16" in output
+
+
+def test_arm_operator_runtime_canary_is_dry_run_safe_before_account_exists(
+    tmp_path,
+    capsys,
+):
+    answers = installer.Answers(
+        install_root=tmp_path / "opt",
+        data_root=tmp_path / "data",
+        config_root=tmp_path / "etc",
+        evo_url="http://evo.local",
+        evo_username="operator",
+        evo_password="secret",
+        local_vlm=True,
+        local_deep=False,
+    )
+
+    with patch.object(installer.pwd, "getpwnam", side_effect=KeyError("eva")):
+        installer.validate_operator_runtime(
+            answers,
+            installer.Runner(dry_run=True),
+            architecture="arm64",
+        )
+
+    output = capsys.readouterr().out
+    assert "docker run --rm --network host --ipc host --gpus all" in output
+    assert "--user EVA_UID:EVA_GID" in output
+    assert installer.SPARK_RUNTIME_IMAGE_ID in output
+    assert "float32" in output
+
+
+def test_runtime_canary_precedes_systemd_activation():
+    source = MODULE_PATH.read_text(encoding="utf-8")
+    apply_body = source.split("def apply_install(", 1)[1].split(
+        "def build_parser(", 1
+    )[0]
+    assert apply_body.index('"operator_runtime_canary"') < apply_body.index(
+        '"systemd_units"'
+    )
+
+
+def test_finalizer_binds_x64_local_vllm_python_runtime(tmp_path):
+    runtime_root = tmp_path / installer.X64_VLLM_PYTHON_DIRECTORY
+    (runtime_root / "bin").mkdir(parents=True)
+    (runtime_root / "lib").mkdir()
+    (runtime_root / "BUILD").write_text("test build\n", encoding="utf-8")
+    (runtime_root / "bin" / "python3.12").write_bytes(b"python")
+    (runtime_root / "lib" / "libpython3.12.so.1.0").write_bytes(b"library")
+    archive = tmp_path / finalizer.X64_VLLM_PYTHON_ARCHIVE
+    archive.parent.mkdir(parents=True)
+    with tarfile.open(archive, "w:gz") as payload:
+        payload.add(runtime_root, arcname=runtime_root.name)
+    expected = hashlib.sha256(archive.read_bytes()).hexdigest()
+
+    with patch.object(finalizer, "X64_VLLM_PYTHON_ARCHIVE_SHA256", expected):
+        contract, critical = finalizer.x64_python_runtime_payload(tmp_path, "amd64")
+
+    assert contract is not None
+    assert contract["version"] == "3.12.13"
+    assert contract["archive_sha256"] == expected
+    assert critical == [finalizer.X64_VLLM_PYTHON_ARCHIVE]
 
 
 def test_factory_spark_install_loads_bundled_runtime_before_canary(tmp_path):
