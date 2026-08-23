@@ -132,6 +132,7 @@ PORT_ENV = {
     # SigLIP2 base needs GPU placement to sustain the single-node 1 Hz
     # semantic archive. It shares the NVIDIA GPU with vLLM under a bounded
     # vLLM allocation; CPU is an explicit fallback profile, not the default.
+    "CUDA_DEVICE_ORDER": "PCI_BUS_ID",
     "CUDA_VISIBLE_DEVICES": "0",
     "EVOSSEARCH_ARCHIVE_STORE": "postgres",
     "EVOSSEARCH_ARCHIVE_MAX_RECORDS": "10000000",
@@ -2666,11 +2667,10 @@ Environment=TRANSFORMERS_OFFLINE=1
 Environment=VLLM_USE_FLASHINFER_SAMPLER=0
 Environment=PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 EnvironmentFile={env_file}
-ExecStart={vllm} serve {model} --served-model-name {DEFAULT_VLM_MODEL} --host 127.0.0.1 --port 1234 --max-model-len 32768 --gpu-memory-utilization 0.72 --max-num-seqs 4 --max-num-batched-tokens 4096 --kv-cache-dtype fp8 --attention-backend TRITON_ATTN --mm-encoder-attn-backend FLASH_ATTN --mm-processor-cache-gb 0 --limit-mm-per-prompt.image 16 --limit-mm-per-prompt.video 0 --mm-processor-kwargs.max_pixels 100352 --enable-auto-tool-choice --tool-call-parser hermes
-ExecStartPost={app_dir}/.venv/bin/python {app_dir}/scripts/wait_openai_endpoint.py --timeout 720
+ExecStart={vllm} serve {model} --served-model-name {DEFAULT_VLM_MODEL} --host 127.0.0.1 --port 1234 --max-model-len 32768 --gpu-memory-utilization 0.85 --max-num-seqs 4 --max-num-batched-tokens 4096 --kv-cache-dtype fp8 --attention-backend TRITON_ATTN --mm-encoder-attn-backend FLASH_ATTN --mm-processor-cache-gb 0 --limit-mm-per-prompt.image 8 --limit-mm-per-prompt.video 0 --mm-processor-kwargs.max_pixels 100352 --enable-auto-tool-choice --tool-call-parser hermes
 Restart=on-failure
 RestartSec=10
-TimeoutStartSec=780
+TimeoutStartSec=120
 TimeoutStopSec=60
 KillMode=mixed
 
@@ -2974,6 +2974,21 @@ def _wait_for_json_endpoint(
     raise InstallError(f"{label} did not become ready within {timeout_sec}s: {last_error}")
 
 
+def _assert_tcp_port_available(host: str, port: int, *, label: str) -> None:
+    """Fail before systemd can mistake an unrelated listener for EVA."""
+
+    probe = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        probe.bind((host, port))
+    except OSError as exc:
+        raise InstallError(
+            f"{label} cannot start because {host}:{port} is already in use. "
+            "Stop the process or service that owns this port and rerun the installer."
+        ) from exc
+    finally:
+        probe.close()
+
+
 def _vision_smoke_png() -> bytes:
     """Build a deterministic PNG without depending on Pillow on a fresh host."""
 
@@ -3106,6 +3121,12 @@ def _verify_vlm_vision(base_url: str, model: str, *, timeout_sec: int = 90) -> N
 
 def start_and_verify(answers: Answers, runner: Runner) -> None:
     if answers.local_vlm:
+        if not runner.dry_run:
+            _assert_tcp_port_available(
+                "127.0.0.1",
+                1234,
+                label="Local VLM",
+            )
         runner.run(("systemctl", "restart", "eva-vllm"))
     if not runner.dry_run:
         _wait_for_json_endpoint(
@@ -3119,6 +3140,12 @@ def start_and_verify(answers: Answers, runner: Runner) -> None:
         runner.run(("systemctl", "restart", "eva-vlm-vision-watchdog.service"))
         runner.run(("systemctl", "restart", "eva-vlm-vision-watchdog.timer"))
     if answers.local_deep:
+        if not runner.dry_run:
+            _assert_tcp_port_available(
+                "127.0.0.1",
+                1236,
+                label="Local deep-review model",
+            )
         runner.run(("systemctl", "restart", "eva-deep-review"))
     if answers.deep_url and not runner.dry_run:
         _wait_for_json_endpoint(
@@ -3130,6 +3157,12 @@ def start_and_verify(answers: Answers, runner: Runner) -> None:
             ),
             timeout_sec=300 if answers.local_deep else 60,
             expected_model=answers.deep_model,
+        )
+    if not runner.dry_run:
+        _assert_tcp_port_available(
+            "127.0.0.1",
+            5000,
+            label="EVA application",
         )
     runner.run(("systemctl", "restart", "eva-ai"))
     if runner.dry_run:
@@ -3259,9 +3292,16 @@ def apply_install(
                 # The container canary is stronger than host PCI/nvidia-smi
                 # heuristics on integrated GB10 systems.
                 return
-            if not requires_local_nvidia(answers) or hardware.nvidia_ready:
+            if not requires_local_nvidia(answers):
                 return
-            if not hardware.nvidia_pci:
+            # The first hardware snapshot is taken before offline APT.  A package
+            # transaction can replace NVIDIA userspace/DKMS while the old kernel
+            # module remains loaded, so it must never authorize the post-APT
+            # runtime on its own.
+            refreshed = detect_hardware() if not dry_run else hardware
+            if refreshed.nvidia_ready:
+                return
+            if not refreshed.nvidia_pci:
                 raise InstallError(
                     "A local CUDA workload (VLM and/or SigLIP2) was selected, "
                     "but no NVIDIA GPU is visible on PCI. External VLM mode "

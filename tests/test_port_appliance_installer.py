@@ -272,6 +272,8 @@ def test_predeploy_gate_runs_react_tests_and_production_build():
 
 
 def test_port_profile_has_bounded_queue_and_context():
+    assert installer.PORT_ENV["CUDA_DEVICE_ORDER"] == "PCI_BUS_ID"
+    assert installer.PORT_ENV["CUDA_VISIBLE_DEVICES"] == "0"
     assert installer.PORT_ENV["EVOSSEARCH_INFERENCE_QUEUE_ENABLED"] == "true"
     assert installer.PORT_ENV["EVOSSEARCH_INFERENCE_WORKER_COUNT"] == "3"
     assert installer.PORT_ENV["EVOSSEARCH_AGENT_CONTEXT_LIMIT_TOKENS"] == "32768"
@@ -283,11 +285,12 @@ def test_port_vlm_uses_stable_vision_backend_and_content_watchdog(tmp_path):
     source = MODULE_PATH.read_text(encoding="utf-8")
     assert "--mm-encoder-attn-backend FLASH_ATTN" in source
     assert "--mm-processor-cache-gb 0" in source
-    assert "--gpu-memory-utilization 0.72" in source
+    assert "--gpu-memory-utilization 0.85" in source
     assert "--max-num-seqs 4" in source
+    assert "--limit-mm-per-prompt.image 8" in source
     assert "--enforce-eager" not in source
-    assert "ExecStartPost={app_dir}/.venv/bin/python {app_dir}/scripts/wait_openai_endpoint.py --timeout 720" in source
-    assert "TimeoutStartSec=780" in source
+    assert "ExecStartPost={app_dir}/.venv/bin/python {app_dir}/scripts/wait_openai_endpoint.py --timeout 720" not in source
+    assert "TimeoutStartSec=120" in source
     assert "eva-vlm-vision-watchdog.timer" in source
     assert "OnFailure=eva-vlm-vision-recover.service" in source
 
@@ -723,6 +726,39 @@ def test_installer_bootstraps_admin_before_starting_runtime():
         '"services_and_readiness"'
     )
     assert "/ready" in source
+
+
+def test_local_listener_is_rejected_before_runtime_start():
+    listener = installer.socket.socket(
+        installer.socket.AF_INET,
+        installer.socket.SOCK_STREAM,
+    )
+    listener.bind(("127.0.0.1", 0))
+    listener.listen(1)
+    port = listener.getsockname()[1]
+    try:
+        with pytest.raises(installer.InstallError, match="already in use"):
+            installer._assert_tcp_port_available(
+                "127.0.0.1",
+                port,
+                label="Test inference",
+            )
+    finally:
+        listener.close()
+
+
+def test_post_apt_gpu_phase_refreshes_the_hardware_snapshot():
+    source = MODULE_PATH.read_text(encoding="utf-8")
+    apply_body = source.split("def apply_install(", 1)[1].split(
+        "def build_parser(", 1
+    )[0]
+    activate_gpu = apply_body.split("def activate_gpu()", 1)[1].split(
+        'run_phase(journal, "gpu", activate_gpu)', 1
+    )[0]
+
+    assert "refreshed = detect_hardware() if not dry_run else hardware" in activate_gpu
+    assert "if refreshed.nvidia_ready:" in activate_gpu
+    assert "if not hardware.nvidia_pci:" not in activate_gpu
 
 
 def test_bootstrap_deb_has_noninteractive_packaging_boundary(tmp_path):

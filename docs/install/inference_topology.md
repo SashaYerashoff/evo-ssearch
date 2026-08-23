@@ -18,10 +18,14 @@ protected agent/alert/rollup slot; L0 may borrow it only while protected work is
 not waiting. At larger scale, separate the agent endpoint so operator questions
 do not compete with the description firehose.
 
-The appliance starts vLLM at `gpu_memory_utilization=0.72` with four concurrent
-sequences. On the measured 12 GiB 4070S-class profile this keeps one full 32k
-sequence available while leaving roughly 1.2 GiB for the in-process FP16
-SigLIP2 base encoder and CUDA/runtime variance. CPU SigLIP2 is a degraded
+The appliance starts vLLM at `gpu_memory_utilization=0.85` with four concurrent
+sequences and a hard limit of eight images per request. EVA's L0 attention
+selector normally submits at most four representative images even when the
+source batch is larger. On the measured 16 GiB RTX 5060 Ti profile this exposed
+121,088 FP8 KV-cache tokens (3.7 full 32k sequences) while leaving about 2.3 GiB
+outside vLLM for the in-process SigLIP2 encoder and CUDA/runtime variance. The
+same bounded profile is intended for 12+ GiB cards, but site acceptance must
+still verify the exact driver/vLLM combination. CPU SigLIP2 is a degraded
 fallback and cannot sustain eight channels at the default one embedding per
 second cadence. EVA admission remains lower than the vLLM sequence limit so
 agent and rollup work cannot be buried by one synchronized L0 wave.
