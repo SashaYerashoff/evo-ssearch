@@ -1722,7 +1722,18 @@ def ensure_accounts_and_dirs(answers: Answers, runner: Runner) -> None:
 def quiesce_existing_runtime(runner: Runner) -> None:
     """Stop only EVA-owned services before replacing code and configuration."""
 
-    for service in ("eva-ai", "eva-vllm", "eva-deep-review"):
+    # Stop supervisors first.  The watchdog service Requires=eva-vllm.service,
+    # so leaving its persistent timer active can resurrect vLLM while a long
+    # offline dependency phase is still running and make the final port guard
+    # mistake our own managed endpoint for a foreign listener.
+    for service in (
+        "eva-vlm-vision-watchdog.timer",
+        "eva-vlm-vision-watchdog.service",
+        "eva-vlm-vision-recover.service",
+        "eva-ai",
+        "eva-vllm",
+        "eva-deep-review",
+    ):
         runner.run(("systemctl", "stop", service), check=False)
     if shutil.which("docker"):
         runner.run(
@@ -3120,7 +3131,17 @@ def _verify_vlm_vision(base_url: str, model: str, *, timeout_sec: int = 90) -> N
 
 
 def start_and_verify(answers: Answers, runner: Runner) -> None:
+    # This phase is independently replayable after an interrupted install.  A
+    # pre-existing watchdog timer may have restarted managed inference since
+    # the earlier quiesce phase, so establish the bind boundary again here.
+    for service in (
+        "eva-vlm-vision-watchdog.timer",
+        "eva-vlm-vision-watchdog.service",
+        "eva-vlm-vision-recover.service",
+    ):
+        runner.run(("systemctl", "stop", service), check=False)
     if answers.local_vlm:
+        runner.run(("systemctl", "stop", "eva-vllm"), check=False)
         if not runner.dry_run:
             _assert_tcp_port_available(
                 "127.0.0.1",
@@ -3140,6 +3161,7 @@ def start_and_verify(answers: Answers, runner: Runner) -> None:
         runner.run(("systemctl", "restart", "eva-vlm-vision-watchdog.service"))
         runner.run(("systemctl", "restart", "eva-vlm-vision-watchdog.timer"))
     if answers.local_deep:
+        runner.run(("systemctl", "stop", "eva-deep-review"), check=False)
         if not runner.dry_run:
             _assert_tcp_port_available(
                 "127.0.0.1",
@@ -3158,6 +3180,7 @@ def start_and_verify(answers: Answers, runner: Runner) -> None:
             timeout_sec=300 if answers.local_deep else 60,
             expected_model=answers.deep_model,
         )
+    runner.run(("systemctl", "stop", "eva-ai"), check=False)
     if not runner.dry_run:
         _assert_tcp_port_available(
             "127.0.0.1",

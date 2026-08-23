@@ -747,6 +747,73 @@ def test_local_listener_is_rejected_before_runtime_start():
         listener.close()
 
 
+def test_runtime_quiesce_stops_vlm_supervision_before_vllm():
+    calls = []
+
+    class RecordingRunner:
+        def run(self, command, **kwargs):
+            calls.append((tuple(command), kwargs))
+            return CompletedProcess(command, 0, "", "")
+
+    with patch.object(installer.shutil, "which", return_value=None):
+        installer.quiesce_existing_runtime(RecordingRunner())
+
+    commands = [call[0] for call in calls]
+    timer_stop = ("systemctl", "stop", "eva-vlm-vision-watchdog.timer")
+    watchdog_stop = ("systemctl", "stop", "eva-vlm-vision-watchdog.service")
+    vllm_stop = ("systemctl", "stop", "eva-vllm")
+    assert commands.index(timer_stop) < commands.index(vllm_stop)
+    assert commands.index(watchdog_stop) < commands.index(vllm_stop)
+    assert all(kwargs == {"check": False} for _, kwargs in calls)
+
+
+def test_readiness_requiesces_managed_units_before_port_guards(tmp_path):
+    answers = installer.Answers(
+        install_root=tmp_path / "opt",
+        data_root=tmp_path / "data",
+        config_root=tmp_path / "etc",
+        evo_url="http://evo.local",
+        evo_username="operator",
+        evo_password="secret",
+        local_vlm=True,
+        local_deep=True,
+    )
+    events = []
+
+    class RecordingRunner:
+        dry_run = False
+
+        def run(self, command, **kwargs):
+            events.append(("command", tuple(command), kwargs))
+            return CompletedProcess(command, 0, "", "")
+
+    def record_port(host, port, *, label):
+        events.append(("port", host, port, label))
+
+    with (
+        patch.object(installer, "_assert_tcp_port_available", side_effect=record_port),
+        patch.object(installer, "_wait_for_json_endpoint"),
+        patch.object(installer, "_verify_vlm_vision"),
+    ):
+        installer.start_and_verify(answers, RecordingRunner())
+
+    def command_index(*command):
+        return events.index(("command", tuple(command), {"check": False}))
+
+    assert command_index("systemctl", "stop", "eva-vlm-vision-watchdog.timer") < events.index(
+        ("port", "127.0.0.1", 1234, "Local VLM")
+    )
+    assert command_index("systemctl", "stop", "eva-vllm") < events.index(
+        ("port", "127.0.0.1", 1234, "Local VLM")
+    )
+    assert command_index("systemctl", "stop", "eva-deep-review") < events.index(
+        ("port", "127.0.0.1", 1236, "Local deep-review model")
+    )
+    assert command_index("systemctl", "stop", "eva-ai") < events.index(
+        ("port", "127.0.0.1", 5000, "EVA application")
+    )
+
+
 def test_post_apt_gpu_phase_refreshes_the_hardware_snapshot():
     source = MODULE_PATH.read_text(encoding="utf-8")
     apply_body = source.split("def apply_install(", 1)[1].split(
