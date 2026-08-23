@@ -526,7 +526,7 @@ def test_report_maps_database_uri_to_libpq_environment_without_argv_secret():
         "_command",
         return_value={"ok": True, "stdout": report.EXPECTED_SCHEMA, "stderr": ""},
     ) as command:
-        result = report._psql(dsn, "SELECT version_num FROM alembic_version")
+        result = report._psql(dsn, "SELECT version_num FROM public.alembic_version")
 
     assert result["ok"] is True
     argv = command.call_args.args[0]

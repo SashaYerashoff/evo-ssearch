@@ -168,7 +168,10 @@ def _psql(dsn: str, sql: str) -> dict[str, Any]:
 
 
 def _schema_status(values: Mapping[str, str]) -> dict[str, Any]:
-    result = _psql(_db_dsn(values), "SELECT version_num FROM alembic_version LIMIT 1")
+    result = _psql(
+        _db_dsn(values),
+        "SELECT version_num FROM public.alembic_version LIMIT 1",
+    )
     revision = str(result.get("stdout") or "").strip().splitlines()[-1:] or [""]
     current = revision[0].strip()
     return {

@@ -132,6 +132,21 @@ def _create_or_update_login(connection, login: RuntimeLogin, password: str) -> N
     )
 
 
+def _grant_migration_revision_access(connection) -> None:
+    """Keep the least-privilege migrator able to run Alembic itself.
+
+    ``public.alembic_version`` is created by Alembic before EVA's owned
+    schemas and is therefore owned by the bootstrap PostgreSQL identity, not
+    ``eva_owner``.  Membership in ``eva_owner`` cannot grant the migrator
+    access to this one table automatically.
+    """
+
+    connection.execute(
+        "GRANT SELECT, INSERT, UPDATE, DELETE "
+        "ON TABLE public.alembic_version TO eva_migrator"
+    )
+
+
 def _env_matrix() -> str:
     return "\n".join(
         (
@@ -171,6 +186,7 @@ def main(argv: list[str] | None = None) -> int:
                         login,
                         passwords[login.password_env],
                     )
+                _grant_migration_revision_access(connection)
         print("Runtime database login roles are ready.")
         print(_env_matrix())
         return 0
