@@ -18728,6 +18728,11 @@ class LuxriotManager:
             "leave",
             match_text,
         )
+        match_text = re.sub(
+            r"\b(?:v|peace)\s+(?:hand\s+)?(?:sign|gesture)\b",
+            "victory gesture",
+            match_text,
+        )
         return [
             cls._alert_policy_match_stem(raw_token)
             for raw_token in re.findall(r"[a-z0-9]+", match_text)
@@ -19037,10 +19042,13 @@ class LuxriotManager:
     ) -> Tuple[str, Dict[str, Any]]:
         """Recover an omitted explicit operator alert from grounded L0 state.
 
-        The fallback cannot infer from prose, memory, CLIP, or homeostasis.  It
-        requires a model-produced current event or validated present-state with
-        snapshot references and a strong lexical match to an imperative
-        operator criterion.
+        The fallback cannot infer from memory, CLIP, probes, CV, or
+        homeostasis. It normally requires a model-produced current event or
+        validated present-state. A narrowly bounded consistency repair also
+        accepts the model's current ``Episode update`` only when the sentence
+        names a valid current snapshot and strongly matches an explicit
+        operator criterion. This repairs ``narrative says it happened`` plus
+        ``events: [], alerts: []`` without turning ungrounded prose into truth.
         """
 
         state = copy.deepcopy(dict(batch_state))
@@ -19092,31 +19100,90 @@ class LuxriotManager:
                         },
                     )
                 )
-        if not candidates:
-            return str(summary_text or ""), state
         with self.cache_lock:
             policy_text = self._get_alert_policy_prompt_locked(channel_id)
         criteria = self._operator_alert_policy_criteria(policy_text)
         if not criteria:
             return str(summary_text or ""), state
 
-        matches: List[Tuple[float, str, str, Mapping[str, Any]]] = []
-        for criterion in criteria:
-            best_for_criterion: Optional[
-                Tuple[float, str, str, Mapping[str, Any]]
-            ] = None
-            for source, candidate_state in candidates:
-                score = self._operator_policy_event_match(criterion, candidate_state)
-                if score is None:
-                    continue
-                candidate = (score, criterion, source, candidate_state)
-                if (
-                    best_for_criterion is None
-                    or candidate[0] > best_for_criterion[0]
+        def policy_matches(
+            source_candidates: Sequence[Tuple[str, Mapping[str, Any]]],
+        ) -> List[Tuple[float, str, str, Mapping[str, Any]]]:
+            matched: List[Tuple[float, str, str, Mapping[str, Any]]] = []
+            for criterion in criteria:
+                best_for_criterion: Optional[
+                    Tuple[float, str, str, Mapping[str, Any]]
+                ] = None
+                for source, candidate_state in source_candidates:
+                    score = self._operator_policy_event_match(
+                        criterion,
+                        candidate_state,
+                    )
+                    if score is None:
+                        continue
+                    candidate = (score, criterion, source, candidate_state)
+                    if (
+                        best_for_criterion is None
+                        or candidate[0] > best_for_criterion[0]
+                    ):
+                        best_for_criterion = candidate
+                if best_for_criterion is not None:
+                    matched.append(best_for_criterion)
+            return matched
+
+        # Structured current state remains authoritative. Consult the bounded
+        # Episode-update repair only when no structured candidate satisfies an
+        # operator criterion.
+        matches = policy_matches(candidates)
+        if not matches:
+            narrative_candidates: List[Tuple[str, Mapping[str, Any]]] = []
+            episode_update = self._extract_markdown_section(
+                str(summary_text or ""),
+                "Episode update",
+            )
+            max_snapshot_index = int(
+                _parse_optional_int(state.get("snapshot_count")) or 0
+            )
+            if episode_update and max_snapshot_index > 0:
+                for sentence in re.split(
+                    r"(?<=[.!?])\s+|\n+",
+                    episode_update,
                 ):
-                    best_for_criterion = candidate
-            if best_for_criterion is not None:
-                matches.append(best_for_criterion)
+                    grounded_sentence = self._truncate_text(sentence, 240)
+                    if not grounded_sentence:
+                        continue
+                    snapshot_indices: List[int] = []
+                    for snapshot_match in re.finditer(
+                        r"\bsnapshots?\s*(?:#\s*)?"
+                        r"(?P<indices>\d+(?:\s*(?:,|and|&)\s*\d+)*)",
+                        grounded_sentence,
+                        flags=re.IGNORECASE,
+                    ):
+                        for raw_index in re.findall(
+                            r"\d+",
+                            snapshot_match.group("indices"),
+                        ):
+                            parsed_index = _parse_optional_int(raw_index)
+                            if (
+                                parsed_index is not None
+                                and 1 <= parsed_index <= max_snapshot_index
+                                and parsed_index not in snapshot_indices
+                            ):
+                                snapshot_indices.append(int(parsed_index))
+                    if not snapshot_indices:
+                        continue
+                    narrative_candidates.append(
+                        (
+                            "grounded_episode_narrative",
+                            {
+                                "label": grounded_sentence,
+                                "summary": grounded_sentence,
+                                "state": "new",
+                                "snapshot_indices": snapshot_indices[:16],
+                            },
+                        )
+                    )
+            matches = policy_matches(narrative_candidates)
         if not matches:
             return str(summary_text or ""), state
 

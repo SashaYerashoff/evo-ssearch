@@ -666,6 +666,94 @@ class VlmAlertPromptContractTests(unittest.TestCase):
             "backend_policy_reconciliation",
         )
 
+    def test_backend_repairs_grounded_episode_alert_omitted_from_machine_state(self):
+        frames = [
+            {"thumbnail": f"frame-{index}", "captured_at": 100.0 + index}
+            for index in range(4)
+        ]
+        summary = (
+            "### Scene description\n"
+            "Person seated at a desk.\n\n"
+            "### Episode update\n"
+            "Person raises hand in a V gesture (snapshot 2), then returns to desk.\n\n"
+            "### Routine and deviations\n"
+            "Routine desk work; victory gesture is novel.\n\n"
+            "### Worth to remember\nNone\n\n"
+            "BATCH_STATE_JSON:\n"
+            '{"version":2,"alerts":[],"events":[],"observed_states":[],'
+            '"cover":{"snapshot_index":2,"kind":"event"},'
+            '"scene":{"status":"uncertain","summary":""},'
+            '"routines":[],"memory_pass":[]}'
+        )
+        with tempfile.TemporaryDirectory() as temp:
+            manager = build_manager(Path(temp))
+            manager.update_prompt_settings(
+                channel_id=112,
+                alert_policy_prompt=(
+                    "Alert if you spot a victory gesture, severity - normal"
+                ),
+            )
+            state = manager._extract_batch_state(summary, frames)
+            patched_summary, reconciled = manager._reconcile_operator_alert_contract(
+                112,
+                summary,
+                state,
+            )
+
+        self.assertEqual(reconciled["contract_status"], "parsed_alert_reconciled")
+        self.assertEqual(
+            reconciled["alert_reconciliation"]["source"],
+            "grounded_episode_narrative",
+        )
+        self.assertEqual(len(reconciled["alerts"]), 1)
+        self.assertEqual(reconciled["alerts"][0]["snapshot_indices"], [2])
+        self.assertEqual(reconciled["alerts"][0]["severity"], "normal")
+        rendered = json.loads(patched_summary.split("BATCH_STATE_JSON:\n", 1)[1])
+        self.assertEqual(len(rendered["alerts"]), 1)
+
+    def test_backend_does_not_repair_negated_or_unanchored_episode_prose(self):
+        frames = [
+            {"thumbnail": f"frame-{index}", "captured_at": 100.0 + index}
+            for index in range(3)
+        ]
+        machine_state = (
+            'BATCH_STATE_JSON:\n{"version":2,"alerts":[],"events":[],'
+            '"observed_states":[],"cover":{},"scene":{},'
+            '"routines":[],"memory_pass":[]}'
+        )
+        summaries = (
+            (
+                "### Episode update\n"
+                "No victory gesture is visible in snapshot 2.\n\n"
+                + machine_state
+            ),
+            (
+                "### Episode update\n"
+                "Person makes a victory gesture.\n\n"
+                + machine_state
+            ),
+        )
+        with tempfile.TemporaryDirectory() as temp:
+            manager = build_manager(Path(temp))
+            manager.update_prompt_settings(
+                channel_id=112,
+                alert_policy_prompt=(
+                    "Alert if you spot a victory gesture, severity - normal"
+                ),
+            )
+            repaired = []
+            for summary in summaries:
+                state = manager._extract_batch_state(summary, frames)
+                _patched, reconciled = manager._reconcile_operator_alert_contract(
+                    112,
+                    summary,
+                    state,
+                )
+                repaired.append(reconciled)
+
+        self.assertEqual(repaired[0]["alerts"], [])
+        self.assertEqual(repaired[1]["alerts"], [])
+
     def test_backend_reconciles_each_distinct_operator_criterion(self):
         frames = [
             {"thumbnail": f"frame-{index}", "captured_at": 100.0 + index}
