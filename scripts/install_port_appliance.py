@@ -2916,6 +2916,115 @@ def _certificate_has_sans(cert: Path, required: Sequence[str]) -> bool:
     return set(required).issubset(observed)
 
 
+def _operator_ui_url(answers: Answers) -> str:
+    """Return the browser-facing appliance URL advertised after installation."""
+
+    for entry in _certificate_san_entries(answers):
+        if not entry.startswith("IP:"):
+            continue
+        address = entry.removeprefix("IP:")
+        parsed = ipaddress.ip_address(address)
+        if parsed.is_loopback or parsed.is_unspecified:
+            continue
+        host = f"[{address}]" if parsed.version == 6 else address
+        return f"https://{host}/"
+    hostname = socket.getfqdn() or socket.gethostname() or "localhost"
+    return f"https://{hostname}/"
+
+
+def _active_graphical_user() -> str:
+    """Find a non-root user whose systemd manager owns a desktop session."""
+
+    candidates: list[str] = []
+    sudo_user = str(os.environ.get("SUDO_USER") or "").strip()
+    if sudo_user and sudo_user != "root":
+        candidates.append(sudo_user)
+    try:
+        current_user = pwd.getpwuid(os.getuid()).pw_name
+    except KeyError:
+        current_user = ""
+    if current_user and current_user != "root" and current_user not in candidates:
+        candidates.append(current_user)
+
+    try:
+        sessions = subprocess.run(
+            ("loginctl", "list-sessions", "--no-legend", "--no-pager"),
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            check=False,
+        )
+    except OSError:
+        sessions = None
+    if sessions is not None:
+        for line in sessions.stdout.splitlines():
+            fields = line.split()
+            if len(fields) >= 3 and fields[2] != "root" and fields[2] not in candidates:
+                candidates.append(fields[2])
+
+    for username in candidates:
+        try:
+            user = pwd.getpwnam(username)
+        except KeyError:
+            continue
+        if user.pw_uid < 1000:
+            continue
+        try:
+            environment = subprocess.run(
+                (
+                    "systemctl",
+                    f"--machine={username}@.host",
+                    "--user",
+                    "show-environment",
+                ),
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                check=False,
+            )
+        except OSError:
+            continue
+        if environment.returncode != 0:
+            continue
+        values = environment.stdout.splitlines()
+        if any(
+            item.startswith("DISPLAY=") or item.startswith("WAYLAND_DISPLAY=")
+            for item in values
+        ):
+            return username
+    return ""
+
+
+def _open_operator_browser(url: str) -> bool:
+    """Best-effort browser launch; headless hosts must remain a successful install."""
+
+    username = _active_graphical_user()
+    systemd_run = shutil.which("systemd-run")
+    xdg_open = shutil.which("xdg-open")
+    if not username or not systemd_run or not xdg_open:
+        return False
+    try:
+        completed = subprocess.run(
+            (
+                systemd_run,
+                f"--machine={username}@.host",
+                "--user",
+                "--collect",
+                "--quiet",
+                "--no-block",
+                xdg_open,
+                url,
+            ),
+            text=True,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=False,
+        )
+    except OSError:
+        return False
+    return completed.returncode == 0
+
+
 def configure_nginx(answers: Answers, runner: Runner) -> None:
     cert_dir = answers.config_root / "tls"
     cert = cert_dir / "eva-ai.crt"
@@ -3567,11 +3676,16 @@ def apply_install(
         )
         raise
     journal.complete()
+    operator_url = _operator_ui_url(answers)
     print("\nINSTALLATION COMPLETE")
-    print("Open EVA AI at: https://<this-server-ip>/")
+    print(f"Open EVA AI at: {operator_url}")
     print("The TLS certificate is locally generated; import/trust it on operator workstations.")
     print("Next: log in, run 'Protocol: Deploy', select the intended Evo channels,")
     print("and configure/confirm the 9B quiet window if it was left disabled.")
+    if _open_operator_browser(operator_url):
+        print("Opened EVA AI in the active desktop user's default browser.")
+    else:
+        print("No active desktop browser was opened; use the URL above.")
 
 
 def build_parser() -> argparse.ArgumentParser:

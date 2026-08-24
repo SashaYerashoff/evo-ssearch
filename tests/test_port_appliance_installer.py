@@ -603,6 +603,64 @@ def test_nginx_site_redirects_http_to_https(tmp_path):
     assert "listen 443 ssl;" in nginx
 
 
+def test_operator_ui_url_uses_site_facing_ip(tmp_path):
+    answers = installer.Answers(
+        install_root=tmp_path / "opt",
+        data_root=tmp_path / "data",
+        config_root=tmp_path / "etc",
+        evo_url="http://192.168.1.100:8080",
+        evo_username="operator",
+        evo_password="secret",
+    )
+
+    with patch.object(
+        installer,
+        "_certificate_san_entries",
+        return_value=("DNS:eva-node", "IP:127.0.0.1", "IP:192.168.1.104"),
+    ):
+        assert installer._operator_ui_url(answers) == "https://192.168.1.104/"
+
+
+def test_operator_browser_runs_as_active_desktop_user():
+    calls = []
+
+    def which(command):
+        return f"/usr/bin/{command}"
+
+    def run(command, **kwargs):
+        calls.append((tuple(command), kwargs))
+        return CompletedProcess(command, 0, "", "")
+
+    with (
+        patch.object(installer, "_active_graphical_user", return_value="sasha"),
+        patch.object(installer.shutil, "which", side_effect=which),
+        patch.object(installer.subprocess, "run", side_effect=run),
+    ):
+        opened = installer._open_operator_browser("https://192.168.1.104/")
+
+    assert opened is True
+    assert calls[0][0] == (
+        "/usr/bin/systemd-run",
+        "--machine=sasha@.host",
+        "--user",
+        "--collect",
+        "--quiet",
+        "--no-block",
+        "/usr/bin/xdg-open",
+        "https://192.168.1.104/",
+    )
+
+
+def test_operator_browser_is_optional_on_headless_host():
+    with (
+        patch.object(installer, "_active_graphical_user", return_value=""),
+        patch.object(installer.subprocess, "run") as run,
+    ):
+        assert installer._open_operator_browser("https://eva-node/") is False
+
+    run.assert_not_called()
+
+
 def test_external_vlm_still_requires_nvidia_for_local_siglip2_cuda(tmp_path):
     answers = installer.Answers(
         install_root=tmp_path / "opt",
