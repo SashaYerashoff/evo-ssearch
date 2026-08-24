@@ -18728,9 +18728,15 @@ class LuxriotManager:
             "leave",
             match_text,
         )
+        # In action prose, ``sign`` and ``gesture`` describe the same event
+        # noun ("worker makes warning sign" / "warning gesture"). Keep the
+        # normalization contextual so static objects such as traffic signs do
+        # not become gestures, and never encode a particular operator symbol.
         match_text = re.sub(
-            r"\b(?:v|peace)\s+(?:hand\s+)?(?:sign|gesture)\b",
-            "victory gesture",
+            r"\b(?P<verb>makes?|made|shows?|showed|gives?|gave|performs?|"
+            r"performed|raises?|raised)\s+(?:a\s+|an\s+|the\s+)?"
+            r"(?P<label>[a-z0-9-]+)\s+(?:hand\s+)?sign\b",
+            r"\g<verb> \g<label> gesture",
             match_text,
         )
         return [
@@ -19045,10 +19051,12 @@ class LuxriotManager:
         The fallback cannot infer from memory, CLIP, probes, CV, or
         homeostasis. It normally requires a model-produced current event or
         validated present-state. A narrowly bounded consistency repair also
-        accepts the model's current ``Episode update`` only when the sentence
-        names a valid current snapshot and strongly matches an explicit
-        operator criterion. This repairs ``narrative says it happened`` plus
-        ``events: [], alerts: []`` without turning ungrounded prose into truth.
+        accepts the model's current ``Episode update`` when the sentence
+        either names a valid current snapshot or describes a closed temporal
+        transition and a valid representative cover exists. It must still
+        strongly match an explicit operator criterion. This repairs
+        ``narrative says it happened`` plus ``events: [], alerts: []`` without
+        turning ungrounded prose or vector attention into truth.
         """
 
         state = copy.deepcopy(dict(batch_state))
@@ -19144,6 +19152,18 @@ class LuxriotManager:
             max_snapshot_index = int(
                 _parse_optional_int(state.get("snapshot_count")) or 0
             )
+            raw_cover = state.get("cover")
+            cover_snapshot_index = (
+                _parse_optional_int(raw_cover.get("snapshot_index"))
+                if isinstance(raw_cover, Mapping)
+                else None
+            )
+            if (
+                cover_snapshot_index is None
+                or cover_snapshot_index < 1
+                or cover_snapshot_index > max_snapshot_index
+            ):
+                cover_snapshot_index = None
             if episode_update and max_snapshot_index > 0:
                 for sentence in re.split(
                     r"(?<=[.!?])\s+|\n+",
@@ -19170,11 +19190,39 @@ class LuxriotManager:
                                 and parsed_index not in snapshot_indices
                             ):
                                 snapshot_indices.append(int(parsed_index))
+                    reconciliation_source = "grounded_episode_narrative"
                     if not snapshot_indices:
-                        continue
+                        # Qwen occasionally states a visually closed action in
+                        # Episode update but omits both the structured event and
+                        # its snapshot reference (for example, "makes victory
+                        # sign then lowers hands"). Accept only an explicit
+                        # current transition and anchor it transparently to the
+                        # already validated representative cover. Static prose,
+                        # prior-window recollections and unanchored one-clause
+                        # claims remain ineligible.
+                        historical = re.search(
+                            r"\b(?:previously|earlier|prior\s+(?:batch|window)|"
+                            r"previous\s+(?:batch|window)|from\s+memory|"
+                            r"before\s+this\s+batch)\b",
+                            grounded_sentence,
+                            flags=re.IGNORECASE,
+                        )
+                        closed_transition = re.search(
+                            r"\b(?:then|subsequently|afterwards?|followed\s+by)\b",
+                            grounded_sentence,
+                            flags=re.IGNORECASE,
+                        )
+                        if (
+                            historical is not None
+                            or closed_transition is None
+                            or cover_snapshot_index is None
+                        ):
+                            continue
+                        snapshot_indices = [int(cover_snapshot_index)]
+                        reconciliation_source = "grounded_episode_transition"
                     narrative_candidates.append(
                         (
-                            "grounded_episode_narrative",
+                            reconciliation_source,
                             {
                                 "label": grounded_sentence,
                                 "summary": grounded_sentence,
@@ -19226,7 +19274,7 @@ class LuxriotManager:
                         120,
                     ),
                     "description": self._truncate_text(
-                        "Current structured VLM event matched operator "
+                        "Current VLM evidence matched operator "
                         f"criterion: {event_summary}",
                         240,
                     ),
@@ -19239,6 +19287,7 @@ class LuxriotManager:
                     "timestamp_ms": 0,
                     "snapshot_indices": snapshot_indices,
                     "source": "backend_policy_reconciliation",
+                    "grounding_source": reconciliation_source,
                     "policy_criterion": self._truncate_text(criterion, 220),
                     "policy_match_score": round(float(score), 3),
                 }

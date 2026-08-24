@@ -581,6 +581,17 @@ class ApiDataflowSmokeTests(unittest.TestCase):
             "alert_counts": {"normal": 1},
             "alert_total": 1,
             "bookmarks_sent": 1,
+            "frame_selection": {
+                "version": 1,
+                "policy": "per_second_attention_apex_v1",
+                "groups": [
+                    {
+                        "selected_source_frame_index": 2,
+                        "selection_source": "capture_cv_frame_delta",
+                        "apex_available": True,
+                    }
+                ],
+            },
             "archive_frames": [
                 {
                     "anchor_role": "first",
@@ -640,6 +651,12 @@ class ApiDataflowSmokeTests(unittest.TestCase):
         self.assertEqual(
             store.records[0]["payload"]["embedding_ref"],
             "probe-buffer:7:1",
+        )
+        self.assertEqual(
+            store.records[0]["payload"]["frame_selection"]["groups"][0][
+                "selection_source"
+            ],
+            "capture_cv_frame_delta",
         )
 
     def test_cv_apex_and_companion_receive_independent_clip_embeddings(self) -> None:

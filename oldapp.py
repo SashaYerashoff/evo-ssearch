@@ -13182,6 +13182,9 @@ def _vlm_summary_frame_records(entry: Mapping[str, Any]) -> Tuple[List[Dict[str,
         "vector_signal": dict(entry.get("vector_signal") or {})
         if isinstance(entry.get("vector_signal"), Mapping)
         else {},
+        "frame_selection": dict(entry.get("frame_selection") or {})
+        if isinstance(entry.get("frame_selection"), Mapping)
+        else {},
         "batch_state": batch_state,
         "batch_cover": batch_cover,
         "latency_trace": dict(entry.get("latency_trace") or {})

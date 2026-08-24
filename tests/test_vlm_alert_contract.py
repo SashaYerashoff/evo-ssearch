@@ -673,11 +673,11 @@ class VlmAlertPromptContractTests(unittest.TestCase):
         ]
         summary = (
             "### Scene description\n"
-            "Person seated at a desk.\n\n"
+            "A person stands beside a restricted area.\n\n"
             "### Episode update\n"
-            "Person raises hand in a V gesture (snapshot 2), then returns to desk.\n\n"
+            "Person enters the restricted area in snapshot 2.\n\n"
             "### Routine and deviations\n"
-            "Routine desk work; victory gesture is novel.\n\n"
+            "Deviation: entry into the restricted area.\n\n"
             "### Worth to remember\nNone\n\n"
             "BATCH_STATE_JSON:\n"
             '{"version":2,"alerts":[],"events":[],"observed_states":[],'
@@ -690,7 +690,7 @@ class VlmAlertPromptContractTests(unittest.TestCase):
             manager.update_prompt_settings(
                 channel_id=112,
                 alert_policy_prompt=(
-                    "Alert if you spot a victory gesture, severity - normal"
+                    "Alert when a person enters the restricted area, severity - normal"
                 ),
             )
             state = manager._extract_batch_state(summary, frames)
@@ -724,12 +724,12 @@ class VlmAlertPromptContractTests(unittest.TestCase):
         summaries = (
             (
                 "### Episode update\n"
-                "No victory gesture is visible in snapshot 2.\n\n"
+                "No person enters the restricted area in snapshot 2.\n\n"
                 + machine_state
             ),
             (
                 "### Episode update\n"
-                "Person makes a victory gesture.\n\n"
+                "Person enters the restricted area.\n\n"
                 + machine_state
             ),
         )
@@ -738,7 +738,7 @@ class VlmAlertPromptContractTests(unittest.TestCase):
             manager.update_prompt_settings(
                 channel_id=112,
                 alert_policy_prompt=(
-                    "Alert if you spot a victory gesture, severity - normal"
+                    "Alert when a person enters the restricted area, severity - normal"
                 ),
             )
             repaired = []
@@ -753,6 +753,109 @@ class VlmAlertPromptContractTests(unittest.TestCase):
 
         self.assertEqual(repaired[0]["alerts"], [])
         self.assertEqual(repaired[1]["alerts"], [])
+
+    def test_backend_repairs_closed_episode_transition_using_valid_cover(self):
+        frames = [
+            {"thumbnail": f"frame-{index}", "captured_at": 100.0 + index}
+            for index in range(4)
+        ]
+        scenarios = (
+            (
+                "Alert when a person enters the restricted area, severity - high",
+                "Person enters the restricted area then exits.",
+                2,
+                "high",
+            ),
+            (
+                "Alert when a vehicle door opens, severity - normal",
+                "Vehicle door opens then closes.",
+                3,
+                "normal",
+            ),
+            (
+                "Alert when a worker makes a warning gesture, severity - low",
+                "Worker makes a warning sign then lowers the hand.",
+                1,
+                "low",
+            ),
+        )
+        for policy, episode_update, cover_index, severity in scenarios:
+            with self.subTest(policy=policy):
+                summary = (
+                    "### Scene description\nCurrent monitored scene.\n\n"
+                    f"### Episode update\n{episode_update}\n\n"
+                    "### Routine and deviations\nA current deviation is described above.\n\n"
+                    "### Worth to remember\nNone\n\n"
+                    "BATCH_STATE_JSON:\n"
+                    '{"version":2,"alerts":[],"events":[],'
+                    '"observed_states":[],"cover":{"snapshot_index":'
+                    f"{cover_index}"
+                    ',"kind":"routine","confidence":"low"},'
+                    '"scene":{"status":"uncertain","summary":""},'
+                    '"routines":[],"memory_pass":[]}'
+                )
+                with tempfile.TemporaryDirectory() as temp:
+                    manager = build_manager(Path(temp))
+                    manager.update_prompt_settings(
+                        channel_id=112,
+                        alert_policy_prompt=policy,
+                    )
+                    state = manager._extract_batch_state(summary, frames)
+                    patched_summary, reconciled = (
+                        manager._reconcile_operator_alert_contract(
+                            112,
+                            summary,
+                            state,
+                        )
+                    )
+
+                self.assertEqual(
+                    reconciled["contract_status"],
+                    "parsed_alert_reconciled",
+                )
+                self.assertEqual(
+                    reconciled["alert_reconciliation"]["source"],
+                    "grounded_episode_transition",
+                )
+                self.assertEqual(
+                    reconciled["alerts"][0]["snapshot_indices"],
+                    [cover_index],
+                )
+                self.assertEqual(reconciled["alerts"][0]["severity"], severity)
+                rendered = json.loads(
+                    patched_summary.split("BATCH_STATE_JSON:\n", 1)[1]
+                )
+                self.assertEqual(len(rendered["alerts"]), 1)
+
+    def test_backend_does_not_repair_historical_episode_transition(self):
+        frames = [
+            {"thumbnail": f"frame-{index}", "captured_at": 100.0 + index}
+            for index in range(3)
+        ]
+        summary = (
+            "### Episode update\n"
+            "In the previous batch, vehicle door opened then closed.\n\n"
+            "BATCH_STATE_JSON:\n"
+            '{"version":2,"alerts":[],"events":[],"observed_states":[],'
+            '"cover":{"snapshot_index":2},"scene":{},'
+            '"routines":[],"memory_pass":[]}'
+        )
+        with tempfile.TemporaryDirectory() as temp:
+            manager = build_manager(Path(temp))
+            manager.update_prompt_settings(
+                channel_id=112,
+                alert_policy_prompt=(
+                    "Alert when a vehicle door opens, severity - normal"
+                ),
+            )
+            state = manager._extract_batch_state(summary, frames)
+            _patched, reconciled = manager._reconcile_operator_alert_contract(
+                112,
+                summary,
+                state,
+            )
+
+        self.assertEqual(reconciled["alerts"], [])
 
     def test_backend_reconciles_each_distinct_operator_criterion(self):
         frames = [
