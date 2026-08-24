@@ -109,22 +109,22 @@ batches_per_min ≈ channels × 60 / (snapshot_interval_s × batch_size)
 ```
 
 The capture window contains `batch_size` saved frames. The VLM sees at most
-`min(batch_size, EVOSSEARCH_LUXRIOT_L0_MAX_SELECTED_FRAMES,
-EVOSSEARCH_LUXRIOT_VLM_MAX_IMAGES_PER_REQUEST)` attention-selected primary
-images. CV/SigLIP still process the wider upstream capture window; the L0 record
-retains the source/selected/omitted counts, while the independent
+between one and `EVOSSEARCH_LUXRIOT_VLM_MAX_IMAGES_PER_REQUEST`
+chronologically ordered evidence images. CV/SigLIP still process the wider
+upstream capture window; the L0 record retains the source/selected/omitted
+counts and reserves a slot for a useful stable companion of a CV apex, while the independent
 per-second semantic snapshot archive retains its own configured cadence. When
 12/16-frame windows are compressed, both the prompt and UI explicitly say that
 VLM visual coverage is partial.
 
-The fresh-install default is batch 8, interval 2 s: about a 14 s observed span,
-a batch every 16 s, and all eight primary images visible to the VLM. That is
-about 30 batches/min for eight channels, but 187.5 batches/min for 50 channels.
-The old batch 12, interval 5 s profile produced only about 50 batches/min at 50
-channels, so changing to 8/2 increases request rate by 3.75x. Confirm the four
-Georgia VLM endpoints sustain the chosen rate before applying it site-wide;
-otherwise use per-channel cadence, truthful profile capacities, and additional
-hosts rather than accepting growing queues or coverage gaps.
+The fresh-install default is a 12-sample temporal window at 1 Hz: a non-empty
+packet seals by about 12 s without waiting to fill the image budget. A quiet
+heartbeat may therefore contain only one or two images, while a busy event may
+use all eight. The absolute 50-channel ceiling is about 250 routine packets/min
+before event coalescing; image and token cost varies with evidence density.
+Confirm the four Georgia VLM endpoints sustain the measured p95 service time;
+otherwise use per-channel policy and additional hosts rather than accepting
+growing queues or coverage gaps.
 
 Levers when the VLM can't keep up:
 - Increase `snapshot_interval` (less blind only if the host was saturated).

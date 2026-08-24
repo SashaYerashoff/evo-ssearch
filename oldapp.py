@@ -4939,43 +4939,93 @@ def _build_video_messages(video_path: str, frames: List[Dict[str, Any]], user_pr
 
 def _build_luxriot_messages(channel_label: str, frames: List[Dict[str, Any]], user_prompt: str, system_prompt: str) -> List[Dict[str, Any]]:
     prompt = (user_prompt or '').strip() or "Describe notable activity, people, vehicles, and anomalies."
-    timestamps = [
-        value
-        for frame in frames
-        if isinstance(frame, dict)
-        for value in [frame.get('captured_at') or frame.get('time_sec')]
-        if isinstance(value, (int, float))
-    ]
-    span_sec = max(timestamps) - min(timestamps) if len(timestamps) > 1 else 0.0
-    span_note = f" spanning about {span_sec:.1f}s" if span_sec > 0 else ""
-    intro = (
-        f"Live snapshots from Luxriot channel {channel_label}. "
-        f"{len(frames)} attention-selected snapshots{span_note}."
-    )
-    user_content: List[Dict[str, Any]] = [{'type': 'text', 'text': f"{intro}\n\nTask: {prompt}"}]
+    try:
+        max_images = max(
+            1,
+            int(getattr(config, 'LUXRIOT_VLM_MAX_IMAGES_PER_REQUEST', 8)),
+        )
+    except (TypeError, ValueError):
+        max_images = 8
+
+    def timestamp_ms(item: Mapping[str, Any]) -> Optional[int]:
+        for key in ('timestamp_ms', 'captured_at_ms'):
+            try:
+                value = int(item.get(key))
+            except (TypeError, ValueError):
+                continue
+            return value
+        for key in ('captured_at', 'time_sec'):
+            try:
+                return int(float(item.get(key)) * 1000.0)
+            except (TypeError, ValueError):
+                continue
+        return None
+
+    def primary_roles(frame: Mapping[str, Any], index: int) -> List[str]:
+        raw_roles = frame.get('evidence_roles')
+        roles = [
+            str(role or '').strip().lower().replace(' ', '_')[:80]
+            for role in raw_roles
+            if str(role or '').strip()
+        ] if isinstance(raw_roles, Sequence) and not isinstance(
+            raw_roles,
+            (str, bytes, bytearray),
+        ) else []
+        if not roles:
+            if index == 0:
+                roles.append('window_start')
+            if index == len(frames) - 1:
+                roles.append('current')
+            selection_source = str(frame.get('selection_source') or '').strip().lower()
+            raw_signal_sources = frame.get('selection_signal_sources')
+            signal_sources = {
+                str(source or '').strip().lower()
+                for source in raw_signal_sources
+                if str(source or '').strip()
+            } if isinstance(raw_signal_sources, Sequence) and not isinstance(
+                raw_signal_sources,
+                (str, bytes, bytearray),
+            ) else set()
+            selection = frame.get('capture_selection')
+            selection_map = selection if isinstance(selection, Mapping) else {}
+            if selection_source == 'clip_probe' or 'clip_probe' in signal_sources:
+                roles.append('probe_signal')
+            if selection_source.startswith('road_') or any(
+                source.startswith('road_') for source in signal_sources
+            ):
+                roles.append('cv_signal')
+            if str(selection_map.get('selection_mode') or '').strip().lower() == 'burst':
+                roles.append('cv_apex')
+            if not roles:
+                roles.append('temporal_sample')
+        return list(dict.fromkeys(roles))
+
+    evidence: List[Dict[str, Any]] = []
     for idx, frame in enumerate(frames):
-        ts_raw = frame.get('captured_at') or frame.get('time_sec')
-        ts_label = time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(ts_raw)) if isinstance(ts_raw, (int, float)) else 'n/a'
-        user_content.append({'type': 'text', 'text': f"Snapshot {idx + 1} (captured at {ts_label})"})
-        thumbnail = frame.get('thumbnail')
-        if thumbnail:
-            user_content.append(
-                {
-                    'type': 'image_url',
-                    'image_url': {
-                        'url': f"data:image/jpeg;base64,{thumbnail}",
-                        'detail': 'high',
-                    },
-                }
-            )
-    # At most one extra frame per batch: the sharper companion of the strongest
-    # burst second, so the model gets identity detail next to the motion peak.
-    companion_thumbnail = None
-    companion_snapshot_no = None
+        thumbnail = str(frame.get('thumbnail') or '').strip()
+        if not thumbnail:
+            continue
+        evidence.append(
+            {
+                'thumbnail': thumbnail,
+                'timestamp_ms': timestamp_ms(frame),
+                'roles': primary_roles(frame, idx),
+                'source_snapshot_no': idx + 1,
+                'kind': 'primary',
+                'stable_order': idx * 2,
+            }
+        )
+
+    # At most one extra image per packet: the sharper neighbour of the
+    # strongest burst second.  It is inserted at its actual timestamp instead
+    # of being appended after the newest frame, so visual presentation remains
+    # a truthful oldest-to-newest timeline.
+    companion: Optional[Mapping[str, Any]] = None
+    companion_parent_no: Optional[int] = None
     best_burst_x = -1.0
     for idx, frame in enumerate(frames):
-        companion = frame.get('burst_companion') if isinstance(frame, dict) else None
-        if not isinstance(companion, dict) or not str(companion.get('thumbnail') or '').strip():
+        candidate = frame.get('burst_companion') if isinstance(frame, dict) else None
+        if not isinstance(candidate, Mapping) or not str(candidate.get('thumbnail') or '').strip():
             continue
         selection = frame.get('capture_selection') if isinstance(frame.get('capture_selection'), dict) else {}
         try:
@@ -4984,31 +5034,93 @@ def _build_luxriot_messages(channel_label: str, frames: List[Dict[str, Any]], us
             burst_x = 0.0
         if burst_x > best_burst_x:
             best_burst_x = burst_x
-            companion_thumbnail = str(companion.get('thumbnail'))
-            companion_snapshot_no = idx + 1
-    try:
-        max_images = max(
-            2,
-            int(getattr(config, 'LUXRIOT_VLM_MAX_IMAGES_PER_REQUEST', 8)),
-        )
-    except (TypeError, ValueError):
-        max_images = 8
-    primary_image_count = sum(
-        1
-        for part in user_content
-        if isinstance(part, dict) and part.get('type') == 'image_url'
-    )
+            companion = candidate
+            companion_parent_no = idx + 1
     if (
-        companion_thumbnail
-        and companion_snapshot_no is not None
-        and primary_image_count < max_images
+        companion is not None
+        and companion_parent_no is not None
+        and len(evidence) < max_images
     ):
+        evidence.append(
+            {
+                'thumbnail': str(companion.get('thumbnail') or ''),
+                'timestamp_ms': timestamp_ms(companion),
+                'roles': ['cv_stable_companion', 'detail_control'],
+                'source_snapshot_no': companion_parent_no,
+                'kind': 'companion',
+                'stable_order': (companion_parent_no - 1) * 2 + 1,
+            }
+        )
+
+    evidence.sort(
+        key=lambda item: (
+            item.get('timestamp_ms') is None,
+            int(item.get('timestamp_ms') or 0),
+            int(item.get('stable_order') or 0),
+        )
+    )
+    timestamps = [
+        int(item['timestamp_ms'])
+        for item in evidence
+        if isinstance(item.get('timestamp_ms'), int)
+    ]
+    span_sec = (
+        float(max(timestamps) - min(timestamps)) / 1000.0
+        if len(timestamps) > 1
+        else 0.0
+    )
+    span_note = f" spanning about {span_sec:.1f}s" if span_sec > 0 else ""
+    intro = (
+        f"Live temporal evidence from Luxriot channel {channel_label}. "
+        f"{len(evidence)} selected image(s){span_note}; the packet is intentionally "
+        "allowed to use fewer images than the endpoint limit. Evidence below is "
+        "strictly ordered oldest to newest. Interpret visible transitions in that "
+        "order before summarizing the routine. Routing roles are hints, not visual "
+        "proof. Do not invent continuity across time gaps or let a general routine "
+        "erase distinct supported changes."
+    )
+    user_content: List[Dict[str, Any]] = [
+        {'type': 'text', 'text': f"{intro}\n\nTask: {prompt}"}
+    ]
+    first_timestamp = min(timestamps) if timestamps else None
+    previous_timestamp: Optional[int] = None
+    for idx, item in enumerate(evidence, start=1):
+        current_timestamp = (
+            int(item['timestamp_ms'])
+            if isinstance(item.get('timestamp_ms'), int)
+            else None
+        )
+        relative = (
+            f"t+{(current_timestamp - first_timestamp) / 1000.0:.1f}s"
+            if current_timestamp is not None and first_timestamp is not None
+            else "t=n/a"
+        )
+        gap = (
+            f", gap +{(current_timestamp - previous_timestamp) / 1000.0:.1f}s"
+            if current_timestamp is not None and previous_timestamp is not None
+            else ""
+        )
+        captured = (
+            time.strftime(
+                '%Y-%m-%d %H:%M:%S',
+                time.localtime(current_timestamp / 1000.0),
+            )
+            if current_timestamp is not None
+            else 'n/a'
+        )
+        roles = ','.join(str(role) for role in item.get('roles') or []) or 'temporal_sample'
+        relationship = ""
+        if item.get('kind') == 'companion':
+            relationship = (
+                f"; sharper companion of source Snapshot {item['source_snapshot_no']} "
+                "(use for identity/detail; use its apex neighbour for action timing)"
+            )
         user_content.append(
             {
                 'type': 'text',
                 'text': (
-                    f"Snapshot {len(frames) + 1} - sharper companion of burst Snapshot {companion_snapshot_no} "
-                    "(same second; use it for identity/detail, the burst snapshot for the action itself)"
+                    f"Evidence {idx} ({relative}{gap}; captured at {captured}; "
+                    f"roles={roles}{relationship})"
                 ),
             }
         )
@@ -5016,11 +5128,13 @@ def _build_luxriot_messages(channel_label: str, frames: List[Dict[str, Any]], us
             {
                 'type': 'image_url',
                 'image_url': {
-                    'url': f"data:image/jpeg;base64,{companion_thumbnail}",
+                    'url': f"data:image/jpeg;base64,{item['thumbnail']}",
                     'detail': 'high',
                 },
             }
         )
+        if current_timestamp is not None:
+            previous_timestamp = current_timestamp
     system_msg = system_prompt.strip() or LUXRIOT_SYSTEM_PROMPT_DEFAULT
     return [
         {'role': 'system', 'content': [{'type': 'text', 'text': system_msg}]},

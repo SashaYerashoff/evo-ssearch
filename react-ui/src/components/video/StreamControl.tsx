@@ -69,7 +69,7 @@ export function describeVlmSampling(
   const maxSelected = Math.max(1, Number(maxSelectedRaw) || 8)
   const maxImages = Math.max(1, Number(maxImagesRaw) || 8)
   const visible = Math.min(batch, maxSelected)
-  const windowSec = Math.max(0, (batch - 1) * interval)
+  const windowSec = Math.max(0.2, batch * interval)
   const window = Number.isInteger(windowSec) ? String(windowSec) : windowSec.toFixed(1)
   const caps = maxSelected === maxImages
     ? `hard cap ${maxImages}`
@@ -77,11 +77,11 @@ export function describeVlmSampling(
   return batch > maxSelected
     ? {
         compressed: true,
-        label: `VLM sees ${visible} of ${batch} frames · attention-selected · partial coverage · ${caps} · ~${window}s span`,
+        label: `VLM sees 1–${visible} useful images from ${batch} samples · no padding · chronological · partial coverage · ${caps} · seals by ~${window}s`,
       }
     : {
         compressed: false,
-        label: `VLM sees all ${batch} frames · ${caps} · ~${window}s span`,
+        label: `VLM sees 1–${visible} useful images · no padding · chronological · ${caps} · seals by ~${window}s`,
       }
 }
 

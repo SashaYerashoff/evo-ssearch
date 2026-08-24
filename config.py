@@ -628,9 +628,9 @@ class Config:
         os.getenv('EVOSSEARCH_LOCAL_VIDEO_SOURCES_JSON', '')
     )
     try:
-        LUXRIOT_SNAPSHOT_INTERVAL = int(os.getenv('EVOSSEARCH_LUXRIOT_SNAPSHOT_INTERVAL', '2'))
+        LUXRIOT_SNAPSHOT_INTERVAL = int(os.getenv('EVOSSEARCH_LUXRIOT_SNAPSHOT_INTERVAL', '1'))
     except (TypeError, ValueError):
-        LUXRIOT_SNAPSHOT_INTERVAL = 2
+        LUXRIOT_SNAPSHOT_INTERVAL = 1
     try:
         LUXRIOT_SNAPSHOT_MAX_EDGE = int(os.getenv('EVOSSEARCH_LUXRIOT_SNAPSHOT_MAX_EDGE', '800'))
     except (TypeError, ValueError):
@@ -1171,12 +1171,12 @@ class Config:
     LUXRIOT_BATCH_SIZES = (4, 8, 12, 16)
     try:
         LUXRIOT_DEFAULT_BATCH_SIZE = int(
-            os.getenv('EVOSSEARCH_LUXRIOT_DEFAULT_BATCH_SIZE', '8')
+            os.getenv('EVOSSEARCH_LUXRIOT_DEFAULT_BATCH_SIZE', '12')
         )
     except (TypeError, ValueError):
-        LUXRIOT_DEFAULT_BATCH_SIZE = 8
+        LUXRIOT_DEFAULT_BATCH_SIZE = 12
     if LUXRIOT_DEFAULT_BATCH_SIZE not in LUXRIOT_BATCH_SIZES:
-        LUXRIOT_DEFAULT_BATCH_SIZE = 8
+        LUXRIOT_DEFAULT_BATCH_SIZE = 12
     try:
         LUXRIOT_SUMMARY_RETENTION_DAYS = float(
             os.getenv('EVOSSEARCH_LUXRIOT_SUMMARY_RETENTION_DAYS', '7')

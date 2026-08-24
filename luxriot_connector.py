@@ -4187,6 +4187,23 @@ class LuxriotCaptureSession:
         )
         return max(wall_age, source_age)
 
+    def _summary_observation_window_sec_locked(self) -> float:
+        """Return the operator-facing maximum span of one live L0 packet.
+
+        ``batch_size`` and ``interval`` describe the desired evidence window,
+        not a requirement to pad every request to ``batch_size`` images.  The
+        attention scheduler may admit fewer snapshots in a quiet scene, but a
+        non-empty packet must still be sealed on this clock.  Keeping that
+        deadline independent from profile targets prevents quiet/watch modes
+        from turning a live observation into a 30--60 second backlog.
+        """
+
+        configured_span = max(
+            1.0,
+            float(max(1, int(self.batch_size))) * max(0.2, float(self.interval)),
+        )
+        return min(float(self.summary_max_window_sec), configured_span)
+
     def _summary_deadline_frame_limit_locked(
         self,
         window_sec: Optional[float] = None,
@@ -4396,6 +4413,9 @@ class LuxriotCaptureSession:
                     for frame in self.frames
                     if isinstance(frame, Mapping)
                 )
+                observation_window_sec = (
+                    self._summary_observation_window_sec_locked()
+                )
                 if adaptive:
                     profile = self._summary_profile_locked()
                     budget_mode = profile.mode
@@ -4407,14 +4427,12 @@ class LuxriotCaptureSession:
                         int(self.summary_max_batch_frames),
                         int(profile.hard_accumulator_cap),
                     )
-                    # Mode profiles express how slowly a quiet channel may be
-                    # sampled under the full eight-channel port budget.  They
-                    # must not weaken the operator-facing L0 window contract:
-                    # every non-empty accumulator is submitted by the configured
-                    # summary maximum (60 s by default), regardless of mode.
+                    # Mode profiles control evidence density, not how long a
+                    # live packet may wait for enough images. The operator
+                    # window seals a sparse heartbeat without padding it.
                     deadline_sec = min(
                         float(profile.deadline_ms) / 1000.0,
-                        float(self.summary_max_window_sec),
+                        float(observation_window_sec),
                     )
                     ready_by_size = bool(size_trigger) and (
                         pending_count >= target_frames
@@ -4424,7 +4442,7 @@ class LuxriotCaptureSession:
                         pending_count > 0
                         and pending_age_sec >= deadline_sec
                     )
-                    # Preserve the ordinary <=60 s batch boundary. Once
+                    # Preserve the operator-facing observation boundary. Once
                     # backpressure has already compacted omitted observations,
                     # processing only the oldest prefix would instead create a
                     # FIFO visual backlog whose output is stale on arrival.
@@ -4449,7 +4467,7 @@ class LuxriotCaptureSession:
                     )
                     ready_by_deadline = (
                         pending_count > 0
-                        and pending_age_sec >= float(self.summary_max_window_sec)
+                        and pending_age_sec >= float(observation_window_sec)
                     )
                     coalesce_all = bool(ready_by_deadline and compacted_pending)
                     frame_limit = min(
@@ -4458,7 +4476,9 @@ class LuxriotCaptureSession:
                         if coalesce_all
                         else int(self.batch_size)
                         if ready_by_size
-                        else self._summary_deadline_frame_limit_locked(),
+                        else self._summary_deadline_frame_limit_locked(
+                            observation_window_sec
+                        ),
                     )
             if not ready_by_size and not ready_by_deadline:
                 return
@@ -5413,6 +5433,9 @@ class LuxriotCaptureSession:
             capture_selector_enabled = bool(self.capture_selector_enabled)
             capture_selector_bias = str(self.capture_selector_bias or "auto")
             summary_pending_age_sec = self._summary_pending_age_locked()
+            summary_observation_window_sec = (
+                self._summary_observation_window_sec_locked()
+            )
         return {
             "running": not self.stop_event.is_set() and self.thread.is_alive(),
             "channel_id": self.channel_id,
@@ -5422,6 +5445,10 @@ class LuxriotCaptureSession:
             "batch_size": self.batch_size,
             "summary_max_batch_frames": int(self.summary_max_batch_frames),
             "summary_max_window_sec": round(float(self.summary_max_window_sec), 3),
+            "summary_observation_window_sec": round(
+                float(summary_observation_window_sec),
+                3,
+            ),
             "summary_quiet_cadence_sec": round(float(self.summary_quiet_cadence_sec), 3),
             "summary_normal_cadence_sec": round(float(self.summary_normal_cadence_sec), 3),
             "summary_burst_cadence_sec": round(float(self.summary_burst_cadence_sec), 3),
@@ -13363,6 +13390,34 @@ class LuxriotManager:
         ).strip()[:120]
         if frame_budget_policy:
             out["frame_budget_policy"] = frame_budget_policy
+        raw_packet = value.get("evidence_packet")
+        if isinstance(raw_packet, Mapping):
+            packet: Dict[str, Any] = {
+                "version": int(
+                    _parse_optional_int(raw_packet.get("version")) or 1
+                ),
+                "policy": str(
+                    raw_packet.get("policy")
+                    or "bounded_temporal_evidence_v1"
+                ).strip()[:120],
+                "presentation_order": "chronological",
+            }
+            for key in (
+                "image_budget",
+                "primary_image_count",
+                "companion_slots_reserved",
+                "window_start_ms",
+                "window_end_ms",
+            ):
+                parsed = _parse_optional_int(raw_packet.get(key))
+                if parsed is not None:
+                    packet[key] = max(0, int(parsed))
+            role_counts = cls._compact_count_breakdown(
+                raw_packet.get("role_counts")
+            )
+            if role_counts:
+                packet["role_counts"] = role_counts
+            out["evidence_packet"] = packet
         selection_sources = cls._compact_count_breakdown(value.get("selection_sources"))
         if selection_sources:
             out["selection_sources"] = selection_sources
@@ -13430,17 +13485,20 @@ class LuxriotManager:
             )
 
         signal_specs = (
-            ("road_cv_cues", "road_cv_cue", 0, ("score",), "timestamp_ms", "cue_type"),
+            # An exact semantic hit must remain visible for false-positive
+            # review. CV signals still contribute roles and scores to that
+            # same second instead of displacing or duplicating the image.
+            ("clip_probe_signals", "clip_probe", 0, ("m", "margin", "p", "pos_score"), "timestamp_ms", "name"),
+            ("road_episodes", "road_episode", 1, ("score",), "apex_timestamp_ms", "event_type"),
+            ("road_cv_cues", "road_cv_cue", 2, ("score",), "timestamp_ms", "cue_type"),
             (
                 "road_cv_frame_scores",
                 "road_cv_frame_score",
-                1,
+                3,
                 ("attention_score", "cue_score", "active_ratio"),
                 "timestamp_ms",
                 None,
             ),
-            ("road_episodes", "road_episode", 2, ("score",), "apex_timestamp_ms", "event_type"),
-            ("clip_probe_signals", "clip_probe", 3, ("m", "margin", "p", "pos_score"), "timestamp_ms", "name"),
         )
         for key, source, priority, score_keys, timestamp_key, label_key in signal_specs:
             raw_items = vector_signal.get(key)
@@ -13611,6 +13669,23 @@ class LuxriotManager:
                 selected["selection_score"] = round(float(selection_score), 6)
             if fallback_reason:
                 selected["selection_fallback_reason"] = fallback_reason
+            selected_candidates = sorted(
+                candidates.get(int(selected_index), []),
+                key=lambda candidate: (
+                    int(candidate.get("priority") or 0),
+                    -float(candidate.get("score") or 0.0),
+                    str(candidate.get("source") or ""),
+                ),
+            )
+            signal_sources = list(
+                dict.fromkeys(
+                    str(candidate.get("source") or "").strip().lower()
+                    for candidate in selected_candidates
+                    if str(candidate.get("source") or "").strip()
+                )
+            )
+            if signal_sources:
+                selected["selection_signal_sources"] = signal_sources[:8]
             selected_rows.append((int(selected_index), selected))
 
             group: Dict[str, Any] = {
@@ -13622,8 +13697,12 @@ class LuxriotManager:
                 "selection_source": selection_source,
                 "apex_available": bool(apex_available),
             }
-            if chosen_candidate is not None:
-                group["signal_references"] = [dict(chosen_candidate.get("reference") or {})]
+            if selected_candidates:
+                group["signal_references"] = [
+                    dict(candidate.get("reference") or {})
+                    for candidate in selected_candidates[:8]
+                    if isinstance(candidate.get("reference"), Mapping)
+                ]
             if selection_score is not None:
                 group["selection_score"] = float(selection_score)
             if source_hashes:
@@ -13689,6 +13768,65 @@ class LuxriotManager:
         return [frame for _index, frame in selected_rows], selection
 
     @classmethod
+    def _evidence_roles_for_frame(
+        cls,
+        frame: Mapping[str, Any],
+        *,
+        index: int,
+        count: int,
+    ) -> Tuple[str, ...]:
+        """Describe why one primary image belongs in an evidence packet."""
+
+        roles: List[str] = []
+
+        def add(role: str) -> None:
+            normalized = str(role or "").strip().lower().replace(" ", "_")
+            if normalized and normalized not in roles:
+                roles.append(normalized[:80])
+
+        if index == 0:
+            add("window_start")
+        if index == count - 1:
+            add("current")
+        selection_source = str(
+            frame.get("selection_source") or ""
+        ).strip().lower()
+        raw_signal_sources = frame.get("selection_signal_sources")
+        signal_sources = {
+            str(source or "").strip().lower()
+            for source in raw_signal_sources
+            if str(source or "").strip()
+        } if isinstance(raw_signal_sources, Sequence) and not isinstance(
+            raw_signal_sources,
+            (str, bytes, bytearray),
+        ) else set()
+        capture = frame.get("capture_selection")
+        capture_map = capture if isinstance(capture, Mapping) else {}
+        capture_mode = str(
+            capture_map.get("selection_mode") or ""
+        ).strip().lower()
+        if selection_source == "clip_probe" or "clip_probe" in signal_sources:
+            add("probe_signal")
+        if selection_source.startswith("road_") or any(
+            source.startswith("road_") for source in signal_sources
+        ):
+            add("cv_signal")
+        if capture_mode == "burst":
+            add("cv_apex")
+        elif selection_source.startswith("capture_cv_"):
+            add("cv_control")
+        existing_roles = frame.get("attention_roles")
+        if isinstance(existing_roles, Sequence) and not isinstance(
+            existing_roles,
+            (str, bytes, bytearray),
+        ):
+            for role in existing_roles[:8]:
+                add(str(role or ""))
+        if not roles or roles in (["window_start"], ["current"]):
+            add("temporal_sample")
+        return tuple(roles)
+
+    @classmethod
     def _limit_attention_frames(
         cls,
         frames: Sequence[Mapping[str, Any]],
@@ -13705,11 +13843,20 @@ class LuxriotManager:
         """
 
         source = [dict(frame) for frame in frames if isinstance(frame, Mapping)]
-        budget = max(2, int(max_frames))
-        if len(source) <= budget:
-            return source, dict(selection)
+        budget = max(1, int(max_frames))
+        if not source:
+            return [], dict(selection)
 
-        def frame_strength(index: int) -> Tuple[int, float]:
+        source_roles = [
+            cls._evidence_roles_for_frame(
+                frame,
+                index=index,
+                count=len(source),
+            )
+            for index, frame in enumerate(source)
+        ]
+
+        def frame_strength(index: int) -> Tuple[int, int, int, float]:
             frame = source[index]
             capture = frame.get("capture_selection")
             capture_map = capture if isinstance(capture, Mapping) else {}
@@ -13717,14 +13864,55 @@ class LuxriotManager:
             score = cls._finite_float(frame.get("selection_score"))
             if score is None:
                 score = cls._finite_float(capture_map.get("activity_x"))
-            return (1 if mode == "burst" else 0, float(score or 0.0))
+            roles = source_roles[index]
+            return (
+                1 if "probe_signal" in roles else 0,
+                1 if mode == "burst" else 0,
+                1 if "cv_signal" in roles else 0,
+                float(score or 0.0),
+            )
 
         timestamps = [
             int(cls._batch_frame_timestamp_ms(frame) or index * 1000)
             for index, frame in enumerate(source)
         ]
-        chosen: Set[int] = {0, len(source) - 1}
-        remaining = set(range(1, len(source) - 1))
+        if len(source) <= budget:
+            chosen = set(range(len(source)))
+        else:
+            # The latest image gives the packet a stable present-tense anchor.
+            # Exact probe evidence outranks the old first-frame invariant when
+            # a deliberately tiny budget makes both impossible.
+            chosen = {len(source) - 1}
+            probe_indices = sorted(
+                (
+                    index
+                    for index, roles in enumerate(source_roles)
+                    if "probe_signal" in roles and index not in chosen
+                ),
+                key=lambda index: (frame_strength(index), index),
+                reverse=True,
+            )
+            for index in probe_indices[:2]:
+                if len(chosen) >= budget:
+                    break
+                chosen.add(index)
+            if len(chosen) < budget:
+                chosen.add(0)
+            burst_indices = sorted(
+                (
+                    index
+                    for index, roles in enumerate(source_roles)
+                    if "cv_apex" in roles and index not in chosen
+                ),
+                key=lambda index: (frame_strength(index), index),
+                reverse=True,
+            )
+            for index in burst_indices[:2]:
+                if len(chosen) >= budget:
+                    break
+                chosen.add(index)
+
+        remaining = set(range(len(source))).difference(chosen)
         if remaining and len(chosen) < budget:
             strongest = max(
                 remaining,
@@ -13747,8 +13935,17 @@ class LuxriotManager:
             chosen.add(next_index)
             remaining.discard(next_index)
 
-        chosen_indices = sorted(chosen)
-        limited = [source[index] for index in chosen_indices]
+        chosen_indices = sorted(chosen, key=lambda index: (timestamps[index], index))
+        limited: List[Dict[str, Any]] = []
+        role_counts: Dict[str, int] = {}
+        for sequence, source_index in enumerate(chosen_indices, start=1):
+            frame = dict(source[source_index])
+            roles = list(source_roles[source_index])
+            frame["evidence_sequence"] = int(sequence)
+            frame["evidence_roles"] = roles
+            limited.append(frame)
+            for role in roles:
+                role_counts[role] = role_counts.get(role, 0) + 1
         chosen_timestamps = {
             int(timestamp)
             for timestamp in (
@@ -13776,8 +13973,19 @@ class LuxriotManager:
                 "pre_budget_selected_frame_count": len(source),
                 "selected_frame_count": len(limited),
                 "frame_budget": budget,
-                "frame_budget_policy": "endpoints_attention_apex_temporal_diversity_v1",
+                "frame_budget_policy": "bounded_temporal_evidence_v1",
                 "omitted_selected_frames": len(source) - len(limited),
+                "evidence_packet": {
+                    "version": 1,
+                    "policy": "bounded_temporal_evidence_v1",
+                    "presentation_order": "chronological",
+                    "image_budget": int(budget),
+                    "primary_image_count": len(limited),
+                    "companion_slots_reserved": 0,
+                    "window_start_ms": min(timestamps),
+                    "window_end_ms": max(timestamps),
+                    "role_counts": role_counts,
+                },
             }
         )
         if groups:
@@ -24772,17 +24980,62 @@ class LuxriotManager:
             cast(Sequence[Mapping[str, Any]], source_frame_items),
             raw_vector_signal,
         )
+        primary_frame_budget = int(self.l0_max_selected_frames)
+        reserve_companion_slot = bool(
+            primary_frame_budget > 1
+            and len(frame_items) >= primary_frame_budget
+            and any(
+                isinstance(frame.get("burst_companion"), Mapping)
+                and str(
+                    cast(Mapping[str, Any], frame.get("burst_companion")).get(
+                        "thumbnail"
+                    )
+                    or ""
+                ).strip()
+                for frame in frame_items
+            )
+        )
+        if reserve_companion_slot:
+            primary_frame_budget -= 1
         frame_items, frame_selection = self._limit_attention_frames(
             cast(Sequence[Mapping[str, Any]], frame_items),
             frame_selection,
-            self.l0_max_selected_frames,
+            primary_frame_budget,
+        )
+        companion_image_count = int(
+            len(frame_items) < int(self.vlm_max_images_per_request)
+            and any(
+                isinstance(frame.get("burst_companion"), Mapping)
+                and str(
+                    cast(Mapping[str, Any], frame.get("burst_companion")).get(
+                        "thumbnail"
+                    )
+                    or ""
+                ).strip()
+                for frame in frame_items
+            )
+        )
+        packet_metadata = dict(frame_selection.get("evidence_packet") or {})
+        packet_metadata.update(
+            {
+                "image_budget": int(self.l0_max_selected_frames),
+                "primary_image_count": len(frame_items),
+                "companion_slots_reserved": companion_image_count,
+            }
+        )
+        frame_selection = self._compact_frame_selection(
+            {
+                **dict(frame_selection),
+                "evidence_packet": packet_metadata,
+            }
         )
         frame_selection_ms = max(
             0.0,
             (time.perf_counter() - frame_selection_started) * 1000.0,
         )
+        estimated_image_count = len(frame_items) + companion_image_count
         estimated_vision_tokens = (
-            len(frame_items) * int(self.l0_vision_tokens_per_image)
+            estimated_image_count * int(self.l0_vision_tokens_per_image)
         )
         if estimated_vision_tokens > int(self.l0_prompt_budget.max_vision_tokens):
             raise PromptBudgetError(
@@ -24851,6 +25104,8 @@ class LuxriotManager:
         llm_input_stats = {
             "phase": "summary_batch_created",
             "frame_count": len(frame_items),
+            "evidence_image_count": estimated_image_count,
+            "companion_image_count": companion_image_count,
             "source_frame_count": provenance_source_frame_count,
             "selected_frame_count": len(frame_items),
             "batch_size": int(batch_size),

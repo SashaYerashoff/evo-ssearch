@@ -2072,13 +2072,13 @@ class LuxriotCaptureAttentionSignalTests(unittest.TestCase):
         self.assertEqual(records[0]["embedding_status"], "ready")
         self.assertEqual(records[0]["embedding_space"]["backend"], "siglip2")
 
-    def test_message_builder_appends_single_burst_companion_frame(self):
+    def test_message_builder_inserts_burst_companion_in_chronological_order(self):
         import oldapp
 
         frames = [
-            _burst_batch_frame(timestamp_ms=100_000, activity_x=5.0),
-            _burst_batch_frame(timestamp_ms=101_000, activity_x=20.0),
-            _burst_batch_frame(timestamp_ms=102_000, mode="normal", activity_x=1.0, with_companion=False),
+            _burst_batch_frame(timestamp_ms=100_000, thumbnail="frame-100", activity_x=5.0),
+            _burst_batch_frame(timestamp_ms=101_000, thumbnail="frame-101", activity_x=20.0),
+            _burst_batch_frame(timestamp_ms=102_000, thumbnail="frame-102", mode="normal", activity_x=1.0, with_companion=False),
         ]
         messages = oldapp._build_luxriot_messages("#7", frames, "Describe.", "System.")
         user_content = messages[1]["content"]
@@ -2090,8 +2090,15 @@ class LuxriotCaptureAttentionSignalTests(unittest.TestCase):
             if part.get("type") == "text" and "sharper companion" in str(part.get("text") or "")
         ]
         self.assertEqual(len(companion_notes), 1)
-        self.assertIn("Snapshot 4 - sharper companion of burst Snapshot 2", companion_notes[0])
-        self.assertIn("companion-101000", image_parts[-1]["image_url"]["url"])
+        self.assertIn("Evidence 3", companion_notes[0])
+        self.assertIn("source Snapshot 2", companion_notes[0])
+        self.assertEqual(
+            [part["image_url"]["url"].rsplit(",", 1)[-1] for part in image_parts],
+            ["frame-100", "frame-101", "companion-101000", "frame-102"],
+        )
+        intro = str(user_content[0].get("text") or "")
+        self.assertIn("strictly ordered oldest to newest", intro)
+        self.assertIn("allowed to use fewer images", intro)
 
     def test_message_builder_never_uses_companion_to_exceed_image_cap(self):
         import oldapp
@@ -2120,6 +2127,56 @@ class LuxriotCaptureAttentionSignalTests(unittest.TestCase):
         ]
         self.assertEqual(len(image_parts), 8)
         self.assertEqual(companion_notes, [])
+
+    def test_evidence_budget_pins_probe_and_cv_apex_then_presents_chronologically(self):
+        frames = [
+            {
+                "timestamp_ms": 100_000 + index * 1_000,
+                "selection_source": "clip_probe" if index == 5 else "single_frame",
+                "selection_score": 0.9 if index == 5 else 0.1,
+                "capture_selection": {
+                    "selection_mode": "burst" if index == 7 else "quiet",
+                    "activity_x": 12.0 if index == 7 else 0.1,
+                },
+            }
+            for index in range(10)
+        ]
+        selection = {
+            "version": 1,
+            "policy": "per_second_attention_apex_v1",
+            "source_frame_count": len(frames),
+            "selected_frame_count": len(frames),
+            "groups": [
+                {
+                    "selected_timestamp_ms": frame["timestamp_ms"],
+                    "selected_source_frame_index": index + 1,
+                    "selection_source": frame["selection_source"],
+                    "apex_available": index in {5, 7},
+                    "source_frame_indices": [index + 1],
+                }
+                for index, frame in enumerate(frames)
+            ],
+        }
+
+        limited, metadata = LuxriotManager._limit_attention_frames(
+            frames,
+            selection,
+            4,
+        )
+
+        timestamps = [frame["timestamp_ms"] for frame in limited]
+        self.assertEqual(timestamps, [100_000, 105_000, 107_000, 109_000])
+        roles_by_timestamp = {
+            frame["timestamp_ms"]: set(frame["evidence_roles"])
+            for frame in limited
+        }
+        self.assertIn("probe_signal", roles_by_timestamp[105_000])
+        self.assertIn("cv_apex", roles_by_timestamp[107_000])
+        self.assertEqual(
+            metadata["evidence_packet"]["presentation_order"],
+            "chronological",
+        )
+        self.assertEqual(metadata["evidence_packet"]["primary_image_count"], 4)
 
     def test_context_token_estimate_warns_before_model_truncation(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -4286,6 +4343,61 @@ class LuxriotCaptureDispatchTests(unittest.TestCase):
                     session.summary_condition.notify_all()
                 session.summary_worker_thread.join(timeout=1.0)
 
+    def test_attention_heartbeat_seals_sparse_packet_on_operator_window(self):
+        with tempfile.TemporaryDirectory() as temp:
+            manager = build_manager(
+                Path(temp),
+                config_overrides={
+                    "LUXRIOT_ATTENTION_SCHEDULER_ENABLED": True,
+                    "LUXRIOT_VECTOR_SIGNALS_ENABLED": False,
+                },
+            )
+            session = LuxriotCaptureSession(
+                manager,
+                channel_id=7,
+                batch_size=12,
+                prompt="Describe.",
+                run_id="run-sparse-heartbeat",
+                interval_override=1.0,
+            )
+            session.frames = [
+                {
+                    "thumbnail": "quiet-start",
+                    "captured_at": 100.0,
+                    "time_sec": 100.0,
+                    "attention_mode": "quiet",
+                },
+                {
+                    "thumbnail": "quiet-current",
+                    "captured_at": 110.0,
+                    "time_sec": 110.0,
+                    "attention_mode": "quiet",
+                },
+            ]
+            session._summary_batch_opened_monotonic = time.monotonic() - 12.1
+            submissions = []
+
+            def enqueue(**kwargs):
+                submissions.append(dict(kwargs))
+                session.frames.clear()
+                session._summary_batch_opened_monotonic = None
+                return True
+
+            with (
+                patch.object(
+                    manager,
+                    "reserve_l0_cost_budget",
+                    return_value=True,
+                ),
+                patch.object(session, "_enqueue_summary_batch", side_effect=enqueue),
+            ):
+                session._summarize_if_ready(size_trigger=False)
+
+            self.assertEqual(session._summary_observation_window_sec_locked(), 12.0)
+            self.assertEqual(len(submissions), 1)
+            self.assertEqual(submissions[0]["workload_class"], "heartbeat")
+            self.assertEqual(submissions[0]["frame_limit"], 2)
+
     def test_capture_cv_apex_is_the_same_frame_sent_to_clip_vlm_and_archive(self):
         probe_calls = []
         vlm_frames = []
@@ -5260,6 +5372,60 @@ class LuxriotCaptureDispatchTests(unittest.TestCase):
             self.assertEqual(compact_runtime["last_source_frame_count"], 6)
             self.assertEqual(compact_runtime["last_frame_selection"]["groups"][2]["fallback_reason"], "single_frame_only_no_intra_second_choice")
 
+    def test_one_capture_apex_keeps_probe_and_cv_roles_without_duplicate_image(self):
+        frame = _burst_batch_frame(
+            timestamp_ms=150_000,
+            thumbnail="shared-apex",
+            with_companion=False,
+        )
+        vector_signal = {
+            "version": 1,
+            "channel_id": 7,
+            "clip_probe_signals": [
+                {
+                    "name": "thumbs up",
+                    "m": 0.18,
+                    "timestamp_ms": 150_000,
+                }
+            ],
+            "road_cv_cues": [
+                {
+                    "cue_type": "motion_candidate",
+                    "score": 0.81,
+                    "timestamp_ms": 150_000,
+                }
+            ],
+        }
+        with tempfile.TemporaryDirectory() as temp:
+            manager = build_manager(Path(temp))
+            with patch.object(
+                manager,
+                "_build_vector_signal_bundle",
+                return_value=vector_signal,
+            ):
+                batch = manager.create_summary_batch(
+                    channel_id=7,
+                    run_id="run-shared-evidence",
+                    batch_size=12,
+                    prompt="Describe activity.",
+                    model_hint="model-a",
+                    interval_sec=1.0,
+                    frames=[frame],
+                )
+
+        self.assertEqual(len(batch["frames"]), 1)
+        roles = set(batch["frames"][0]["evidence_roles"])
+        self.assertIn("probe_signal", roles)
+        self.assertIn("cv_signal", roles)
+        self.assertIn("cv_apex", roles)
+        references = batch["frame_selection"]["groups"][0][
+            "signal_references"
+        ]
+        self.assertEqual(
+            [reference["source"] for reference in references[:2]],
+            ["clip_probe", "road_cv_cue"],
+        )
+
     def test_summary_batch_uses_deterministic_midpoint_when_apex_unavailable(self):
         frames = [
             {
@@ -5333,6 +5499,11 @@ class LuxriotCaptureDispatchTests(unittest.TestCase):
             selection = batch["frame_selection"]
             self.assertEqual(selection["source_frame_count"], 3)
             self.assertEqual(selection["selected_frame_count"], 3)
+            self.assertEqual(
+                selection["evidence_packet"]["primary_image_count"],
+                3,
+            )
+            self.assertEqual(selection["evidence_packet"]["image_budget"], 8)
             self.assertEqual(selection["single_frame_count"], 3)
             self.assertEqual(selection["fallback_count"], 3)
             self.assertEqual(
@@ -5374,6 +5545,55 @@ class LuxriotCaptureDispatchTests(unittest.TestCase):
         self.assertIn("only 8 attention-selected images are visible", batch["system_prompt"])
         self.assertIn("remaining 4 candidates are not visible", batch["system_prompt"])
         self.assertIn("do not infer that nothing happened", batch["system_prompt"])
+
+    def test_evidence_composer_reserves_one_of_eight_slots_for_stable_companion(self):
+        import oldapp
+
+        frames = [
+            _burst_batch_frame(
+                timestamp_ms=500_000 + index * 1_000,
+                thumbnail=f"primary-{index}",
+                activity_x=20.0 if index == 4 else 4.0,
+            )
+            for index in range(8)
+        ]
+        with tempfile.TemporaryDirectory() as temp:
+            manager = build_manager(
+                Path(temp),
+                config_overrides={
+                    "LUXRIOT_L0_MAX_SELECTED_FRAMES": 8,
+                    "LUXRIOT_VLM_MAX_IMAGES_PER_REQUEST": 8,
+                },
+            )
+            with patch.object(manager, "_build_vector_signal_bundle", return_value={}):
+                batch = manager.create_summary_batch(
+                    channel_id=7,
+                    run_id="run-companion-budget",
+                    batch_size=8,
+                    prompt="Describe activity.",
+                    model_hint="model-a",
+                    interval_sec=1.0,
+                    frames=frames,
+                )
+
+        packet = batch["frame_selection"]["evidence_packet"]
+        self.assertEqual(len(batch["frames"]), 7)
+        self.assertEqual(packet["image_budget"], 8)
+        self.assertEqual(packet["primary_image_count"], 7)
+        self.assertEqual(packet["companion_slots_reserved"], 1)
+        self.assertEqual(batch["llm_input_stats"]["evidence_image_count"], 8)
+        messages = oldapp._build_luxriot_messages(
+            "#7",
+            batch["frames"],
+            "Describe.",
+            "System.",
+        )
+        image_parts = [
+            part
+            for part in messages[1]["content"]
+            if part.get("type") == "image_url"
+        ]
+        self.assertEqual(len(image_parts), 8)
 
     def test_road_cv_directional_cues_wait_for_frozen_high_confidence_scene(self):
         with tempfile.TemporaryDirectory() as temp:

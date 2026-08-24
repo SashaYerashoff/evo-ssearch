@@ -155,11 +155,11 @@ PORT_ENV = {
     "EVOSSEARCH_LUXRIOT_FFMPEG_INTEL_DEVICE": "",
     "EVOSSEARCH_LUXRIOT_LIVE_SEGMENT_SECONDS": "60",
     "EVOSSEARCH_LUXRIOT_LIVE_SEGMENT_FPS": "4",
-    # A fresh channel seals an eight-frame L0 window every ~16 seconds. The
-    # VLM request is independently hard-capped at the endpoint's eight-image
-    # multimodal limit; legacy 12/16-frame windows are attention-compressed.
-    "EVOSSEARCH_LUXRIOT_SNAPSHOT_INTERVAL": "2",
-    "EVOSSEARCH_LUXRIOT_DEFAULT_BATCH_SIZE": "8",
+    # Observe at 1 Hz and seal a live evidence window by about 12 seconds.
+    # The evidence composer independently sends only 1--8 useful images; batch
+    # size is a temporal window contract, not an image-padding target.
+    "EVOSSEARCH_LUXRIOT_SNAPSHOT_INTERVAL": "1",
+    "EVOSSEARCH_LUXRIOT_DEFAULT_BATCH_SIZE": "12",
     "EVOSSEARCH_LUXRIOT_SUMMARY_MAX_BATCH_FRAMES": "16",
     "EVOSSEARCH_LUXRIOT_VLM_MAX_IMAGES_PER_REQUEST": "8",
     "EVOSSEARCH_LUXRIOT_L0_MAX_SELECTED_FRAMES": "8",
