@@ -2093,6 +2093,34 @@ class LuxriotCaptureAttentionSignalTests(unittest.TestCase):
         self.assertIn("Snapshot 4 - sharper companion of burst Snapshot 2", companion_notes[0])
         self.assertIn("companion-101000", image_parts[-1]["image_url"]["url"])
 
+    def test_message_builder_never_uses_companion_to_exceed_image_cap(self):
+        import oldapp
+
+        frames = [
+            _burst_batch_frame(timestamp_ms=100_000 + index * 1_000)
+            for index in range(8)
+        ]
+        with patch.object(oldapp.config, "LUXRIOT_VLM_MAX_IMAGES_PER_REQUEST", 8):
+            messages = oldapp._build_luxriot_messages(
+                "#7",
+                frames,
+                "Describe.",
+                "System.",
+            )
+
+        user_content = messages[1]["content"]
+        image_parts = [
+            part for part in user_content if part.get("type") == "image_url"
+        ]
+        companion_notes = [
+            part
+            for part in user_content
+            if part.get("type") == "text"
+            and "sharper companion" in str(part.get("text") or "")
+        ]
+        self.assertEqual(len(image_parts), 8)
+        self.assertEqual(companion_notes, [])
+
     def test_context_token_estimate_warns_before_model_truncation(self):
         with tempfile.TemporaryDirectory() as temp:
             manager = build_manager(Path(temp))
@@ -3989,11 +4017,11 @@ class LuxriotCaptureDispatchTests(unittest.TestCase):
                 [call["timestamp_ms"] for call in probe_calls],
                 [source_anchor_ms + 333 + second * 1000 for second in range(15)],
             )
-            self.assertEqual(len(vlm_frames), 4)
+            self.assertEqual(len(vlm_frames), 8)
             self.assertTrue(all(frame["thumbnail"] in {"level-0", "level-240"} for frame in vlm_frames))
             self.assertEqual(len(archive_entries), 1)
             self.assertEqual(archive_entries[0]["source_frame_count"], 12)
-            self.assertEqual(archive_entries[0]["selected_frame_count"], 4)
+            self.assertEqual(archive_entries[0]["selected_frame_count"], 8)
             self.assertTrue(
                 all(
                     frame["thumbnail"] in {"level-0", "level-240"}
@@ -4171,14 +4199,32 @@ class LuxriotCaptureDispatchTests(unittest.TestCase):
 
             session._summarize_if_ready()
 
-            self.assertEqual([len(item["thumbnails"]) for item in dispatched], [4, 4])
+            self.assertEqual([len(item["thumbnails"]) for item in dispatched], [8, 8])
             self.assertEqual(
                 dispatched[0]["thumbnails"],
-                ["frame-0", "frame-1", "frame-6", "frame-11"],
+                [
+                    "frame-0",
+                    "frame-1",
+                    "frame-2",
+                    "frame-3",
+                    "frame-4",
+                    "frame-6",
+                    "frame-8",
+                    "frame-11",
+                ],
             )
             self.assertEqual(
                 dispatched[1]["thumbnails"],
-                ["frame-12", "frame-13", "frame-18", "frame-23"],
+                [
+                    "frame-12",
+                    "frame-13",
+                    "frame-14",
+                    "frame-15",
+                    "frame-16",
+                    "frame-18",
+                    "frame-20",
+                    "frame-23",
+                ],
             )
             self.assertEqual(
                 [item["source_frame_count"] for item in dispatched],
@@ -4186,7 +4232,7 @@ class LuxriotCaptureDispatchTests(unittest.TestCase):
             )
             self.assertEqual(
                 [item["selected_frame_count"] for item in dispatched],
-                [4, 4],
+                [8, 8],
             )
             self.assertEqual([frame["thumbnail"] for frame in session.frames], ["frame-24"])
 
@@ -5013,6 +5059,52 @@ class LuxriotCaptureDispatchTests(unittest.TestCase):
             self.assertIn("warnings", stats)
             self.assertIn("llm_input_stats", manager.summary_history[7][0])
 
+    def test_summary_request_rejects_too_many_images_before_inference(self):
+        calls = []
+
+        def lm_callback(_messages, _model):
+            calls.append(True)
+            return "summary"
+
+        with tempfile.TemporaryDirectory() as temp:
+            manager = build_manager(
+                Path(temp),
+                lm_callback=lm_callback,
+                config_overrides={"LUXRIOT_VLM_MAX_IMAGES_PER_REQUEST": 8},
+            )
+            manager.message_builder = lambda *_args: [
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "image_url",
+                            "image_url": {
+                                "url": f"data:image/jpeg;base64,frame-{index}",
+                                "detail": "high",
+                            },
+                        }
+                        for index in range(9)
+                    ],
+                }
+            ]
+            batch = manager.create_summary_batch(
+                channel_id=7,
+                run_id="run-7",
+                batch_size=2,
+                prompt="Describe activity.",
+                model_hint="model-a",
+                interval_sec=2.0,
+                frames=sample_frames(),
+            )
+
+            with self.assertRaisesRegex(
+                PromptBudgetError,
+                r"image limit \(9 > 8\).*rejected before inference",
+            ):
+                manager.run_summary_batch(batch)
+
+        self.assertEqual(calls, [])
+
     def test_summary_batch_injects_vector_signal_bundle_into_l0_prompt_and_status(self):
         captured_messages = []
 
@@ -5248,6 +5340,41 @@ class LuxriotCaptureDispatchTests(unittest.TestCase):
                 ["single_frame", "single_frame", "single_frame"],
             )
 
+    def test_wider_capture_window_discloses_partial_vlm_coverage(self):
+        frames = [
+            {
+                "thumbnail": f"frame-{index}",
+                "captured_at": 400.0 + index * 2.0,
+                "time_sec": 400.0 + index * 2.0,
+            }
+            for index in range(12)
+        ]
+
+        with tempfile.TemporaryDirectory() as temp:
+            manager = build_manager(
+                Path(temp),
+                config_overrides={
+                    "LUXRIOT_L0_MAX_SELECTED_FRAMES": 8,
+                    "LUXRIOT_VLM_MAX_IMAGES_PER_REQUEST": 8,
+                },
+            )
+            with patch.object(manager, "_build_vector_signal_bundle", return_value={}):
+                batch = manager.create_summary_batch(
+                    channel_id=7,
+                    run_id="run-7",
+                    batch_size=12,
+                    prompt="Describe activity.",
+                    model_hint="model-a",
+                    interval_sec=2.0,
+                    frames=frames,
+                )
+
+        self.assertEqual(len(batch["frames"]), 8)
+        self.assertEqual(batch["frame_selection"]["omitted_selected_frames"], 4)
+        self.assertIn("only 8 attention-selected images are visible", batch["system_prompt"])
+        self.assertIn("remaining 4 candidates are not visible", batch["system_prompt"])
+        self.assertIn("do not infer that nothing happened", batch["system_prompt"])
+
     def test_road_cv_directional_cues_wait_for_frozen_high_confidence_scene(self):
         with tempfile.TemporaryDirectory() as temp:
             manager = build_manager(
@@ -5444,21 +5571,21 @@ class LuxriotCaptureDispatchTests(unittest.TestCase):
 
             self.assertFalse(outcome["queued"])
             saved = archived[0]["archive_frames"]
-            self.assertEqual([frame["frame_index"] for frame in saved], [0, 1, 2, 3])
+            self.assertEqual([frame["frame_index"] for frame in saved], [0, 1, 2, 3, 4])
             self.assertEqual(
                 [frame["source_frame_index"] for frame in saved],
-                [1, 2, 3, 5],
+                [1, 2, 3, 4, 5],
             )
             self.assertEqual(
                 [frame["anchor_role"] for frame in saved],
-                ["first", "sample", "sample", "last"],
+                ["first", "sample", "sample", "sample", "last"],
             )
             self.assertEqual(
                 [frame["timestamp_ms"] for frame in saved],
-                [100000, 101000, 102000, 104000],
+                [100000, 101000, 102000, 103000, 104000],
             )
-            self.assertTrue(saved[1]["is_cover"])
-            self.assertEqual(saved[1]["cover_source"], "backend_fallback")
+            self.assertTrue(saved[2]["is_cover"])
+            self.assertEqual(saved[2]["cover_source"], "backend_fallback")
 
     def test_summary_alert_counts_roll_up_by_severity(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -5752,6 +5879,8 @@ class LuxriotCaptureDispatchTests(unittest.TestCase):
             self.assertEqual(streams["capture_defaults"]["batch_size"], 12)
             self.assertEqual(streams["capture_defaults"]["interval_sec"], 5.0)
             self.assertEqual(streams["capture_defaults"]["allowed_batch_sizes"], [4, 8, 12, 16])
+            self.assertEqual(streams["capture_defaults"]["max_vlm_images_per_request"], 8)
+            self.assertEqual(streams["capture_defaults"]["max_selected_frames"], 8)
             self.assertEqual(
                 streams["capture_configurations"],
                 [
@@ -11614,6 +11743,25 @@ class LuxriotCaptureDispatchTests(unittest.TestCase):
 
             with self.assertRaisesRegex(ValueError, "Unsupported batch_size 24"):
                 manager.start_session(7, batch_size=24)
+
+            self.assertNotIn(7, manager.sessions)
+
+    def test_start_session_rejects_batch_above_capture_limit_instead_of_clamping(self):
+        with tempfile.TemporaryDirectory() as temp:
+            manager = build_manager(
+                Path(temp),
+                config_overrides={
+                    "LUXRIOT_BATCH_SIZES": (4, 8, 12, 16),
+                    "LUXRIOT_DEFAULT_BATCH_SIZE": 8,
+                    "LUXRIOT_SUMMARY_MAX_BATCH_FRAMES": 8,
+                },
+            )
+
+            with self.assertRaisesRegex(
+                ValueError,
+                "batch_size 16 exceeds the configured capture limit 8",
+            ):
+                manager.start_session(7, batch_size=16)
 
             self.assertNotIn(7, manager.sessions)
 

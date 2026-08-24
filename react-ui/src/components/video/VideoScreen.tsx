@@ -226,11 +226,19 @@ function SummaryCard({
   const coalesced = Number(entry.coalesced?.batches || 0)
   const itemCount = Number(entry.item_count || 0)
   const frameCount = Number(entry.frame_count || 0)
+  const selectedFrameCount = Number(entry.selected_frame_count || frameCount || 0)
+  const sourceFrameCount = Number(entry.source_frame_count || selectedFrameCount || 0)
+  const partialVisualCoverage = level === 'L0'
+    && sourceFrameCount > 0
+    && selectedFrameCount > 0
+    && selectedFrameCount < sourceFrameCount
   const runCount = Array.isArray(entry.run_ids) ? entry.run_ids.length : 0
   const sourceTokens = Number(entry.source_tokens || 0)
   const contentStats = level === 'L0'
     ? [
-        frameCount > 0 ? `${frameCount} frames` : '',
+        partialVisualCoverage
+          ? `${selectedFrameCount}/${sourceFrameCount} VLM frames`
+          : (selectedFrameCount > 0 ? `${selectedFrameCount} frames` : ''),
         entry.model ? String(entry.model) : '',
       ].filter(Boolean)
     : [
@@ -286,6 +294,14 @@ function SummaryCard({
             <span className="vid-meta-chip transition">{entry.state_transition_total} transitions</span>
           )}
           {entry.coverage_gap && <span className="vid-meta-chip gap">coverage gap</span>}
+          {partialVisualCoverage && (
+            <span
+              className="vid-meta-chip gap"
+              title="The capture window was wider than the VLM image budget. EVA selected representative frames; omitted intervals were not visible to the model."
+            >
+              partial visual coverage
+            </span>
+          )}
           {cameraMotion && cameraMotion !== 'steady' && (
             <span
               className="vid-meta-chip gap"
@@ -1076,6 +1092,8 @@ export function VideoScreen({
         onReload={reloadChannels}
         batch={batch} onBatch={updateBatch}
         allowedBatchSizes={(streams.capture_defaults?.allowed_batch_sizes || []).map(String)}
+        maxSelectedFrames={Number(streams.capture_defaults?.max_selected_frames || 8)}
+        maxVlmImages={Number(streams.capture_defaults?.max_vlm_images_per_request || 8)}
         every={every} onEvery={updateEvery}
         routingSelector={routingSelector} onRoutingSelector={updateRoutingSelector}
         routingOptions={routingOptions} routingStatus={routingStatus}

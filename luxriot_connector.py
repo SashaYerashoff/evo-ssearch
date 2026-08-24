@@ -6249,21 +6249,41 @@ class LuxriotManager:
             ),
         )
         try:
-            self.l0_max_selected_frames = max(
+            self.vlm_max_images_per_request = max(
                 2,
                 min(
-                    16,
+                    64,
                     int(
                         getattr(
                             config,
-                            "LUXRIOT_L0_MAX_SELECTED_FRAMES",
-                            4,
+                            "LUXRIOT_VLM_MAX_IMAGES_PER_REQUEST",
+                            8,
                         )
                     ),
                 ),
             )
         except (TypeError, ValueError):
-            self.l0_max_selected_frames = 4
+            self.vlm_max_images_per_request = 8
+        try:
+            self.l0_max_selected_frames = max(
+                2,
+                min(
+                    16,
+                    self.vlm_max_images_per_request,
+                    int(
+                        getattr(
+                            config,
+                            "LUXRIOT_L0_MAX_SELECTED_FRAMES",
+                            8,
+                        )
+                    ),
+                ),
+            )
+        except (TypeError, ValueError):
+            self.l0_max_selected_frames = min(
+                8,
+                self.vlm_max_images_per_request,
+            )
         self.incident_prompt_planner = IncidentPromptEnvelopePlanner(
             self.incident_attention_policy,
             token_estimator=estimate_text_tokens,
@@ -10802,6 +10822,8 @@ class LuxriotManager:
             "message_count",
             "text_chars",
             "image_parts",
+            "max_images_per_request",
+            "image_budget_status",
             "high_detail_images",
             "image_url_chars",
             "total_payload_chars",
@@ -24795,6 +24817,28 @@ class LuxriotManager:
             vector_signal_frames=cast(Sequence[Mapping[str, Any]], frame_items),
             vision_tokens=estimated_vision_tokens,
         )
+        omitted_selected_frames = int(
+            _parse_optional_int(frame_selection.get("omitted_selected_frames")) or 0
+        )
+        if omitted_selected_frames > 0:
+            pre_budget_count = int(
+                _parse_optional_int(
+                    frame_selection.get("pre_budget_selected_frame_count")
+                )
+                or len(frame_items) + omitted_selected_frames
+            )
+            system_prompt = (
+                f"{system_prompt.rstrip()}\n\n"
+                "CURRENT VLM IMAGE COVERAGE:\n"
+                f"The capture window produced {pre_budget_count} time-bucket "
+                f"candidates, but only {len(frame_items)} attention-selected images "
+                f"are visible in this request because the L0 primary-frame budget "
+                f"is {self.l0_max_selected_frames}; the hard request image cap is "
+                f"{self.vlm_max_images_per_request}. The remaining "
+                f"{omitted_selected_frames} candidates are not visible. Do not claim "
+                "continuous or full visual coverage, and do not infer that nothing "
+                "happened in omitted intervals; state uncertainty where relevant."
+            )
         prompt_compose_ms = max(
             0.0,
             (time.perf_counter() - prompt_started) * 1000.0,
@@ -24925,6 +24969,7 @@ class LuxriotManager:
                 "message_count": message_stats.get("message_count"),
                 "text_chars": message_stats.get("text_chars"),
                 "image_parts": message_stats.get("image_parts"),
+                "max_images_per_request": self.vlm_max_images_per_request,
                 "high_detail_images": message_stats.get("high_detail_images"),
                 "image_url_chars": message_stats.get("image_url_chars"),
                 "total_payload_chars": message_stats.get("total_payload_chars"),
@@ -24934,6 +24979,17 @@ class LuxriotManager:
                 "request_build_ms": round(request_build_ms, 2),
             }
         )
+        image_parts = int(
+            _parse_optional_int(message_stats.get("image_parts")) or 0
+        )
+        if image_parts > self.vlm_max_images_per_request:
+            llm_input_stats["image_budget_status"] = "rejected"
+            raise PromptBudgetError(
+                "L0 request exceeds the configured VLM image limit "
+                f"({image_parts} > {self.vlm_max_images_per_request}); "
+                "the request was rejected before inference"
+            )
+        llm_input_stats["image_budget_status"] = "within_budget"
         estimated_input_tokens = int(
             _parse_optional_int(message_stats.get("estimated_context_tokens")) or 0
         )
@@ -26562,6 +26618,24 @@ class LuxriotManager:
                     f"Unsupported batch_size {candidate}; choose one of: {allowed}"
                 )
             batch = candidate
+        try:
+            max_capture_batch = max(
+                1,
+                int(
+                    getattr(
+                        self.config,
+                        "LUXRIOT_SUMMARY_MAX_BATCH_FRAMES",
+                        16,
+                    )
+                ),
+            )
+        except (TypeError, ValueError):
+            max_capture_batch = 16
+        if batch > max_capture_batch:
+            raise ValueError(
+                f"batch_size {batch} exceeds the configured capture limit "
+                f"{max_capture_batch}; refusing to clamp it silently"
+            )
         prompt = prompt or ""
         normalized_model_hint = str(model_hint or "").strip() or None
         requested_interval_sec = self._normalize_capture_interval_sec(interval_sec)
@@ -27641,6 +27715,8 @@ class LuxriotManager:
                 "batch_size": default_batch_size,
                 "interval_sec": default_interval_sec,
                 "allowed_batch_sizes": configured_batch_sizes,
+                "max_vlm_images_per_request": self.vlm_max_images_per_request,
+                "max_selected_frames": self.l0_max_selected_frames,
             },
             "capture_configurations": capture_configurations,
             "desired_video_channels": desired_video_channels,

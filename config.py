@@ -628,9 +628,9 @@ class Config:
         os.getenv('EVOSSEARCH_LOCAL_VIDEO_SOURCES_JSON', '')
     )
     try:
-        LUXRIOT_SNAPSHOT_INTERVAL = int(os.getenv('EVOSSEARCH_LUXRIOT_SNAPSHOT_INTERVAL', '5'))
+        LUXRIOT_SNAPSHOT_INTERVAL = int(os.getenv('EVOSSEARCH_LUXRIOT_SNAPSHOT_INTERVAL', '2'))
     except (TypeError, ValueError):
-        LUXRIOT_SNAPSHOT_INTERVAL = 5
+        LUXRIOT_SNAPSHOT_INTERVAL = 2
     try:
         LUXRIOT_SNAPSHOT_MAX_EDGE = int(os.getenv('EVOSSEARCH_LUXRIOT_SNAPSHOT_MAX_EDGE', '800'))
     except (TypeError, ValueError):
@@ -671,16 +671,30 @@ class Config:
         min(16, LUXRIOT_SUMMARY_MAX_BATCH_FRAMES),
     )
     try:
-        LUXRIOT_L0_MAX_SELECTED_FRAMES = int(
-            os.getenv('EVOSSEARCH_LUXRIOT_L0_MAX_SELECTED_FRAMES', '4')
+        LUXRIOT_VLM_MAX_IMAGES_PER_REQUEST = int(
+            os.getenv('EVOSSEARCH_LUXRIOT_VLM_MAX_IMAGES_PER_REQUEST', '8')
         )
     except (TypeError, ValueError):
-        LUXRIOT_L0_MAX_SELECTED_FRAMES = 4
+        LUXRIOT_VLM_MAX_IMAGES_PER_REQUEST = 8
+    LUXRIOT_VLM_MAX_IMAGES_PER_REQUEST = max(
+        2,
+        min(64, LUXRIOT_VLM_MAX_IMAGES_PER_REQUEST),
+    )
+    try:
+        LUXRIOT_L0_MAX_SELECTED_FRAMES = int(
+            os.getenv('EVOSSEARCH_LUXRIOT_L0_MAX_SELECTED_FRAMES', '8')
+        )
+    except (TypeError, ValueError):
+        LUXRIOT_L0_MAX_SELECTED_FRAMES = 8
     # Keep the wider capture window as provenance while bounding the number of
     # image encodes in one realtime VLM request.
     LUXRIOT_L0_MAX_SELECTED_FRAMES = max(
         2,
-        min(16, LUXRIOT_L0_MAX_SELECTED_FRAMES),
+        min(
+            16,
+            LUXRIOT_VLM_MAX_IMAGES_PER_REQUEST,
+            LUXRIOT_L0_MAX_SELECTED_FRAMES,
+        ),
     )
     try:
         LUXRIOT_SUMMARY_MAX_WINDOW_SEC = float(
@@ -1155,7 +1169,14 @@ class Config:
     # explicit default must not depend on ordering: operators may deliberately
     # choose a smaller batch to trade visual coverage for lower alert latency.
     LUXRIOT_BATCH_SIZES = (4, 8, 12, 16)
-    LUXRIOT_DEFAULT_BATCH_SIZE = 12
+    try:
+        LUXRIOT_DEFAULT_BATCH_SIZE = int(
+            os.getenv('EVOSSEARCH_LUXRIOT_DEFAULT_BATCH_SIZE', '8')
+        )
+    except (TypeError, ValueError):
+        LUXRIOT_DEFAULT_BATCH_SIZE = 8
+    if LUXRIOT_DEFAULT_BATCH_SIZE not in LUXRIOT_BATCH_SIZES:
+        LUXRIOT_DEFAULT_BATCH_SIZE = 8
     try:
         LUXRIOT_SUMMARY_RETENTION_DAYS = float(
             os.getenv('EVOSSEARCH_LUXRIOT_SUMMARY_RETENTION_DAYS', '7')

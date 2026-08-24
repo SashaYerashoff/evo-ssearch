@@ -74,7 +74,7 @@ EVOSSEARCH_AUTH_COOKIE_SECURE=true   # when TLS terminates at app or proxy
 | `EVOSSEARCH_LUXRIOT_BASE_URL` | Luxriot Evo host `[FIELD]` |
 | `EVOSSEARCH_LUXRIOT_USERNAME` / `_PASSWORD` | Credentials `[FIELD]` |
 | `EVOSSEARCH_LUXRIOT_DEFAULT_CHANNEL_ID` (`1`) | Default channel |
-| `EVOSSEARCH_LUXRIOT_SNAPSHOT_INTERVAL` (`5`) | Capture cadence (s). Pilot uses aggressive values `[FIELD]` — see sizing |
+| `EVOSSEARCH_LUXRIOT_SNAPSHOT_INTERVAL` (`2`) | Saved-frame cadence (s) for new/unconfigured channels. Together with the default batch of 8 this yields an approximately 14 s observed span / 16 s fill cadence. Existing per-channel settings remain authoritative |
 | `EVOSSEARCH_LUXRIOT_SNAPSHOT_MAX_EDGE` (`800`) | Snapshot max edge px |
 | `EVOSSEARCH_LUXRIOT_CAPTURE_SOURCE` (`auto`) | `snapshot`, `live_segment`, or automatic fallback. A true intra-second CV apex requires `live_segment` |
 | `EVOSSEARCH_LUXRIOT_FFMPEG_HWACCEL` (`auto`) | `auto` probes QSV, then Intel VAAPI, and uses the first working hardware decode/VPP path; any channel-level failure is retried in software. Use `qsv`, `vaapi`, or `software`/`off` to force a guarded backend |
@@ -284,7 +284,10 @@ markers reach the model via `VECTOR_SIGNALS_JSON.capture_attention`.
 
 | Var (default) | Notes |
 |---|---|
-| `EVOSSEARCH_LUXRIOT_SUMMARY_MAX_BATCH_FRAMES` (`16`) | Hard upper bound for saved snapshots in one L0 VLM batch |
+| `EVOSSEARCH_LUXRIOT_DEFAULT_BATCH_SIZE` (`8`) | Default saved-frame window for new/unconfigured channels. Valid choices remain `4,8,12,16`; persisted channel settings are not silently rewritten |
+| `EVOSSEARCH_LUXRIOT_SUMMARY_MAX_BATCH_FRAMES` (`16`) | Hard upper bound for the saved-frame capture window upstream of L0 attention selection; this is not the VLM request image limit |
+| `EVOSSEARCH_LUXRIOT_VLM_MAX_IMAGES_PER_REQUEST` (`8`) | Hard pre-inference image count. Requests over this limit are rejected locally instead of risking endpoint failure or silent truncation |
+| `EVOSSEARCH_LUXRIOT_L0_MAX_SELECTED_FRAMES` (`8`) | Maximum primary attention-selected images sent to ordinary L0, additionally clamped by the hard request limit. Wider 12/16-frame capture windows are compressed with explicit partial-coverage provenance |
 | `EVOSSEARCH_LUXRIOT_SUMMARY_MAX_WINDOW_SEC` (`60`) | Hard source/wall-clock deadline for a non-empty L0 batch |
 | `EVOSSEARCH_LUXRIOT_SUMMARY_QUIET_CADENCE_SEC` (`5`) | Saved-snapshot cadence admitted to the VLM batch during quiet intervals |
 | `EVOSSEARCH_LUXRIOT_SUMMARY_NORMAL_CADENCE_SEC` (`2`) | Saved-snapshot cadence admitted during normal activity |

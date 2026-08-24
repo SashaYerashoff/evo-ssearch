@@ -58,6 +58,33 @@ export function resolveVideoWorkspaceTab(
   return visibleVideoWorkspaceTabs(showIncidents).includes(active) ? active : 'review'
 }
 
+export function describeVlmSampling(
+  batchRaw: string | number,
+  intervalRaw: string | number,
+  maxSelectedRaw: string | number,
+  maxImagesRaw: string | number = maxSelectedRaw,
+): { compressed: boolean; label: string } {
+  const batch = Math.max(1, Number(batchRaw) || 1)
+  const interval = Math.max(0.2, Number(intervalRaw) || 0.2)
+  const maxSelected = Math.max(1, Number(maxSelectedRaw) || 8)
+  const maxImages = Math.max(1, Number(maxImagesRaw) || 8)
+  const visible = Math.min(batch, maxSelected)
+  const windowSec = Math.max(0, (batch - 1) * interval)
+  const window = Number.isInteger(windowSec) ? String(windowSec) : windowSec.toFixed(1)
+  const caps = maxSelected === maxImages
+    ? `hard cap ${maxImages}`
+    : `selection budget ${maxSelected} · hard cap ${maxImages}`
+  return batch > maxSelected
+    ? {
+        compressed: true,
+        label: `VLM sees ${visible} of ${batch} frames · attention-selected · partial coverage · ${caps} · ~${window}s span`,
+      }
+    : {
+        compressed: false,
+        label: `VLM sees all ${batch} frames · ${caps} · ~${window}s span`,
+      }
+}
+
 export function StreamControl(p: {
   navigation?: ReactNode
   channels: Channel[]
@@ -70,6 +97,8 @@ export function StreamControl(p: {
   onReload: () => void
   batch: string; onBatch: (v: string) => void
   allowedBatchSizes: string[]
+  maxSelectedFrames: number
+  maxVlmImages: number
   every: string; onEvery: (v: string) => void
   routingSelector: string
   onRoutingSelector: (v: string) => void
@@ -111,6 +140,12 @@ export function StreamControl(p: {
   const batchOptions = p.allowedBatchSizes.length > 0
     ? p.allowedBatchSizes
     : (p.batch ? [p.batch] : [])
+  const samplingCoverage = describeVlmSampling(
+    p.batch,
+    p.every,
+    p.maxSelectedFrames,
+    p.maxVlmImages,
+  )
   const settingsSummary = `${settingsTitle} · ${t('video.batch').toLocaleLowerCase()} ${p.batch} · ${p.every}s · ${p.capturing ? t('status.capturing') : t('status.idle')}`
   const reviewSummary = [
     reviewTitle,
@@ -157,6 +192,9 @@ export function StreamControl(p: {
               <div className="wfield xs"><label>{t('video.every')}</label>
                 <input type="number" min={0.2} max={300} step={0.1} value={p.every} onChange={(e) => p.onEvery(e.target.value)} />
               </div>
+            </div>
+            <div className={`vid-sampling-contract${samplingCoverage.compressed ? ' warning' : ''}`}>
+              {samplingCoverage.label}
             </div>
           </section>
           <section className="vid-control-group inference">

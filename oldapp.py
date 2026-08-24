@@ -4939,9 +4939,18 @@ def _build_video_messages(video_path: str, frames: List[Dict[str, Any]], user_pr
 
 def _build_luxriot_messages(channel_label: str, frames: List[Dict[str, Any]], user_prompt: str, system_prompt: str) -> List[Dict[str, Any]]:
     prompt = (user_prompt or '').strip() or "Describe notable activity, people, vehicles, and anomalies."
+    timestamps = [
+        value
+        for frame in frames
+        if isinstance(frame, dict)
+        for value in [frame.get('captured_at') or frame.get('time_sec')]
+        if isinstance(value, (int, float))
+    ]
+    span_sec = max(timestamps) - min(timestamps) if len(timestamps) > 1 else 0.0
+    span_note = f" spanning about {span_sec:.1f}s" if span_sec > 0 else ""
     intro = (
         f"Live snapshots from Luxriot channel {channel_label}. "
-        f"{len(frames)} snapshots captured roughly every {config.LUXRIOT_SNAPSHOT_INTERVAL}s."
+        f"{len(frames)} attention-selected snapshots{span_note}."
     )
     user_content: List[Dict[str, Any]] = [{'type': 'text', 'text': f"{intro}\n\nTask: {prompt}"}]
     for idx, frame in enumerate(frames):
@@ -4977,7 +4986,23 @@ def _build_luxriot_messages(channel_label: str, frames: List[Dict[str, Any]], us
             best_burst_x = burst_x
             companion_thumbnail = str(companion.get('thumbnail'))
             companion_snapshot_no = idx + 1
-    if companion_thumbnail and companion_snapshot_no is not None:
+    try:
+        max_images = max(
+            2,
+            int(getattr(config, 'LUXRIOT_VLM_MAX_IMAGES_PER_REQUEST', 8)),
+        )
+    except (TypeError, ValueError):
+        max_images = 8
+    primary_image_count = sum(
+        1
+        for part in user_content
+        if isinstance(part, dict) and part.get('type') == 'image_url'
+    )
+    if (
+        companion_thumbnail
+        and companion_snapshot_no is not None
+        and primary_image_count < max_images
+    ):
         user_content.append(
             {
                 'type': 'text',

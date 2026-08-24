@@ -20,8 +20,11 @@ do not compete with the description firehose.
 
 The appliance starts vLLM at `gpu_memory_utilization=0.85` with four concurrent
 sequences and a hard limit of eight images per request. EVA's L0 attention
-selector normally submits at most four representative images even when the
-source batch is larger. On the measured 16 GiB RTX 5060 Ti profile this exposed
+selector submits at most eight representative images even when a legacy or
+operator-selected source batch is larger. A same-second sharper companion is
+attached only when an image slot remains. EVA also counts the fully constructed
+request and rejects it locally if it exceeds eight images, so the endpoint never
+has to truncate it silently. On the measured 16 GiB RTX 5060 Ti profile this exposed
 121,088 FP8 KV-cache tokens (3.7 full 32k sequences) while leaving about 2.3 GiB
 outside vLLM for the in-process SigLIP2 encoder and CUDA/runtime variance. The
 same bounded profile is intended for 12+ GiB cards, but site acceptance must
@@ -105,13 +108,28 @@ Approximate description batch rate:
 batches_per_min ≈ channels × 60 / (snapshot_interval_s × batch_size)
 ```
 
-Each batch is `batch_size` images to the VLM. Example: 50 channels, interval 5 s,
-batch 12 → ~50 batches/min. Lowering the interval multiplies the load fast
-(interval 1 s → ~250 batches/min) — confirm the VLM hosts sustain the chosen rate
-before scaling, or coverage gaps appear (dropped batches).
+The capture window contains `batch_size` saved frames. The VLM sees at most
+`min(batch_size, EVOSSEARCH_LUXRIOT_L0_MAX_SELECTED_FRAMES,
+EVOSSEARCH_LUXRIOT_VLM_MAX_IMAGES_PER_REQUEST)` attention-selected primary
+images. CV/SigLIP still process the wider upstream capture window; the L0 record
+retains the source/selected/omitted counts, while the independent
+per-second semantic snapshot archive retains its own configured cadence. When
+12/16-frame windows are compressed, both the prompt and UI explicitly say that
+VLM visual coverage is partial.
+
+The fresh-install default is batch 8, interval 2 s: about a 14 s observed span,
+a batch every 16 s, and all eight primary images visible to the VLM. That is
+about 30 batches/min for eight channels, but 187.5 batches/min for 50 channels.
+The old batch 12, interval 5 s profile produced only about 50 batches/min at 50
+channels, so changing to 8/2 increases request rate by 3.75x. Confirm the four
+Georgia VLM endpoints sustain the chosen rate before applying it site-wide;
+otherwise use per-channel cadence, truthful profile capacities, and additional
+hosts rather than accepting growing queues or coverage gaps.
 
 Levers when the VLM can't keep up:
 - Increase `snapshot_interval` (less blind only if the host was saturated).
+- Use batch 12/16 only as an explicitly partial, attention-compressed window;
+  it is not exhaustive VLM inspection of every saved frame.
 - Add VLM hosts + Auto-routing profiles with truthful per-profile capacity.
 - Enable the durable inference queue + bounded worker pool (off by default;
   validate on a stand first).

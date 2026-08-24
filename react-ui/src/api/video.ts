@@ -33,7 +33,13 @@ export interface Stream {
 export interface StreamsStatus {
   video_streams?: Stream[]
   analytics_streams?: Stream[]
-  capture_defaults?: { batch_size?: number; interval_sec?: number; allowed_batch_sizes?: number[] }
+  capture_defaults?: {
+    batch_size?: number
+    interval_sec?: number
+    allowed_batch_sizes?: number[]
+    max_vlm_images_per_request?: number
+    max_selected_frames?: number
+  }
   capture_configurations?: Array<{
     channel_id: number
     enabled?: boolean
@@ -60,6 +66,15 @@ export interface SummaryEntry {
   channel_id?: number
   summary?: string
   frame_count?: number
+  source_frame_count?: number
+  selected_frame_count?: number
+  frame_selection?: {
+    pre_budget_selected_frame_count?: number
+    selected_frame_count?: number
+    frame_budget?: number
+    omitted_selected_frames?: number
+    [k: string]: any
+  }
   model?: string
   batch_start_ms?: number
   batch_end_ms?: number
