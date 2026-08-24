@@ -12,6 +12,7 @@ import argparse
 import base64
 import getpass
 import hashlib
+import ipaddress
 import json
 import os
 import platform
@@ -21,6 +22,7 @@ import secrets
 import shlex
 import shutil
 import socket
+import ssl
 import struct
 import subprocess
 import sys
@@ -2841,27 +2843,92 @@ WantedBy=multi-user.target
     )
 
 
+def _route_ip_for_host(host: str, port: int) -> str:
+    """Return the local address used to reach the configured site network."""
+
+    try:
+        candidates = socket.getaddrinfo(
+            host,
+            port,
+            type=socket.SOCK_DGRAM,
+        )
+    except socket.gaierror:
+        return ""
+    for family, socket_type, protocol, _canonical, address in candidates:
+        probe = socket.socket(family, socket_type, protocol)
+        try:
+            probe.connect(address)
+            local = str(probe.getsockname()[0]).split("%", 1)[0]
+            parsed = ipaddress.ip_address(local)
+            if not parsed.is_loopback and not parsed.is_unspecified:
+                return str(parsed)
+        except (OSError, ValueError):
+            continue
+        finally:
+            probe.close()
+    return ""
+
+
+def _certificate_san_entries(answers: Answers) -> tuple[str, ...]:
+    hostname = socket.gethostname() or "eva-ai"
+    fqdn = socket.getfqdn() or hostname
+    entries = {f"DNS:{hostname}", f"DNS:{fqdn}", "DNS:localhost", "IP:127.0.0.1"}
+
+    evo = urlsplit(answers.evo_url)
+    site_address = _route_ip_for_host(
+        str(evo.hostname or ""),
+        int(evo.port or (443 if evo.scheme == "https" else 8080)),
+    )
+    if not site_address:
+        # Minimal Ubuntu hosts do not always resolve their own hostname.  Use
+        # hostname -I only as a fallback and take the first non-loopback
+        # address, which is the same address operators are normally given.
+        completed = subprocess.run(
+            ("hostname", "-I"),
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            check=False,
+        )
+        for raw in completed.stdout.split():
+            try:
+                candidate = ipaddress.ip_address(raw.split("%", 1)[0])
+            except ValueError:
+                continue
+            if not candidate.is_loopback and not candidate.is_unspecified:
+                site_address = str(candidate)
+                break
+    if site_address:
+        entries.add(f"IP:{site_address}")
+    return tuple(sorted(entries))
+
+
+def _certificate_has_sans(cert: Path, required: Sequence[str]) -> bool:
+    try:
+        decoded = ssl._ssl._test_decode_cert(str(cert))  # type: ignore[attr-defined]
+    except (OSError, ValueError, ssl.SSLError):
+        return False
+    observed = {
+        ("IP:" if kind == "IP Address" else "DNS:") + str(value)
+        for kind, value in decoded.get("subjectAltName", ())
+        if kind in {"DNS", "IP Address"}
+    }
+    return set(required).issubset(observed)
+
+
 def configure_nginx(answers: Answers, runner: Runner) -> None:
     cert_dir = answers.config_root / "tls"
     cert = cert_dir / "eva-ai.crt"
     key = cert_dir / "eva-ai.key"
     runner.run(("mkdir", "-p", cert_dir))
-    if not cert.exists() or not key.exists() or runner.dry_run:
+    san_entries = _certificate_san_entries(answers)
+    if (
+        not cert.exists()
+        or not key.exists()
+        or not _certificate_has_sans(cert, san_entries)
+        or runner.dry_run
+    ):
         hostname = socket.getfqdn() or socket.gethostname() or "eva-ai"
-        san_entries = [f"DNS:{hostname}", f"DNS:{socket.gethostname()}"]
-        try:
-            addresses = {
-                info[4][0]
-                for info in socket.getaddrinfo(
-                    socket.gethostname(),
-                    None,
-                    socket.AF_INET,
-                )
-                if not info[4][0].startswith("127.")
-            }
-        except socket.gaierror:
-            addresses = set()
-        san_entries.extend(f"IP:{address}" for address in sorted(addresses))
         runner.run(
             (
                 "openssl",
@@ -2885,6 +2952,13 @@ def configure_nginx(answers: Answers, runner: Runner) -> None:
         )
         runner.run(("chmod", "0600", key))
     nginx = f"""server {{
+    listen 80;
+    listen [::]:80;
+    server_name _;
+    return 308 https://$host$request_uri;
+}}
+
+server {{
     listen 443 ssl;
     listen [::]:443 ssl;
     server_name _;

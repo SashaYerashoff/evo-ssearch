@@ -540,6 +540,69 @@ def test_nginx_configuration_restarts_an_existing_process(tmp_path, capsys):
     assert "systemctl enable --now nginx" not in commands
 
 
+def test_certificate_sans_include_site_facing_address(tmp_path):
+    answers = installer.Answers(
+        install_root=tmp_path / "opt",
+        data_root=tmp_path / "data",
+        config_root=tmp_path / "etc",
+        evo_url="http://192.168.1.100:8080",
+        evo_username="operator",
+        evo_password="secret",
+    )
+
+    with (
+        patch.object(installer.socket, "gethostname", return_value="eva-node"),
+        patch.object(installer.socket, "getfqdn", return_value="eva-node.local"),
+        patch.object(installer, "_route_ip_for_host", return_value="192.168.1.104"),
+    ):
+        entries = installer._certificate_san_entries(answers)
+
+    assert "DNS:eva-node" in entries
+    assert "DNS:eva-node.local" in entries
+    assert "DNS:localhost" in entries
+    assert "IP:127.0.0.1" in entries
+    assert "IP:192.168.1.104" in entries
+
+
+def test_nginx_site_redirects_http_to_https(tmp_path):
+    answers = installer.Answers(
+        install_root=tmp_path / "opt",
+        data_root=tmp_path / "data",
+        config_root=tmp_path / "etc",
+        evo_url="http://192.168.1.100:8080",
+        evo_username="operator",
+        evo_password="secret",
+    )
+    cert_dir = answers.config_root / "tls"
+    cert_dir.mkdir(parents=True)
+    (cert_dir / "eva-ai.crt").write_text("certificate", encoding="utf-8")
+    (cert_dir / "eva-ai.key").write_text("key", encoding="utf-8")
+    writes = {}
+
+    class RecordingRunner:
+        dry_run = False
+
+        def run(self, command, **_kwargs):
+            return CompletedProcess(command, 0, "", "")
+
+    with (
+        patch.object(installer, "_certificate_has_sans", return_value=True),
+        patch.object(
+            installer,
+            "_atomic_write",
+            side_effect=lambda path, content, mode: writes.setdefault(
+                str(path), (content, mode)
+            ),
+        ),
+    ):
+        installer.configure_nginx(answers, RecordingRunner())
+
+    nginx = writes["/etc/nginx/sites-available/eva-ai"][0]
+    assert "listen 80;" in nginx
+    assert "return 308 https://$host$request_uri;" in nginx
+    assert "listen 443 ssl;" in nginx
+
+
 def test_external_vlm_still_requires_nvidia_for_local_siglip2_cuda(tmp_path):
     answers = installer.Answers(
         install_root=tmp_path / "opt",
