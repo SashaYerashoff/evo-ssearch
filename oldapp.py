@@ -8581,8 +8581,11 @@ def _check_vlm_vision_health(
     )
     busy_grace = bool(
         status == "busy"
+        and bool(state.get("ok"))
         and bool(state.get("endpoint_liveness_ok"))
-        and last_success_recent
+        and bool(state.get("workload_known"))
+        and bool(state.get("workload_busy"))
+        and failures < failure_threshold
     )
     healthy = bool(
         not stale

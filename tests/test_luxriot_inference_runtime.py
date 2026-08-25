@@ -1603,7 +1603,7 @@ class LuxriotSummaryBackpressureTests(unittest.TestCase):
         )
         self.assertTrue(stats["batch_state_canonicalized"])
 
-    def test_l0_retries_cjk_output_once_and_keeps_english_result(self):
+    def test_l0_repairs_cjk_output_text_only_and_keeps_english_result(self):
         calls = []
         responses = [
             (
@@ -1649,12 +1649,16 @@ class LuxriotSummaryBackpressureTests(unittest.TestCase):
 
         self.assertIn("concise English only", batch["system_prompt"])
         self.assertEqual(len(calls), 2)
-        self.assertIn("violated the mandatory output-language contract", calls[1][-1]["content"])
-        self.assertIn("室内场景", calls[1][-2]["content"])
+        self.assertEqual([item["role"] for item in calls[1]], ["system", "user"])
+        self.assertIn("violated the mandatory output-language contract", calls[1][1]["content"])
+        self.assertIn("室内场景", calls[1][1]["content"])
+        self.assertNotIn("image_url", repr(calls[1]))
         self.assertEqual(manager._east_asian_script_char_count(entry["summary"]), 0)
         self.assertIn("A person is seated at a computer", entry["summary"])
         self.assertEqual(entry["lm_response_stats"]["language_contract_status"], "recovered")
         self.assertEqual(entry["lm_response_stats"]["language_retry_count"], 1)
+        self.assertEqual(entry["lm_response_stats"]["language_retry_mode"], "text_only")
+        self.assertFalse(entry["lm_response_stats"]["language_retry_vision_replayed"])
         self.assertEqual(entry["lm_response_stats"]["attempt_count"], 2)
 
     def test_l0_quarantines_persistent_cjk_but_preserves_structured_alert(self):

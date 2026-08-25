@@ -69,7 +69,7 @@ def test_content_health_gate_allows_one_suspect_after_recent_success(tmp_path, m
     assert health["suspect_grace"] is True
 
 
-def test_content_health_gate_allows_busy_endpoint_after_recent_visual_success(
+def test_content_health_gate_allows_confirmed_busy_endpoint_after_old_visual_success(
     tmp_path,
     monkeypatch,
 ):
@@ -81,12 +81,17 @@ def test_content_health_gate_allows_busy_endpoint_after_recent_visual_success(
             "ok": True,
             "vision_ok": False,
             "endpoint_liveness_ok": True,
+            "workload_known": True,
+            "workload_busy": True,
             "checked_at_epoch": time.time(),
             "base_url": "http://vlm.local/v1",
             "model": "vlm-test",
             "consecutive_failures": 0,
             "failure_threshold": 2,
-            "last_success_at": datetime.now(timezone.utc).isoformat(),
+            "last_success_at": datetime.fromtimestamp(
+                time.time() - 600,
+                timezone.utc,
+            ).isoformat(),
         },
     )
     monkeypatch.setattr(oldapp.config, "LM_VISION_HEALTH_STATE_FILE", str(state_file))
@@ -97,6 +102,37 @@ def test_content_health_gate_allows_busy_endpoint_after_recent_visual_success(
     assert health["ok"] is True
     assert health["status"] == "busy"
     assert health["busy_grace"] is True
+
+
+def test_content_health_gate_blocks_unconfirmed_busy_endpoint(
+    tmp_path,
+    monkeypatch,
+):
+    state_file = tmp_path / "vision-health.json"
+    write_health_state(
+        state_file,
+        {
+            "status": "busy",
+            "ok": True,
+            "vision_ok": False,
+            "endpoint_liveness_ok": True,
+            "workload_known": False,
+            "workload_busy": False,
+            "checked_at_epoch": time.time(),
+            "base_url": "http://vlm.local/v1",
+            "model": "vlm-test",
+            "consecutive_failures": 0,
+            "failure_threshold": 2,
+        },
+    )
+    monkeypatch.setattr(oldapp.config, "LM_VISION_HEALTH_STATE_FILE", str(state_file))
+    monkeypatch.setattr(oldapp.config, "LM_VISION_HEALTH_MAX_AGE_SEC", 180.0)
+
+    health = oldapp._check_vlm_vision_health(profile=_profile())
+
+    assert health["ok"] is False
+    assert health["status"] == "busy"
+    assert health["busy_grace"] is False
 
 
 def test_content_health_gate_blocks_suspect_without_prior_success(tmp_path, monkeypatch):
