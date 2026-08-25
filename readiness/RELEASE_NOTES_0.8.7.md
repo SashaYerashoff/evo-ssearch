@@ -53,6 +53,12 @@ used by the office and maritime pilots.
   repaired by migration `0013`.
 - Offline deployment reports and installers expect schema `20260805_0013` and
   the React console.
+- Local appliance updates now use a random process-only PostgreSQL migration
+  identity with full-site RLS visibility. It is created through local peer auth
+  only after operator approval, expires within two hours, and is removed before
+  handoff. Fresh-install migrator and backup logins receive the explicit
+  `BYPASSRLS` capability their full-site contracts require; API, worker, and
+  audit logins remain tenant-restricted.
 - The universal Ubuntu 24.04 bundle now has one field entry point for a fresh
   appliance or an in-place upgrade. Manifest v2 records the clean source
   commit, fresh/update/report modes, every offline APT/wheel artifact and the

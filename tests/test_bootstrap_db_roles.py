@@ -8,6 +8,18 @@ from scripts import bootstrap_db_roles
 
 
 class BootstrapDbRolesTests(unittest.TestCase):
+    def test_only_full_site_operational_logins_bypass_tenant_rls(self):
+        attributes = {
+            login.login_role: login.bypass_rls
+            for login in bootstrap_db_roles.RUNTIME_LOGINS
+        }
+
+        self.assertTrue(attributes["eva_migrator_login"])
+        self.assertTrue(attributes["eva_backup_login"])
+        self.assertFalse(attributes["eva_api_login"])
+        self.assertFalse(attributes["eva_audit_login"])
+        self.assertFalse(attributes["eva_worker_login"])
+
     def test_required_password_rejects_short_or_missing_values(self):
         with patch.dict(os.environ, {}, clear=True):
             with self.assertRaises(SystemExit):

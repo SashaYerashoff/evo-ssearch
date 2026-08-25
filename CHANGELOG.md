@@ -6,6 +6,14 @@ Format loosely follows Keep a Changelog.
 
 ## Unreleased
 
+- **No RLS-blind appliance updates or backups:** fresh-install migrator and
+  full-site backup logins now receive explicit `BYPASSRLS`, while API, worker,
+  and audit logins remain tenant-filtered. Existing local appliances update
+  through a random process-only migration identity created after approval via
+  PostgreSQL peer auth, limited to a two-hour password lifetime, and removed
+  before handoff. This repairs older installer-created `eva_migrator_login`
+  roles without persisting a superuser DSN or weakening tenant runtime roles.
+
 - **Incident Review is explicitly feature-in-progress:** its Video workspace tab
   now carries a visible FiP badge and operator warning. Settings → Features has
   a workstation-local `Show incidents (FiP)` switch which immediately unmounts

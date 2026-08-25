@@ -23,12 +23,15 @@ import os
 import platform
 import pwd
 import re
+import secrets
 import shlex
 import subprocess
 import sys
 from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Mapping, Sequence
+from urllib.parse import quote, unquote, urlsplit
 
 
 SCRIPT_DIR = Path(__file__).resolve().parent
@@ -74,6 +77,13 @@ class DeploymentDetection:
     mode: str
     existing: ExistingDeployment | None = None
     incomplete: IncompleteFreshInstall | None = None
+
+
+@dataclass(frozen=True)
+class LocalMigrationLease:
+    role: str
+    database: str
+    dsn: str
 
 
 def _run(
@@ -533,6 +543,163 @@ def _report(
     _run(command, check=check)
 
 
+def _postgres_uri_parts(value: str) -> tuple[str, str, int, str] | None:
+    """Return user/host/port/database for a PostgreSQL URI, without its secret."""
+
+    text = str(value or "").strip()
+    if not text:
+        return None
+    try:
+        parsed = urlsplit(text)
+        if parsed.scheme not in {"postgres", "postgresql"}:
+            return None
+        username = unquote(str(parsed.username or ""))
+        host = str(parsed.hostname or "")
+        port = int(parsed.port or 5432)
+        database = unquote(parsed.path.lstrip("/"))
+    except (TypeError, ValueError):
+        return None
+    if not username or not host or not database:
+        return None
+    return username, host, port, database
+
+
+def _managed_local_migration_target(
+    values: Mapping[str, str],
+) -> tuple[str, int] | None:
+    """Recognize only the installer-managed local migration login contract."""
+
+    migration = _postgres_uri_parts(values.get("EVA_MIGRATION_DATABASE_DSN", ""))
+    runtime = _postgres_uri_parts(values.get("EVA_DATABASE_DSN", ""))
+    if migration is None or runtime is None:
+        return None
+    migration_user, migration_host, migration_port, migration_database = migration
+    _runtime_user, runtime_host, runtime_port, runtime_database = runtime
+    local_hosts = {"127.0.0.1", "localhost", "::1"}
+    if migration_user != "eva_migrator_login":
+        return None
+    if migration_host not in local_hosts or runtime_host not in local_hosts:
+        return None
+    if migration_port != runtime_port or migration_database != runtime_database:
+        return None
+    return migration_database, migration_port
+
+
+def _local_postgres_sql(database: str, sql: str) -> subprocess.CompletedProcess[str]:
+    """Execute non-logged SQL through local peer auth; SQL can contain a lease secret."""
+
+    command = [
+        "runuser",
+        "-u",
+        "postgres",
+        "--",
+        "psql",
+        "--no-psqlrc",
+        "--dbname",
+        database,
+        "--set",
+        "ON_ERROR_STOP=1",
+    ]
+    completed = subprocess.run(
+        command,
+        input=sql,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+    if completed.returncode:
+        detail = (completed.stderr or completed.stdout or "local PostgreSQL command failed").strip()
+        raise DeployError(detail.splitlines()[-1])
+    return completed
+
+
+def _verify_local_peer_migration_path(database: str) -> None:
+    """Prove the local peer identity can preserve and migrate all EVA rows."""
+
+    sql = """
+        BEGIN;
+        SELECT version_num FROM public.alembic_version LIMIT 1;
+        UPDATE public.alembic_version SET version_num = version_num;
+        SET LOCAL row_security = off;
+        DO $eva_row_visibility$
+        DECLARE
+            protected record;
+        BEGIN
+            FOR protected IN
+                SELECT namespace.nspname AS schema_name,
+                       relation.relname AS table_name
+                FROM pg_class relation
+                JOIN pg_namespace namespace ON namespace.oid = relation.relnamespace
+                WHERE namespace.nspname = ANY(ARRAY['agent', 'archive', 'audit', 'iam', 'jobs'])
+                  AND relation.relkind IN ('r', 'p')
+                  AND relation.relforcerowsecurity
+            LOOP
+                EXECUTE format(
+                    'SELECT 1 FROM %I.%I LIMIT 1',
+                    protected.schema_name,
+                    protected.table_name
+                );
+            END LOOP;
+        END
+        $eva_row_visibility$;
+        SET LOCAL ROLE eva_owner;
+        CREATE TABLE archive.__eva_local_migration_preflight (id integer);
+        ROLLBACK;
+    """
+    _local_postgres_sql(database, sql)
+
+
+def _create_local_migration_lease(database: str, port: int) -> LocalMigrationLease:
+    """Create a short-lived full-site role after operator approval."""
+
+    role = f"eva_update_{os.getpid()}_{secrets.token_hex(6)}"
+    password = secrets.token_hex(32)
+    expires = (datetime.now(timezone.utc) + timedelta(hours=2)).strftime(
+        "%Y-%m-%d %H:%M:%S+00"
+    )
+    sql = f"""
+        BEGIN;
+        DO $eva_full_site_roles$
+        BEGIN
+            IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'eva_migrator_login') THEN
+                ALTER ROLE eva_migrator_login BYPASSRLS;
+            END IF;
+            IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'eva_backup_login') THEN
+                ALTER ROLE eva_backup_login BYPASSRLS;
+            END IF;
+        END
+        $eva_full_site_roles$;
+        CREATE ROLE {role}
+            LOGIN INHERIT NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION
+            BYPASSRLS PASSWORD '{password}' VALID UNTIL '{expires}';
+        GRANT eva_owner TO {role};
+        GRANT SELECT, INSERT, UPDATE, DELETE
+            ON TABLE public.alembic_version TO {role};
+        COMMIT;
+    """
+    _local_postgres_sql(database, sql)
+    dsn = (
+        f"postgresql://{role}:{quote(password, safe='')}"
+        f"@127.0.0.1:{port}/{quote(database, safe='')}"
+    )
+    return LocalMigrationLease(role=role, database=database, dsn=dsn)
+
+
+def _drop_local_migration_lease(lease: LocalMigrationLease) -> None:
+    """Remove the temporary login; its password expires even if cleanup fails."""
+
+    sql = f"""
+        BEGIN;
+        REVOKE SELECT, INSERT, UPDATE, DELETE
+            ON TABLE public.alembic_version FROM {lease.role};
+        REVOKE eva_owner FROM {lease.role};
+        DROP ROLE {lease.role};
+        COMMIT;
+    """
+    _local_postgres_sql(lease.database, sql)
+
+
 def _update(
     bundle_root: Path,
     deployment: ExistingDeployment,
@@ -549,6 +716,14 @@ def _update(
         raise DeployError(f"Update engine is missing: {installer}")
     values = _parse_env(deployment.env_file)
     process_env = dict(os.environ)
+    explicit_process_migration = bool(
+        str(process_env.get("EVA_INSTALL_MIGRATION_DSN") or "").strip()
+    )
+    local_migration_target = (
+        None
+        if explicit_process_migration
+        else _managed_local_migration_target(values)
+    )
     if not process_env.get("EVA_INSTALL_MIGRATION_DSN") and not values.get(
         "EVA_MIGRATION_DATABASE_DSN"
     ):
@@ -560,6 +735,14 @@ def _update(
                 "A privileged migration DSN is required; it is not written to eva-ai.env"
             )
         process_env["EVA_INSTALL_MIGRATION_DSN"] = migration_dsn
+
+    if local_migration_target is not None:
+        local_database, _local_port = local_migration_target
+        _verify_local_peer_migration_path(local_database)
+        print(
+            "Local PostgreSQL migration preflight: OK. After approval the updater "
+            "will use a random two-hour BYPASSRLS login and remove it before handoff."
+        )
 
     DEFAULT_REPORT_ROOT.mkdir(parents=True, exist_ok=True)
     baseline = DEFAULT_REPORT_ROOT / "pre-update-baseline.json"
@@ -607,7 +790,29 @@ def _update(
             print("No changes made.")
             return
     print("\nAPPLYING EVA AI UPDATE")
-    _run((*common, "--apply"), env=process_env)
+    lease: LocalMigrationLease | None = None
+    apply_env = dict(process_env)
+    try:
+        if local_migration_target is not None:
+            local_database, local_port = local_migration_target
+            lease = _create_local_migration_lease(local_database, local_port)
+            apply_env["EVA_INSTALL_MIGRATION_DSN"] = lease.dsn
+            print(
+                "Temporary local migration identity created; it is process-only "
+                "and expires automatically within two hours."
+            )
+        _run((*common, "--apply"), env=apply_env)
+    finally:
+        if lease is not None:
+            try:
+                _drop_local_migration_lease(lease)
+                print("Temporary local migration identity removed.")
+            except DeployError as exc:
+                print(
+                    "WARNING: temporary migration identity cleanup failed; "
+                    f"its password will expire automatically ({exc}).",
+                    file=sys.stderr,
+                )
 
     commit = _manifest_commit(bundle_root)
     if commit:

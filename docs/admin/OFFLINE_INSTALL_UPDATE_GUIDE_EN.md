@@ -281,6 +281,26 @@ migration identity for that site. The value is not displayed or saved. Do not
 substitute the ordinary restricted EVA runtime DSN and never paste either DSN
 into chat.
 
+For an installer-managed local PostgreSQL appliance, the updater does not need
+a permanent superuser credential. Before approval it proves the local
+PostgreSQL peer-auth path without lasting changes. After approval it creates a
+random, process-only migration login with full-site RLS visibility, limits its
+password lifetime to two hours, uses it for the preservation manifest, backup,
+and migrations, and removes it before handoff. It also repairs older
+installer-managed migrator and full-site backup roles so their declared
+cross-tenant purpose is not silently filtered by RLS. Tenant-scoped runtime
+roles are not changed. The terminal should print:
+
+```text
+Local PostgreSQL migration preflight: OK.
+Temporary local migration identity created...
+Temporary local migration identity removed.
+```
+
+If cleanup cannot remove the temporary identity, the updater reports a warning;
+its random password still expires automatically. Send that warning to EVA
+engineering rather than attempting manual role or database cleanup.
+
 The successful terminal report should show:
 
 ```text

@@ -708,3 +708,113 @@ def test_update_forwards_explicit_live_evo_credential_verification(tmp_path):
     installer_commands = [row for row in commands if str(installer) in row]
     assert len(installer_commands) == 2
     assert all("--verify-luxriot-credential" in row for row in installer_commands)
+
+
+def test_managed_local_migration_target_is_narrowly_scoped():
+    local = {
+        "EVA_DATABASE_DSN": "postgresql://eva_api_login:api@127.0.0.1:5432/eva",
+        "EVA_MIGRATION_DATABASE_DSN": (
+            "postgresql://eva_migrator_login:migrate@127.0.0.1:5432/eva"
+        ),
+    }
+    assert deploy._managed_local_migration_target(local) == ("eva", 5432)
+
+    remote = dict(local)
+    remote["EVA_MIGRATION_DATABASE_DSN"] = (
+        "postgresql://eva_migrator_login:migrate@db.internal:5432/eva"
+    )
+    assert deploy._managed_local_migration_target(remote) is None
+
+    custom = dict(local)
+    custom["EVA_MIGRATION_DATABASE_DSN"] = (
+        "postgresql://site_migrator:migrate@127.0.0.1:5432/eva"
+    )
+    assert deploy._managed_local_migration_target(custom) is None
+
+
+def test_local_migration_lease_secret_is_stdin_only(monkeypatch):
+    calls = []
+
+    def fake_run(command, **kwargs):
+        calls.append((list(command), dict(kwargs)))
+        return type("Completed", (), {"returncode": 0, "stdout": "", "stderr": ""})()
+
+    tokens = iter(("abc123", "d" * 64))
+    monkeypatch.setattr(deploy.subprocess, "run", fake_run)
+    monkeypatch.setattr(deploy.secrets, "token_hex", lambda _size: next(tokens))
+
+    lease = deploy._create_local_migration_lease("eva", 5432)
+
+    command, kwargs = calls[0]
+    assert "d" * 64 not in command
+    assert "d" * 64 in kwargs["input"]
+    assert "ALTER ROLE eva_migrator_login BYPASSRLS" in kwargs["input"]
+    assert "ALTER ROLE eva_backup_login BYPASSRLS" in kwargs["input"]
+    assert "d" * 64 in lease.dsn
+    assert lease.role.startswith("eva_update_")
+
+
+def test_update_uses_and_removes_process_only_local_migration_lease(tmp_path):
+    bundle = tmp_path / "bundle"
+    source = bundle / "repo"
+    scripts = source / "scripts"
+    scripts.mkdir(parents=True)
+    installer = scripts / "install_eva_083.py"
+    installer.write_text("# installer\n", encoding="utf-8")
+    app = tmp_path / "app"
+    app.mkdir()
+    env_file = tmp_path / "eva-ai.env"
+    env_file.write_text(
+        "\n".join(
+            (
+                "EVA_DATABASE_DSN=postgresql://eva_api_login:api@127.0.0.1:5432/eva",
+                (
+                    "EVA_MIGRATION_DATABASE_DSN="
+                    "postgresql://eva_migrator_login:migrate@127.0.0.1:5432/eva"
+                ),
+            )
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    deployment = deploy.ExistingDeployment(
+        service="eva-ai",
+        app_dir=app,
+        env_file=env_file,
+        unit_file=tmp_path / "eva-ai.service",
+        service_user="eva",
+        service_group="eva",
+        base_url="http://127.0.0.1:5000",
+    )
+    lease = deploy.LocalMigrationLease(
+        role="eva_update_test",
+        database="eva",
+        dsn="postgresql://eva_update_test:temporary@127.0.0.1:5432/eva",
+    )
+    commands = []
+
+    def capture_run(argv, **kwargs):
+        commands.append(([str(item) for item in argv], dict(kwargs.get("env") or {})))
+        return type("Completed", (), {"returncode": 0})()
+
+    with (
+        patch.dict(deploy.os.environ, {}, clear=True),
+        patch.object(deploy.os, "geteuid", return_value=0),
+        patch.object(deploy, "DEFAULT_REPORT_ROOT", tmp_path / "reports"),
+        patch.object(deploy, "DEFAULT_BACKUP_ROOT", tmp_path / "backups"),
+        patch.object(deploy, "_run", side_effect=capture_run),
+        patch.object(deploy, "_report"),
+        patch.object(deploy, "_assert_update_compatibility"),
+        patch.object(deploy, "_verify_local_peer_migration_path") as verify_peer,
+        patch.object(deploy, "_create_local_migration_lease", return_value=lease) as create_lease,
+        patch.object(deploy, "_drop_local_migration_lease") as drop_lease,
+    ):
+        deploy._update(bundle, deployment, assume_yes=True, wait_streams=0)
+
+    installer_commands = [row for row in commands if str(installer) in row[0]]
+    assert len(installer_commands) == 2
+    assert "EVA_INSTALL_MIGRATION_DSN" not in installer_commands[0][1]
+    assert installer_commands[1][1]["EVA_INSTALL_MIGRATION_DSN"] == lease.dsn
+    verify_peer.assert_called_once_with("eva")
+    create_lease.assert_called_once_with("eva", 5432)
+    drop_lease.assert_called_once_with(lease)

@@ -25,14 +25,25 @@ class RuntimeLogin:
     login_role: str
     group_role: str
     password_env: str
+    bypass_rls: bool = False
 
 
 RUNTIME_LOGINS = (
-    RuntimeLogin("eva_migrator_login", "eva_migrator", "EVA_MIGRATOR_PASSWORD"),
+    RuntimeLogin(
+        "eva_migrator_login",
+        "eva_migrator",
+        "EVA_MIGRATOR_PASSWORD",
+        bypass_rls=True,
+    ),
     RuntimeLogin("eva_api_login", "eva_api", "EVA_API_PASSWORD"),
     RuntimeLogin("eva_audit_login", "eva_audit_writer", "EVA_AUDIT_PASSWORD"),
     RuntimeLogin("eva_worker_login", "eva_worker", "EVA_WORKER_PASSWORD"),
-    RuntimeLogin("eva_backup_login", "eva_backup", "EVA_BACKUP_PASSWORD"),
+    RuntimeLogin(
+        "eva_backup_login",
+        "eva_backup",
+        "EVA_BACKUP_PASSWORD",
+        bypass_rls=True,
+    ),
 )
 
 
@@ -80,6 +91,9 @@ def _assert_privileged_connection(pool: PsycopgPool) -> None:
 def _create_or_update_login(connection, login: RuntimeLogin, password: str) -> None:
     from psycopg import sql
 
+    row_security_attribute = sql.SQL(
+        "BYPASSRLS" if login.bypass_rls else "NOBYPASSRLS"
+    )
     connection.execute(
         sql.SQL(
             """
@@ -95,7 +109,7 @@ def _create_or_update_login(connection, login: RuntimeLogin, password: str) -> N
                     NOCREATEDB
                     NOCREATEROLE
                     NOREPLICATION
-                    NOBYPASSRLS;
+                    {row_security_attribute};
             END IF;
         END
         $$
@@ -103,6 +117,7 @@ def _create_or_update_login(connection, login: RuntimeLogin, password: str) -> N
         ).format(
             login_role_name=sql.Literal(login.login_role),
             login_role=sql.Identifier(login.login_role),
+            row_security_attribute=row_security_attribute,
         )
     )
     connection.execute(
@@ -116,11 +131,12 @@ def _create_or_update_login(connection, login: RuntimeLogin, password: str) -> N
             NOCREATEDB
             NOCREATEROLE
             NOREPLICATION
-            NOBYPASSRLS
+            {row_security_attribute}
             PASSWORD {password}
         """
         ).format(
             login_role=sql.Identifier(login.login_role),
+            row_security_attribute=row_security_attribute,
             password=sql.Literal(password),
         )
     )
