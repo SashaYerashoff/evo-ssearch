@@ -245,6 +245,20 @@ cd /path/to/EVA-AI-0.8.7-OFFLINE-ARCH-COMMIT
 sudo ./START_EVA_AI.sh --mode update
 ```
 
+Some pilot Evo servers intentionally use a weak value such as `123` as their
+real administrator password. The update preflight treats common weak values as
+placeholders and stops by default. If, and only if, the saved value is the real
+site credential, rerun with explicit live credential verification:
+
+```bash
+sudo ./START_EVA_AI.sh --mode update --verify-luxriot-credential
+```
+
+This flag does not waive the check. It permits the value only after a live,
+authenticated, read-only Evo `/channels` request succeeds. A failed request
+still blocks the update without changing the installation. Do not use the flag
+to bypass an unknown or unconfirmed credential.
+
 An update preserves the existing environment, Evo credentials, users, probes,
 channel settings, inference profiles and routing, runtime state, and archive
 database. It backs up PostgreSQL and application/configuration state before
