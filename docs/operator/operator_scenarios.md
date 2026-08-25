@@ -89,3 +89,60 @@ Terms: [glossary](../00_CANON/glossary.md). What the agent can/can't do:
   see only the most recent slice — always scope.
 - A "quiet" answer is trustworthy only when coverage shows no gaps; the system
   reports its own coverage so you can tell.
+
+## Backlog: versioned industry scenario packs
+
+Design and ship a versioned catalog of preconfigured AI Operator scenarios. A
+pack must be selectable from both the operator UI and the agent deployment flow,
+but must never be enabled automatically on arbitrary channels. Deployment should
+ask for channel/zone scope and expose the proposed semantics, thresholds,
+deduplication/cooldown, evidence path, and expected latency before approval.
+
+Each scenario template should declare whether it is best served by a semantic
+probe, a VLM alert, or a hybrid path; positive and hard-negative semantics;
+recommended cadence and evidence window; default threshold/margin; bookmark and
+incident policy; known false-positive conditions; minimum scene/camera
+requirements; localization; and a schema/version identifier. Site-specific
+calibration remains separate from the immutable catalog default.
+
+### Army / Defense / Border Control
+
+- Pirate boat detection.
+- Small boat carrying many people.
+- People climbing or forcing their way over a border barrier.
+
+### Public Safety (Police / 911)
+
+- Drifting detection.
+- Motorcycle riding on one wheel.
+- Traffic moving in the wrong direction.
+- Multiple people riding the same e-scooter.
+- E-scooter left in the road.
+- Scooter riding on the pavement.
+- Vehicle parked at a charging point without charging.
+- Vehicle accelerating or speeding suddenly.
+- Graffiti in progress.
+- Dog attack.
+- Car stopped on tram tracks.
+
+### Industrial / Construction
+
+- Falling container.
+- Person falling from scaffolding.
+- Work on scaffolding without required PPE.
+- Fire and smoke.
+- General accident.
+- Leaking pipe.
+- Floor leakage or pooling liquid.
+
+### Acceptance questions for the design pass
+
+- Where the catalog and its migrations live, and how an offline update adds or
+  revises templates without overwriting site-calibrated instances.
+- How one-click UI deployment and agent deployment produce the same inspectable
+  draft and approval transaction.
+- Which scenarios require zones, direction lines, speed calibration, temporal
+  tracking, or external signals and therefore cannot honestly be represented by
+  text prompts alone.
+- How evaluation clips, false-positive/false-negative feedback, model/version
+  compatibility, and rollback are attached to each catalog version.
