@@ -1,0 +1,856 @@
+{
+  "version": 1,
+  "_readme": "Scene manifest for scripts/ui_shots.py. See docs/ui/README.md. Every screenshot in the guides is produced from a scene here — no hand-taken screenshots. React UI only; the legacy template UI is carried for compatibility and is not documented.",
+
+  "defaults": {
+    "viewport": {"width": 1920, "height": 1080},
+    "device_scale_factor": 1,
+    "color_scheme": "dark",
+    "locale": "en-US",
+    "settle_ms": 1500,
+    "media_policy": "placeholder",
+    "local_storage": {
+      "eva.ui.language.v1": "en",
+      "evs_agent_width_preset": "0"
+    },
+    "redact_always": [
+      "video",
+      "canvas",
+      "[data-eva-media]"
+    ],
+    "redact": [
+      "img[src*='/detections/']",
+      "img[src*='/image/']",
+      "img[src^='data:image']",
+      ".card-thumb img",
+      ".vid-sum-thumbnail img",
+      ".ag-lightbox img"
+    ]
+  },
+
+  "scenes": [
+    {
+      "id": "react-home",
+      "ui": "react",
+      "auth": "operator",
+      "title": "Home",
+      "caption": "EVA AI home screen: the perception loop visualisation with the live metadata counter.",
+      "path": "/?ui=react",
+      "steps": [
+        {"wait_for": ".home-screen"},
+        {"wait_ms": 1200},
+        {"set_text": {"selector": ".hud-timer", "value": "04:12:37"}},
+        {"set_text": {"selector": ".hud-count", "value": "18 402"}}
+      ],
+      "clip": null,
+      "output": "docs/ui/assets/react-home.png",
+      "used_by": []
+    },
+    {
+      "id": "react-nav-drawer",
+      "ui": "react",
+      "auth": "operator",
+      "title": "Navigation drawer",
+      "caption": "The left rail drawer: Archive, Summaries, Probes, plus Settings and sign-out. Sections you have no grant for are absent, not disabled.",
+      "path": "/?ui=react",
+      "steps": [
+        {"wait_for": ".menu-ear"},
+        {"click": ".menu-ear"},
+        {"wait_for": "#eva-main-menu .menu-item"}
+      ],
+      "clip": ".menu-shell",
+      "output": "docs/ui/assets/react-nav-drawer.png",
+      "used_by": []
+    },
+    {
+      "id": "react-appearance-modal",
+      "ui": "react",
+      "auth": "operator",
+      "title": "Appearance",
+      "caption": "Appearance settings from the top bar: theme, motion and language for this workstation.",
+      "path": "/?ui=react",
+      "steps": [
+        {"wait_for": ".appearance-toggle"},
+        {"click": ".appearance-toggle"},
+        {"wait_for": ".appearance-modal"}
+      ],
+      "clip": ".appearance-modal",
+      "output": "docs/ui/assets/react-appearance-modal.png",
+      "used_by": []
+    },
+
+    {
+      "id": "react-archive-filters",
+      "ui": "react",
+      "auth": "operator",
+      "title": "Archive — Filters tab",
+      "caption": "Archive Research, Filters tab: stream picker, probe and source filters, the period segment, and Load. The tab strip is fixed; the active tab opens its controls below.",
+      "path": "/?ui=react",
+      "steps": [
+        {"wait_for": ".menu-ear"},
+        {"click": ".menu-ear"},
+        {"click": ".menu-item:has-text('Archive')"},
+        {"wait_for": ".archive-screen"},
+        {"click": ".atp-tab:has-text('Filters')"},
+        {"wait_for": ".filter-bar"}
+      ],
+      "clip": null,
+      "output": "docs/ui/assets/react-archive-filters.png",
+      "used_by": [],
+      "requires": "at least one channel visible to the capture account"
+    },
+    {
+      "id": "react-archive-channel-picker",
+      "ui": "react",
+      "auth": "operator",
+      "title": "Archive — stream picker",
+      "caption": "Multi-select stream picker. With nothing selected the search spans every granted stream; scoping by stream and period is what keeps a broad search honest.",
+      "path": "/?ui=react",
+      "steps": [
+        {"wait_for": ".menu-ear"},
+        {"click": ".menu-ear"},
+        {"click": ".menu-item:has-text('Archive')"},
+        {"wait_for": ".archive-screen"},
+        {"click": ".atp-tab:has-text('Filters')"},
+        {"click": ".archive-channel-picker-toggle"},
+        {"wait_for": ".archive-channel-picker-pop"}
+      ],
+      "clip": ".archive-channel-picker-pop",
+      "output": "docs/ui/assets/react-archive-channel-picker.png",
+      "used_by": [],
+      "requires": "at least one channel visible to the capture account"
+    },
+    {
+      "id": "react-archive-period-menu",
+      "ui": "react",
+      "auth": "operator",
+      "title": "Archive — period menu",
+      "caption": "Period presets for the archive query. The calendar icon next to it opens an explicit from/to range.",
+      "path": "/?ui=react",
+      "steps": [
+        {"wait_for": ".menu-ear"},
+        {"click": ".menu-ear"},
+        {"click": ".menu-item:has-text('Archive')"},
+        {"wait_for": ".archive-screen"},
+        {"click": ".atp-tab:has-text('Filters')"},
+        {"click": ".qf-menu .qf-seg"},
+        {"wait_for": ".qf-pop"}
+      ],
+      "clip": ".qf-split",
+      "output": "docs/ui/assets/react-archive-period-menu.png",
+      "used_by": []
+    },
+    {
+      "id": "react-archive-date-range-modal",
+      "ui": "react",
+      "auth": "operator",
+      "title": "Archive — date range",
+      "caption": "Explicit from/to range for an archive query, for when a preset window is the wrong shape.",
+      "path": "/?ui=react",
+      "steps": [
+        {"wait_for": ".menu-ear"},
+        {"click": ".menu-ear"},
+        {"click": ".menu-item:has-text('Archive')"},
+        {"wait_for": ".archive-screen"},
+        {"click": ".atp-tab:has-text('Filters')"},
+        {"click": ".qf-seg.qf-icon"},
+        {"wait_for": ".scrim .modal"}
+      ],
+      "clip": ".scrim .modal",
+      "output": "docs/ui/assets/react-archive-date-range-modal.png",
+      "used_by": []
+    },
+    {
+      "id": "react-archive-text-query",
+      "ui": "react",
+      "auth": "operator",
+      "title": "Archive — text query",
+      "caption": "Semantic text search over archived frames, with the min-match slider normalised to the score range this query actually returned.",
+      "path": "/?ui=react",
+      "steps": [
+        {"wait_for": ".menu-ear"},
+        {"click": ".menu-ear"},
+        {"click": ".menu-item:has-text('Archive')"},
+        {"wait_for": ".archive-screen"},
+        {"click": ".atp-tab:has-text('Text query')"},
+        {"wait_for": ".atp-min"}
+      ],
+      "clip": null,
+      "output": "docs/ui/assets/react-archive-text-query.png",
+      "used_by": []
+    },
+    {
+      "id": "react-archive-image-query",
+      "ui": "react",
+      "auth": "operator",
+      "title": "Archive — image query",
+      "caption": "Image query tab: upload a reference frame and rank the archive by visual similarity.",
+      "path": "/?ui=react",
+      "steps": [
+        {"wait_for": ".menu-ear"},
+        {"click": ".menu-ear"},
+        {"click": ".menu-item:has-text('Archive')"},
+        {"wait_for": ".archive-screen"},
+        {"click": ".atp-tab:has-text('Image')"},
+        {"wait_for": ".atp-image"}
+      ],
+      "clip": ".tool-tabs",
+      "output": "docs/ui/assets/react-archive-image-query.png",
+      "used_by": []
+    },
+    {
+      "id": "react-archive-results",
+      "ui": "react",
+      "auth": "operator",
+      "title": "Archive — results",
+      "caption": "Result grid with the match count, the coverage line for the query, and per-card source labels.",
+      "path": "/?ui=react",
+      "steps": [
+        {"wait_for": ".menu-ear"},
+        {"click": ".menu-ear"},
+        {"click": ".menu-item:has-text('Archive')"},
+        {"wait_for": ".archive-screen"},
+        {"wait_for": ".card-grid .card"}
+      ],
+      "clip": null,
+      "output": "docs/ui/assets/react-archive-results.png",
+      "used_by": [],
+      "requires": "archived frames in the default window (the scene fails rather than documenting an empty state)"
+    },
+    {
+      "id": "react-archive-inspector-modal",
+      "ui": "react",
+      "auth": "operator",
+      "title": "Archive — research review",
+      "caption": "Archive research review: the frame, its provenance, and the describe / find-similar / report actions.",
+      "path": "/?ui=react",
+      "steps": [
+        {"wait_for": ".menu-ear"},
+        {"click": ".menu-ear"},
+        {"click": ".menu-item:has-text('Archive')"},
+        {"wait_for": ".archive-screen"},
+        {"wait_for": ".card-grid .card"},
+        {"click": ".card-grid .card"},
+        {"wait_for": ".archive-review-modal"}
+      ],
+      "clip": ".archive-review-modal",
+      "output": "docs/ui/assets/react-archive-inspector-modal.png",
+      "used_by": [],
+      "requires": "archived frames in the default window"
+    },
+
+    {
+      "id": "react-summaries-review",
+      "ui": "react",
+      "auth": "operator",
+      "title": "Summaries — stream review",
+      "caption": "Stream review: channel, period and resolution on the left, the video-description feed with L0-L3 rollups on the right.",
+      "path": "/?ui=react",
+      "steps": [
+        {"wait_for": ".menu-ear"},
+        {"click": ".menu-ear"},
+        {"click": ".menu-item:has-text('Summaries')"},
+        {"wait_for": ".vid-cols"},
+        {"click": ".atp-tab:has-text('Stream review')"},
+        {"wait_for": ".vid-review-feed"}
+      ],
+      "clip": null,
+      "output": "docs/ui/assets/react-summaries-review.png",
+      "used_by": []
+    },
+    {
+      "id": "react-summaries-period-menu",
+      "ui": "react",
+      "auth": "operator",
+      "title": "Summaries — period",
+      "caption": "Period selector for the feed. Historical periods span service restarts and are paged out of PostgreSQL, not out of memory.",
+      "path": "/?ui=react",
+      "steps": [
+        {"wait_for": ".menu-ear"},
+        {"click": ".menu-ear"},
+        {"click": ".menu-item:has-text('Summaries')"},
+        {"wait_for": ".vid-cols"},
+        {"click": ".atp-tab:has-text('Stream review')"},
+        {"click": ".wfield.hist .dd-btn"},
+        {"wait_for": ".wfield.hist .dd-pop"}
+      ],
+      "clip": ".vid-lens-row",
+      "output": "docs/ui/assets/react-summaries-period-menu.png",
+      "used_by": []
+    },
+    {
+      "id": "react-summaries-resolution-menu",
+      "ui": "react",
+      "auth": "operator",
+      "title": "Summaries — resolution",
+      "caption": "Resolution selector: Auto picks a practical depth for the chosen period; the explicit depths are observations, 15 min, 1 h and 6 h.",
+      "path": "/?ui=react",
+      "steps": [
+        {"wait_for": ".menu-ear"},
+        {"click": ".menu-ear"},
+        {"click": ".menu-item:has-text('Summaries')"},
+        {"wait_for": ".vid-cols"},
+        {"click": ".atp-tab:has-text('Stream review')"},
+        {"click": ".wfield.resolution .dd-btn"},
+        {"wait_for": ".wfield.resolution .dd-pop"}
+      ],
+      "clip": ".vid-lens-row",
+      "output": "docs/ui/assets/react-summaries-resolution-menu.png",
+      "used_by": []
+    },
+    {
+      "id": "react-summaries-card-expanded",
+      "ui": "react",
+      "auth": "operator",
+      "title": "Summaries — expanded description",
+      "caption": "One expanded video-description: level badge, time range, semantic status, coverage-gap and transition chips, and the operator narrative.",
+      "path": "/?ui=react",
+      "steps": [
+        {"wait_for": ".menu-ear"},
+        {"click": ".menu-ear"},
+        {"click": ".menu-item:has-text('Summaries')"},
+        {"wait_for": ".vid-cols"},
+        {"wait_for": ".vid-sum-toggle"},
+        {"click": ".vid-sum-toggle"},
+        {"wait_for": ".vid-sum-copy"}
+      ],
+      "clip": ".vid-review-feed",
+      "output": "docs/ui/assets/react-summaries-card-expanded.png",
+      "used_by": [],
+      "requires": "at least one video-description in the selected period"
+    },
+    {
+      "id": "react-summaries-preview-drawer",
+      "ui": "react",
+      "auth": "operator",
+      "title": "Summaries — preview drawer",
+      "caption": "The preview drawer beside the feed. Model view shows the frames EVA actually reads; full live opens the recorder stream for short verification only.",
+      "path": "/?ui=react",
+      "steps": [
+        {"wait_for": ".menu-ear"},
+        {"click": ".menu-ear"},
+        {"click": ".menu-item:has-text('Summaries')"},
+        {"wait_for": ".vid-cols"},
+        {"click": ".atp-tab:has-text('Stream review')"},
+        {"click": ".mon-btn:has-text('Open preview')"},
+        {"wait_for": ".vid-review-preview-drawer"}
+      ],
+      "clip": null,
+      "output": "docs/ui/assets/react-summaries-preview-drawer.png",
+      "used_by": [],
+      "requires": "a selected review channel"
+    },
+    {
+      "id": "react-summaries-settings-tab",
+      "ui": "react",
+      "auth": "engineer",
+      "title": "Summaries — stream settings",
+      "caption": "Stream settings: source, sampling and batching, runtime controls, and the runtime/attention panel for the independently selected settings channel.",
+      "path": "/?ui=react",
+      "steps": [
+        {"wait_for": ".menu-ear"},
+        {"click": ".menu-ear"},
+        {"click": ".menu-item:has-text('Summaries')"},
+        {"wait_for": ".vid-cols"},
+        {"click": ".atp-tab:has-text('Stream settings')"},
+        {"wait_for": ".vid-settings-toolbar"}
+      ],
+      "clip": null,
+      "output": "docs/ui/assets/react-summaries-settings-tab.png",
+      "used_by": []
+    },
+    {
+      "id": "react-summaries-prompt-modal-stream",
+      "ui": "react",
+      "auth": "engineer",
+      "title": "Prompts & alerts — Stream",
+      "caption": "System prompt settings, Stream tab: the L0 description prompt, which controls description style and role.",
+      "path": "/?ui=react",
+      "steps": [
+        {"wait_for": ".menu-ear"},
+        {"click": ".menu-ear"},
+        {"click": ".menu-item:has-text('Summaries')"},
+        {"wait_for": ".vid-cols"},
+        {"click": ".atp-tab:has-text('Stream settings')"},
+        {"click": ".mon-btn:has-text('Prompts & alerts')"},
+        {"wait_for": ".vid-tabs"},
+        {"click": ".vid-tab:has-text('Stream')"}
+      ],
+      "clip": ".scrim .modal",
+      "output": "docs/ui/assets/react-summaries-prompt-modal-stream.png",
+      "used_by": []
+    },
+    {
+      "id": "react-summaries-prompt-modal-alerts",
+      "ui": "react",
+      "auth": "engineer",
+      "title": "Prompts & alerts — Alerts",
+      "caption": "Alert Criteria: the plain-language watch-for policy. Separate from the L0 stream prompt, and separate again from the machine-readable BATCH_STATE_JSON contract on the JSON tab.",
+      "path": "/?ui=react",
+      "steps": [
+        {"wait_for": ".menu-ear"},
+        {"click": ".menu-ear"},
+        {"click": ".menu-item:has-text('Summaries')"},
+        {"wait_for": ".vid-cols"},
+        {"click": ".atp-tab:has-text('Stream settings')"},
+        {"click": ".mon-btn:has-text('Prompts & alerts')"},
+        {"wait_for": ".vid-tabs"},
+        {"click": ".vid-tab:has-text('Alerts')"}
+      ],
+      "clip": ".scrim .modal",
+      "output": "docs/ui/assets/react-summaries-prompt-modal-alerts.png",
+      "used_by": []
+    },
+    {
+      "id": "react-summaries-prompt-modal-rollups",
+      "ui": "react",
+      "auth": "engineer",
+      "title": "Prompts & alerts — L2",
+      "caption": "Rollup prompts are per level: L1 minutes, L2 hours, L3 days. Each consolidates the level below it.",
+      "path": "/?ui=react",
+      "steps": [
+        {"wait_for": ".menu-ear"},
+        {"click": ".menu-ear"},
+        {"click": ".menu-item:has-text('Summaries')"},
+        {"wait_for": ".vid-cols"},
+        {"click": ".atp-tab:has-text('Stream settings')"},
+        {"click": ".mon-btn:has-text('Prompts & alerts')"},
+        {"wait_for": ".vid-tabs"},
+        {"click": ".vid-tab:has-text('L2 · hours')"}
+      ],
+      "clip": ".scrim .modal",
+      "output": "docs/ui/assets/react-summaries-prompt-modal-rollups.png",
+      "used_by": []
+    },
+    {
+      "id": "react-summaries-incident-modal",
+      "ui": "react",
+      "auth": "operator",
+      "title": "Report incident",
+      "caption": "Incident report raised from a video-description, pre-filled with the channel and window it came from.",
+      "path": "/?ui=react",
+      "steps": [
+        {"wait_for": ".menu-ear"},
+        {"click": ".menu-ear"},
+        {"click": ".menu-item:has-text('Summaries')"},
+        {"wait_for": ".vid-cols"},
+        {"wait_for": ".vid-sum-toggle"},
+        {"click": ".btn.compact:has-text('Report incident')"},
+        {"wait_for": ".incident-modal"}
+      ],
+      "clip": ".incident-modal",
+      "output": "docs/ui/assets/react-summaries-incident-modal.png",
+      "used_by": [],
+      "requires": "a video-description in view and the incidents:report permission"
+    },
+
+    {
+      "id": "react-probes-board",
+      "ui": "react",
+      "auth": "operator",
+      "title": "Probes — board",
+      "caption": "Probe board grouped channel group → channel → probe, with author (OP/AI) and state filter chips, search, and the card/list view toggle.",
+      "path": "/?ui=react",
+      "steps": [
+        {"wait_for": ".menu-ear"},
+        {"click": ".menu-ear"},
+        {"click": ".menu-item:has-text('Probes')"},
+        {"wait_for": ".probe-board-screen"},
+        {"wait_for": ".probe-board-toolbar"}
+      ],
+      "clip": null,
+      "output": "docs/ui/assets/react-probes-board.png",
+      "used_by": []
+    },
+    {
+      "id": "react-probes-board-list-view",
+      "ui": "react",
+      "auth": "operator",
+      "title": "Probes — list view",
+      "caption": "The same board in list view: denser, and easier to scan when many probes are cast across channels.",
+      "path": "/?ui=react",
+      "steps": [
+        {"wait_for": ".menu-ear"},
+        {"click": ".menu-ear"},
+        {"click": ".menu-item:has-text('Probes')"},
+        {"wait_for": ".probe-board-screen"},
+        {"click": ".probe-view-toggle button:nth-child(2)"},
+        {"wait_ms": 400}
+      ],
+      "clip": null,
+      "output": "docs/ui/assets/react-probes-board-list-view.png",
+      "used_by": [],
+      "requires": "at least one probe"
+    },
+    {
+      "id": "react-probes-inspector-modal",
+      "ui": "react",
+      "auth": "operator",
+      "title": "Probes — selected probe",
+      "caption": "Selected probe: origin badge, gate and threshold, last hit, hit sparkline, and the run/settings/delete actions your role allows.",
+      "path": "/?ui=react",
+      "steps": [
+        {"wait_for": ".menu-ear"},
+        {"click": ".menu-ear"},
+        {"click": ".menu-item:has-text('Probes')"},
+        {"wait_for": ".probe-board-screen"},
+        {"wait_for": ".probe-card"},
+        {"click": ".probe-card"},
+        {"wait_for": ".probe-inspect-modal"}
+      ],
+      "clip": ".probe-inspect-modal",
+      "output": "docs/ui/assets/react-probes-inspector-modal.png",
+      "used_by": [],
+      "requires": "at least one probe"
+    },
+    {
+      "id": "react-probes-settings-modal",
+      "ui": "react",
+      "auth": "engineer",
+      "title": "Probes — new probe",
+      "caption": "Semantic probe settings: positive/negative prompt pairs, the ROI control, and the reference-image option.",
+      "path": "/?ui=react",
+      "steps": [
+        {"wait_for": ".menu-ear"},
+        {"click": ".menu-ear"},
+        {"click": ".menu-item:has-text('Probes')"},
+        {"wait_for": ".probe-board-screen"},
+        {"click": ".mon-btn.accent:has-text('New probe')"},
+        {"wait_for": ".probe-modal"}
+      ],
+      "clip": ".probe-modal",
+      "output": "docs/ui/assets/react-probes-settings-modal.png",
+      "used_by": []
+    },
+    {
+      "id": "react-probes-settings-advanced",
+      "ui": "react",
+      "auth": "engineer",
+      "title": "Probes — advanced section",
+      "caption": "The probe editor's collapsed technical and advanced sections opened: thresholds, debounce and gate behaviour behind the everyday controls.",
+      "path": "/?ui=react",
+      "steps": [
+        {"wait_for": ".menu-ear"},
+        {"click": ".menu-ear"},
+        {"click": ".menu-item:has-text('Probes')"},
+        {"wait_for": ".probe-board-screen"},
+        {"click": ".mon-btn.accent:has-text('New probe')"},
+        {"wait_for": ".probe-modal"},
+        {"click": ".probe-tab:has-text('Technical details')"},
+        {"click": ".probe-tab:has-text('Advanced settings')"},
+        {"wait_ms": 400}
+      ],
+      "clip": ".probe-modal",
+      "output": "docs/ui/assets/react-probes-settings-advanced.png",
+      "used_by": []
+    },
+    {
+      "id": "react-probes-cast-modal",
+      "ui": "react",
+      "auth": "engineer",
+      "title": "Probes — cast to channels",
+      "caption": "Casting one probe across channels. Casting is what turns a single matcher into a watch-list detector on a set of streams.",
+      "path": "/?ui=react",
+      "steps": [
+        {"wait_for": ".menu-ear"},
+        {"click": ".menu-ear"},
+        {"click": ".menu-item:has-text('Probes')"},
+        {"wait_for": ".probe-board-screen"},
+        {"click": ".mon-btn.accent:has-text('New probe')"},
+        {"wait_for": ".probe-modal"},
+        {"click": ".probe-footer-actions .mon-btn:has-text('Cast')"},
+        {"wait_for": ".probe-cast"}
+      ],
+      "clip": ".probe-cast",
+      "output": "docs/ui/assets/react-probes-cast-modal.png",
+      "used_by": []
+    },
+    {
+      "id": "react-probes-group-modal",
+      "ui": "react",
+      "auth": "engineer",
+      "title": "Probes — channel groups",
+      "caption": "Channel groups are EVA-side labels you create yourself. A channel belongs to one group; ungrouped channels collect under Ungrouped, and deleting a group never deletes probes.",
+      "path": "/?ui=react",
+      "steps": [
+        {"wait_for": ".menu-ear"},
+        {"click": ".menu-ear"},
+        {"click": ".menu-item:has-text('Probes')"},
+        {"wait_for": ".probe-board-screen"},
+        {"click": ".mon-btn.sm:has-text('Groups')"},
+        {"wait_for": ".probe-group-modal"}
+      ],
+      "clip": ".probe-group-modal",
+      "output": "docs/ui/assets/react-probes-group-modal.png",
+      "used_by": []
+    },
+
+    {
+      "id": "react-agent-docked",
+      "ui": "react",
+      "auth": "operator",
+      "title": "Agent — docked",
+      "caption": "The agent docked beside the console: the console stays usable, and completed tool results can open and refilter it while Operator Mode is ON.",
+      "path": "/?ui=react",
+      "steps": [
+        {"wait_for": ".menu-ear"},
+        {"click": ".menu-ear"},
+        {"click": ".menu-item:has-text('Archive')"},
+        {"wait_for": ".archive-screen"},
+        {"click": ".agent-ear"},
+        {"wait_for": ".agent-dock.open"},
+        {"wait_ms": 600}
+      ],
+      "clip": null,
+      "output": "docs/ui/assets/react-agent-docked.png",
+      "used_by": []
+    },
+    {
+      "id": "react-agent-panel-controls",
+      "ui": "react",
+      "auth": "operator",
+      "title": "Agent — panel controls",
+      "caption": "Panel header controls: full screen, cycle to the next fixed width layout, and close. The docked panel can also be dragged; releasing snaps it to the nearest layout.",
+      "path": "/?ui=react",
+      "steps": [
+        {"wait_for": ".agent-ear"},
+        {"click": ".agent-ear"},
+        {"wait_for": ".agent-dock.open"},
+        {"wait_ms": 400}
+      ],
+      "clip": ".agent-head",
+      "output": "docs/ui/assets/react-agent-panel-controls.png",
+      "used_by": []
+    },
+    {
+      "id": "react-agent-strip",
+      "ui": "react",
+      "auth": "operator",
+      "title": "Agent — control strip",
+      "caption": "Agent control strip: new session, session history, the Operator ON/OFF console-driving switch, skills, and active video streams.",
+      "path": "/?ui=react",
+      "steps": [
+        {"wait_for": ".agent-ear"},
+        {"click": ".agent-ear"},
+        {"wait_for": ".ag-strip"},
+        {"wait_ms": 400}
+      ],
+      "clip": ".ag-strip",
+      "output": "docs/ui/assets/react-agent-strip.png",
+      "used_by": []
+    },
+    {
+      "id": "react-agent-history-menu",
+      "ui": "react",
+      "auth": "operator",
+      "title": "Agent — session history",
+      "caption": "Session history: investigation threads persist. Start a new session for a new incident; reopen an old one to keep its task context.",
+      "path": "/?ui=react",
+      "steps": [
+        {"wait_for": ".agent-ear"},
+        {"click": ".agent-ear"},
+        {"wait_for": ".ag-strip"},
+        {"click": ".ag-drop button:has-text('History')"},
+        {"wait_for": ".ag-drop-pop"}
+      ],
+      "clip": ".ag-strip",
+      "output": "docs/ui/assets/react-agent-history-menu.png",
+      "used_by": [],
+      "requires": "a few saved sessions for the capture account, otherwise the list shows its empty state"
+    },
+    {
+      "id": "react-agent-skills-menu",
+      "ui": "react",
+      "auth": "operator",
+      "title": "Agent — skills",
+      "caption": "Skills are process-wide playbooks managed by a system admin, not tenant prompt-editor content. Operators run them; they do not edit them.",
+      "path": "/?ui=react",
+      "steps": [
+        {"wait_for": ".agent-ear"},
+        {"click": ".agent-ear"},
+        {"wait_for": ".ag-strip"},
+        {"click": ".ag-drop button:has-text('Skills')"},
+        {"wait_for": ".ag-drop-pop"}
+      ],
+      "clip": ".ag-strip",
+      "output": "docs/ui/assets/react-agent-skills-menu.png",
+      "used_by": []
+    },
+    {
+      "id": "react-agent-streams-menu",
+      "ui": "react",
+      "auth": "operator",
+      "title": "Agent — active streams",
+      "caption": "Active video streams and their configured probes, as context for what the agent can currently see.",
+      "path": "/?ui=react",
+      "steps": [
+        {"wait_for": ".agent-ear"},
+        {"click": ".agent-ear"},
+        {"wait_for": ".ag-strip"},
+        {"click": ".ag-drop button:has-text('Streams')"},
+        {"wait_for": ".ag-drop-pop"}
+      ],
+      "clip": ".ag-strip",
+      "output": "docs/ui/assets/react-agent-streams-menu.png",
+      "used_by": []
+    },
+    {
+      "id": "react-agent-composer",
+      "ui": "react",
+      "auth": "operator",
+      "title": "Agent — composer",
+      "caption": "Ask with a channel and a period. An image can be attached to the question; the send control becomes a stop control while a turn is running.",
+      "path": "/?ui=react",
+      "steps": [
+        {"wait_for": ".agent-ear"},
+        {"click": ".agent-ear"},
+        {"wait_for": ".agent-composer"},
+        {"fill": {"selector": ".agent-input textarea", "value": "What happened on channel 12 in the last 2 hours?"}},
+        {"wait_ms": 300}
+      ],
+      "clip": ".agent-composer",
+      "output": "docs/ui/assets/react-agent-composer.png",
+      "used_by": []
+    },
+    {
+      "id": "react-agent-full",
+      "ui": "react",
+      "auth": "operator",
+      "title": "Agent — full screen",
+      "caption": "Full screen agent: the session rail appears on the left with the chat history, and the console is handed over entirely to the investigation.",
+      "path": "/?ui=react",
+      "steps": [
+        {"wait_for": ".agent-ear"},
+        {"click": ".agent-ear"},
+        {"wait_for": ".agent-dock.open"},
+        {"click": ".agent-head-btns .modal-close"},
+        {"wait_for": ".agent-dock.full .ag-rail"},
+        {"wait_ms": 600}
+      ],
+      "clip": null,
+      "output": "docs/ui/assets/react-agent-full.png",
+      "used_by": []
+    },
+    {
+      "id": "react-agent-transcript",
+      "ui": "react",
+      "auth": "operator",
+      "title": "Agent — answer with evidence",
+      "caption": "An answered turn: tool calls, the coverage line stating period requested versus actually inspected, and evidence frames attached to the claim.",
+      "path": "/?ui=react",
+      "steps": [
+        {"wait_for": ".agent-ear"},
+        {"click": ".agent-ear"},
+        {"wait_for": ".agent-dock.open"},
+        {"click": ".agent-head-btns .modal-close"},
+        {"wait_for": ".agent-dock.full .ag-rail"},
+        {"click": ".ag-rail .ag-session"},
+        {"wait_for": ".ag-messages"},
+        {"wait_ms": 1200}
+      ],
+      "clip": ".ag-chat",
+      "output": "docs/ui/assets/react-agent-transcript.png",
+      "used_by": [],
+      "requires": "a saved session whose transcript is safe to publish — this is the one scene where the content, not just the layout, ends up in the guide"
+    },
+
+    {
+      "id": "react-settings-server",
+      "ui": "react",
+      "auth": "admin",
+      "title": "Settings — Server",
+      "caption": "Settings dialog. The left nav lists only the tabs your role may view; environment-backed values are reported as restart-required rather than applied live.",
+      "path": "/?ui=react",
+      "steps": [
+        {"wait_for": ".menu-ear"},
+        {"click": ".menu-ear"},
+        {"click": ".menu-item:has-text('Settings')"},
+        {"wait_for": ".set-modal"},
+        {"click": ".set-navitem:has-text('Server')"},
+        {"wait_ms": 300}
+      ],
+      "clip": ".set-modal",
+      "output": "docs/ui/assets/react-settings-server.png",
+      "used_by": []
+    },
+    {
+      "id": "react-settings-users",
+      "ui": "react",
+      "auth": "admin",
+      "title": "Settings — Users",
+      "caption": "User administration: roles, channel grants, password reset, enable/disable and session revocation. Grants are enforced at the API and by row-level security, not only here.",
+      "path": "/?ui=react",
+      "steps": [
+        {"wait_for": ".menu-ear"},
+        {"click": ".menu-ear"},
+        {"click": ".menu-item:has-text('Settings')"},
+        {"wait_for": ".set-modal"},
+        {"click": ".set-navitem:has-text('Users')"},
+        {"wait_ms": 500}
+      ],
+      "clip": ".set-modal",
+      "output": "docs/ui/assets/react-settings-users.png",
+      "used_by": [],
+      "requires": "capture with a throwaway admin account; the user list is a screenshot of real account names"
+    },
+    {
+      "id": "react-settings-audit",
+      "ui": "react",
+      "auth": "admin",
+      "title": "Settings — Audit",
+      "caption": "Audit reader: sensitive endpoints and agent tool calls, who did what and when.",
+      "path": "/?ui=react",
+      "steps": [
+        {"wait_for": ".menu-ear"},
+        {"click": ".menu-ear"},
+        {"click": ".menu-item:has-text('Settings')"},
+        {"wait_for": ".set-modal"},
+        {"click": ".set-navitem:has-text('Audit')"},
+        {"wait_ms": 500}
+      ],
+      "clip": ".set-modal",
+      "output": "docs/ui/assets/react-settings-audit.png",
+      "used_by": [],
+      "requires": "capture on a demo deployment; audit rows name real accounts and actions"
+    },
+    {
+      "id": "react-settings-environment",
+      "ui": "react",
+      "auth": "admin",
+      "title": "Settings — Environment",
+      "caption": "Environment tab: which variables the running process actually resolved. Values that carry secrets are not rendered.",
+      "path": "/?ui=react",
+      "steps": [
+        {"wait_for": ".menu-ear"},
+        {"click": ".menu-ear"},
+        {"click": ".menu-item:has-text('Settings')"},
+        {"wait_for": ".set-modal"},
+        {"click": ".set-navitem:has-text('Environment')"},
+        {"wait_ms": 500}
+      ],
+      "clip": ".set-modal",
+      "output": "docs/ui/assets/react-settings-environment.png",
+      "used_by": [],
+      "requires": "review the shot before committing — this tab is the most likely place for a DSN or host name to leak into a picture"
+    },
+    {
+      "id": "react-settings-diagnostics",
+      "ui": "react",
+      "auth": "admin",
+      "title": "Settings — Diagnostics",
+      "caption": "Diagnostics tab: component readiness and the protected diagnostics reader.",
+      "path": "/?ui=react",
+      "steps": [
+        {"wait_for": ".menu-ear"},
+        {"click": ".menu-ear"},
+        {"click": ".menu-item:has-text('Settings')"},
+        {"wait_for": ".set-modal"},
+        {"click": ".set-navitem:has-text('Diagnostics')"},
+        {"wait_ms": 500}
+      ],
+      "clip": ".set-modal",
+      "output": "docs/ui/assets/react-settings-diagnostics.png",
+      "used_by": []
+    }
+  ]
+}

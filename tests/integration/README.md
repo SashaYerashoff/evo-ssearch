@@ -145,10 +145,13 @@ keeps per-scenario regressions visible instead of hiding them in an average.
 - **Not here (build-gating golden/unit):** calibration verdict math, negation
   rejection, provenance/`delivery_status`, transition debounce, the status
   digest — those are deterministic and live in the normal pytest suite.
-- **Browser-only (manual / Playwright later):** pixels, role-based UI hiding and
-  the physical click target. The harness does require the same trusted target,
-  action and payload that the React console consumes; it therefore catches a
-  backend/UI projection gap before the final visual smoke.
+- **Browser-only:** rendered pixels and cards, role-based UI hiding, and the
+  physical click target. The live integration harness still requires the same
+  trusted target, action, and payload consumed by the React console, so it
+  catches a backend/UI projection gap before the final visual smoke. A
+  Playwright harness now exists for reproducible documentation screenshots
+  (`docs/ui/README.md`, `scripts/ui_shots.py`) and is the natural place to grow
+  those browser checks.
 
 `test_sse_parser.py` here is deterministic and **does** run in the normal suite —
 it regression-covers the harness (parser + scenario checker) without a live service.

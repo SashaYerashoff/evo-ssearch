@@ -97,7 +97,10 @@ live test into a passing claim.
 
 - Preserve unrelated working-tree changes and local evidence files.
 - Add a regression test for every bug fix; for browser behavior, prefer an
-  executable browser test once the Playwright harness is available.
+  executable browser test (Playwright harness: `docs/ui/README.md`).
+- UI screenshots in the guides are generated from `docs/ui/shots.json` via
+  `scripts/ui_shots.py`. Never hand-take one, and never commit a screenshot
+  containing real evidence frames.
 - Run `scripts/check_docs_drift.sh` whenever canonical facts, deployment, tools,
   permissions, or schema revisions change.
 - Schema changes require an Alembic revision plus updates to the code-expected

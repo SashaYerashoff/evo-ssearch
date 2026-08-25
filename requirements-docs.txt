@@ -1,0 +1,11 @@
+# Documentation screenshot harness (scripts/ui_shots.py) — DEV/DOCS ONLY.
+#
+# Deliberately NOT part of requirements.txt: the appliance runtime must not ship
+# a browser driver, and the offline bundle must not grow by ~120 MB of Chromium.
+# Install on a workstation that regenerates docs/ui/assets:
+#
+#   uv pip install --python .venv/bin/python -r requirements-docs.txt
+#   .venv/bin/python -m playwright install chromium
+#
+# `ui_shots.py validate` (the CI gate) is stdlib-only and does NOT need this file.
+playwright>=1.49,<2

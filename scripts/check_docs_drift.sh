@@ -39,6 +39,20 @@ if [ -n "${code_head:-}" ] && ! grep -qF "$code_head" docs/00_CANON/facts.md 2>/
   fail=1
 fi
 
+# UI screenshots: every guide picture must come from a scene in docs/ui/shots.json
+# and still exist. Stdlib-only, no browser, no running service.
+py=""
+for candidate in python3 python; do
+  if command -v "$candidate" >/dev/null 2>&1; then py="$candidate"; break; fi
+done
+if [ -n "$py" ]; then
+  if ! "$py" scripts/ui_shots.py validate; then
+    fail=1
+  fi
+else
+  echo "ui shots: no python interpreter found; screenshot manifest not checked"
+fi
+
 if [ "$fail" -eq 0 ]; then
   echo "docs drift check: OK"
 fi
