@@ -135,8 +135,8 @@ Other repositories:
 Desktop entry points:
 
 ```text
-/home/sasha/Desktop/EVA_GEORGIA_UPGRADE_RECOVER.sh
-/home/sasha/Desktop/EVA_GEORGIA_UPGRADE_TEST.sh
+/home/sasha/Projects/evo-ssearch/scripts/lab/georgia_upgrade_recover.sh
+/home/sasha/Projects/evo-ssearch/scripts/lab/georgia_upgrade_test.sh
 ```
 
 `EVA_GEORGIA_UPGRADE_RECOVER.sh` restores the exact pre-upgrade rehearsal baseline:
@@ -1611,7 +1611,7 @@ hashes. As with the previously successful rehearsal artifact, this incremental
 upgrade bundle reuses the preserved application venv: it does not include a full
 wheelhouse or a SigLIP model.
 
-`/home/sasha/Desktop/EVA_GEORGIA_UPGRADE_TEST.sh` now pins this archive and exact
+`scripts/lab/georgia_upgrade_test.sh` now pins this archive and exact
 commit and also waits up to 300 seconds in its independent post-update health
 gate. Shell syntax validation passes. The launcher still requires an explicit
 interactive confirmation after its read-only preflight.
@@ -1713,7 +1713,7 @@ Its outer checksum, every `runtime/SHA256SUMS` entry, the staged backend hashes,
 and React assets `index-ClBMw_wN.js` / `index-CKjVPy8G.css` were verified. The
 manifest records a clean `main` snapshot, beta 0.8.7 and the Linux x86-64 media
 runtime; as before, it reuses the target venv and does not contain a wheelhouse or
-SigLIP model. `/home/sasha/Desktop/EVA_GEORGIA_UPGRADE_TEST.sh` now pins this
+SigLIP model. `scripts/lab/georgia_upgrade_test.sh` now pins this
 archive and exact commit, and `bash -n` passes. No destructive reset or upgrade
 rehearsal was run.
 
@@ -1982,8 +1982,8 @@ into the release archive.
 Run, in order:
 
 ```bash
-/home/sasha/Desktop/EVA_GEORGIA_UPGRADE_RECOVER.sh
-/home/sasha/Desktop/EVA_GEORGIA_UPGRADE_TEST.sh
+/home/sasha/Projects/evo-ssearch/scripts/lab/georgia_upgrade_recover.sh
+/home/sasha/Projects/evo-ssearch/scripts/lab/georgia_upgrade_test.sh
 ```
 
 Before apply, record without exposing secrets:
@@ -2163,7 +2163,7 @@ backend source hash, and React assets `index-BJEko90E.js` /
 runtime but deliberately contains neither a wheelhouse nor the SigLIP model; it
 preserves and reuses the accepted target venv/model configuration.
 
-`/home/sasha/Desktop/EVA_GEORGIA_UPGRADE_TEST.sh` now pins this archive and the
+`scripts/lab/georgia_upgrade_test.sh` now pins this archive and the
 exact manifest commit; `bash -n` and a final outer checksum check pass. The prior
 `b18876b` archive remains immutable as the previous recovery artifact. No
 destructive RECOVER or interactive upgrade rehearsal was run while producing
