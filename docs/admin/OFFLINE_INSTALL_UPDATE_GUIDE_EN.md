@@ -14,9 +14,11 @@ Hosts outside that contract require an explicit engineering acceptance pass.
 
 - Root or `sudo` access.
 - The bundle matching the target architecture and operating system:
-  - **x64:** Ubuntu 26.04 LTS amd64 for a fresh installation. The same x64
-    bundle can update supported EVA installations on Ubuntu 24.04 or 26.04
-    whose existing EVA virtual environment uses CPython 3.12, 3.13, or 3.14.
+  - **x64:** use the x64/Ubuntu 24.04 bundle for a fresh Ubuntu 24.04 host, or
+    the x64/Ubuntu 26.04 bundle for a fresh Ubuntu 26.04 host. Both bundles can
+    update supported EVA installations on Ubuntu 24.04 or 26.04 whose existing
+    EVA virtual environment uses CPython 3.12, 3.13, or 3.14. Do not use one
+    release's offline APT payload for a fresh installation of the other.
   - **NVIDIA GB10 / Spark-class ARM64:** Ubuntu 24.04 LTS arm64.
 - Working `python3` from the Ubuntu installation. Do not preinstall Python ML
   packages: the bundle carries the reviewed application and inference

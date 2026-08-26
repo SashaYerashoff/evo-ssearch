@@ -10,8 +10,8 @@ listed platform and passes the installer's capability canaries.
 | Component | x64 appliance | NVIDIA GB10 / Spark-class ARM64 appliance |
 | --- | --- | --- |
 | Architecture | `amd64` / `x86_64` | `arm64` / `aarch64` |
-| Operating system | Ubuntu 26.04 LTS | Ubuntu 24.04 LTS |
-| Host Python | Ubuntu system `python3`; no host ML packages required | Ubuntu 24.04 system Python 3.12; no host PyTorch, vLLM, or Transformers required |
+| Operating system | Ubuntu 24.04 LTS or Ubuntu 26.04 LTS; use the x64 bundle built for the exact host release | Ubuntu 24.04 LTS |
+| Host Python | Ubuntu system Python 3.12 on 24.04 or Python 3.14 on 26.04; no host ML packages required | Ubuntu 24.04 system Python 3.12; no host PyTorch, vLLM, or Transformers required |
 | GPU | Modern NVIDIA GPU with at least 12 GiB VRAM | NVIDIA GB10 or an OEM Spark-class GB10 equivalent |
 | Memory | Workload-dependent; 32 GiB RAM recommended | 120 GiB unified memory class |
 | Free disk before install | At least 48 GiB; installer may require more from the actual payload size | At least 70 GiB; more is recommended for diagnostics, backups, and archive growth |
@@ -21,6 +21,11 @@ listed platform and passes the installer's capability canaries.
 Fresh installation on other Linux distributions, Ubuntu interim releases,
 WSL, Docker Desktop, rootless Docker, generic ARM servers without GB10, or
 unlisted CPU architectures is unsupported.
+
+The x64 Ubuntu 24.04 and 26.04 bundles are separate release artifacts because
+their offline APT closures are distribution-specific. They contain the same
+EVA release and update compatibility, but they are not interchangeable for a
+fresh installation. The launcher verifies this before changing the host.
 
 ## ARM64 Docker and NVIDIA contract
 

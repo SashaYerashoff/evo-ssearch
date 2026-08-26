@@ -85,6 +85,19 @@ def test_fresh_host_validation_uses_declared_ubuntu_release(tmp_path):
         installer.validate_target_host(manifest, os_release=os_release)
 
 
+def test_fresh_host_validation_accepts_declared_ubuntu_24_04_x64(tmp_path):
+    os_release = tmp_path / "os-release"
+    os_release.write_text('ID=ubuntu\nVERSION_ID="24.04"\n', encoding="utf-8")
+    manifest = {
+        "offline_dependencies": {
+            "target": {"architecture": "amd64", "os_release": "24.04"}
+        }
+    }
+
+    with patch.object(installer.platform, "machine", return_value="x86_64"):
+        installer.validate_target_host(manifest, os_release=os_release)
+
+
 def test_usb_builder_builds_react_for_node_free_runtime():
     builder = (ROOT / "scripts" / "build_port_usb_bundle.sh").read_text(
         encoding="utf-8"
