@@ -72,6 +72,9 @@ SPARK_RUNTIME_IMAGE = "eva-ai/spark-runtime:0.8.7-arm64"
 SPARK_RUNTIME_IMAGE_ID = (
     "sha256:5f79999e8001200efe1bacff71758a1ac459c83707f4ddab74311996863e17ba"
 )
+SPARK_RUNTIME_IMAGE_MANIFEST_DIGEST = (
+    "sha256:2652b56f319448cb89d7f0307bb897b95004a4f19e9d179a72d0af75b07cddd3"
+)
 SPARK_RUNTIME_CONTAINER_NAME = "eva-ai-app"
 SPARK_VLM_REPO = "Qwen/Qwen3-VL-4B-Instruct"
 SPARK_VLM_REVISION = "ebb281ec70b05090aa6165b016eac8ec08e71b17"
@@ -371,6 +374,19 @@ class Hardware:
     @property
     def nvidia_ready(self) -> bool:
         return bool(self.gpu_lines)
+
+
+@dataclass(frozen=True)
+class SparkRuntimeIdentity:
+    """Daemon-local identity for the content-pinned Spark runtime image.
+
+    Docker's classic image store exposes the OCI config digest as ``.Id``.
+    Docker's containerd image store exposes the OCI manifest digest instead.
+    Both identify the same verified archive and both must remain runnable.
+    """
+
+    architecture: str
+    image_id: str
 
 
 @dataclass
@@ -709,6 +725,7 @@ def spark_runtime_contract(manifest: Mapping) -> dict[str, str]:
         "base_image_id": SPARK_RUNTIME_BASE_IMAGE_ID,
         "image": SPARK_RUNTIME_IMAGE,
         "image_id": SPARK_RUNTIME_IMAGE_ID,
+        "image_manifest_digest": SPARK_RUNTIME_IMAGE_MANIFEST_DIGEST,
         "model": SPARK_VLM_REPO,
         "model_revision": SPARK_VLM_REVISION,
         "numpy": SPARK_NUMPY_VERSION,
@@ -720,7 +737,13 @@ def spark_runtime_contract(manifest: Mapping) -> dict[str, str]:
         "ffmpeg_bin": SPARK_FFMPEG_BIN,
         "ffmpeg_h264_decoder": "required",
     }
+    # Early 0.8.7 ARM bundles contain the correct config digest but predate the
+    # explicit manifest-digest field. Supporting that exact immutable identity
+    # lets a checksum-bound field hotfix resume an interrupted installation.
+    legacy_optional = {"image_manifest_digest"}
     for key, value in expected.items():
+        if key in legacy_optional and not str(raw.get(key) or "").strip():
+            continue
         if str(raw.get(key) or "") != value:
             raise InstallError(
                 f"Spark runtime {key} does not match this installer: "
@@ -759,16 +782,58 @@ def x64_python_runtime_contract(manifest: Mapping) -> dict[str, str]:
     return expected
 
 
-def _spark_image_present() -> bool:
+def _inspect_spark_runtime_identity() -> SparkRuntimeIdentity | None:
+    """Resolve the pinned image by tag across classic and containerd stores."""
+
     if not shutil.which("docker"):
-        return False
-    completed = subprocess.run(
-        ("docker", "image", "inspect", SPARK_RUNTIME_IMAGE_ID),
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
+        return None
+    inspected = subprocess.run(
+        (
+            "docker",
+            "image",
+            "inspect",
+            "--format",
+            "{{.Architecture}}|{{.Id}}",
+            SPARK_RUNTIME_IMAGE,
+        ),
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
         check=False,
     )
-    return completed.returncode == 0
+    if inspected.returncode:
+        return None
+    architecture, separator, image_id = inspected.stdout.strip().partition("|")
+    if separator != "|" or normalize_architecture(architecture) != "arm64":
+        raise InstallError(
+            f"Pinned Spark runtime has unexpected architecture {architecture!r}."
+        )
+    accepted_ids = {
+        SPARK_RUNTIME_IMAGE_ID,
+        SPARK_RUNTIME_IMAGE_MANIFEST_DIGEST,
+    }
+    if image_id not in accepted_ids:
+        raise InstallError(
+            "Pinned Spark runtime identity changed: "
+            f"{image_id or '[missing]'}. Expected the release config or manifest digest."
+        )
+    return SparkRuntimeIdentity(architecture=architecture, image_id=image_id)
+
+
+def _spark_image_present() -> bool:
+    return _inspect_spark_runtime_identity() is not None
+
+
+def spark_runtime_reference() -> str:
+    """Return the immutable image reference understood by this Docker daemon.
+
+    A missing image falls back to the classic config digest only to keep
+    pre-load dry-runs renderable. Real ARM installation phases call
+    ``ensure_spark_runtime`` before using this reference.
+    """
+
+    identity = _inspect_spark_runtime_identity()
+    return identity.image_id if identity is not None else SPARK_RUNTIME_IMAGE_ID
 
 
 def validate_spark_container_runtime(
@@ -799,35 +864,14 @@ def validate_spark_container_runtime(
             "Spark ARM64 requires the vendor Docker daemon before EVA can load "
             f"its offline runtime image: {tail}"
         )
-    if not _spark_image_present():
+    identity = _inspect_spark_runtime_identity()
+    if identity is None:
         return None
-    inspected = subprocess.run(
-        (
-            "docker",
-            "image",
-            "inspect",
-            "--format",
-            "{{.Architecture}}|{{.Id}}",
-            SPARK_RUNTIME_IMAGE_ID,
-        ),
-        text=True,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        check=False,
-    )
-    if inspected.returncode:
-        raise InstallError("Cannot inspect the pinned Spark runtime image.")
-    architecture, separator, image_id = inspected.stdout.strip().partition("|")
-    if separator != "|" or normalize_architecture(architecture) != "arm64":
-        raise InstallError(
-            f"Pinned Spark runtime has unexpected architecture {architecture!r}."
-        )
-    if image_id != SPARK_RUNTIME_IMAGE_ID:
-        raise InstallError(
-            f"Pinned Spark runtime image ID changed: {image_id or '[missing]'}."
-        )
     if not run_gpu_probe:
-        return {"image_id": image_id, "architecture": architecture}
+        return {
+            "image_id": identity.image_id,
+            "architecture": identity.architecture,
+        }
 
     probe = """
 import json
@@ -899,7 +943,7 @@ print(json.dumps(payload, sort_keys=True))
         (
             "--entrypoint",
             "python3",
-            SPARK_RUNTIME_IMAGE_ID,
+            identity.image_id,
             "-c",
             probe,
         )
@@ -973,7 +1017,7 @@ def ensure_spark_runtime(
     contract = spark_runtime_contract(manifest)
     if _spark_image_present():
         if runner.dry_run:
-            print(f"+ reuse pinned Spark runtime {SPARK_RUNTIME_IMAGE_ID}")
+            print(f"+ reuse pinned Spark runtime {spark_runtime_reference()}")
             return
         validate_spark_container_runtime(
             manifest,
@@ -1910,7 +1954,7 @@ def install_python_envs(
                 ),
                 "--entrypoint",
                 "python3",
-                SPARK_RUNTIME_IMAGE_ID,
+                spark_runtime_reference(),
                 "-m",
                 "venv",
                 "--system-site-packages",
@@ -1959,7 +2003,7 @@ def install_python_envs(
             ),
             "--entrypoint",
             app_python,
-            SPARK_RUNTIME_IMAGE_ID,
+            spark_runtime_reference(),
             *pip_command[1:],
         )
     runner.run(pip_command)
@@ -1969,7 +2013,7 @@ def install_python_envs(
                 *spark_docker_base(answers),
                 "--entrypoint",
                 app_python,
-                SPARK_RUNTIME_IMAGE_ID,
+                spark_runtime_reference(),
                 "-c",
                 (
                     "import cv2,torch,torchvision; "
@@ -2074,7 +2118,7 @@ def prepare_database(
             "EVA_DATABASE_DSN",
             "--entrypoint",
             app_dir / ".venv" / "bin" / "alembic",
-            SPARK_RUNTIME_IMAGE_ID,
+            spark_runtime_reference(),
             "upgrade",
             "head",
         )
@@ -2124,7 +2168,7 @@ def prepare_database(
             ),
             "--entrypoint",
             app_dir / ".venv" / "bin" / "python",
-            SPARK_RUNTIME_IMAGE_ID,
+            spark_runtime_reference(),
             "scripts/bootstrap_db_roles.py",
         )
     else:
@@ -2328,7 +2372,7 @@ def validate_runtime_config(
             *spark_docker_base(answers, gpu=False),
             "--entrypoint",
             command[0],
-            SPARK_RUNTIME_IMAGE_ID,
+            spark_runtime_reference(),
             *command[1:],
         )
     runner.run(command)
@@ -2441,7 +2485,7 @@ print(json.dumps({{
             ),
             "--entrypoint",
             app_python,
-            SPARK_RUNTIME_IMAGE_ID,
+            spark_runtime_reference(),
             "-c",
             probe,
         )
@@ -2483,7 +2527,7 @@ def install_systemd_units(
                 *common,
                 "--entrypoint",
                 app_dir / ".venv" / "bin" / "python",
-                SPARK_RUNTIME_IMAGE_ID,
+                spark_runtime_reference(),
                 validate_config,
                 "--env-file",
                 env_file,
@@ -2497,7 +2541,7 @@ def install_systemd_units(
                 f"HOME={answers.data_root}",
                 "--entrypoint",
                 app_dir / ".venv" / "bin" / "python",
-                SPARK_RUNTIME_IMAGE_ID,
+                spark_runtime_reference(),
                 exec_with_env,
                 "--env-file",
                 env_file,
@@ -2526,7 +2570,7 @@ def install_systemd_units(
                 f"HOME={answers.data_root}",
                 "--entrypoint",
                 app_dir / ".venv" / "bin" / "python",
-                SPARK_RUNTIME_IMAGE_ID,
+                spark_runtime_reference(),
                 exec_with_env,
                 "--env-file",
                 env_file,
@@ -2619,7 +2663,7 @@ WantedBy=multi-user.target
                     f"HOME={answers.data_root}",
                     "--entrypoint",
                     "vllm",
-                    SPARK_RUNTIME_IMAGE_ID,
+                    spark_runtime_reference(),
                     "serve",
                     model,
                     "--served-model-name",
@@ -2719,7 +2763,7 @@ WantedBy=multi-user.target
                     f"HOME={answers.data_root}",
                     "--entrypoint",
                     python,
-                    SPARK_RUNTIME_IMAGE_ID,
+                    spark_runtime_reference(),
                     exec_with_env,
                     "--env-file",
                     env_file,
@@ -3441,7 +3485,7 @@ def bootstrap_admin(
             "EVA_BOOTSTRAP_ADMIN_PASSWORD",
             "--entrypoint",
             command[0],
-            SPARK_RUNTIME_IMAGE_ID,
+            spark_runtime_reference(),
             *command[1:],
         )
     runner.run(command, env=env)

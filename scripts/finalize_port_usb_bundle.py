@@ -28,6 +28,9 @@ SPARK_RUNTIME_IMAGE = "eva-ai/spark-runtime:0.8.7-arm64"
 SPARK_RUNTIME_IMAGE_ID = (
     "sha256:5f79999e8001200efe1bacff71758a1ac459c83707f4ddab74311996863e17ba"
 )
+SPARK_RUNTIME_IMAGE_MANIFEST_DIGEST = (
+    "sha256:2652b56f319448cb89d7f0307bb897b95004a4f19e9d179a72d0af75b07cddd3"
+)
 SPARK_RUNTIME_ARCHIVE = "container/eva-spark-runtime-0.8.7-arm64.tar.zst"
 SPARK_VLM_REPO = "Qwen/Qwen3-VL-4B-Instruct"
 SPARK_VLM_REVISION = "ebb281ec70b05090aa6165b016eac8ec08e71b17"
@@ -208,6 +211,7 @@ def spark_runtime_payload(root: Path, architecture: str) -> tuple[dict[str, Any]
         "base_image_id": SPARK_RUNTIME_BASE_IMAGE_ID,
         "image": SPARK_RUNTIME_IMAGE,
         "image_id": SPARK_RUNTIME_IMAGE_ID,
+        "image_manifest_digest": SPARK_RUNTIME_IMAGE_MANIFEST_DIGEST,
         "platform": "linux/arm64",
         "model": SPARK_VLM_REPO,
         "model_revision": SPARK_VLM_REVISION,
@@ -246,6 +250,26 @@ def spark_runtime_payload(root: Path, architecture: str) -> tuple[dict[str, Any]
     ):
         raise SystemExit(
             "Spark runtime archive does not contain the pinned ARM64 image ID."
+        )
+    archive_index = subprocess.run(
+        ("tar", "--zstd", "-xOf", archive, "index.json"),
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+    try:
+        index = json.loads(archive_index.stdout) if not archive_index.returncode else {}
+        manifest_digests = {
+            str(item.get("digest") or "")
+            for item in index.get("manifests", [])
+            if isinstance(item, dict)
+        }
+    except json.JSONDecodeError:
+        manifest_digests = set()
+    if SPARK_RUNTIME_IMAGE_MANIFEST_DIGEST not in manifest_digests:
+        raise SystemExit(
+            "Spark runtime archive does not contain the pinned ARM64 manifest digest."
         )
     contract["archive"] = SPARK_RUNTIME_ARCHIVE
     contract["archive_sha256"] = digest(archive)

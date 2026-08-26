@@ -1102,6 +1102,7 @@ def _spark_manifest(archive: str = ""):
         "base_image_id": installer.SPARK_RUNTIME_BASE_IMAGE_ID,
         "image": installer.SPARK_RUNTIME_IMAGE,
         "image_id": installer.SPARK_RUNTIME_IMAGE_ID,
+        "image_manifest_digest": installer.SPARK_RUNTIME_IMAGE_MANIFEST_DIGEST,
         "model": installer.SPARK_VLM_REPO,
         "model_revision": installer.SPARK_VLM_REVISION,
         "numpy": installer.SPARK_NUMPY_VERSION,
@@ -1148,6 +1149,10 @@ def test_spark_runtime_contract_is_immutable_and_path_safe():
         _spark_manifest("container/eva-spark-runtime-0.8.7-arm64.tar.zst")
     )
     assert contract["image_id"] == installer.SPARK_RUNTIME_IMAGE_ID
+    assert (
+        contract["image_manifest_digest"]
+        == installer.SPARK_RUNTIME_IMAGE_MANIFEST_DIGEST
+    )
 
     changed = _spark_manifest()
     changed["container_runtime"]["image"] = "nvcr.io/nvidia/vllm:latest"
@@ -1156,6 +1161,57 @@ def test_spark_runtime_contract_is_immutable_and_path_safe():
 
     with pytest.raises(installer.InstallError, match="unsafe"):
         installer.spark_runtime_contract(_spark_manifest("../runtime.tar"))
+
+
+def test_spark_runtime_contract_accepts_legacy_087_config_only_identity():
+    manifest = _spark_manifest()
+    del manifest["container_runtime"]["image_manifest_digest"]
+
+    contract = installer.spark_runtime_contract(manifest)
+
+    assert contract["image_id"] == installer.SPARK_RUNTIME_IMAGE_ID
+    assert (
+        contract["image_manifest_digest"]
+        == installer.SPARK_RUNTIME_IMAGE_MANIFEST_DIGEST
+    )
+
+
+@pytest.mark.parametrize(
+    "reported_id",
+    (
+        installer.SPARK_RUNTIME_IMAGE_ID,
+        installer.SPARK_RUNTIME_IMAGE_MANIFEST_DIGEST,
+    ),
+)
+def test_spark_runtime_identity_supports_classic_and_containerd_image_stores(
+    reported_id,
+):
+    with (
+        patch.object(installer.shutil, "which", return_value="/usr/bin/docker"),
+        patch.object(
+            installer.subprocess,
+            "run",
+            return_value=CompletedProcess([], 0, f"arm64|{reported_id}\n", ""),
+        ) as run,
+    ):
+        identity = installer._inspect_spark_runtime_identity()
+
+    assert identity is not None
+    assert identity.image_id == reported_id
+    assert run.call_args.args[0][-1] == installer.SPARK_RUNTIME_IMAGE
+
+
+def test_spark_runtime_identity_rejects_unpinned_tag_target():
+    with (
+        patch.object(installer.shutil, "which", return_value="/usr/bin/docker"),
+        patch.object(
+            installer.subprocess,
+            "run",
+            return_value=CompletedProcess([], 0, f"arm64|sha256:{'1' * 64}\n", ""),
+        ),
+        pytest.raises(installer.InstallError, match="identity changed"),
+    ):
+        installer._inspect_spark_runtime_identity()
 
 
 def test_spark_vendor_numpy_contract_is_consistent_across_release_inputs():
@@ -1727,6 +1783,52 @@ def test_spark_systemd_uses_separate_pinned_gpu_container(tmp_path):
     assert f"--env-file {tmp_path / 'etc' / 'eva-ai.env'}" in unit
 
 
+def test_spark_systemd_uses_containerd_manifest_identity_when_resolved(tmp_path):
+    answers = installer.Answers(
+        install_root=tmp_path / "opt",
+        data_root=tmp_path / "data",
+        config_root=tmp_path / "etc",
+        evo_url="http://evo.local",
+        evo_username="operator",
+        evo_password="secret",
+        local_vlm=True,
+        local_deep=False,
+    )
+    written = {}
+
+    class RecordingRunner:
+        dry_run = False
+
+        def run(self, command, **_kwargs):
+            return CompletedProcess(command, 0, "", "")
+
+    def record(path, content, mode):
+        written[str(path)] = (content, mode)
+
+    account = SimpleNamespace(pw_uid=991, pw_gid=991)
+    with (
+        patch.object(installer.pwd, "getpwnam", return_value=account),
+        patch.object(installer, "_atomic_write", side_effect=record),
+        patch.object(
+            installer,
+            "spark_runtime_reference",
+            return_value=installer.SPARK_RUNTIME_IMAGE_MANIFEST_DIGEST,
+        ),
+    ):
+        installer.install_systemd_units(
+            answers,
+            RecordingRunner(),
+            architecture="arm64",
+        )
+
+    app_unit = written["/etc/systemd/system/eva-ai.service"][0]
+    vlm_unit = written["/etc/systemd/system/eva-vllm.service"][0]
+    assert installer.SPARK_RUNTIME_IMAGE_MANIFEST_DIGEST in app_unit
+    assert installer.SPARK_RUNTIME_IMAGE_MANIFEST_DIGEST in vlm_unit
+    assert installer.SPARK_RUNTIME_IMAGE_ID not in app_unit
+    assert installer.SPARK_RUNTIME_IMAGE_ID not in vlm_unit
+
+
 def test_appliance_config_directory_is_private_but_service_writable(tmp_path):
     answers = installer.Answers(
         install_root=tmp_path / "opt",
@@ -1848,15 +1950,29 @@ def test_finalizer_binds_required_spark_image_archive(tmp_path):
     archive_manifest = json.dumps(
         [{"Config": installer.SPARK_RUNTIME_IMAGE_ID.removeprefix("sha256:")}]
     )
+    archive_index = json.dumps(
+        {
+            "manifests": [
+                {"digest": installer.SPARK_RUNTIME_IMAGE_MANIFEST_DIGEST}
+            ]
+        }
+    )
     with patch.object(
         finalizer.subprocess,
         "run",
-        return_value=CompletedProcess([], 0, archive_manifest, ""),
+        side_effect=(
+            CompletedProcess([], 0, archive_manifest, ""),
+            CompletedProcess([], 0, archive_index, ""),
+        ),
     ):
         runtime, critical = finalizer.spark_runtime_payload(tmp_path, "arm64")
 
     assert runtime is not None
     assert runtime["image_id"] == installer.SPARK_RUNTIME_IMAGE_ID
+    assert (
+        runtime["image_manifest_digest"]
+        == installer.SPARK_RUNTIME_IMAGE_MANIFEST_DIGEST
+    )
     assert runtime["archive"] == finalizer.SPARK_RUNTIME_ARCHIVE
     assert runtime["archive_sha256"] == hashlib.sha256(archive.read_bytes()).hexdigest()
     assert finalizer.SPARK_RUNTIME_ARCHIVE in critical

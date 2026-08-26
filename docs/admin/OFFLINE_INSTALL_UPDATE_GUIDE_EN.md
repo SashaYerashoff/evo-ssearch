@@ -6,6 +6,10 @@ directory intact. Do not copy only `START_EVA_AI.sh`.
 
 ## 1. What must be ready before you start
 
+The normative platform, Docker, NVIDIA, Python, network, and host-state matrix
+is in [OFFLINE_APPLIANCE_COMPATIBILITY_MATRIX_EN.md](OFFLINE_APPLIANCE_COMPATIBILITY_MATRIX_EN.md).
+Hosts outside that contract require an explicit engineering acceptance pass.
+
 ### Target computer
 
 - Root or `sudo` access.

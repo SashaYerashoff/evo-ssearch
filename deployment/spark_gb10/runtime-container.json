@@ -6,6 +6,7 @@
   "base_image_id": "sha256:4c704f1343c7cb3aa7ea5cc57cab5fa1ed1a2160daf4f57d1e0c06fc1e2c7dbb",
   "image": "eva-ai/spark-runtime:0.8.7-arm64",
   "image_id": "sha256:5f79999e8001200efe1bacff71758a1ac459c83707f4ddab74311996863e17ba",
+  "image_manifest_digest": "sha256:2652b56f319448cb89d7f0307bb897b95004a4f19e9d179a72d0af75b07cddd3",
   "platform": "linux/arm64",
   "model": "Qwen/Qwen3-VL-4B-Instruct",
   "model_revision": "ebb281ec70b05090aa6165b016eac8ec08e71b17",
