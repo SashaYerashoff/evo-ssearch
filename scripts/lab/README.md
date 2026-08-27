@@ -8,5 +8,8 @@ and must not be shipped as generic client recovery commands.
 - `georgia_upgrade_test.sh` runs the pinned local Georgia upgrade rehearsal.
 - `reset_factory_x64.sh` retires only the disposable x64 factory appliance
   under `/mnt/eva-llamacpp-lab/factory-x64` after an explicit confirmation.
+- `enable_local_webcam_demo.sh` adds an idempotent direct `/dev/video0` training
+  channel to the installed appliance, proves capture as the `eva` service user,
+  restarts only `eva-ai.service`, and records an env backup first.
 
 Review their pinned paths and artifact identities before every use.
