@@ -21,6 +21,32 @@ export interface SummaryTextParts {
   marker: string
 }
 
+export interface SummaryNarrativeSections {
+  scene: string
+  episode: string
+  alerts: string
+  routine: string
+  deviations: string
+  memory: string
+  other: string
+  structured: boolean
+}
+
+export interface SummaryAlertItem {
+  title: string
+  description: string
+  severity: SummarySeverity
+  snapshotIndices: number[]
+  timestampMs: number | null
+}
+
+export interface SummaryEvidenceMeta {
+  selectedFrames: number
+  frameBudget: number
+  sourceFrames: number
+  periodSeconds: number | null
+}
+
 export type SummaryPeriod =
   | 'live'
   | 'today'
@@ -267,5 +293,150 @@ export function splitSummaryMachineJson(value: unknown): SummaryTextParts {
     narrative: text.slice(0, marker.index).trim(),
     machineJson: text.slice(jsonStart).trim(),
     marker: marker[0].replace(/\s+/g, ' ').trim(),
+  }
+}
+
+function narrativeSectionKey(value: string): keyof Omit<SummaryNarrativeSections, 'structured'> | null {
+  const key = value.trim().toLowerCase().replace(/[^a-z]+/g, ' ').trim()
+  if (key === 'scene' || key === 'scene description') return 'scene'
+  if (key === 'episode' || key === 'episode update' || key === 'activity description') return 'episode'
+  if (key === 'alerts' || key === 'alert') return 'alerts'
+  if (key === 'routine') return 'routine'
+  if (key === 'deviation' || key === 'deviations') return 'deviations'
+  if (key === 'worth to remember' || key === 'memory') return 'memory'
+  if (key === 'routine and deviations') return 'routine'
+  return null
+}
+
+function appendSection(current: string, value: string): string {
+  const clean = value.trim()
+  if (!clean) return current
+  return current ? `${current}\n\n${clean}` : clean
+}
+
+export function summaryNarrativeSections(value: unknown): SummaryNarrativeSections {
+  const text = String(value || '').trim()
+  const result: SummaryNarrativeSections = {
+    scene: '',
+    episode: '',
+    alerts: '',
+    routine: '',
+    deviations: '',
+    memory: '',
+    other: '',
+    structured: false,
+  }
+  const headings = [...text.matchAll(/^#{1,6}\s+(.+?)\s*$/gm)]
+  if (!headings.length) {
+    result.other = text
+    return result
+  }
+  const prefix = text.slice(0, headings[0].index).trim()
+  if (prefix) result.other = prefix
+  for (let index = 0; index < headings.length; index += 1) {
+    const heading = headings[index]
+    const start = Number(heading.index || 0) + heading[0].length
+    const end = index + 1 < headings.length
+      ? Number(headings[index + 1].index || text.length)
+      : text.length
+    const body = text.slice(start, end).trim()
+    const key = narrativeSectionKey(heading[1])
+    if (!key) {
+      result.other = appendSection(result.other, `${heading[0]}\n${body}`)
+      continue
+    }
+    result.structured = true
+    if (heading[1].trim().toLowerCase().replace(/[^a-z]+/g, ' ').trim() === 'routine and deviations') {
+      const deviationMarker = /(?:^|\n)\s*deviations?\s*:\s*/i.exec(body)
+      if (deviationMarker?.index != null) {
+        const routine = body.slice(0, deviationMarker.index).replace(/^\s*routine\s*:\s*/i, '').trim()
+        const deviations = body.slice(deviationMarker.index + deviationMarker[0].length).trim()
+        result.routine = appendSection(result.routine, routine)
+        result.deviations = appendSection(result.deviations, deviations)
+        continue
+      }
+    }
+    result[key] = appendSection(result[key], body)
+  }
+  return result
+}
+
+function normalizeSummarySeverity(value: unknown): SummarySeverity {
+  const raw = String(value || '').trim().toLowerCase()
+  const aliases: Record<string, SummarySeverity> = {
+    information: 'info',
+    informational: 'info',
+    warning: 'low',
+    warn: 'low',
+    medium: 'normal',
+    moderate: 'normal',
+    danger: 'high',
+    emergency: 'critical',
+  }
+  const normalized = aliases[raw] || raw
+  return SUMMARY_SEVERITIES.includes(normalized as SummarySeverity)
+    ? normalized as SummarySeverity
+    : 'normal'
+}
+
+export function summaryAlertItems(entry: SummaryEntry): SummaryAlertItem[] {
+  const sources: unknown[] = [
+    entry.alert_events,
+    entry.batch_state && typeof entry.batch_state === 'object'
+      ? (entry.batch_state as Record<string, unknown>).alerts
+      : null,
+  ]
+  const parts = splitSummaryMachineJson(entry.summary)
+  if (parts.machineJson) {
+    try {
+      sources.push(JSON.parse(parts.machineJson)?.alerts)
+    } catch {
+      // The visible narrative remains usable when legacy machine JSON is malformed.
+    }
+  }
+  const selected = sources.find((source) => Array.isArray(source) && source.length > 0)
+  if (!Array.isArray(selected)) return []
+  const seen = new Set<string>()
+  const alerts: SummaryAlertItem[] = []
+  for (const raw of selected) {
+    if (!raw || typeof raw !== 'object') continue
+    const item = raw as Record<string, unknown>
+    const title = String(item.title || item.label || 'Alert').trim() || 'Alert'
+    const snapshotIndices = Array.isArray(item.snapshot_indices)
+      ? item.snapshot_indices
+        .map((value) => Number(value))
+        .filter((value) => Number.isInteger(value) && value > 0)
+      : []
+    const timestamp = Number(item.timestamp_ms)
+    const timestampMs = Number.isFinite(timestamp) && timestamp > 0 ? timestamp : null
+    const dedupe = `${title.toLowerCase()}|${snapshotIndices.join(',')}|${timestampMs || 0}`
+    if (seen.has(dedupe)) continue
+    seen.add(dedupe)
+    alerts.push({
+      title,
+      description: String(item.description || item.summary || '').trim(),
+      severity: normalizeSummarySeverity(item.severity),
+      snapshotIndices,
+      timestampMs,
+    })
+  }
+  return alerts
+}
+
+export function summaryEvidenceMeta(entry: SummaryEntry): SummaryEvidenceMeta {
+  const selected = Number(entry.selected_frame_count || entry.frame_count || 0)
+  const source = Number(entry.source_frame_count || selected || 0)
+  const configuredBudget = Number(entry.frame_selection?.frame_budget || 8)
+  const frameBudget = Math.max(4, Math.min(8, Number.isFinite(configuredBudget) ? configuredBudget : 8))
+  const start = Number(entry.batch_start_ms)
+  const end = Number(entry.batch_end_ms)
+  const periodSeconds = Number.isFinite(start) && Number.isFinite(end) && end >= start
+    ? Math.round(((end - start) / 1000) * 10) / 10
+    : null
+  return {
+    selectedFrames: Number.isFinite(selected) ? Math.max(0, Math.floor(selected)) : 0,
+    frameBudget,
+    sourceFrames: Number.isFinite(source) ? Math.max(0, Math.floor(source)) : 0,
+    periodSeconds,
   }
 }

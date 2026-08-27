@@ -83,6 +83,19 @@ export interface SummaryEntry {
   run_id?: string
   severity?: string
   alert_counts?: Record<string, number>
+  alert_events?: Array<{
+    title?: string
+    description?: string
+    severity?: string
+    state?: string
+    timestamp_ms?: number
+    snapshot_indices?: number[]
+    [k: string]: any
+  }>
+  batch_state?: {
+    alerts?: Array<Record<string, any>>
+    [k: string]: any
+  }
   alert_total?: number
   level?: string
   rollup_id?: string

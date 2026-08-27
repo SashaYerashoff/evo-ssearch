@@ -2,8 +2,11 @@ import { describe, expect, it } from 'vitest'
 import {
   resolveSummaryResolution,
   summaryAlertCounts,
+  summaryAlertItems,
   summaryBurst,
+  summaryEvidenceMeta,
   summaryEntryKey,
+  summaryNarrativeSections,
   summaryPeriodBounds,
   summarySemanticStatus,
   splitSummaryMachineJson,
@@ -73,6 +76,55 @@ describe('video summary view metadata', () => {
       machineJson: '{"events":[]}',
       marker: 'BATCH_STATE_JSON:',
     })
+  })
+
+  it('turns the L0 narrative into stable human sections', () => {
+    expect(summaryNarrativeSections(
+      '### Scene\nKitchen with two people.\n\n'
+      + '### Episode\nSnapshot 1: A person stands by the sink.\n\n'
+      + '### Alerts\nNone\n\n'
+      + '### Routine\nPeople prepare food.\n\n'
+      + '### Deviations\nA knife was raised.\n\n'
+      + '### Worth to remember\nThe action remains unresolved.',
+    )).toMatchObject({
+      scene: 'Kitchen with two people.',
+      episode: 'Snapshot 1: A person stands by the sink.',
+      alerts: 'None',
+      routine: 'People prepare food.',
+      deviations: 'A knife was raised.',
+      memory: 'The action remains unresolved.',
+      structured: true,
+    })
+  })
+
+  it('renders factual frame, period, and alert metadata from the backend', () => {
+    const entry = {
+      selected_frame_count: 6,
+      source_frame_count: 11,
+      frame_selection: { frame_budget: 8 },
+      batch_start_ms: 1_000,
+      batch_end_ms: 16_000,
+      alert_events: [{
+        title: 'Knife visible',
+        description: 'A person holds a knife.',
+        severity: 'low',
+        timestamp_ms: 12_000,
+        snapshot_indices: [4],
+      }],
+    }
+    expect(summaryEvidenceMeta(entry)).toEqual({
+      selectedFrames: 6,
+      frameBudget: 8,
+      sourceFrames: 11,
+      periodSeconds: 15,
+    })
+    expect(summaryAlertItems(entry)).toEqual([{
+      title: 'Knife visible',
+      description: 'A person holds a knife.',
+      severity: 'low',
+      timestampMs: 12_000,
+      snapshotIndices: [4],
+    }])
   })
 
   it('matches the legacy period windows in the browser timezone', () => {

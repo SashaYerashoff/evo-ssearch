@@ -1683,6 +1683,39 @@
 .vid-sum-body.empty { color: var(--text-mut); font-style: italic; }
 .vid-sum-body > :first-child { margin-top: 0; }
 .vid-sum-body > :last-child { margin-bottom: 0; }
+.vid-human-summary { display: grid; gap: 12px; color: var(--text-2); }
+.vid-human-facts {
+  display: flex; align-items: center; flex-wrap: wrap; gap: 7px 16px;
+  padding: 8px 10px; border: 1px solid var(--line); border-radius: 8px;
+  background: color-mix(in srgb, var(--panel) 78%, transparent);
+  color: var(--text-mut); font-size: 10.5px;
+}
+.vid-human-facts strong {
+  margin-right: 5px; color: var(--text-2); font-size: 9px;
+  letter-spacing: .06em; text-transform: uppercase;
+}
+.vid-human-section { display: grid; gap: 4px; }
+.vid-human-section h4 {
+  margin: 0; color: var(--text-1); font-size: 10px; font-weight: 800;
+  letter-spacing: .065em; text-transform: uppercase;
+}
+.vid-human-section-copy { color: var(--text-2); font-size: 13px; line-height: 1.45; }
+.vid-human-section-copy > :first-child { margin-top: 0; }
+.vid-human-section-copy > :last-child { margin-bottom: 0; }
+.vid-human-alert-list { display: grid; gap: 6px; }
+.vid-human-alert {
+  display: grid; gap: 4px; padding: 8px 9px; border: 1px solid var(--line);
+  border-left: 2px solid var(--accent-line); border-radius: 7px; background: var(--space-0);
+}
+.vid-human-alert.sev-critical { border-left-color: var(--danger); }
+.vid-human-alert.sev-high, .vid-human-alert.sev-normal { border-left-color: var(--warning); }
+.vid-human-alert.sev-low { border-left-color: var(--success); }
+.vid-human-alert.sev-info { border-left-color: var(--info); }
+.vid-human-alert-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+.vid-human-alert-head strong { color: var(--text-1); font-size: 12px; }
+.vid-human-alert-meta { color: var(--text-mut); font-family: var(--mono); font-size: 9.5px; }
+.vid-human-alert p { margin: 0; color: var(--text-2); font-size: 11.5px; line-height: 1.4; }
+.vid-human-none { color: var(--text-mut); font-size: 11.5px; font-style: italic; }
 .vid-machine-state {
   margin-top: 10px; overflow: hidden; border: 1px solid var(--line);
   border-radius: 8px; background: var(--space-0);

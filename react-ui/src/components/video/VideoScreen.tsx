@@ -40,9 +40,12 @@ import {
   resolveSummaryResolution,
   splitSummaryMachineJson,
   summaryAlertCounts,
+  summaryAlertItems,
   summaryBurst,
+  summaryEvidenceMeta,
   summaryEntryKey,
   summaryLevel,
+  summaryNarrativeSections,
   summaryPeriodBounds,
   summarySemanticStatus,
   type SummaryPeriod,
@@ -183,6 +186,93 @@ function exportSummary(entry: SummaryEntry, level: string): void {
   link.click()
   link.remove()
   URL.revokeObjectURL(url)
+}
+
+function HumanSummarySection({ title, content }: { title: string; content: string }) {
+  if (!content.trim()) return null
+  return (
+    <section className="vid-human-section">
+      <h4>{title}</h4>
+      <div
+        className="vid-human-section-copy md"
+        dangerouslySetInnerHTML={{ __html: renderMarkdown(content) }}
+      />
+    </section>
+  )
+}
+
+function HumanSummaryNarrative({
+  entry,
+  narrative,
+  level,
+  locale,
+}: {
+  entry: SummaryEntry
+  narrative: string
+  level: string
+  locale: string
+}) {
+  const sections = summaryNarrativeSections(narrative)
+  const alertItems = summaryAlertItems(entry)
+  const evidence = summaryEvidenceMeta(entry)
+  if (!sections.structured) {
+    return narrative
+      ? <div className="vid-sum-body md" dangerouslySetInnerHTML={{ __html: renderMarkdown(narrative) }} />
+      : null
+  }
+  return (
+    <div className="vid-human-summary">
+      {level === 'L0' && evidence.selectedFrames > 0 && (
+        <div className="vid-human-facts">
+          <span><strong>Frames</strong> {evidence.selectedFrames}/{evidence.frameBudget}</span>
+          <span><strong>Period</strong> {evidence.periodSeconds == null ? '—' : `${evidence.periodSeconds}s`}</span>
+          {evidence.sourceFrames > evidence.selectedFrames && (
+            <span title="The wider source window was attention-ranked into the bounded VLM packet">
+              <strong>Source observations</strong> {evidence.sourceFrames}
+            </span>
+          )}
+        </div>
+      )}
+      <HumanSummarySection title="Scene" content={sections.scene} />
+      <HumanSummarySection title="Episode" content={sections.episode} />
+      <section className="vid-human-section vid-human-alerts">
+        <h4>Alerts</h4>
+        {alertItems.length > 0 ? (
+          <div className="vid-human-alert-list">
+            {alertItems.map((alert, index) => (
+              <div className={`vid-human-alert sev-${alert.severity}`} key={`${alert.title}-${index}`}>
+                <div className="vid-human-alert-head">
+                  <strong>{alert.title}</strong>
+                  <span className={`vid-sev sev-${alert.severity}`}>{alert.severity}</span>
+                </div>
+                <div className="vid-human-alert-meta">
+                  {alert.snapshotIndices.length > 0
+                    ? `Frame${alert.snapshotIndices.length > 1 ? 's' : ''} ${alert.snapshotIndices.join(', ')}`
+                    : 'Frame reference unavailable'}
+                  {' · '}
+                  {alert.timestampMs ? fmtTimestamp(alert.timestampMs, locale) : 'timestamp unavailable'}
+                </div>
+                {alert.description && <p>{alert.description}</p>}
+              </div>
+            ))}
+          </div>
+        ) : sections.alerts ? (
+          <div
+            className="vid-human-section-copy md"
+            dangerouslySetInnerHTML={{ __html: renderMarkdown(sections.alerts) }}
+          />
+        ) : (
+          <div className="vid-human-none">None</div>
+        )}
+      </section>
+      <HumanSummarySection title="Routine" content={sections.routine} />
+      <HumanSummarySection title="Deviations" content={sections.deviations} />
+      <HumanSummarySection title="Worth to remember" content={sections.memory} />
+      {sections.other && (
+        <div className="vid-sum-body md" dangerouslySetInnerHTML={{ __html: renderMarkdown(sections.other) }} />
+      )}
+    </div>
+  )
 }
 
 function SummaryCard({
@@ -379,7 +469,7 @@ function SummaryCard({
             ) : (
               <>
                 {parts.narrative
-                  ? <div className="vid-sum-body md" dangerouslySetInnerHTML={{ __html: renderMarkdown(parts.narrative) }} />
+                  ? <HumanSummaryNarrative entry={entry} narrative={parts.narrative} level={level} locale={locale} />
                   : !parts.machineJson && <div className="vid-sum-body empty">No operator-facing narrative was returned.</div>}
                 {parts.machineJson && (
                   <details className="vid-machine-state">

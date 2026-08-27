@@ -126,10 +126,12 @@ class VlmAlertPromptContractTests(unittest.TestCase):
 
         self.assertLess(schema.index("alerts"), schema.index("events"))
         self.assertLess(schema.index("alerts"), schema.index("memory_pass"))
-        self.assertIn("roughly 80-180 words", DEFAULT_ALERTS_JSON_PROMPT)
+        self.assertIn("roughly 100-220 words", DEFAULT_ALERTS_JSON_PROMPT)
         self.assertIn("Snapshot N:", DEFAULT_ALERTS_JSON_PROMPT)
         self.assertIn("for EVERY supplied snapshot", DEFAULT_ALERTS_JSON_PROMPT)
         self.assertIn("ALERT — <title>", DEFAULT_ALERTS_JSON_PROMPT)
+        self.assertIn("### Scene, ### Episode, ### Alerts, ### Routine", DEFAULT_ALERTS_JSON_PROMPT)
+        self.assertIn("### Deviations, ### Worth to remember", DEFAULT_ALERTS_JSON_PROMPT)
         self.assertIn("one COMPLETE, compact JSON object", DEFAULT_ALERTS_JSON_PROMPT)
         self.assertIn(
             "always finish with literal BATCH_STATE_JSON:",

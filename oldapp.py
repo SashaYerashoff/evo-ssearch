@@ -6893,6 +6893,7 @@ def _is_previous_luxriot_system_prompt(value: object) -> bool:
     lowered = normalized.lower()
     return bool(
         normalized == PREVIOUS_LUXRIOT_SYSTEM_PROMPT_DEFAULT.strip()
+        or normalized == PREVIOUS_RICH_LUXRIOT_SYSTEM_PROMPT_DEFAULT.strip()
         or (
             lowered.startswith("you are a cctv operator assistant for luxriot.")
             and "### scene description" in lowered
@@ -6906,7 +6907,7 @@ def _is_previous_luxriot_system_prompt(value: object) -> bool:
     )
 
 
-LUXRIOT_SYSTEM_PROMPT_DEFAULT = (
+PREVIOUS_RICH_LUXRIOT_SYSTEM_PROMPT_DEFAULT = (
     "You are EVA's visual-semantic intellectual core within an intelligent security system that may operate "
     "from a home installation to city-scale infrastructure. You do not imitate a human guard or analyst. "
     "Your outputs become part of the system's memory and may affect future attention, event continuity, "
@@ -6941,6 +6942,42 @@ LUXRIOT_SYSTEM_PROMPT_DEFAULT = (
     "is routine, and do not merge away a supplied snapshot. Avoid empty boilerplate; do not infer intent, identity, "
     "legality, or safety outside sampled evidence. The backend appends current-observation, homeostasis, "
     "alert-policy, and unified BATCH_STATE_JSON instructions; follow that final output contract."
+)
+
+LUXRIOT_SYSTEM_PROMPT_DEFAULT = (
+    PREVIOUS_RICH_LUXRIOT_SYSTEM_PROMPT_DEFAULT.replace(
+        "Return Markdown with exactly these sections and order:\n"
+        "### Scene description\n",
+        "Return Markdown with exactly these sections and order:\n"
+        "### Scene\n",
+        1,
+    ).replace(
+        "### Episode update\n"
+        "Write one concise `Snapshot N:` observation for every supplied image in chronological order, including "
+        "stable visible facts, then synthesize observable events as new, continuing, resolved, or uncertain. "
+        "Reconcile unfinished prior events only against current snapshots. When an operator alert criterion is "
+        "visibly met, duplicate it here as `ALERT — title: visible evidence (snapshots N,...)`; the backend uses "
+        "that prose as a consistency path when machine JSON is incomplete.\n"
+        "### Routine and deviations\n"
+        "Separate visibly reinforced routine from deviations and novelty. Novelty raises preservation priority, "
+        "not alert severity.\n"
+        "### Worth to remember\n",
+        "### Episode\n"
+        "Write one concise `Snapshot N:` observation for every supplied image in chronological order, including "
+        "stable visible facts, then write one natural temporal account that connects the observed actions. "
+        "Reconcile unfinished prior events only against current snapshots.\n"
+        "### Alerts\n"
+        "For every visibly grounded operator criterion, write `ALERT — title: visible evidence "
+        "(snapshots N,...)`; write None when there is no current alert. The backend uses this prose only as a "
+        "consistency path when machine JSON is incomplete.\n"
+        "### Routine\n"
+        "State the visibly reinforced baseline without erasing concrete scene facts.\n"
+        "### Deviations\n"
+        "State visible departures and novelty separately, or None. Novelty raises preservation priority, not "
+        "alert severity.\n"
+        "### Worth to remember\n",
+        1,
+    )
 )
 
 current_stream_prompt = str(getattr(config, 'LUXRIOT_SYSTEM_PROMPT_DEFAULT', '') or '').strip()

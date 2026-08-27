@@ -555,6 +555,41 @@ DEFAULT_BATCH_STATE_JSON_PROMPT = (
     )
 )
 
+# The first richer operator narrative still combined routine/deviation prose
+# and placed alert prose inside Episode update.  Keep its exact value so pilot
+# state that persisted the shipped default follows the presentation upgrade.
+PREVIOUS_RICH_BATCH_STATE_JSON_PROMPT = DEFAULT_BATCH_STATE_JSON_PROMPT
+
+DEFAULT_BATCH_STATE_JSON_PROMPT = (
+    PREVIOUS_RICH_BATCH_STATE_JSON_PROMPT.replace(
+        "Before the JSON write a factual operator-readable account under exactly these headings: "
+        "### Scene description, ### Episode update, ### Routine and deviations, ### Worth to remember. "
+        "Use roughly 80-180 words total when the images support that detail; never shorten a visible scene to "
+        "a bare routine label. Scene description must inventory the current environment, people, important "
+        "objects, spatial relations, and coverage limitations in 2-4 concrete sentences. Episode update must "
+        "contain one concise `Snapshot N:` observation for EVERY supplied snapshot, in order, followed by a "
+        "short temporal synthesis. Describe visible facts even when nothing changed; do not omit, merge, or "
+        "silently deduplicate snapshots. Routine and deviations must distinguish stable context from visible "
+        "changes. Worth to remember is concise and may be None.\n",
+        "Before the JSON write a factual operator-readable account under exactly these headings and order: "
+        "### Scene, ### Episode, ### Alerts, ### Routine, ### Deviations, ### Worth to remember. "
+        "Use roughly 100-220 words total when the images support that detail; never shorten a visible scene to "
+        "a bare routine label. Scene must inventory the current environment, people, important objects, spatial "
+        "relations, and coverage limitations in 2-4 concrete sentences. Episode must contain one concise "
+        "`Snapshot N:` observation for EVERY supplied snapshot, in order, followed by one natural temporal "
+        "account connecting the observed actions. Describe visible facts even when nothing changed; do not omit, "
+        "merge, or silently deduplicate snapshots. Alerts contains one `ALERT — <title>: <visible evidence> "
+        "(snapshots N,...)` line for every emitted alert, or None. Routine states the reinforced baseline. "
+        "Deviations separately states visible departures from that baseline, or None. Worth to remember follows "
+        "them and contains only grounded information useful to later consolidation, or None.\n",
+        1,
+    ).replace(
+        "plain-English `ALERT — <title>: <visible evidence> (snapshots N,...)` sentence in Episode update.",
+        "plain-English `ALERT — <title>: <visible evidence> (snapshots N,...)` line in the Alerts section.",
+        1,
+    )
+)
+
 # Compatibility name retained for persisted settings and public API fields.
 DEFAULT_ALERTS_JSON_PROMPT = DEFAULT_BATCH_STATE_JSON_PROMPT
 
@@ -5775,6 +5810,8 @@ class LuxriotManager:
         if text == PREVIOUS_PRE_ENGLISH_BATCH_STATE_JSON_PROMPT.strip():
             return DEFAULT_ALERTS_JSON_PROMPT
         if text == PREVIOUS_BOUNDED_BATCH_STATE_JSON_PROMPT.strip():
+            return DEFAULT_ALERTS_JSON_PROMPT
+        if text == PREVIOUS_RICH_BATCH_STATE_JSON_PROMPT.strip():
             return DEFAULT_ALERTS_JSON_PROMPT
         lowered = text.lower()
         if "batch_state_json:" not in lowered:
@@ -19470,9 +19507,15 @@ class LuxriotManager:
             matches = policy_matches(plaintext_alert_candidates)
         if not matches:
             narrative_candidates: List[Tuple[str, Mapping[str, Any]]] = []
-            episode_update = self._extract_markdown_section(
-                str(summary_text or ""),
-                "Episode update",
+            episode_update = (
+                self._extract_markdown_section(
+                    str(summary_text or ""),
+                    "Episode",
+                )
+                or self._extract_markdown_section(
+                    str(summary_text or ""),
+                    "Episode update",
+                )
             )
             max_snapshot_index = int(
                 _parse_optional_int(state.get("snapshot_count")) or 0

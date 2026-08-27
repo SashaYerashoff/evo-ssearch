@@ -55,6 +55,10 @@ boundary and `EVOSSEARCH_AUTH_COOKIE_SECURE=true`.
 3. Dispatch to the VLM (synchronous by default; durable queue available but off).
 4. VLM returns a description plus one `BATCH_STATE_JSON` block containing the
    cover, episode state, memory pass, observations, and zero or more alerts.
+   The L0 UI presents factual frame count and observation span from backend
+   metadata, then separates Scene, Episode, Alerts, Routine, Deviations, and
+   Worth to remember. Alert frame references, timestamps, and severity come
+   from the structured state rather than model-formatted prose.
 5. Accept: validate the unified batch state and snapshot references → optional
    Luxriot bookmarks (gated, instrumented); retain the cover and evidence frames
    under one stable batch id in the CLIP-indexed archive; record compact state
