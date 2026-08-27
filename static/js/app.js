@@ -9545,8 +9545,8 @@
                     current: settings.archiveStorageSummary
                 });
                 if (luxriotAutoBookmarksInput) luxriotAutoBookmarksInput.checked = toBool(settings.luxriotAutoBookmarks, false);
-                if (probeBookmarkCooldownSecInput) probeBookmarkCooldownSecInput.value = settings.probeBookmarkCooldownSec ?? 8.0;
-                if (probeBookmarkDedupeWindowSecInput) probeBookmarkDedupeWindowSecInput.value = settings.probeBookmarkDedupeWindowSec ?? 20.0;
+                if (probeBookmarkCooldownSecInput) probeBookmarkCooldownSecInput.value = settings.probeBookmarkCooldownSec ?? 5.0;
+                if (probeBookmarkDedupeWindowSecInput) probeBookmarkDedupeWindowSecInput.value = settings.probeBookmarkDedupeWindowSec ?? 5.0;
                 if (probeBookmarkSimHighInput) probeBookmarkSimHighInput.value = settings.probeBookmarkSimHigh ?? 0.985;
                 if (probeBookmarkMarginDeltaInput) probeBookmarkMarginDeltaInput.value = settings.probeBookmarkMarginDelta ?? 0.08;
                 if (probeBookmarkScoreDeltaInput) probeBookmarkScoreDeltaInput.value = settings.probeBookmarkScoreDelta ?? 0.08;
@@ -9621,8 +9621,8 @@
                 archiveEstimateAvgJpegKb: parseFloat(archiveEstimateAvgJpegKbInput ? archiveEstimateAvgJpegKbInput.value : '100'),
                 archiveEstimateProbeRecordsPerChannelDay: parseFloat(archiveEstimateProbeRowsInput ? archiveEstimateProbeRowsInput.value : '250'),
                 luxriotAutoBookmarks: luxriotAutoBookmarksInput ? luxriotAutoBookmarksInput.checked : false,
-                probeBookmarkCooldownSec: parseFloat(probeBookmarkCooldownSecInput ? probeBookmarkCooldownSecInput.value : '8'),
-                probeBookmarkDedupeWindowSec: parseFloat(probeBookmarkDedupeWindowSecInput ? probeBookmarkDedupeWindowSecInput.value : '20'),
+                probeBookmarkCooldownSec: parseFloat(probeBookmarkCooldownSecInput ? probeBookmarkCooldownSecInput.value : '5'),
+                probeBookmarkDedupeWindowSec: parseFloat(probeBookmarkDedupeWindowSecInput ? probeBookmarkDedupeWindowSecInput.value : '5'),
                 probeBookmarkSimHigh: parseFloat(probeBookmarkSimHighInput ? probeBookmarkSimHighInput.value : '0.985'),
                 probeBookmarkMarginDelta: parseFloat(probeBookmarkMarginDeltaInput ? probeBookmarkMarginDeltaInput.value : '0.08'),
                 probeBookmarkScoreDelta: parseFloat(probeBookmarkScoreDeltaInput ? probeBookmarkScoreDeltaInput.value : '0.08'),
@@ -9684,10 +9684,10 @@
             }
 
             if (!Number.isFinite(settings.probeBookmarkCooldownSec) || settings.probeBookmarkCooldownSec < 0) {
-                settings.probeBookmarkCooldownSec = 8.0;
+                settings.probeBookmarkCooldownSec = 5.0;
             }
             if (!Number.isFinite(settings.probeBookmarkDedupeWindowSec) || settings.probeBookmarkDedupeWindowSec < 0.5) {
-                settings.probeBookmarkDedupeWindowSec = 20.0;
+                settings.probeBookmarkDedupeWindowSec = 5.0;
             }
             if (!Number.isFinite(settings.probeBookmarkSimHigh)) {
                 settings.probeBookmarkSimHigh = 0.985;
@@ -9815,8 +9815,8 @@
             if (archiveEstimateAvgJpegKbInput) archiveEstimateAvgJpegKbInput.value = '100';
             if (archiveEstimateProbeRowsInput) archiveEstimateProbeRowsInput.value = '250';
             if (luxriotAutoBookmarksInput) luxriotAutoBookmarksInput.checked = false;
-            if (probeBookmarkCooldownSecInput) probeBookmarkCooldownSecInput.value = '8.0';
-            if (probeBookmarkDedupeWindowSecInput) probeBookmarkDedupeWindowSecInput.value = '20.0';
+            if (probeBookmarkCooldownSecInput) probeBookmarkCooldownSecInput.value = '5.0';
+            if (probeBookmarkDedupeWindowSecInput) probeBookmarkDedupeWindowSecInput.value = '5.0';
             if (probeBookmarkSimHighInput) probeBookmarkSimHighInput.value = '0.985';
             if (probeBookmarkMarginDeltaInput) probeBookmarkMarginDeltaInput.value = '0.08';
             if (probeBookmarkScoreDeltaInput) probeBookmarkScoreDeltaInput.value = '0.08';
@@ -11695,8 +11695,8 @@
         };
         if (userHasPermission('bookmarks:create')) {
             payload.bookmark = probeBookmarkToggle ? probeBookmarkToggle.checked : true;
-            payload.bookmark_cooldown_sec = probeBookmarkCooldownLocalInput ? (parseFloat(probeBookmarkCooldownLocalInput.value) || 0) : 8;
-            payload.bookmark_dedupe_window_sec = probeBookmarkDedupeWindowLocalInput ? (parseFloat(probeBookmarkDedupeWindowLocalInput.value) || 0.5) : 20;
+            payload.bookmark_cooldown_sec = probeBookmarkCooldownLocalInput ? (parseFloat(probeBookmarkCooldownLocalInput.value) || 0) : 5;
+            payload.bookmark_dedupe_window_sec = probeBookmarkDedupeWindowLocalInput ? (parseFloat(probeBookmarkDedupeWindowLocalInput.value) || 0.5) : 5;
         }
         return payload;
     }
@@ -12706,8 +12706,8 @@
         if (probeWindowSecInput) probeWindowSecInput.value = probe?.window_sec ?? 300;
         if (probeBookmarkSeverityInput) probeBookmarkSeverityInput.value = probe?.severity || 'info';
         if (probeBookmarkToggle) probeBookmarkToggle.checked = probe?.bookmark !== false;
-        if (probeBookmarkCooldownLocalInput) probeBookmarkCooldownLocalInput.value = probe?.bookmark_cooldown_sec ?? 8;
-        if (probeBookmarkDedupeWindowLocalInput) probeBookmarkDedupeWindowLocalInput.value = probe?.bookmark_dedupe_window_sec ?? 20;
+        if (probeBookmarkCooldownLocalInput) probeBookmarkCooldownLocalInput.value = probe?.bookmark_cooldown_sec ?? 5;
+        if (probeBookmarkDedupeWindowLocalInput) probeBookmarkDedupeWindowLocalInput.value = probe?.bookmark_dedupe_window_sec ?? 5;
         if (probeEnableToggle) probeEnableToggle.checked = probe?.enabled !== false;
         const normalizedPairs = normalizeProbePairsForEditor(probe?.pairs);
         probePairsState = normalizedPairs.length

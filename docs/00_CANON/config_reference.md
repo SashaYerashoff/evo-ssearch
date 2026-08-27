@@ -95,8 +95,8 @@ EVOSSEARCH_AUTH_COOKIE_SECURE=true   # when TLS terminates at app or proxy
 | `EVOSSEARCH_LUXRIOT_ARCHIVE_MEDIA_MAX_SECONDS` (`45.0`) | Maximum lifetime of one bounded archive broker response; clamped to 1–300 s |
 | `EVOSSEARCH_LUXRIOT_ARCHIVE_MEDIA_MAX_BYTES` (`134217728`) | Maximum bytes in one archive broker response (128 MiB default; clamp 1 KiB–512 MiB) |
 | `EVOSSEARCH_LUXRIOT_AUTO_BOOKMARKS` (`false`) | Push alerts as Luxriot bookmarks |
-| `EVOSSEARCH_LUXRIOT_BOOKMARK_COOLDOWN_SEC` (`60`) | Dedup cooldown |
-| `EVOSSEARCH_LUXRIOT_ALERT_DEDUPE_WINDOW_SEC` (`600`) | Per-channel bookmark delivery dedupe by normalized alert title + severity; `0` disables, clamped to 0–86400 s. Alert records remain in history/archive |
+| `EVOSSEARCH_LUXRIOT_BOOKMARK_COOLDOWN_SEC` (`5`) | Default per-channel bookmark cooldown. Explicit channel overrides remain authoritative |
+| `EVOSSEARCH_LUXRIOT_ALERT_DEDUPE_WINDOW_SEC` (`5`) | Per-channel bookmark delivery dedupe by normalized alert title + severity; `0` disables, clamped to 0–86400 s. Alert records remain in history/archive |
 | `EVOSSEARCH_LUXRIOT_ALERTS_MAX_PER_BATCH` (`8`) | Max alerts per batch |
 | `EVOSSEARCH_LUXRIOT_SEV_*` | Severity token mapping to Luxriot |
 
@@ -253,7 +253,8 @@ thresholds, alert policy, live sampling, or the live routine context.
 | `EVOSSEARCH_PROBE_CAPTURE_WARMUP_SEC` (`2.5`) | Maximum first-frame wait before an empty manual probe query returns an explicit capture-warming state |
 | `EVOSSEARCH_ARCHIVE_DISK_MIN_FREE_GB` (`2.0`) | Stop writing new filesystem snapshots below this free-space floor while continuing metadata rows |
 | `EVOSSEARCH_ARCHIVE_DISK_MIN_FREE_PERCENT` (`5.0`) | Stop writing new filesystem snapshots below this filesystem free-space percentage |
-| `EVOSSEARCH_PROBE_BOOKMARK_*` | Probe bookmark cooldown/dedup/thresholds |
+| `EVOSSEARCH_PROBE_BOOKMARK_COOLDOWN_SEC` (`5`) / `_DEDUPE_WINDOW_SEC` (`5`) | Default realtime-probe bookmark cooldown and same-event dedupe window. Per-probe values remain authoritative |
+| `EVOSSEARCH_PROBE_BOOKMARK_*` | Remaining probe bookmark confidence/margin thresholds |
 | `EVOSSEARCH_PROBE_REALTIME_BOOKMARK_ENABLED` (`true`) | Evaluate only operator-authored, bookmark-enabled text probes on each completed 1 Hz semantic apex. ROI text probes use a fresh crop and ROI embedding cache; automatic/VLM-derived and image-reference probes remain on the retrospective daemon and cannot enter this alarm lane |
 | `EVOSSEARCH_PROBE_REALTIME_CONFIRM_HITS` (`2`) / `_CONFIRM_WINDOW_SEC` (`3.2`) / `_MAX_EVENT_AGE_SEC` (`5`) | Require repeated current-frame evidence before a direct probe bookmark and reject stale embedding completions. A match exceeding both P and M floors by `_STRONG_SCORE_BOOST` (`0.06`) may pass immediately |
 | `EVOSSEARCH_PROBE_REALTIME_WORKERS` (`2`) / `_QUEUE_CAPACITY` (`32`) | Bounded asynchronous scoring/bookmark delivery; saturation drops the acceleration attempt, never the independent semantic archive or normal probe daemon |
@@ -312,7 +313,7 @@ markers reach the model via `VECTOR_SIGNALS_JSON.capture_attention`.
 | `EVOSSEARCH_VLM_FAST_ALERT_POST_ROLL_SEC` (`2.5`) / `_OPERATOR_PROBE_POST_ROLL_SEC` (`1.0`) / `_MAX_FRAMES` (`6`) / `_MAX_TOKENS` (`384`) | Bound the 4–8-image control/pre/onset/apex/post evidence set and completion length. An exact operator-probe frame uses one short post-roll cadence while retaining control, scored, motion-apex, and fresh post evidence; ungrounded CV/semantic bursts keep the longer trajectory window |
 | `EVOSSEARCH_VLM_FAST_ALERT_WORKERS` (`2`) | Admit two independent burst checks concurrently; the global LM admission controller still gives interactive agent work priority and bounds total inference pressure |
 | `EVOSSEARCH_VLM_FAST_ALERT_SEMANTIC_DELTA` (`0.22`) / `_MIN_MOVING_FRACTION` (`0.15`) | Also validate a large consecutive SigLIP scene change when CV confirms distributed motion. This catches meaningful changes on continuously active channels whose motion has become baseline; the vector delta only routes frames and is never alert proof |
-| `EVOSSEARCH_VLM_FAST_ALERT_COOLDOWN_SEC` (`12`) / `_DEDUPE_WINDOW_SEC` (`12`) | Bound repeated burst passes, debounce consecutive scored frames from one held operator-probe action, and suppress an identical fast-phase/full-L0 bookmark replay without suppressing differently titled hazards |
+| `EVOSSEARCH_VLM_FAST_ALERT_COOLDOWN_SEC` (`5`) / `_DEDUPE_WINDOW_SEC` (`5`) | Bound repeated burst passes, debounce consecutive scored frames from one held operator-probe action, and suppress an identical fast-phase/full-L0 bookmark replay without suppressing differently titled hazards |
 | `EVOSSEARCH_LUXRIOT_ALERT_DERIVED_PROBES_ENABLED` (`false`) | Admit bounded, temporary attention-only probes from direct VLM alerts |
 | `EVOSSEARCH_LUXRIOT_ALERT_DERIVED_PROBE_TTL_SEC` (`300`) | TTL for alert-derived probes |
 

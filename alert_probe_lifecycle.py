@@ -467,7 +467,7 @@ class AlertProbeLifecycle:
         default_ttl_seconds: float = 300.0,
         min_ttl_seconds: float = 5.0,
         max_ttl_seconds: float = 3600.0,
-        cooldown_seconds: float = 180.0,
+        cooldown_seconds: float = 5.0,
         semantic_dedupe_threshold: float = 0.8,
         history_limit: int = 2048,
         clock: Callable[[], float] = time.time,

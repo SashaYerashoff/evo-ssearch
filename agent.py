@@ -5644,8 +5644,8 @@ class AgentTools:
                 if raw_probe.get("margin") is not None
                 else config.PROBE_MARGIN_DEFAULT
             ),
-            "bookmark_cooldown_sec": 20.0,
-            "bookmark_dedupe_window_sec": 60.0,
+            "bookmark_cooldown_sec": 5.0,
+            "bookmark_dedupe_window_sec": 5.0,
             "top_k": max(1, int(raw_probe.get("top_k") or 6)),
             "window_sec": max(0.0, float(raw_probe.get("window_sec") or 300.0)),
             "severity": (
@@ -6474,7 +6474,7 @@ class AgentTools:
                                 (current_probe or {}).get(
                                     "bookmark_dedupe_window_sec"
                                 )
-                                or 60.0
+                                or 5.0
                             )
                         )
                         cooldown_sec = (
@@ -6484,7 +6484,7 @@ class AgentTools:
                                 (current_probe or {}).get(
                                     "bookmark_cooldown_sec"
                                 )
-                                or 20.0
+                                or 5.0
                             )
                         )
                         cadence_proposal = {
@@ -6754,8 +6754,8 @@ class AgentTools:
             "negatives": negatives,
             "pos_floor": _opt_float(args.get("pos_floor")) if args.get("pos_floor") is not None else config.PROBE_POS_FLOOR_DEFAULT,
             "margin": _opt_float(args.get("margin_thr")) if args.get("margin_thr") is not None else config.PROBE_MARGIN_DEFAULT,
-            "bookmark_cooldown_sec": _opt_float(args.get("bookmark_cooldown_sec")) if args.get("bookmark_cooldown_sec") is not None else 8.0,
-            "bookmark_dedupe_window_sec": _opt_float(args.get("bookmark_dedupe_window_sec")) if args.get("bookmark_dedupe_window_sec") is not None else 20.0,
+            "bookmark_cooldown_sec": _opt_float(args.get("bookmark_cooldown_sec")) if args.get("bookmark_cooldown_sec") is not None else 5.0,
+            "bookmark_dedupe_window_sec": _opt_float(args.get("bookmark_dedupe_window_sec")) if args.get("bookmark_dedupe_window_sec") is not None else 5.0,
             "top_k": max(1, int(args.get("top_k") or 6)),
             "window_sec": max(0.0, float(args.get("window_sec") or 300.0)),
             "severity": str(args.get("severity") or "critical").strip().lower(),

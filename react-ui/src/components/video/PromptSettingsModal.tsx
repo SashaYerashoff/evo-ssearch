@@ -89,7 +89,7 @@ export function PromptSettingsModal({
           {loaded && !loadErr && canCreateBookmarks && <div className="vid-bookmark-row">
             <label className="mon-check"><input type="checkbox" checked={!!s.bookmark_enabled} onChange={(e) => setS({ ...s, bookmark_enabled: e.target.checked })} /> Make bookmarks on alerts</label>
             <div className="wfield" style={{ maxWidth: 150 }}><label>Cooldown (s)</label>
-              <input type="number" step="0.5" min="0" value={s.bookmark_cooldown_sec ?? 8} onChange={(e) => setS({ ...s, bookmark_cooldown_sec: Number(e.target.value) })} />
+              <input type="number" step="0.5" min="0" value={s.bookmark_cooldown_sec ?? 5} onChange={(e) => setS({ ...s, bookmark_cooldown_sec: Number(e.target.value) })} />
             </div>
           </div>}
           {err && <div className="chat-error">{err}</div>}

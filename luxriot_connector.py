@@ -6250,14 +6250,14 @@ class LuxriotManager:
         ] = {}
         self.default_bookmark_enabled = bool(getattr(config, "LUXRIOT_AUTO_BOOKMARKS", False))
         try:
-            cooldown_value = float(getattr(config, "LUXRIOT_BOOKMARK_COOLDOWN_SEC", 60.0))
+            cooldown_value = float(getattr(config, "LUXRIOT_BOOKMARK_COOLDOWN_SEC", 5.0))
         except Exception:
-            cooldown_value = 60.0
+            cooldown_value = 5.0
         self.default_bookmark_cooldown_sec = max(0.0, cooldown_value)
         try:
-            alert_dedupe_value = float(getattr(config, "LUXRIOT_ALERT_DEDUPE_WINDOW_SEC", 600.0))
+            alert_dedupe_value = float(getattr(config, "LUXRIOT_ALERT_DEDUPE_WINDOW_SEC", 5.0))
         except Exception:
-            alert_dedupe_value = 600.0
+            alert_dedupe_value = 5.0
         self.alert_dedupe_window_sec = max(0.0, min(86400.0, alert_dedupe_value))
         try:
             max_alerts_value = int(getattr(config, "LUXRIOT_ALERTS_MAX_PER_BATCH", 8))
@@ -26959,7 +26959,7 @@ class LuxriotManager:
     ) -> bool:
         if window_sec is None:
             window_sec = float(
-                getattr(self, "alert_dedupe_window_sec", 600.0) or 0.0
+                getattr(self, "alert_dedupe_window_sec", 5.0) or 0.0
             )
         window_sec = max(0.0, float(window_sec))
         if window_sec <= 0:
@@ -26998,7 +26998,7 @@ class LuxriotManager:
     ) -> None:
         if window_sec is None:
             window_sec = float(
-                getattr(self, "alert_dedupe_window_sec", 600.0) or 0.0
+                getattr(self, "alert_dedupe_window_sec", 5.0) or 0.0
             )
         window_sec = max(0.0, float(window_sec))
         if window_sec <= 0:
@@ -27156,7 +27156,7 @@ class LuxriotManager:
             now_ms = int(time.time() * 1000)
             alert_cooldown_sec = self._bookmark_cooldown_for_severity(cooldown_sec, alert["severity"])
             configured_content_window_sec = float(
-                getattr(self, "alert_dedupe_window_sec", 600.0) or 0.0
+                getattr(self, "alert_dedupe_window_sec", 5.0) or 0.0
             )
             # The operator-visible per-channel cooldown is authoritative.
             # Content normalization protects against title/description drift,
@@ -27176,8 +27176,8 @@ class LuxriotManager:
             fast_alert_dedupe_window_sec = max(
                 0.0,
                 float(
-                    getattr(self.config, "VLM_FAST_ALERT_DEDUPE_WINDOW_SEC", 12.0)
-                    or 12.0
+                    getattr(self.config, "VLM_FAST_ALERT_DEDUPE_WINDOW_SEC", 5.0)
+                    or 5.0
                 ),
             )
             with self.cache_lock:

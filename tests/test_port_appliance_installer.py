@@ -159,6 +159,12 @@ def test_port_profile_shares_bounded_gpu_with_siglip2():
     assert installer.PORT_ENV["EVOSSEARCH_LUXRIOT_ATTENTION_MAX_VLM_FRAMES"] == "8"
     assert installer.PORT_ENV["EVOSSEARCH_EMBEDDER_EAGER_LOAD"] == "true"
     assert installer.PORT_ENV["EVOSSEARCH_UI_MODE"] == "react"
+    assert installer.PORT_ENV["EVOSSEARCH_PROBE_BOOKMARK_COOLDOWN_SEC"] == "5"
+    assert installer.PORT_ENV["EVOSSEARCH_PROBE_BOOKMARK_DEDUPE_WINDOW_SEC"] == "5"
+    assert installer.PORT_ENV["EVOSSEARCH_LUXRIOT_BOOKMARK_COOLDOWN_SEC"] == "5"
+    assert installer.PORT_ENV["EVOSSEARCH_LUXRIOT_ALERT_DEDUPE_WINDOW_SEC"] == "5"
+    assert installer.PORT_ENV["EVOSSEARCH_VLM_FAST_ALERT_COOLDOWN_SEC"] == "5"
+    assert installer.PORT_ENV["EVOSSEARCH_VLM_FAST_ALERT_DEDUPE_WINDOW_SEC"] == "5"
 
 
 def test_port_payload_requires_maritime_runtime_and_react_assets():
@@ -815,6 +821,58 @@ def test_runtime_env_drops_legacy_token_and_repairs_partial_tenant_ids(tmp_path)
     )
     assert "EVOSSEARCH_ADMIN_TOKEN" not in values
     assert {values[key] for key in installer.TENANT_ID_KEYS} == {tenant_id}
+
+
+def test_runtime_env_uses_short_alert_defaults_but_preserves_site_tuning(tmp_path):
+    answers = installer.Answers(
+        install_root=tmp_path / "opt",
+        data_root=tmp_path / "data",
+        config_root=tmp_path / "etc",
+        evo_url="http://evo.local",
+        evo_username="operator",
+        evo_password="secret",
+    )
+    passwords = {
+        "EVA_MIGRATOR_PASSWORD": "a" * 64,
+        "EVA_API_PASSWORD": "b" * 64,
+        "EVA_AUDIT_PASSWORD": "c" * 64,
+        "EVA_WORKER_PASSWORD": "d" * 64,
+        "EVA_BACKUP_PASSWORD": "e" * 64,
+    }
+
+    fresh = installer.render_runtime_env(answers, {}, passwords)
+    assert {
+        fresh[key]
+        for key in installer.PRESERVED_OPERATOR_TUNING_ENV_KEYS
+    } == {"5"}
+
+    existing = {
+        "EVOSSEARCH_PROBE_BOOKMARK_COOLDOWN_SEC": "17.5",
+        "EVOSSEARCH_PROBE_BOOKMARK_DEDUPE_WINDOW_SEC": "45",
+        "EVOSSEARCH_LUXRIOT_BOOKMARK_COOLDOWN_SEC": "30",
+        "EVOSSEARCH_LUXRIOT_ALERT_DEDUPE_WINDOW_SEC": "90",
+        "EVOSSEARCH_VLM_FAST_ALERT_COOLDOWN_SEC": "7",
+        "EVOSSEARCH_VLM_FAST_ALERT_DEDUPE_WINDOW_SEC": "9",
+    }
+    updated = installer.render_runtime_env(answers, existing, passwords)
+    assert {
+        key: updated[key]
+        for key in installer.PRESERVED_OPERATOR_TUNING_ENV_KEYS
+    } == existing
+
+    legacy = {
+        "EVOSSEARCH_PROBE_BOOKMARK_COOLDOWN_SEC": "8.0",
+        "EVOSSEARCH_PROBE_BOOKMARK_DEDUPE_WINDOW_SEC": "20",
+        "EVOSSEARCH_LUXRIOT_BOOKMARK_COOLDOWN_SEC": "60",
+        "EVOSSEARCH_LUXRIOT_ALERT_DEDUPE_WINDOW_SEC": "600.0",
+        "EVOSSEARCH_VLM_FAST_ALERT_COOLDOWN_SEC": "12",
+        "EVOSSEARCH_VLM_FAST_ALERT_DEDUPE_WINDOW_SEC": "12.0",
+    }
+    migrated = installer.render_runtime_env(answers, legacy, passwords)
+    assert {
+        migrated[key]
+        for key in installer.PRESERVED_OPERATOR_TUNING_ENV_KEYS
+    } == {"5"}
 
 
 def test_spark_runtime_env_pins_working_siglip_precision_and_ffmpeg(tmp_path):

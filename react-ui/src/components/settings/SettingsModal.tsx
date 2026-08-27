@@ -23,7 +23,7 @@ const DEFAULTS: Settings = {
   luxriotBaseUrl: '', luxriotUsername: '', luxriotPassword: '', luxriotDefaultChannelId: 1,
   luxriotSnapshotInterval: 5, luxriotSnapshotMaxEdge: 800, luxriotMaxBufferFrames: 180,
   luxriotSummaryRetentionDays: 7, luxriotSummaryHistoryLimit: 10080, luxriotAutoBookmarks: false,
-  probeBookmarkCooldownSec: 8, probeBookmarkDedupeWindowSec: 20, probeBookmarkSimHigh: 0.985,
+  probeBookmarkCooldownSec: 5, probeBookmarkDedupeWindowSec: 5, probeBookmarkSimHigh: 0.985,
   probeBookmarkMarginDelta: 0.08, probeBookmarkScoreDelta: 0.08, probeBookmarkMaxFrameGap: 8,
   luxriotSeverityMap: { info: 'info', low: 'low', normal: 'normal', high: 'high', critical: 'critical' },
   archiveRetentionEnabled: true, archiveRowRetentionDays: 90, archiveThumbnailRetentionDays: 14, archiveMaxRecords: 5000000,

@@ -11099,9 +11099,9 @@ def _stop_archive_retention_thread() -> None:
 
 class _ProbeBookmarkGate:
     def __init__(self) -> None:
-        self.cooldown_ms = int(max(0.0, float(getattr(config, "PROBE_BOOKMARK_COOLDOWN_SEC", 8.0)) * 1000.0))
+        self.cooldown_ms = int(max(0.0, float(getattr(config, "PROBE_BOOKMARK_COOLDOWN_SEC", 5.0)) * 1000.0))
         self.dedupe_window_ms = int(
-            max(500.0, float(getattr(config, "PROBE_BOOKMARK_DEDUPE_WINDOW_SEC", 20.0)) * 1000.0)
+            max(500.0, float(getattr(config, "PROBE_BOOKMARK_DEDUPE_WINDOW_SEC", 5.0)) * 1000.0)
         )
         self.sim_high = float(getattr(config, "PROBE_BOOKMARK_SIM_HIGH", 0.985))
         self.margin_delta_thr = float(getattr(config, "PROBE_BOOKMARK_MARGIN_DELTA", 0.08))
@@ -11639,7 +11639,7 @@ class _FastVlmAlertRuntime:
             )
         )
         self.cooldown_ms = int(
-            max(1.0, float(getattr(config, "VLM_FAST_ALERT_COOLDOWN_SEC", 12.0) or 12.0))
+            max(1.0, float(getattr(config, "VLM_FAST_ALERT_COOLDOWN_SEC", 5.0) or 5.0))
             * 1000.0
         )
         self.max_frames = min(

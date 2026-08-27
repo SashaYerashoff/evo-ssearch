@@ -595,7 +595,7 @@ class AttentionPolicyConfig:
     degraded_target_interval_ms: int = 300_000
     min_mode_dwell_ms: int = 5_000
     burst_min_dwell_ms: int = 2_000
-    burst_cooldown_ms: int = 15_000
+    burst_cooldown_ms: int = 5_000
     degraded_min_dwell_ms: int = 10_000
     max_coverage_debt: float = 2.0
     bootstrap_coverage_debt: float = 1.0

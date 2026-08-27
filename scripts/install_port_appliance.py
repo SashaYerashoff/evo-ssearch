@@ -197,15 +197,19 @@ PORT_ENV = {
     "EVOSSEARCH_PROBE_REALTIME_CONFIRM_HITS": "2",
     "EVOSSEARCH_PROBE_REALTIME_CONFIRM_WINDOW_SEC": "3.2",
     "EVOSSEARCH_PROBE_REALTIME_MAX_EVENT_AGE_SEC": "5",
+    "EVOSSEARCH_PROBE_BOOKMARK_COOLDOWN_SEC": "5",
+    "EVOSSEARCH_PROBE_BOOKMARK_DEDUPE_WINDOW_SEC": "5",
+    "EVOSSEARCH_LUXRIOT_BOOKMARK_COOLDOWN_SEC": "5",
+    "EVOSSEARCH_LUXRIOT_ALERT_DEDUPE_WINDOW_SEC": "5",
     "EVOSSEARCH_VLM_FAST_ALERT_ENABLED": "true",
     "EVOSSEARCH_VLM_FAST_ALERT_POST_ROLL_SEC": "2.5",
-    "EVOSSEARCH_VLM_FAST_ALERT_COOLDOWN_SEC": "12",
+    "EVOSSEARCH_VLM_FAST_ALERT_COOLDOWN_SEC": "5",
     "EVOSSEARCH_VLM_FAST_ALERT_MAX_FRAMES": "6",
     "EVOSSEARCH_VLM_FAST_ALERT_MAX_TOKENS": "384",
     "EVOSSEARCH_VLM_FAST_ALERT_WORKERS": "2",
     "EVOSSEARCH_VLM_FAST_ALERT_SEMANTIC_DELTA": "0.22",
     "EVOSSEARCH_VLM_FAST_ALERT_MIN_MOVING_FRACTION": "0.15",
-    "EVOSSEARCH_VLM_FAST_ALERT_DEDUPE_WINDOW_SEC": "12",
+    "EVOSSEARCH_VLM_FAST_ALERT_DEDUPE_WINDOW_SEC": "5",
     "EVOSSEARCH_LUXRIOT_ROLLUP_SCHEDULER_ENABLED": "true",
     "EVOSSEARCH_LUXRIOT_ROLLUP_L1_SETTLE_DELAY_SEC": "30",
     "EVOSSEARCH_LUXRIOT_ROLLUP_L2_SETTLE_DELAY_SEC": "120",
@@ -2236,6 +2240,39 @@ OBSOLETE_OR_UNSAFE_ENV_KEYS = {
     "EVOSSEARCH_ADMIN_TOKEN",
 }
 
+# These are operator policy, not appliance compatibility pins. Fresh installs
+# receive PORT_ENV's short demo-friendly defaults. During an update, known
+# factory defaults from older bundles advance to the new default while a value
+# that differs from every known factory default remains site-owned.
+PRESERVED_OPERATOR_TUNING_ENV_KEYS = {
+    "EVOSSEARCH_PROBE_BOOKMARK_COOLDOWN_SEC",
+    "EVOSSEARCH_PROBE_BOOKMARK_DEDUPE_WINDOW_SEC",
+    "EVOSSEARCH_LUXRIOT_BOOKMARK_COOLDOWN_SEC",
+    "EVOSSEARCH_LUXRIOT_ALERT_DEDUPE_WINDOW_SEC",
+    "EVOSSEARCH_VLM_FAST_ALERT_COOLDOWN_SEC",
+    "EVOSSEARCH_VLM_FAST_ALERT_DEDUPE_WINDOW_SEC",
+}
+
+LEGACY_OPERATOR_TUNING_DEFAULTS = {
+    "EVOSSEARCH_PROBE_BOOKMARK_COOLDOWN_SEC": {8.0},
+    "EVOSSEARCH_PROBE_BOOKMARK_DEDUPE_WINDOW_SEC": {20.0},
+    "EVOSSEARCH_LUXRIOT_BOOKMARK_COOLDOWN_SEC": {60.0},
+    "EVOSSEARCH_LUXRIOT_ALERT_DEDUPE_WINDOW_SEC": {600.0},
+    "EVOSSEARCH_VLM_FAST_ALERT_COOLDOWN_SEC": {12.0},
+    "EVOSSEARCH_VLM_FAST_ALERT_DEDUPE_WINDOW_SEC": {12.0},
+}
+
+
+def _is_legacy_operator_default(key: str, value: object) -> bool:
+    try:
+        numeric = float(str(value).strip())
+    except (TypeError, ValueError):
+        return False
+    return any(
+        abs(numeric - expected) < 1e-9
+        for expected in LEGACY_OPERATOR_TUNING_DEFAULTS.get(key, ())
+    )
+
 
 def resolve_tenant_id(existing: Mapping[str, str]) -> str:
     configured = {
@@ -2353,6 +2390,12 @@ def render_runtime_env(
     for key, value in existing.items():
         if key not in values and key not in OBSOLETE_OR_UNSAFE_ENV_KEYS:
             values[key] = value
+    for key in PRESERVED_OPERATOR_TUNING_ENV_KEYS:
+        if (
+            str(existing.get(key) or "").strip()
+            and not _is_legacy_operator_default(key, existing[key])
+        ):
+            values[key] = str(existing[key])
     return values
 
 

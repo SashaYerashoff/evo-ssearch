@@ -2912,6 +2912,21 @@ class AgentVideoSummaryToolTests(unittest.TestCase):
                 },
             )
 
+    def test_agent_created_probe_defaults_to_five_second_repeat_gates(self):
+        result = _tools().execute(
+            "create_probe",
+            {
+                "name": "door occupancy",
+                "channel_id": 7,
+                "positives": ["person at the doorway"],
+                "negatives": ["empty doorway"],
+                "preview": True,
+            },
+        )
+
+        self.assertEqual(result["proposed"]["bookmark_cooldown_sec"], 5.0)
+        self.assertEqual(result["proposed"]["bookmark_dedupe_window_sec"], 5.0)
+
     def test_track_visual_state_transition_negative_embedding_warning_is_specific(self):
         store = _DetectionStore(
             [

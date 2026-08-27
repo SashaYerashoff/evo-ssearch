@@ -113,6 +113,9 @@ class CvAggregationTests(unittest.TestCase):
 
 
 class HomeostaticPolicyTests(unittest.TestCase):
+    def test_default_burst_reentry_cooldown_is_five_seconds(self):
+        self.assertEqual(AttentionPolicyConfig().burst_cooldown_ms, 5_000)
+
     def setUp(self):
         self.policy = HomeostaticAttentionPolicy(
             AttentionPolicyConfig(

@@ -184,6 +184,20 @@ def _configured_state(store):
     return deployment_id
 
 
+def test_deployment_probe_defaults_keep_operator_repeat_window_short():
+    payload = AgentTools._deployment_probe_payload(
+        {
+            "name": "Door occupancy",
+            "channel_id": 11,
+            "positives": ["person at the door"],
+            "negatives": ["empty doorway"],
+        }
+    )
+
+    assert payload["bookmark_cooldown_sec"] == 5.0
+    assert payload["bookmark_dedupe_window_sec"] == 5.0
+
+
 def test_protocol_deploy_builds_bounded_durable_plan():
     runtime = _RuntimeState()
     store = ProtocolDeploymentStore(runtime)

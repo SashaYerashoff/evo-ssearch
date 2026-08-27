@@ -13,6 +13,9 @@ def _spec(label, positive, negative):
 
 
 class AlertProbeLifecycleTests(unittest.TestCase):
+    def test_default_post_expiry_cooldown_is_five_seconds(self):
+        self.assertEqual(AlertProbeLifecycle().cooldown_seconds, 5.0)
+
     def setUp(self):
         self.now = 1000.0
         self.lifecycle = AlertProbeLifecycle(

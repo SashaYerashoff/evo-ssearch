@@ -67,7 +67,7 @@ def build_manager(directory: Path) -> LuxriotManager:
         LUXRIOT_SUMMARY_HISTORY_LIMIT=100,
         LUXRIOT_SUMMARY_RETENTION_DAYS=0,
         LUXRIOT_AUTO_BOOKMARKS=False,
-        LUXRIOT_BOOKMARK_COOLDOWN_SEC=60.0,
+        LUXRIOT_BOOKMARK_COOLDOWN_SEC=5.0,
         LUXRIOT_ALERTS_MAX_PER_BATCH=8,
         LUXRIOT_SUMMARY_STATE_FILE=str(directory / "summaries.json"),
         LUXRIOT_ROLLUP_CACHE_FILE=str(directory / "rollups.json"),
