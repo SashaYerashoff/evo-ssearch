@@ -121,6 +121,47 @@ LOGGER = logging.getLogger(__name__)
 ROLLUP_OPERATOR_FORMAT_VERSION = 2
 
 
+def compact_alert_topic(value: object, fallback: str = "Event") -> str:
+    """Return a short operator topic suitable for an Evo bookmark title.
+
+    Models and reconciliation fallbacks may put an evidence sentence in the
+    alert title even though Evo exposes a separate description field.  Keep
+    the delivery title stable and scannable without teaching the backend any
+    domain-specific event names.  The original evidence remains available in
+    the alert description and archive record.
+    """
+
+    text = " ".join(str(value or "").replace("\n", " ").split()).strip()
+    if not text:
+        text = str(fallback or "Event").strip() or "Event"
+    # Remove transport/reconciliation wrappers before taking the topic.  Do
+    # not maintain a vocabulary of gestures, objects, or incident classes.
+    text = re.sub(
+        r"^(?:(?:alert|probe(?:\s+hit)?|event)\s*[:\-—–]\s*)+",
+        "",
+        text,
+        flags=re.IGNORECASE,
+    ).strip()
+    text = re.sub(
+        r"^(?:snapshots?|frames?)\s*#?\d+(?:\s*[-–]\s*\d+)?\s*[:\-—–]\s*",
+        "",
+        text,
+        flags=re.IGNORECASE,
+    ).strip()
+    # Parenthetical qualifiers and the first evidence delimiter belong in the
+    # description, not in the recorder's compact title column.
+    text = re.sub(r"\s*\([^)]*\)\s*$", "", text).strip()
+    text = re.split(r"\s*(?:[:;—–|]|\s-\s)\s*", text, maxsplit=1)[0].strip()
+    words = re.findall(r"[^\W_]+(?:[-'’][^\W_]+)*", text, flags=re.UNICODE)
+    if not words:
+        words = re.findall(
+            r"[^\W_]+(?:[-'’][^\W_]+)*",
+            str(fallback or "Event"),
+            flags=re.UNICODE,
+        )
+    return " ".join(words[:3]) or "Event"
+
+
 def _ffmpeg_binary() -> str:
     """Prefer the verified offline runtime shipped beside the application."""
 
@@ -706,9 +747,11 @@ _ALERT_POLICY_ACTION_STEMS = {
     "exit",
     "fall",
     "fight",
-    "gesture",
+    "give",
     "leave",
+    "make",
     "move",
+    "perform",
     "raise",
     "run",
     "show",
@@ -909,6 +952,11 @@ class AlertDeliveryResult(int):
                     "severity": severity,
                     "state": state,
                 }
+                bookmark_title = str(
+                    raw_event.get("bookmark_title") or ""
+                ).strip()
+                if bookmark_title:
+                    event["bookmark_title"] = bookmark_title[:120]
                 alert_id = str(
                     raw_event.get("id") or raw_event.get("alert_id") or ""
                 ).strip()
@@ -19106,10 +19154,9 @@ class LuxriotManager:
         seen: Set[str] = set()
         marker = re.compile(
             r"\b(?:"
-            r"create\s+(?:an?\s+)?alert\s+if|"
-            r"raise\s+(?:an?\s+)?alert\s+(?:if|when)|"
-            r"alert\s+(?:if|when|is)|"
-            r"bookmark\s+(?:if|when)|"
+            r"(?:create|make|raise)\s+(?:an?\s+)?alert\s+(?:if|when|on|for)|"
+            r"alert\s+(?:if|when|is|on|for)|"
+            r"bookmark\s+(?:if|when|on|for)|"
             r"watch\s+for|"
             r"detect"
             r")\b",
@@ -19236,13 +19283,32 @@ class LuxriotManager:
             for clause in re.split(r"[.;!?]|\bbut\b|\bhowever\b", evidence_text.casefold()):
                 stems = cls._alert_policy_match_stems(clause)
                 for index, stem in enumerate(stems):
-                    if stem not in criterion_actions:
+                    if stem not in _ALERT_POLICY_ACTION_STEMS:
                         continue
                     preceding = set(stems[max(0, index - 4) : index])
                     if preceding & {"no", "not", "never", "without", "neither"}:
                         continue
                     positive_actions.add(stem)
-            if not (criterion_actions & positive_actions):
+            direct_action_match = bool(criterion_actions & positive_actions)
+            # Small VLMs alternate between "shows", "gives", "makes",
+            # "performs", and "raises" for the same visible gesture.  Treat
+            # those verbs as equivalent only when the configured criterion
+            # explicitly names a gesture; object transfer and unrelated
+            # actions retain exact action matching.
+            gesture_display_actions = {
+                "give",
+                "make",
+                "perform",
+                "raise",
+                "show",
+                "wave",
+            }
+            gesture_action_match = bool(
+                "gesture" in criterion_tokens
+                and criterion_actions & gesture_display_actions
+                and positive_actions & gesture_display_actions
+            )
+            if not direct_action_match and not gesture_action_match:
                 return None
         score = len(overlap) / max(1, len(criterion_tokens))
         threshold = 2.0 / 3.0 if len(criterion_tokens) <= 3 else 0.6
@@ -19637,10 +19703,7 @@ class LuxriotManager:
             )
             reconciled_alerts.append(
                 {
-                    "title": self._truncate_text(
-                        f"{label} — operator criterion",
-                        120,
-                    ),
+                    "title": compact_alert_topic(criterion),
                     "description": self._truncate_text(
                         "Current VLM evidence matched operator "
                         f"criterion: {event_summary}",
@@ -27142,6 +27205,20 @@ class LuxriotManager:
                 alert["snapshot_indices"] = snapshot_indices
             if anchor_snapshot is not None:
                 alert["anchor_snapshot"] = int(anchor_snapshot)
+            bookmark_title = compact_alert_topic(alert["title"])
+            bookmark_description = str(alert["description"] or "").strip()
+            raw_title = " ".join(str(alert["title"] or "").split()).strip()
+            if (
+                raw_title
+                and raw_title.casefold() != bookmark_title.casefold()
+                and raw_title.casefold() not in bookmark_description.casefold()
+            ):
+                bookmark_description = (
+                    f"{raw_title}. {bookmark_description}"
+                    if bookmark_description
+                    else raw_title
+                )
+            alert["bookmark_title"] = bookmark_title
             if self.is_local_channel(channel_id):
                 alert_events.append({**alert, "delivery_status": "local_source_no_recorder"})
                 continue
@@ -27230,8 +27307,8 @@ class LuxriotManager:
                 bookmark_attempted_at_ms = int(time.time() * 1000.0)
                 self.send_bookmark_event(
                     channel_id=int(channel_id),
-                    title=str(alert["title"]),
-                    description=str(alert["description"]),
+                    title=bookmark_title,
+                    description=bookmark_description,
                     severity=str(alert["severity"]),
                     state=str(alert["state"]),
                     timestamp_ms=int(alert["timestamp_ms"]),

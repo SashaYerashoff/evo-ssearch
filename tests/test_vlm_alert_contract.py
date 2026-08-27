@@ -8,7 +8,11 @@ from types import SimpleNamespace
 from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
 from unittest.mock import patch
 
-from luxriot_connector import DEFAULT_ALERTS_JSON_PROMPT, LuxriotManager
+from luxriot_connector import (
+    DEFAULT_ALERTS_JSON_PROMPT,
+    LuxriotManager,
+    compact_alert_topic,
+)
 
 
 def build_manager(directory: Path, alert_parser=None, **config_overrides: Any) -> LuxriotManager:
@@ -108,6 +112,18 @@ def install_channel_memory(manager: LuxriotManager, channel_id: int = 7) -> None
 
 
 class VlmAlertPromptContractTests(unittest.TestCase):
+    def test_bookmark_topic_is_generic_and_never_exceeds_three_words(self):
+        self.assertEqual(
+            compact_alert_topic(
+                "Snapshot 2: Red car drifts sharply right, tires kicking up smoke."
+            ),
+            "Red car drifts",
+        )
+        self.assertEqual(
+            compact_alert_topic("ALERT — Person giving thumbs-up gesture: visible evidence"),
+            "Person giving thumbs-up",
+        )
+
     def test_l0_output_budget_cannot_exceed_actual_generation_limit(self):
         with tempfile.TemporaryDirectory() as temp:
             manager = build_manager(
@@ -281,6 +297,49 @@ class VlmAlertPromptContractTests(unittest.TestCase):
         self.assertEqual(state["contract_status"], "partial_prefix")
         self.assertEqual(reconciled["contract_status"], "parsed_alert_reconciled")
         self.assertEqual(reconciled["alerts"][0]["severity"], "info")
+        self.assertIn("BATCH_STATE_JSON:", patched_summary)
+
+    def test_make_alert_on_policy_promotes_grounded_episode_observation(self):
+        frames = [
+            {"thumbnail": f"frame-{index}", "captured_at": 100.0 + index}
+            for index in range(6)
+        ]
+        summary = (
+            "### Scene\nA person sits at a desk.\n\n"
+            "### Episode\n"
+            "Snapshot 1: Person seated, hands resting.\n"
+            "Snapshot 2: Raises right hand, thumb up.\n"
+            "Snapshot 3: Hand remains raised.\n"
+            "Snapshot 4: Lowering hand.\n\n"
+            "### Alerts\nNone\n\n"
+            "### Routine\nSeated desk work.\n\n"
+            "### Deviations\nThumb-up gesture (Snap 2).\n\n"
+            "### Worth to remember\nNone\n\n"
+            "BATCH_STATE_JSON:\n"
+            '{"version":2,"alerts":[],"events":[],"observed_states":[],'
+            '"cover":{"snapshot_index":3,"kind":"routine","confidence":"low"},'
+            '"scene":{"status":"uncertain","summary":""},'
+            '"routines":[],"memory_pass":[]}'
+        )
+        with tempfile.TemporaryDirectory() as temp:
+            manager = build_manager(Path(temp))
+            manager.update_prompt_settings(
+                channel_id=112,
+                alert_policy_prompt=(
+                    "Make alert on thumbs up gesture, severity - critical"
+                ),
+            )
+            state = manager._extract_batch_state(summary, frames)
+            patched_summary, reconciled = manager._reconcile_operator_alert_contract(
+                112,
+                summary,
+                state,
+            )
+
+        self.assertEqual(reconciled["contract_status"], "parsed_alert_reconciled")
+        self.assertEqual(reconciled["alerts"][0]["title"], "thumbs up gesture")
+        self.assertEqual(reconciled["alerts"][0]["severity"], "critical")
+        self.assertEqual(reconciled["alerts"][0]["snapshot_indices"], [2])
         self.assertIn("BATCH_STATE_JSON:", patched_summary)
 
     def test_grounded_plaintext_alert_repairs_empty_json_alert_array(self):

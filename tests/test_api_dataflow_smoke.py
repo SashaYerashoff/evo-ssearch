@@ -992,6 +992,11 @@ class ApiDataflowSmokeTests(unittest.TestCase):
         )
         self.assertGreaterEqual(gate["event_to_bookmark_ack_ms"], 0)
         send.assert_called_once()
+        bookmark = send.call_args.kwargs
+        self.assertEqual(bookmark["title"], "Immediate collision watch")
+        self.assertLessEqual(len(bookmark["title"].split()), 3)
+        self.assertIn("Probe: Immediate collision watch.", bookmark["description"])
+        self.assertIn("pos 0.900 / neg 0.100", bookmark["description"])
         embed.assert_not_called()
 
     def test_probe_bookmark_gate_serializes_realtime_and_daemon_delivery(self) -> None:

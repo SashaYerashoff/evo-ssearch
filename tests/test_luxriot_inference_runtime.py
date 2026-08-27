@@ -6503,6 +6503,39 @@ class LuxriotCaptureDispatchTests(unittest.TestCase):
             self.assertEqual(second.alert_events[0]["delivery_status"], "deduplicated")
             self.assertEqual(second.skipped_duplicate, 1)
 
+    def test_vlm_bookmark_uses_short_topic_and_keeps_full_title_in_description(self):
+        with tempfile.TemporaryDirectory() as temp:
+            raw_title = (
+                "Snapshot 2: Red car drifts sharply right, tires kicking up smoke."
+            )
+            manager = build_manager(
+                Path(temp),
+                alert_parser=lambda *_args, **_kwargs: [
+                    {
+                        "title": raw_title,
+                        "description": "The vehicle rotates across the intersection.",
+                        "severity": "high",
+                    }
+                ],
+            )
+            manager.default_bookmark_enabled = True
+            sent = []
+            with patch.object(
+                manager,
+                "send_bookmark_event",
+                side_effect=lambda **kwargs: sent.append(kwargs)
+                or {"success": True},
+            ):
+                result = manager.process_summary_alerts(118, "ALERTS_JSON: {}")
+
+            self.assertEqual(int(result), 1)
+            self.assertEqual(sent[0]["title"], "Red car drifts")
+            self.assertTrue(sent[0]["description"].startswith(raw_title))
+            self.assertEqual(
+                result.alert_events[0]["bookmark_title"],
+                "Red car drifts",
+            )
+
     def test_operator_cooldown_caps_content_dedupe_window(self):
         with tempfile.TemporaryDirectory() as temp:
             manager = build_manager(

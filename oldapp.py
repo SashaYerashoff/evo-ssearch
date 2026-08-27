@@ -153,7 +153,11 @@ from lm_admission import (
     get_lm_admission_controller,
     normalize_lm_resource,
 )
-from luxriot_connector import DEFAULT_BATCH_STATE_JSON_PROMPT, LuxriotManager
+from luxriot_connector import (
+    DEFAULT_BATCH_STATE_JSON_PROMPT,
+    LuxriotManager,
+    compact_alert_topic,
+)
 from probe_manager import ProbeManager
 from road_events import AutoSceneCardConfig, DecodedVideoFrame, infer_scene_card_from_frames
 from semantic_snapshot_archive import SemanticSnapshotArchiveWriter
@@ -11386,10 +11390,15 @@ def _maybe_send_probe_bookmark_serialized(
     gate_meta["bookmark_attempted_at_ms"] = bookmark_attempted_at_ms
     gate_meta["event_to_bookmark_attempt_ms"] = max(0, bookmark_attempted_at_ms - ts_ms)
     try:
+        bookmark_title = compact_alert_topic(probe_name)
+        bookmark_description = (
+            f"Probe: {probe_name}. "
+            f"pos {pos_score:.3f} / neg {neg_score:.3f} · margin {margin:.3f}"
+        )
         luxriot_manager.send_bookmark_event(
             channel_id=channel_id,
-            title=f"Probe hit: {probe_name}",
-            description=f"pos {pos_score:.3f} / neg {neg_score:.3f} · margin {margin:.3f}",
+            title=bookmark_title,
+            description=bookmark_description,
             severity=severity,
             state="new",
             timestamp_ms=ts_ms,
