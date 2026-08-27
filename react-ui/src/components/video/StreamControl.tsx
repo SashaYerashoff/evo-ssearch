@@ -77,11 +77,11 @@ export function describeVlmSampling(
   return batch > maxSelected
     ? {
         compressed: true,
-        label: `VLM sees 1–${visible} useful images from ${batch} samples · no padding · chronological · partial coverage · ${caps} · seals by ~${window}s`,
+        label: `VLM sees 4–${visible} chronological images from ${batch} captured observations · attention-ranked with temporal context backfill · partial coverage · ${caps} · seals by ~${window}s`,
       }
     : {
         compressed: false,
-        label: `VLM sees 1–${visible} useful images · no padding · chronological · ${caps} · seals by ~${window}s`,
+        label: `VLM sees 4–${Math.max(4, visible)} chronological images · attention-ranked with temporal context backfill · ${caps} · seals by ~${window}s`,
       }
 }
 
@@ -137,16 +137,7 @@ export function StreamControl(p: {
   const resolutions = RESOLUTIONS.map((item) => ({ ...item, label: t(RESOLUTION_LABEL_KEYS[item.v]) }))
   const settingsTitle = p.channels.find((c) => c.id === p.settingsChannelId)?.title || '—'
   const reviewTitle = p.channels.find((c) => c.id === p.reviewChannelId)?.title || '—'
-  const batchOptions = p.allowedBatchSizes.length > 0
-    ? p.allowedBatchSizes
-    : (p.batch ? [p.batch] : [])
-  const samplingCoverage = describeVlmSampling(
-    p.batch,
-    p.every,
-    p.maxSelectedFrames,
-    p.maxVlmImages,
-  )
-  const settingsSummary = `${settingsTitle} · ${t('video.batch').toLocaleLowerCase()} ${p.batch} · ${p.every}s · ${p.capturing ? t('status.capturing') : t('status.idle')}`
+  const settingsSummary = `${settingsTitle} · adaptive 4–8-frame evidence · ${p.capturing ? t('status.capturing') : t('status.idle')}`
   const reviewSummary = [
     reviewTitle,
     periods.find((item) => item.v === p.period)?.label || t('period.live'),
@@ -184,17 +175,9 @@ export function StreamControl(p: {
             </div>
           </section>
           <section className="vid-control-group sampling">
-            <div className="vid-control-group-title">{t('video.sampling')}</div>
-            <div className="vid-control-fields">
-              <div className="wfield batch"><label>{t('video.batch')}</label>
-                <Dropdown value={p.batch} onChange={p.onBatch} options={batchOptions.map((b) => ({ value: b, label: b }))} />
-              </div>
-              <div className="wfield xs"><label>{t('video.every')}</label>
-                <input type="number" min={0.2} max={300} step={0.1} value={p.every} onChange={(e) => p.onEvery(e.target.value)} />
-              </div>
-            </div>
-            <div className={`vid-sampling-contract${samplingCoverage.compressed ? ' warning' : ''}`}>
-              {samplingCoverage.label}
+            <div className="vid-control-group-title">Evidence policy</div>
+            <div className="vid-sampling-contract">
+              Adaptive chronological 4–8-frame VLM evidence. CV and semantic signals rank frames; the backend preserves temporal context and controls cadence.
             </div>
           </section>
           <section className="vid-control-group inference">

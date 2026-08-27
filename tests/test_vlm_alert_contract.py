@@ -126,7 +126,10 @@ class VlmAlertPromptContractTests(unittest.TestCase):
 
         self.assertLess(schema.index("alerts"), schema.index("events"))
         self.assertLess(schema.index("alerts"), schema.index("memory_pass"))
-        self.assertIn("no more than 36 words", DEFAULT_ALERTS_JSON_PROMPT)
+        self.assertIn("roughly 80-180 words", DEFAULT_ALERTS_JSON_PROMPT)
+        self.assertIn("Snapshot N:", DEFAULT_ALERTS_JSON_PROMPT)
+        self.assertIn("for EVERY supplied snapshot", DEFAULT_ALERTS_JSON_PROMPT)
+        self.assertIn("ALERT — <title>", DEFAULT_ALERTS_JSON_PROMPT)
         self.assertIn("one COMPLETE, compact JSON object", DEFAULT_ALERTS_JSON_PROMPT)
         self.assertIn(
             "always finish with literal BATCH_STATE_JSON:",
@@ -276,6 +279,51 @@ class VlmAlertPromptContractTests(unittest.TestCase):
         self.assertEqual(state["contract_status"], "partial_prefix")
         self.assertEqual(reconciled["contract_status"], "parsed_alert_reconciled")
         self.assertEqual(reconciled["alerts"][0]["severity"], "info")
+        self.assertIn("BATCH_STATE_JSON:", patched_summary)
+
+    def test_grounded_plaintext_alert_repairs_empty_json_alert_array(self):
+        frames = [
+            {"thumbnail": f"frame-{index}", "captured_at": 100.0 + index}
+            for index in range(4)
+        ]
+        summary = (
+            "### Scene description\nA person sits at a desk.\n\n"
+            "### Episode update\n"
+            "Snapshot 1: Person is seated.\n"
+            "Snapshot 2: Person raises two fingers.\n"
+            "Snapshot 3: The V hand gesture remains visible.\n"
+            "Snapshot 4: The hand lowers.\n"
+            "ALERT — Victory gesture: person makes a visible victory hand gesture "
+            "(snapshots 2,3).\n\n"
+            "### Routine and deviations\nRoutine desk work; gesture is a deviation.\n\n"
+            "### Worth to remember\nNone\n"
+            "BATCH_STATE_JSON:\n"
+            '{"version":2,"alerts":[],"events":[],"observed_states":[],'
+            '"cover":{"snapshot_index":2,"kind":"event","confidence":"high"},'
+            '"scene":{"status":"matched","summary":"Person at desk"},'
+            '"routines":[],"memory_pass":[]}'
+        )
+        with tempfile.TemporaryDirectory() as temp:
+            manager = build_manager(Path(temp))
+            manager.update_prompt_settings(
+                channel_id=7,
+                alert_policy_prompt=(
+                    "Alert when a person makes a victory gesture, severity info."
+                ),
+            )
+            state = manager._extract_batch_state(summary, frames)
+            patched_summary, reconciled = manager._reconcile_operator_alert_contract(
+                7,
+                summary,
+                state,
+            )
+
+        self.assertEqual(reconciled["contract_status"], "parsed_alert_reconciled")
+        self.assertEqual(
+            reconciled["alert_reconciliation"]["source"],
+            "grounded_plaintext_alert",
+        )
+        self.assertEqual(reconciled["alerts"][0]["snapshot_indices"], [2, 3])
         self.assertIn("BATCH_STATE_JSON:", patched_summary)
     def test_final_live_prompt_places_prior_memory_before_batch_state_contract(self):
         with tempfile.TemporaryDirectory() as temp:

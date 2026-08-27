@@ -677,8 +677,8 @@ class Config:
     except (TypeError, ValueError):
         LUXRIOT_VLM_MAX_IMAGES_PER_REQUEST = 8
     LUXRIOT_VLM_MAX_IMAGES_PER_REQUEST = max(
-        2,
-        min(64, LUXRIOT_VLM_MAX_IMAGES_PER_REQUEST),
+        4,
+        min(8, LUXRIOT_VLM_MAX_IMAGES_PER_REQUEST),
     )
     try:
         LUXRIOT_L0_MAX_SELECTED_FRAMES = int(
@@ -689,9 +689,9 @@ class Config:
     # Keep the wider capture window as provenance while bounding the number of
     # image encodes in one realtime VLM request.
     LUXRIOT_L0_MAX_SELECTED_FRAMES = max(
-        2,
+        4,
         min(
-            16,
+            8,
             LUXRIOT_VLM_MAX_IMAGES_PER_REQUEST,
             LUXRIOT_L0_MAX_SELECTED_FRAMES,
         ),
@@ -1018,6 +1018,24 @@ class Config:
             _value = _default
         locals()[_name] = max(_minimum, min(_maximum, _value))
     del _name, _env_name, _default, _minimum, _maximum, _value, _L0_PROMPT_BUDGET_DEFAULTS
+    # L0 now carries a factual scene inventory, one observation for every
+    # supplied snapshot, and a prose/JSON alert parity contract.  Older 0.8.x
+    # site env files pinned the former ultra-compact 320/384-token envelope;
+    # keeping those values would truncate the richer contract after a code-only
+    # upgrade.  These are minimum safety envelopes, not forced generation
+    # lengths: the model may stop as soon as the complete response is done.
+    LUXRIOT_L0_OUTPUT_BUDGET_TOKENS = max(
+        1024,
+        LUXRIOT_L0_OUTPUT_BUDGET_TOKENS,
+    )
+    LUXRIOT_L0_HEARTBEAT_OUTPUT_TOKENS = max(
+        640,
+        LUXRIOT_L0_HEARTBEAT_OUTPUT_TOKENS,
+    )
+    LUXRIOT_L0_EVENT_OUTPUT_TOKENS = max(
+        896,
+        LUXRIOT_L0_EVENT_OUTPUT_TOKENS,
+    )
     LUXRIOT_ALERT_DERIVED_PROBES_ENABLED = _get_bool_env(
         'EVOSSEARCH_LUXRIOT_ALERT_DERIVED_PROBES_ENABLED',
         'False',

@@ -15,24 +15,24 @@ describe('video workspace feature visibility', () => {
 })
 
 describe('VLM sampling contract', () => {
-  it('shows a sparse chronological default 12/1 evidence packet', () => {
+  it('shows the bounded chronological default 12/1 evidence packet', () => {
     expect(describeVlmSampling('12', '1', 8)).toEqual({
       compressed: true,
-      label: 'VLM sees 1–8 useful images from 12 samples · no padding · chronological · partial coverage · hard cap 8 · seals by ~12s',
+      label: 'VLM sees 4–8 chronological images from 12 captured observations · attention-ranked with temporal context backfill · partial coverage · hard cap 8 · seals by ~12s',
     })
   })
 
-  it('does not promise to pad a smaller window', () => {
+  it('states the minimum temporal context for a smaller window', () => {
     expect(describeVlmSampling('8', '2', 8)).toEqual({
       compressed: false,
-      label: 'VLM sees 1–8 useful images · no padding · chronological · hard cap 8 · seals by ~16s',
+      label: 'VLM sees 4–8 chronological images · attention-ranked with temporal context backfill · hard cap 8 · seals by ~16s',
     })
   })
 
   it('marks legacy wider batches as partial attention-selected coverage', () => {
     expect(describeVlmSampling('12', '2', 8)).toEqual({
       compressed: true,
-      label: 'VLM sees 1–8 useful images from 12 samples · no padding · chronological · partial coverage · hard cap 8 · seals by ~24s',
+      label: 'VLM sees 4–8 chronological images from 12 captured observations · attention-ranked with temporal context backfill · partial coverage · hard cap 8 · seals by ~24s',
     })
   })
 

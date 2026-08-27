@@ -108,8 +108,8 @@ Approximate description batch rate:
 batches_per_min ≈ channels × 60 / (snapshot_interval_s × batch_size)
 ```
 
-The capture window contains `batch_size` saved frames. The VLM sees at most
-between one and `EVOSSEARCH_LUXRIOT_VLM_MAX_IMAGES_PER_REQUEST`
+The capture window contains `batch_size` saved frames. Every live VLM request
+contains between four and `EVOSSEARCH_LUXRIOT_VLM_MAX_IMAGES_PER_REQUEST`
 chronologically ordered evidence images. CV/SigLIP still process the wider
 upstream capture window; the L0 record retains the source/selected/omitted
 counts and reserves a slot for a useful stable companion of a CV apex, while the independent
@@ -117,10 +117,11 @@ per-second semantic snapshot archive retains its own configured cadence. When
 12/16-frame windows are compressed, both the prompt and UI explicitly say that
 VLM visual coverage is partial.
 
-The fresh-install default is a 12-sample temporal window at 1 Hz: a non-empty
-packet seals by about 12 s without waiting to fill the image budget. A quiet
-heartbeat may therefore contain only one or two images, while a busy event may
-use all eight. The absolute 50-channel ceiling is about 250 routine packets/min
+The fresh-install source cadence is 1 Hz. Attention may seal an evidence packet
+before the wider capture window fills, but it waits until at least four distinct
+time observations exist; stable context backfills a sparse apex selection and
+is not content-deduplicated away. A quiet heartbeat may use four images while a
+busy event may use all eight. The absolute 50-channel ceiling is about 250 routine packets/min
 before event coalescing; image and token cost varies with evidence density.
 Confirm the four Georgia VLM endpoints sustain the measured p95 service time;
 otherwise use per-channel policy and additional hosts rather than accepting

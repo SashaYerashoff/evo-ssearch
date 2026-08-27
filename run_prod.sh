@@ -2,6 +2,14 @@
 set -euo pipefail
 
 APP_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# Legacy git/systemd deployments often load APP_DIR/.env through
+# EnvironmentFile but do not tell the process which file supplied it.  Declare
+# that one canonical path before Python imports config so Settings writes back
+# to the same source instead of refusing an ambiguous secure-deployment write.
+if [[ -z "${EVOSSEARCH_CONFIG_ENV_FILE:-}" && -f "${APP_DIR}/.env" ]]; then
+  export EVOSSEARCH_CONFIG_ENV_FILE="${APP_DIR}/.env"
+fi
+cd "${APP_DIR}"
 RUNTIME_DIR="${APP_DIR}/.eva-runtime"
 if [[ -x "${RUNTIME_DIR}/bin/ffmpeg" ]]; then
   export PATH="${RUNTIME_DIR}/bin:${PATH}"

@@ -53,7 +53,7 @@ EVOSSEARCH_AUTH_COOKIE_SECURE=true   # when TLS terminates at app or proxy
 | `EVOSSEARCH_GUNICORN_THREADS` (`8`) | HTTP request threads inside the single required worker. Eight leaves capacity for bounded live-media responses plus Agent/status traffic |
 | `EVOSSEARCH_SETTINGS_LOCAL_ONLY` (`true`) | Restrict settings writes |
 | `EVOSSEARCH_TRUSTED_PROXY_HOPS` (`0`) | Number of reverse-proxy hops trusted for client IP, scheme, and host. Keep `0` when EVA is directly reachable; the clean appliance installer binds EVA to loopback and sets `1` for its local proxy |
-| `EVOSSEARCH_CONFIG_ENV_FILE` | Absolute path declaration for Settings precedence/provenance, normally identical to systemd `EnvironmentFile`. It does not load or retarget the Settings editor by itself |
+| `EVOSSEARCH_CONFIG_ENV_FILE` | Canonical absolute env path for startup and Settings write-back, normally identical to systemd `EnvironmentFile`. Process/systemd values still win over dotenv values. `run_prod.sh` declares `APP_DIR/.env` for legacy git deployments when no explicit path was supplied |
 | `EVOSSEARCH_SITE_TIMEZONE` (`UTC`) | Optional neutral fallback for agent calendar normalization. Omit it unless the deployment explicitly configures a timezone; operator-facing UI uses the browser timezone without displaying a location label. |
 
 ## Auth
@@ -74,7 +74,7 @@ EVOSSEARCH_AUTH_COOKIE_SECURE=true   # when TLS terminates at app or proxy
 | `EVOSSEARCH_LUXRIOT_BASE_URL` | Luxriot Evo host `[FIELD]` |
 | `EVOSSEARCH_LUXRIOT_USERNAME` / `_PASSWORD` | Credentials `[FIELD]` |
 | `EVOSSEARCH_LUXRIOT_DEFAULT_CHANNEL_ID` (`1`) | Default channel |
-| `EVOSSEARCH_LUXRIOT_SNAPSHOT_INTERVAL` (`1`) | Saved evidence cadence (s) for new/unconfigured channels. Together with the default 12-sample window this seals live L0 by about 12 s; the evidence composer independently sends only 1–8 useful images. Existing per-channel settings remain authoritative |
+| `EVOSSEARCH_LUXRIOT_SNAPSHOT_INTERVAL` (`1`) | Saved evidence cadence (s) for new/unconfigured channels. Attention controls sealing, while the evidence composer sends 4–8 chronological images and backfills stable temporal context when ranking is sparse. Existing per-channel settings remain authoritative |
 | `EVOSSEARCH_LUXRIOT_SNAPSHOT_MAX_EDGE` (`800`) | Snapshot max edge px |
 | `EVOSSEARCH_LUXRIOT_CAPTURE_SOURCE` (`auto`) | `snapshot`, `live_segment`, or automatic fallback. A true intra-second CV apex requires `live_segment` |
 | `EVOSSEARCH_LUXRIOT_FFMPEG_HWACCEL` (`auto`) | `auto` probes QSV, then Intel VAAPI, and uses the first working hardware decode/VPP path; any channel-level failure is retried in software. Use `qsv`, `vaapi`, or `software`/`off` to force a guarded backend |
@@ -186,8 +186,8 @@ thresholds, alert policy, live sampling, or the live routine context.
 | `EVOSSEARCH_INCIDENT_MAINTENANCE_ENABLED` (`true`) | Reconcile expired Follow leases durably even when a channel produces no new L0 batch |
 | `EVOSSEARCH_INCIDENT_MAINTENANCE_INTERVAL_SEC` (`15`) | Bounded background reconciliation interval, clamped to 1–300 seconds |
 | `EVOSSEARCH_LUXRIOT_L0_CONTEXT_WINDOW_TOKENS` (`16384`) | Measurable L0 context envelope used by the prompt planner |
-| `EVOSSEARCH_LUXRIOT_L0_TEXT_BUDGET_TOKENS` / `_VISION_BUDGET_TOKENS` / `_OUTPUT_BUDGET_TOKENS` (`5000/5500/512`) | Separate L0 envelope ceilings. Alert criteria and `BATCH_STATE_JSON` are protected atomic blocks; incident context is semantically compacted first |
-| `EVOSSEARCH_LUXRIOT_L0_HEARTBEAT_OUTPUT_TOKENS` / `_EVENT_OUTPUT_TOKENS` (`320/384`) | Per-request generation caps below the L0 envelope ceiling. The compact state contract keeps routine batches fresh while event/manual descriptions retain room for distinct alerts and episode state |
+| `EVOSSEARCH_LUXRIOT_L0_TEXT_BUDGET_TOKENS` / `_VISION_BUDGET_TOKENS` / `_OUTPUT_BUDGET_TOKENS` (`5000/5500/1024`) | Separate L0 envelope ceilings. Alert criteria, the per-snapshot human account, and `BATCH_STATE_JSON` are protected atomic blocks; incident context is semantically compacted first |
+| `EVOSSEARCH_LUXRIOT_L0_HEARTBEAT_OUTPUT_TOKENS` / `_EVENT_OUTPUT_TOKENS` (`640/896`) | Per-request generation caps below the L0 envelope ceiling. They allow a concrete scene inventory, one observation per supplied snapshot, alert prose/JSON parity, and the complete compact state object |
 | `EVOSSEARCH_LUXRIOT_L0_INCIDENT_BUDGET_TOKENS` (`900`) | Sub-budget shared by at most four incident contexts in an L0 request; incidents 5–8 remain scheduler state only |
 | `EVOSSEARCH_LUXRIOT_L0_VISION_TOKENS_PER_IMAGE_ESTIMATE` (`300`) | Conservative accounting estimate per selected frame for telemetry and fail-before-send budget checks |
 | `EVOSSEARCH_LM_VLM_BALANCER_ENABLED` | Enables capacity/health/admission-aware session assignment across multiple VLM profiles. Auto assignments are persisted and replanned on restore; manual and pre-selector legacy pins remain fixed. This is not per-request round robin or in-flight failover |
@@ -284,10 +284,10 @@ markers reach the model via `VECTOR_SIGNALS_JSON.capture_attention`.
 
 | Var (default) | Notes |
 |---|---|
-| `EVOSSEARCH_LUXRIOT_DEFAULT_BATCH_SIZE` (`12`) | Default temporal evidence window for new/unconfigured channels. It is not a request image target: the bounded composer sends 1–8 useful images. Valid choices remain `4,8,12,16`; persisted channel settings are not silently rewritten |
+| `EVOSSEARCH_LUXRIOT_DEFAULT_BATCH_SIZE` (`12`) | Legacy/source temporal accumulator bound for new or unconfigured channels, not an operator-facing request target. The adaptive composer sends 4–8 chronological images; persisted wider capture settings remain readable but no longer permit a sparse visual request |
 | `EVOSSEARCH_LUXRIOT_SUMMARY_MAX_BATCH_FRAMES` (`16`) | Hard upper bound for the saved-frame capture window upstream of L0 attention selection; this is not the VLM request image limit |
-| `EVOSSEARCH_LUXRIOT_VLM_MAX_IMAGES_PER_REQUEST` (`8`) | Hard pre-inference image count. Requests over this limit are rejected locally instead of risking endpoint failure or silent truncation |
-| `EVOSSEARCH_LUXRIOT_L0_MAX_SELECTED_FRAMES` (`8`) | Total ordinary-L0 evidence-image budget, additionally clamped by the hard request limit. The composer may reserve one slot for a stable companion of a CV apex; wider 12/16-frame windows are compressed with explicit partial-coverage provenance |
+| `EVOSSEARCH_LUXRIOT_VLM_MAX_IMAGES_PER_REQUEST` (`8`) | Hard pre-inference image count, clamped to 4–8. Real live requests outside that interval are rejected locally instead of risking endpoint failure, silent truncation, or a one-frame assertion |
+| `EVOSSEARCH_LUXRIOT_L0_MAX_SELECTED_FRAMES` (`8`) | Total ordinary-L0 evidence-image budget, clamped to 4–8 and by the hard request limit. Attention ranks frames but stable observations at distinct times backfill any selection below four. The composer may reserve one slot for a stable companion of a CV apex; wider capture windows are compressed with explicit partial-coverage provenance |
 | `EVOSSEARCH_LUXRIOT_SUMMARY_MAX_WINDOW_SEC` (`60`) | Hard source/wall-clock deadline for a non-empty L0 batch |
 | `EVOSSEARCH_LUXRIOT_SUMMARY_QUIET_CADENCE_SEC` (`5`) | Saved-snapshot cadence admitted to the VLM batch during quiet intervals |
 | `EVOSSEARCH_LUXRIOT_SUMMARY_NORMAL_CADENCE_SEC` (`2`) | Saved-snapshot cadence admitted during normal activity |
@@ -309,7 +309,7 @@ markers reach the model via `VECTOR_SIGNALS_JSON.capture_attention`.
 | `EVOSSEARCH_LUXRIOT_ATTENTION_POSTROLL_SEC` (`3`) | Burst post-roll collected before episode dispatch |
 | `EVOSSEARCH_LUXRIOT_ATTENTION_MAX_VLM_FRAMES` (`8`) | Maximum saved embedding frames in one episode |
 | `EVOSSEARCH_VLM_FAST_ALERT_ENABLED` (`true`) | Run a separate alert-only VLM phase after a measured CV burst. A calibrated operator bookmark-probe hit may also wake this visual gate and carries its exact scored frame as attention-only evidence; a hit that arrives while another fast pass is inflight is deferred rather than discarded. This does not replace or enter the visible full L0 memory stream |
-| `EVOSSEARCH_VLM_FAST_ALERT_POST_ROLL_SEC` (`2.5`) / `_OPERATOR_PROBE_POST_ROLL_SEC` (`1.0`) / `_MAX_FRAMES` (`6`) / `_MAX_TOKENS` (`128`) | Bound the control/pre/onset/apex/post evidence set and compact completion length. An exact operator-probe frame uses one short post-roll cadence while retaining control, scored, motion-apex, and fresh post evidence; ungrounded CV/semantic bursts keep the longer trajectory window |
+| `EVOSSEARCH_VLM_FAST_ALERT_POST_ROLL_SEC` (`2.5`) / `_OPERATOR_PROBE_POST_ROLL_SEC` (`1.0`) / `_MAX_FRAMES` (`6`) / `_MAX_TOKENS` (`384`) | Bound the 4–8-image control/pre/onset/apex/post evidence set and completion length. An exact operator-probe frame uses one short post-roll cadence while retaining control, scored, motion-apex, and fresh post evidence; ungrounded CV/semantic bursts keep the longer trajectory window |
 | `EVOSSEARCH_VLM_FAST_ALERT_WORKERS` (`2`) | Admit two independent burst checks concurrently; the global LM admission controller still gives interactive agent work priority and bounds total inference pressure |
 | `EVOSSEARCH_VLM_FAST_ALERT_SEMANTIC_DELTA` (`0.22`) / `_MIN_MOVING_FRACTION` (`0.15`) | Also validate a large consecutive SigLIP scene change when CV confirms distributed motion. This catches meaningful changes on continuously active channels whose motion has become baseline; the vector delta only routes frames and is never alert proof |
 | `EVOSSEARCH_VLM_FAST_ALERT_COOLDOWN_SEC` (`12`) / `_DEDUPE_WINDOW_SEC` (`12`) | Bound repeated burst passes, debounce consecutive scored frames from one held operator-probe action, and suppress an identical fast-phase/full-L0 bookmark replay without suppressing differently titled hazards |

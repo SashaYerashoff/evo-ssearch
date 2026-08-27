@@ -1356,6 +1356,7 @@ class ApiDataflowSmokeTests(unittest.TestCase):
                 "capture_selection": {"activity_x": activity},
             }
             for timestamp_ms, activity in (
+                (trigger_ms - 2_000, 0.05),
                 (trigger_ms - 1_000, 0.1),
                 (trigger_ms, 0.9),
                 (post_ms, 0.2),
@@ -1448,7 +1449,7 @@ class ApiDataflowSmokeTests(unittest.TestCase):
             self.assertEqual(trace["lm_effective_capacity"], 1)
             self.assertEqual(trace["event_to_lm_admission_ms"], 4_000)
             self.assertEqual(trace["post_roll_source_ms"], 2_500)
-            self.assertEqual(trace["batch_first_frame_at_ms"], trigger_ms - 1_000)
+            self.assertEqual(trace["batch_first_frame_at_ms"], trigger_ms - 2_000)
             self.assertEqual(status["last_inference_ms"], 1_200)
             self.assertEqual(status["last_admission_wait_ms"], 750.0)
             self.assertEqual(emitted[0][0], "scheduler_decision")

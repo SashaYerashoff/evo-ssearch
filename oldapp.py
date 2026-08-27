@@ -43,6 +43,7 @@ import re
 import secrets
 import shutil
 import socket
+import stat
 import sys
 import tempfile
 import threading
@@ -5072,8 +5073,8 @@ def _build_luxriot_messages(channel_label: str, frames: List[Dict[str, Any]], us
     span_note = f" spanning about {span_sec:.1f}s" if span_sec > 0 else ""
     intro = (
         f"Live temporal evidence from Luxriot channel {channel_label}. "
-        f"{len(evidence)} selected image(s){span_note}; the packet is intentionally "
-        "allowed to use fewer images than the endpoint limit. Evidence below is "
+        f"{len(evidence)} selected image(s){span_note}; a valid live packet always "
+        "contains 4–8 images. Evidence below is "
         "strictly ordered oldest to newest. Interpret visible transitions in that "
         "order before summarizing the routine. Routing roles are hints, not visual "
         "proof. Do not invent continuity across time gaps or let a general routine "
@@ -5119,7 +5120,7 @@ def _build_luxriot_messages(channel_label: str, frames: List[Dict[str, Any]], us
             {
                 'type': 'text',
                 'text': (
-                    f"Evidence {idx} ({relative}{gap}; captured at {captured}; "
+                    f"Snapshot {idx} ({relative}{gap}; captured at {captured}; "
                     f"roles={roles}{relationship})"
                 ),
             }
@@ -5140,6 +5141,12 @@ def _build_luxriot_messages(channel_label: str, frames: List[Dict[str, Any]], us
         {'role': 'system', 'content': [{'type': 'text', 'text': system_msg}]},
         {'role': 'user', 'content': user_content},
     ]
+
+
+# LuxriotManager uses this marker to apply the final 4–8 image gate to the
+# real live multimodal payload while allowing narrow unit collaborators to
+# exercise parser/queue mechanics without fabricating base64 image parts.
+setattr(_build_luxriot_messages, "eva_live_visual_contract", True)
 
 
 def _configured_lm_profiles() -> Dict[str, Dict[str, Any]]:
@@ -6914,18 +6921,24 @@ LUXRIOT_SYSTEM_PROMPT_DEFAULT = (
     "not descriptions of reality.\n"
     "Return Markdown with exactly these sections and order:\n"
     "### Scene description\n"
-    "Describe the current scene and whether it plausibly matches supplied scene/channel context; report "
-    "unavailable, frozen, obstructed, or ambiguous coverage rather than inventing content.\n"
+    "Give a concrete current-scene inventory: environment, people, important objects, spatial relations, "
+    "lighting/visibility, and whether the view plausibly matches supplied scene/channel context. Use enough "
+    "detail that an operator can understand the world shown without opening every image. Report unavailable, "
+    "frozen, obstructed, or ambiguous coverage rather than inventing content.\n"
     "### Episode update\n"
-    "Describe observable events as new, continuing, resolved, or uncertain. Reconcile unfinished prior "
-    "events only against current snapshots and reference snapshot numbers or timestamps.\n"
+    "Write one concise `Snapshot N:` observation for every supplied image in chronological order, including "
+    "stable visible facts, then synthesize observable events as new, continuing, resolved, or uncertain. "
+    "Reconcile unfinished prior events only against current snapshots. When an operator alert criterion is "
+    "visibly met, duplicate it here as `ALERT — title: visible evidence (snapshots N,...)`; the backend uses "
+    "that prose as a consistency path when machine JSON is incomplete.\n"
     "### Routine and deviations\n"
     "Separate visibly reinforced routine from deviations and novelty. Novelty raises preservation priority, "
     "not alert severity.\n"
     "### Worth to remember\n"
     "List only grounded items useful for later consolidation, especially unresolved events and rare deviations; "
     "write 'None' when there is nothing worth preserving.\n"
-    "Rules: keep human-readable prose factual and concise; avoid repetition; do not infer intent, identity, "
+    "Rules: keep human-readable prose factual and information-dense; do not erase scene state merely because it "
+    "is routine, and do not merge away a supplied snapshot. Avoid empty boilerplate; do not infer intent, identity, "
     "legality, or safety outside sampled evidence. The backend appends current-observation, homeostasis, "
     "alert-policy, and unified BATCH_STATE_JSON instructions; follow that final output contract."
 )
@@ -11592,8 +11605,14 @@ class _FastVlmAlertRuntime:
             max(1.0, float(getattr(config, "VLM_FAST_ALERT_COOLDOWN_SEC", 12.0) or 12.0))
             * 1000.0
         )
-        self.max_frames = max(4, int(getattr(config, "VLM_FAST_ALERT_MAX_FRAMES", 6) or 6))
-        self.max_tokens = max(128, int(getattr(config, "VLM_FAST_ALERT_MAX_TOKENS", 128) or 128))
+        self.max_frames = min(
+            8,
+            max(4, int(getattr(config, "VLM_FAST_ALERT_MAX_FRAMES", 6) or 6)),
+        )
+        self.max_tokens = max(
+            384,
+            int(getattr(config, "VLM_FAST_ALERT_MAX_TOKENS", 128) or 128),
+        )
         workers = max(1, int(getattr(config, "VLM_FAST_ALERT_WORKERS", 2) or 2))
         self.semantic_delta_threshold = max(
             0.0,
@@ -12067,6 +12086,36 @@ class _FastVlmAlertRuntime:
         selected[self._frame_timestamp_ms(apex)] = apex
         selected[self._frame_timestamp_ms(frames[-1])] = frames[-1]
         ordered = sorted(selected.values(), key=self._frame_timestamp_ms)
+        if len(ordered) < 4:
+            selected_timestamps = {
+                self._frame_timestamp_ms(frame)
+                for frame in ordered
+            }
+            for frame in sorted(
+                frames,
+                key=lambda item: (
+                    min(
+                        (
+                            abs(
+                                self._frame_timestamp_ms(item)
+                                - selected_timestamp
+                            )
+                            for selected_timestamp in selected_timestamps
+                        ),
+                        default=0,
+                    ),
+                    self._frame_timestamp_ms(item),
+                ),
+                reverse=True,
+            ):
+                timestamp = self._frame_timestamp_ms(frame)
+                if timestamp in selected_timestamps:
+                    continue
+                ordered.append(frame)
+                selected_timestamps.add(timestamp)
+                if len(ordered) >= 4:
+                    break
+            ordered.sort(key=self._frame_timestamp_ms)
         if len(ordered) > self.max_frames:
             probe_frame = next(
                 (
@@ -12130,8 +12179,8 @@ class _FastVlmAlertRuntime:
                 else None
             ),
         )
-        if len(frames) < 2:
-            raise RuntimeError("fast VLM episode has fewer than two evidence frames")
+        if len(frames) < 4:
+            raise RuntimeError("fast VLM episode has fewer than four evidence frames")
         episode_id = str(
             uuid.uuid5(
                 uuid.NAMESPACE_URL,
@@ -12151,7 +12200,10 @@ class _FastVlmAlertRuntime:
             "snapshots. CV motion and semantic probes selected the frames but are not visual proof. "
             "Raise an alert only when the images themselves ground a current operator criterion or an "
             "immediate safety hazard such as collision risk, fall/collapse, fire, or dangerous intrusion. "
-            "Do not describe routine. Return only `BATCH_STATE_JSON:` followed by one compact JSON object. "
+            "Before JSON, write one concise `Snapshot N:` observation for every supplied image. For every "
+            "emitted alert also write `ALERT — <title>: <visible evidence> (snapshots N,...)`; prose and JSON "
+            "must agree. Stable/routine frames are control evidence and must still be described. Then write "
+            "`BATCH_STATE_JSON:` followed by one compact JSON object. "
             "Always use numeric `version`: 2 and include alerts. Include events or "
             "observed_states only when they provide current "
             "visual evidence for an operator criterion; omit cover, scene, routines, and memory_pass in this fast phase. "
@@ -21112,12 +21164,59 @@ def _write_env_file_atomic(content: str, path: Union[str, Path] = ".env") -> Non
         env_path.write_text(content, encoding="utf-8")
         return
     tmp_path = env_path.with_name(f".{env_path.name}.tmp-{os.getpid()}")
-    tmp_path.write_text(content, encoding="utf-8")
+
+    def write_existing_file_in_place() -> None:
+        """Persist through file permission when its directory is read-only.
+
+        Older 0.8.x installations shipped the declared env as root:eva 0660
+        inside a root:eva 0750 directory.  The service can safely update that
+        exact regular file but cannot create an atomic sibling.  Do not run the
+        web process as root and do not redirect to an ambiguous project .env;
+        use a no-symlink descriptor, preserve ownership/mode, flush, and fsync.
+        """
+
+        flags = os.O_WRONLY
+        if hasattr(os, "O_NONBLOCK"):
+            flags |= os.O_NONBLOCK
+        if hasattr(os, "O_CLOEXEC"):
+            flags |= os.O_CLOEXEC
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        descriptor = os.open(str(env_path), flags)
+        try:
+            file_stat = os.fstat(descriptor)
+            if not stat.S_ISREG(file_stat.st_mode):
+                raise OSError("declared settings env is not a regular file")
+            os.ftruncate(descriptor, 0)
+            payload = content.encode("utf-8")
+            written = 0
+            while written < len(payload):
+                chunk_size = os.write(descriptor, payload[written:])
+                if chunk_size <= 0:
+                    raise OSError("declared settings env write made no progress")
+                written += chunk_size
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+
+    try:
+        tmp_path.write_text(content, encoding="utf-8")
+    except PermissionError:
+        write_existing_file_in_place()
+        return
     try:
         os.chmod(tmp_path, 0o600)
     except OSError:
         pass
-    os.replace(tmp_path, env_path)
+    try:
+        os.replace(tmp_path, env_path)
+    except PermissionError:
+        try:
+            tmp_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+        write_existing_file_in_place()
+        return
     try:
         os.chmod(env_path, 0o600)
     except OSError:

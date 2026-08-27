@@ -2094,7 +2094,7 @@ class LuxriotCaptureAttentionSignalTests(unittest.TestCase):
             if part.get("type") == "text" and "sharper companion" in str(part.get("text") or "")
         ]
         self.assertEqual(len(companion_notes), 1)
-        self.assertIn("Evidence 3", companion_notes[0])
+        self.assertIn("Snapshot 3", companion_notes[0])
         self.assertIn("source Snapshot 2", companion_notes[0])
         self.assertEqual(
             [part["image_url"]["url"].rsplit(",", 1)[-1] for part in image_parts],
@@ -2102,7 +2102,7 @@ class LuxriotCaptureAttentionSignalTests(unittest.TestCase):
         )
         intro = str(user_content[0].get("text") or "")
         self.assertIn("strictly ordered oldest to newest", intro)
-        self.assertIn("allowed to use fewer images", intro)
+        self.assertIn("always contains 4–8 images", intro)
 
     def test_message_builder_never_uses_companion_to_exceed_image_cap(self):
         import oldapp
@@ -2388,7 +2388,7 @@ class LuxriotCaptureDispatchTests(unittest.TestCase):
             session = LuxriotCaptureSession(
                 manager,
                 channel_id=7,
-                batch_size=2,
+                batch_size=4,
                 prompt="Describe activity.",
                 run_id="run-7",
             )
@@ -2396,15 +2396,17 @@ class LuxriotCaptureDispatchTests(unittest.TestCase):
 
             session._accept_captured_frame(image, 1_000, summarize=True)
             session._accept_captured_frame(image, 2_000, summarize=True)
+            session._accept_captured_frame(image, 3_000, summarize=True)
+            session._accept_captured_frame(image, 4_000, summarize=True)
 
             self.assertEqual(len(session.frames), 0)
-            self.assertEqual(len(session.recent_frame_items()), 2)
+            self.assertEqual(len(session.recent_frame_items()), 4)
             self.assertEqual(session.nearest_frame_thumbnail(), "jpeg")
             status = session.status()
             self.assertEqual(status["pending_frames"], 0)
-            self.assertEqual(status["recent_frame_count"], 2)
+            self.assertEqual(status["recent_frame_count"], 4)
 
-    def test_repeated_exact_frames_mark_source_frozen_and_stop_buffering(self):
+    def test_repeated_exact_frames_mark_source_frozen_and_keep_bounded_heartbeat(self):
         with tempfile.TemporaryDirectory() as temp:
             manager = build_manager(
                 Path(temp),
@@ -2433,15 +2435,22 @@ class LuxriotCaptureDispatchTests(unittest.TestCase):
                 status = session.status()
             self.assertTrue(status["frozen_signal"])
             self.assertEqual(status["frozen_frame_count"], 3)
+            self.assertEqual(status["frozen_frame_dropped_count"], 0)
+            self.assertEqual(status["frozen_frame_retained_count"], 1)
+            self.assertEqual(len(session.recent_frame_items()), 3)
+
+            with patch("luxriot_connector.time.time", return_value=113.0):
+                session._accept_captured_frame(image, 113_000, summarize=True)
+                status = session.status()
             self.assertEqual(status["frozen_frame_dropped_count"], 1)
-            self.assertEqual(len(session.recent_frame_items()), 2)
+            self.assertEqual(len(session.recent_frame_items()), 3)
 
             manager.jpeg_encoder = lambda _image, **_kwargs: "jpeg-new"
             with patch("luxriot_connector.time.time", return_value=114.0):
                 session._accept_captured_frame(image, 114_000, summarize=True)
                 status = session.status()
             self.assertFalse(status["frozen_signal"])
-            self.assertEqual(len(session.recent_frame_items()), 3)
+            self.assertEqual(len(session.recent_frame_items()), 4)
 
     def test_dispatch_failure_restores_detached_frames(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -2454,20 +2463,20 @@ class LuxriotCaptureDispatchTests(unittest.TestCase):
             session = LuxriotCaptureSession(
                 manager,
                 channel_id=7,
-                batch_size=2,
+                batch_size=4,
                 prompt="Describe activity.",
                 run_id="run-7",
             )
-            session.frames = sample_frames()
+            session.frames = sample_frames() + sample_frames(start=110.0)
 
             session._summarize_batch()
 
-            self.assertEqual(len(session.frames), 2)
+            self.assertEqual(len(session.frames), 4)
             self.assertIn("database unavailable", session.last_error)
             self.assertEqual(session.queue_dropped_batches, 0)
             self.assertEqual(session.summary_coverage_gap_batches, 0)
 
-    def test_capture_loop_keeps_summary_failure_visible(self):
+    def test_capture_loop_defers_sparse_summary_before_dispatch(self):
         with tempfile.TemporaryDirectory() as temp:
             manager = build_manager(Path(temp))
 
@@ -2494,7 +2503,7 @@ class LuxriotCaptureDispatchTests(unittest.TestCase):
             session._run()
 
             self.assertEqual(len(session.frames), 1)
-            self.assertIn("vlm unavailable", session.last_error)
+            self.assertIn("fewer than four evidence frames", session.last_error)
             self.assertEqual(session.queue_dropped_batches, 0)
             self.assertEqual(session.summary_coverage_gap_batches, 0)
 
@@ -2507,14 +2516,14 @@ class LuxriotCaptureDispatchTests(unittest.TestCase):
             session = LuxriotCaptureSession(
                 manager,
                 channel_id=7,
-                batch_size=2,
+                batch_size=4,
                 prompt="Describe activity.",
                 run_id="run-7",
             )
             manager.sessions[7] = session
 
             dispatched = session._dispatch_summary_frames(
-                sample_frames(),
+                sample_frames() + sample_frames(start=110.0),
                 restore_on_failure=False,
             )
 
@@ -2522,7 +2531,7 @@ class LuxriotCaptureDispatchTests(unittest.TestCase):
             self.assertIn("vlm unavailable", session.summary_last_error)
             self.assertEqual(session.summary_failed_batches, 1)
             self.assertEqual(session.queue_dropped_batches, 1)
-            self.assertEqual(session.dropped_frames, 2)
+            self.assertEqual(session.dropped_frames, 4)
             gaps = [
                 row
                 for row in manager.summary_history.get(7, [])
@@ -2741,7 +2750,7 @@ class LuxriotCaptureDispatchTests(unittest.TestCase):
             batch = restored.create_summary_batch(
                 channel_id=7,
                 run_id="prompt-audit",
-                batch_size=2,
+                batch_size=4,
                 prompt="",
                 model_hint=None,
                 interval_sec=1.0,
@@ -4221,7 +4230,7 @@ class LuxriotCaptureDispatchTests(unittest.TestCase):
             self.assertIsNone(status["last_live_segment_error"])
             self.assertEqual(status["live_segment_failed_count"], 0)
 
-    def test_incremental_summary_slicing_dispatches_exact_batches_and_keeps_remainder(self):
+    def test_overdue_summary_coalesces_to_one_fresh_bounded_packet(self):
         dispatched = []
         with tempfile.TemporaryDirectory() as temp:
             manager = build_manager(
@@ -4260,44 +4269,20 @@ class LuxriotCaptureDispatchTests(unittest.TestCase):
 
             session._summarize_if_ready()
 
-            self.assertEqual([len(item["thumbnails"]) for item in dispatched], [8, 8])
-            self.assertEqual(
-                dispatched[0]["thumbnails"],
-                [
-                    "frame-0",
-                    "frame-1",
-                    "frame-2",
-                    "frame-3",
-                    "frame-4",
-                    "frame-6",
-                    "frame-8",
-                    "frame-11",
-                ],
-            )
-            self.assertEqual(
-                dispatched[1]["thumbnails"],
-                [
-                    "frame-12",
-                    "frame-13",
-                    "frame-14",
-                    "frame-15",
-                    "frame-16",
-                    "frame-18",
-                    "frame-20",
-                    "frame-23",
-                ],
-            )
+            self.assertEqual([len(item["thumbnails"]) for item in dispatched], [8])
+            self.assertEqual(dispatched[0]["thumbnails"][0], "frame-0")
+            self.assertEqual(dispatched[0]["thumbnails"][-1], "frame-24")
             self.assertEqual(
                 [item["source_frame_count"] for item in dispatched],
-                [12, 12],
+                [25],
             )
             self.assertEqual(
                 [item["selected_frame_count"] for item in dispatched],
-                [8, 8],
+                [8],
             )
-            self.assertEqual([frame["thumbnail"] for frame in session.frames], ["frame-24"])
+            self.assertEqual(session.frames, [])
 
-    def test_summary_deadline_dispatches_without_a_followup_capture_frame(self):
+    def test_summary_deadline_does_not_dispatch_a_one_frame_packet(self):
         dispatched = []
         completed = threading.Event()
         with tempfile.TemporaryDirectory() as temp:
@@ -4334,20 +4319,19 @@ class LuxriotCaptureDispatchTests(unittest.TestCase):
                         }
                     )
 
-                self.assertTrue(completed.wait(timeout=1.5))
-                self.assertEqual(len(dispatched), 1)
+                self.assertFalse(completed.wait(timeout=0.25))
+                self.assertEqual(dispatched, [])
                 self.assertEqual(
-                    [frame["thumbnail"] for frame in dispatched[0][0]["frames"]],
+                    [frame["thumbnail"] for frame in session.frames],
                     ["only-frame"],
                 )
-                self.assertEqual(session.frames, [])
             finally:
                 session.stop_event.set()
                 with session.summary_condition:
                     session.summary_condition.notify_all()
                 session.summary_worker_thread.join(timeout=1.0)
 
-    def test_attention_heartbeat_seals_sparse_packet_on_operator_window(self):
+    def test_attention_heartbeat_waits_for_four_frame_operator_context(self):
         with tempfile.TemporaryDirectory() as temp:
             manager = build_manager(
                 Path(temp),
@@ -4398,9 +4382,8 @@ class LuxriotCaptureDispatchTests(unittest.TestCase):
                 session._summarize_if_ready(size_trigger=False)
 
             self.assertEqual(session._summary_observation_window_sec_locked(), 12.0)
-            self.assertEqual(len(submissions), 1)
-            self.assertEqual(submissions[0]["workload_class"], "heartbeat")
-            self.assertEqual(submissions[0]["frame_limit"], 2)
+            self.assertEqual(submissions, [])
+            self.assertEqual(len(session.frames), 2)
 
     def test_capture_cv_apex_is_the_same_frame_sent_to_clip_vlm_and_archive(self):
         probe_calls = []
@@ -4823,7 +4806,7 @@ class LuxriotCaptureDispatchTests(unittest.TestCase):
             session = LuxriotCaptureSession(
                 manager,
                 channel_id=7,
-                batch_size=2,
+                batch_size=4,
                 prompt="Describe activity.",
                 run_id="run-7",
             )
@@ -4831,12 +4814,14 @@ class LuxriotCaptureDispatchTests(unittest.TestCase):
             try:
                 session._accept_captured_frame(SimpleNamespace(width=1280, height=720, marker=1), 1_000, summarize=True)
                 session._accept_captured_frame(SimpleNamespace(width=1280, height=720, marker=2), 2_000, summarize=True)
+                session._accept_captured_frame(SimpleNamespace(width=1280, height=720, marker=3), 3_000, summarize=True)
+                session._accept_captured_frame(SimpleNamespace(width=1280, height=720, marker=4), 4_000, summarize=True)
                 self.assertTrue(started.wait(timeout=1.0))
 
-                session._accept_captured_frame(SimpleNamespace(width=1280, height=720, marker=3), 3_000, summarize=True)
+                session._accept_captured_frame(SimpleNamespace(width=1280, height=720, marker=5), 5_000, summarize=True)
 
-                self.assertEqual(len(session.recent_frame_items()), 3)
-                self.assertEqual(session.nearest_frame_thumbnail(), "jpeg-3")
+                self.assertEqual(len(session.recent_frame_items()), 5)
+                self.assertEqual(session.nearest_frame_thumbnail(), "jpeg-5")
                 status = session.status()
                 self.assertTrue(status["summary_inflight"])
                 self.assertEqual(status["pending_frames"], 1)
@@ -4863,25 +4848,34 @@ class LuxriotCaptureDispatchTests(unittest.TestCase):
             session = LuxriotCaptureSession(
                 manager,
                 channel_id=7,
-                batch_size=1,
+                batch_size=4,
                 prompt="Describe activity.",
                 run_id="run-7",
             )
             session.summary_worker_thread.start()
             try:
-                session._accept_captured_frame(SimpleNamespace(width=1280, height=720, marker=1), 1_000, summarize=True)
+                for marker in range(1, 5):
+                    session._accept_captured_frame(
+                        SimpleNamespace(width=1280, height=720, marker=marker),
+                        marker * 1_000,
+                        summarize=True,
+                    )
                 self.assertTrue(started.wait(timeout=1.0))
-                session._accept_captured_frame(SimpleNamespace(width=1280, height=720, marker=2), 2_000, summarize=True)
-                session._accept_captured_frame(SimpleNamespace(width=1280, height=720, marker=3), 3_000, summarize=True)
+                for marker in range(5, 13):
+                    session._accept_captured_frame(
+                        SimpleNamespace(width=1280, height=720, marker=marker),
+                        marker * 1_000,
+                        summarize=True,
+                    )
 
                 status = session.status()
                 self.assertEqual(status["summary_queue_depth"], 1)
-                self.assertEqual(status["summary_queue_frame_count"], 1)
+                self.assertEqual(status["summary_queue_frame_count"], 4)
                 self.assertEqual(session.queue_dropped_batches, 1)
                 self.assertEqual(session.summary_failed_batches, 1)
                 self.assertIn("queue overflow", session.summary_last_error)
-                self.assertEqual(session.dropped_frames, 1)
-                self.assertEqual(session.nearest_frame_thumbnail(), "jpeg-3")
+                self.assertEqual(session.dropped_frames, 4)
+                self.assertEqual(session.nearest_frame_thumbnail(), "jpeg-12")
             finally:
                 release.set()
                 session.stop()
@@ -4893,15 +4887,19 @@ class LuxriotCaptureDispatchTests(unittest.TestCase):
             session = LuxriotCaptureSession(
                 manager,
                 channel_id=7,
-                batch_size=2,
+                batch_size=4,
                 prompt="Describe activity.",
                 run_id="run-7",
             )
             manager.sessions[7] = session
             session.summary_worker_thread.start()
             try:
-                session._accept_captured_frame(SimpleNamespace(width=1280, height=720, marker=1), 1_000, summarize=True)
-                session._accept_captured_frame(SimpleNamespace(width=1280, height=720, marker=2), 2_000, summarize=True)
+                for marker in range(1, 5):
+                    session._accept_captured_frame(
+                        SimpleNamespace(width=1280, height=720, marker=marker),
+                        marker * 1_000,
+                        summarize=True,
+                    )
                 for _ in range(40):
                     if session.status()["logs"]:
                         break
@@ -5215,7 +5213,7 @@ class LuxriotCaptureDispatchTests(unittest.TestCase):
 
             with self.assertRaisesRegex(
                 PromptBudgetError,
-                r"image limit \(9 > 8\).*rejected before inference",
+                r"image contract \(9 not in 4\.\.8\).*rejected before inference",
             ):
                 manager.run_summary_batch(batch)
 
@@ -5329,11 +5327,12 @@ class LuxriotCaptureDispatchTests(unittest.TestCase):
                     frames=frames,
                 )
 
-            self.assertEqual([frame["thumbnail"] for frame in batch["frames"]], ["frame-b", "frame-e", "frame-f"])
-            self.assertEqual([frame["source_frame_index"] for frame in batch["frames"]], [2, 5, 6])
+            self.assertEqual([frame["thumbnail"] for frame in batch["frames"]], ["frame-b", "frame-d", "frame-e", "frame-f"])
+            self.assertEqual([frame["source_frame_index"] for frame in batch["frames"]], [2, 4, 5, 6])
             selection = batch["frame_selection"]
             self.assertEqual(selection["source_frame_count"], 6)
-            self.assertEqual(selection["selected_frame_count"], 3)
+            self.assertEqual(selection["selected_frame_count"], 4)
+            self.assertEqual(selection["minimum_context_backfill_count"], 1)
             self.assertEqual(
                 [group["selection_source"] for group in selection["groups"]],
                 ["road_cv_cue", "clip_probe", "single_frame"],
@@ -5350,16 +5349,16 @@ class LuxriotCaptureDispatchTests(unittest.TestCase):
 
             entry = manager.run_summary_batch(batch)
 
-            self.assertEqual([frame["thumbnail"] for frame in vlm_frames], ["frame-b", "frame-e", "frame-f"])
+            self.assertEqual([frame["thumbnail"] for frame in vlm_frames], ["frame-b", "frame-d", "frame-e", "frame-f"])
             self.assertEqual(entry["source_frame_count"], 6)
-            self.assertEqual(entry["selected_frame_count"], 3)
+            self.assertEqual(entry["selected_frame_count"], 4)
             self.assertEqual(entry["frame_selection"]["groups"], selection["groups"])
             self.assertEqual(
                 [frame["source_frame_index"] for frame in entry["archive_frames"]],
-                [2, 5, 6],
+                [2, 4, 5, 6],
             )
             self.assertEqual(entry["archive_frames"][0]["selection_source"], "road_cv_cue")
-            self.assertEqual(entry["archive_frames"][2]["fallback_reason"], "single_frame_only_no_intra_second_choice")
+            self.assertEqual(entry["archive_frames"][3]["fallback_reason"], "single_frame_only_no_intra_second_choice")
 
             accepted = manager.accept_summary_entry(entry)
             stored = manager.summary_history[7][0]
@@ -5369,7 +5368,7 @@ class LuxriotCaptureDispatchTests(unittest.TestCase):
             self.assertEqual(l0["frame_selection"]["groups"][1]["selection_source"], "clip_probe")
             digest = manager.system_status_digest(channel_ids=[7])["channels"][0]
             self.assertEqual(digest["source_frame_count"], 6)
-            self.assertEqual(digest["selected_frame_count"], 3)
+            self.assertEqual(digest["selected_frame_count"], 4)
             self.assertEqual(digest["selection_fallback_count"], 1)
             self.assertEqual(digest["last_frame_selection"]["groups"][0]["selected_source_frame_index"], 2)
             compact_runtime = manager._compact_stream_status("video", {"channel_id": 7, "logs": [accepted]})
@@ -5466,8 +5465,12 @@ class LuxriotCaptureDispatchTests(unittest.TestCase):
                     frames=frames,
                 )
 
-            self.assertEqual([frame["thumbnail"] for frame in first["frames"]], ["frame-b"])
-            self.assertEqual([frame["thumbnail"] for frame in second["frames"]], ["frame-b"])
+            self.assertEqual([frame["thumbnail"] for frame in first["frames"]], ["frame-a", "frame-b", "frame-c"])
+            self.assertEqual([frame["thumbnail"] for frame in second["frames"]], ["frame-a", "frame-b", "frame-c"])
+            self.assertEqual(
+                first["frame_selection"]["minimum_context_backfill_count"],
+                2,
+            )
             group = first["frame_selection"]["groups"][0]
             self.assertEqual(group["selection_source"], "deterministic_temporal_midpoint")
             self.assertFalse(group["apex_available"])
@@ -5514,6 +5517,75 @@ class LuxriotCaptureDispatchTests(unittest.TestCase):
                 [group["selection_source"] for group in selection["groups"]],
                 ["single_frame", "single_frame", "single_frame"],
             )
+
+    def test_same_second_attention_ranking_backfills_four_temporal_observations(self):
+        frames = [
+            {
+                "thumbnail": f"same-second-{index}",
+                "captured_at": 350.0 + index * 0.1,
+                "time_sec": 350.0 + index * 0.1,
+                "source_frame_index": index + 1,
+            }
+            for index in range(6)
+        ]
+
+        with tempfile.TemporaryDirectory() as temp:
+            manager = build_manager(Path(temp))
+            with patch.object(manager, "_build_vector_signal_bundle", return_value={}):
+                batch = manager.create_summary_batch(
+                    channel_id=7,
+                    run_id="run-same-second",
+                    batch_size=6,
+                    prompt="Describe activity.",
+                    model_hint="model-a",
+                    interval_sec=0.1,
+                    frames=frames,
+                )
+
+        self.assertEqual(len(batch["frames"]), 4)
+        self.assertEqual(
+            batch["frame_selection"]["minimum_context_backfill_count"],
+            3,
+        )
+        self.assertEqual(
+            [frame["captured_at"] for frame in batch["frames"]],
+            sorted(frame["captured_at"] for frame in batch["frames"]),
+        )
+
+    def test_real_live_message_builder_rejects_sparse_visual_request_before_lm(self):
+        import oldapp
+
+        callback_calls = []
+        frames = [
+            {
+                "thumbnail": f"frame-{index}",
+                "captured_at": 360.0 + index,
+                "time_sec": 360.0 + index,
+            }
+            for index in range(3)
+        ]
+        with tempfile.TemporaryDirectory() as temp:
+            manager = build_manager(
+                Path(temp),
+                lm_callback=lambda messages, model: callback_calls.append(
+                    (messages, model)
+                ) or "summary",
+            )
+            manager.message_builder = oldapp._build_luxriot_messages
+            with patch.object(manager, "_build_vector_signal_bundle", return_value={}):
+                batch = manager.create_summary_batch(
+                    channel_id=7,
+                    run_id="run-sparse-contract",
+                    batch_size=3,
+                    prompt="Describe activity.",
+                    model_hint="model-a",
+                    interval_sec=1.0,
+                    frames=frames,
+                )
+            with self.assertRaises(PromptBudgetError):
+                manager.run_summary_batch(batch)
+
+        self.assertEqual(callback_calls, [])
 
     def test_wider_capture_window_discloses_partial_vlm_coverage(self):
         frames = [

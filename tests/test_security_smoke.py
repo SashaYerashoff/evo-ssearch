@@ -8,6 +8,7 @@ from oldapp import (
     ENV_SECRET_REDACTION,
     _redact_env_map,
     _restore_redacted_env_secrets,
+    _write_env_file_atomic,
     app,
     config,
 )
@@ -208,6 +209,26 @@ class SecuritySmokeTests(unittest.TestCase):
             "postgresql://eva:db-secret@db.internal/eva",
         )
         self.assertEqual(restored["EVOSSEARCH_PORT"], "5001")
+
+    def test_declared_env_updates_when_file_is_writable_but_directory_is_not(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            directory = Path(temp) / "config"
+            directory.mkdir(mode=0o700)
+            env_file = directory / "eva-ai.env"
+            env_file.write_text("EVOSSEARCH_HOST=127.0.0.1\n", encoding="utf-8")
+            env_file.chmod(0o600)
+            directory.chmod(0o500)
+            try:
+                _write_env_file_atomic(
+                    "EVOSSEARCH_HOST=0.0.0.0\nEVOSSEARCH_PORT=5000\n",
+                    env_file,
+                )
+                self.assertEqual(
+                    env_file.read_text(encoding="utf-8"),
+                    "EVOSSEARCH_HOST=0.0.0.0\nEVOSSEARCH_PORT=5000\n",
+                )
+            finally:
+                directory.chmod(0o700)
 
     def test_env_endpoint_never_returns_secret_values(self) -> None:
         with (

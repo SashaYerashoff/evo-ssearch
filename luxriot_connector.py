@@ -524,6 +524,37 @@ DEFAULT_BATCH_STATE_JSON_PROMPT = (
     )
 )
 
+# Exact compact contract shipped immediately before the richer per-snapshot
+# observation repair.  Persisted infrastructure defaults migrate to the new
+# contract below; operator-authored machine contracts remain untouched.
+PREVIOUS_BOUNDED_BATCH_STATE_JSON_PROMPT = DEFAULT_BATCH_STATE_JSON_PROMPT
+
+DEFAULT_BATCH_STATE_JSON_PROMPT = (
+    PREVIOUS_BOUNDED_BATCH_STATE_JSON_PROMPT.replace(
+        "Before the JSON write no more than 36 words total under exactly these headings: "
+        "### Scene description, ### Episode update, ### Routine and deviations, ### Worth to remember. "
+        "Use one short sentence or None per heading. Do not repeat JSON detail.\n",
+        "Before the JSON write a factual operator-readable account under exactly these headings: "
+        "### Scene description, ### Episode update, ### Routine and deviations, ### Worth to remember. "
+        "Use roughly 80-180 words total when the images support that detail; never shorten a visible scene to "
+        "a bare routine label. Scene description must inventory the current environment, people, important "
+        "objects, spatial relations, and coverage limitations in 2-4 concrete sentences. Episode update must "
+        "contain one concise `Snapshot N:` observation for EVERY supplied snapshot, in order, followed by a "
+        "short temporal synthesis. Describe visible facts even when nothing changed; do not omit, merge, or "
+        "silently deduplicate snapshots. Routine and deviations must distinguish stable context from visible "
+        "changes. Worth to remember is concise and may be None.\n",
+        1,
+    ).replace(
+        "- alerts (max 8): title, description, severity, snapshot_indices. Emit one per distinct current visible "
+        "operator criterion or immediate hazard; [] when none.",
+        "- alerts (max 8): title, description, severity, snapshot_indices. Emit one per distinct current visible "
+        "operator criterion or immediate hazard; [] when none. For EVERY emitted alert, also write an affirmative "
+        "plain-English `ALERT — <title>: <visible evidence> (snapshots N,...)` sentence in Episode update. The prose "
+        "and JSON alert sets must agree; routine classification and prior delivery never suppress a current match.",
+        1,
+    )
+)
+
 # Compatibility name retained for persisted settings and public API fields.
 DEFAULT_ALERTS_JSON_PROMPT = DEFAULT_BATCH_STATE_JSON_PROMPT
 
@@ -742,6 +773,13 @@ _CAPTURE_COMPANION_SHARPNESS_GAIN = 1.3  # companion must be meaningfully sharpe
 # original batches; beyond that the oldest window is dropped WITH an explicit
 # coverage-gap history entry.
 _SUMMARY_COALESCE_MAX_BATCHES = 4
+
+# Public live-VLM evidence contract.  Capture and archive paths may retain a
+# wider window, but every actual visual-model request must contain enough
+# chronological context to describe change and must fit all supported VLM
+# endpoints without silent image truncation.
+VLM_REQUEST_MIN_IMAGES = 4
+VLM_REQUEST_MAX_IMAGES = 8
 
 
 class ProbeManagerLike(Protocol):
@@ -1876,6 +1914,7 @@ class LuxriotCaptureSession:
         self.frozen_frame_hash: Optional[str] = None
         self.frozen_frame_dropped_count = 0
         self.frozen_frame_retained_count = 0
+        self._frozen_last_retained_at: Optional[float] = None
         self._capture_source_sequence = 0
         self._capture_apex_bucket_start_ms: Optional[int] = None
         self._capture_apex_bucket: List[Dict[str, Any]] = []
@@ -3126,6 +3165,7 @@ class LuxriotCaptureSession:
             self.frozen_signal_since = None
             self.frozen_frame_count = 0
             self.frozen_frame_hash = None
+            self._frozen_last_retained_at = None
             return False
 
         if self._same_frame_started_at is None:
@@ -4197,11 +4237,11 @@ class LuxriotCaptureSession:
         """Return the operator-facing maximum span of one live L0 packet.
 
         ``batch_size`` and ``interval`` describe the desired evidence window,
-        not a requirement to pad every request to ``batch_size`` images.  The
-        attention scheduler may admit fewer snapshots in a quiet scene, but a
-        non-empty packet must still be sealed on this clock.  Keeping that
-        deadline independent from profile targets prevents quiet/watch modes
-        from turning a live observation into a 30--60 second backlog.
+        not a requirement to fill every request to ``batch_size`` images.  The
+        attention scheduler may seal a quiet packet once its mandatory four
+        chronological observations exist. Keeping that deadline independent
+        from profile targets prevents quiet/watch modes from turning a live
+        observation into a 30--60 second backlog.
         """
 
         configured_span = max(
@@ -4299,12 +4339,23 @@ class LuxriotCaptureSession:
                 return
             frozen_now = self._record_frame_hash_locked(frame_hash, observed_at)
             if frozen_now:
-                if not self.manager.attention_scheduler_enabled:
+                # Frozen content is a coverage/scene fact, not permission to
+                # erase the world from all later L0 packets.  On legacy
+                # non-adaptive sites retain a bounded heartbeat; the adaptive
+                # scheduler applies its own degraded cadence downstream.
+                frozen_retain_interval = max(
+                    1.0,
+                    float(self.summary_quiet_cadence_sec),
+                )
+                if (
+                    not self.manager.attention_scheduler_enabled
+                    and self._frozen_last_retained_at is not None
+                    and observed_at - self._frozen_last_retained_at
+                    < frozen_retain_interval
+                ):
                     self.frozen_frame_dropped_count += 1
                     return
-                # A frozen feed is still a meaningful quiet/coverage state.
-                # Retain its embedding heartbeat at the bounded quiet cadence
-                # instead of turning unchanged content into a silent gap.
+                self._frozen_last_retained_at = observed_at
                 self.frozen_frame_retained_count += 1
                 frame["frozen_signal"] = True
             self._capture_source_sequence += 1
@@ -4414,11 +4465,6 @@ class LuxriotCaptureSession:
                 workload_class = "heartbeat"
                 budget_mode = AttentionMode.QUIET
                 coalesce_all = False
-                compacted_pending = any(
-                    self._summary_source_weight(frame) > 1
-                    for frame in self.frames
-                    if isinstance(frame, Mapping)
-                )
                 observation_window_sec = (
                     self._summary_observation_window_sec_locked()
                 )
@@ -4435,7 +4481,8 @@ class LuxriotCaptureSession:
                     )
                     # Mode profiles control evidence density, not how long a
                     # live packet may wait for enough images. The operator
-                    # window seals a sparse heartbeat without padding it.
+                    # window seals once the mandatory four-frame temporal
+                    # context exists; it never pads by duplicating one image.
                     deadline_sec = min(
                         float(profile.deadline_ms) / 1000.0,
                         float(observation_window_sec),
@@ -4445,14 +4492,16 @@ class LuxriotCaptureSession:
                         or pending_count >= hard_cap
                     )
                     ready_by_deadline = (
-                        pending_count > 0
+                        pending_count >= max(
+                            VLM_REQUEST_MIN_IMAGES,
+                            int(profile.min_frames),
+                        )
                         and pending_age_sec >= deadline_sec
                     )
-                    # Preserve the operator-facing observation boundary. Once
-                    # backpressure has already compacted omitted observations,
-                    # processing only the oldest prefix would instead create a
-                    # FIFO visual backlog whose output is stale on arrival.
-                    coalesce_all = bool(ready_by_deadline and compacted_pending)
+                    # A deadline closes the current bounded observation, not an
+                    # oldest-only prefix. Otherwise quiet channels become a
+                    # FIFO of stale visual packets while newer state waits.
+                    coalesce_all = bool(ready_by_deadline)
                     frame_limit = min(
                         int(profile.max_frames),
                         pending_count
@@ -4472,10 +4521,10 @@ class LuxriotCaptureSession:
                         and pending_count >= int(self.batch_size)
                     )
                     ready_by_deadline = (
-                        pending_count > 0
+                        pending_count >= VLM_REQUEST_MIN_IMAGES
                         and pending_age_sec >= float(observation_window_sec)
                     )
-                    coalesce_all = bool(ready_by_deadline and compacted_pending)
+                    coalesce_all = bool(ready_by_deadline)
                     frame_limit = min(
                         int(self.summary_max_batch_frames),
                         pending_count
@@ -4485,6 +4534,15 @@ class LuxriotCaptureSession:
                         else self._summary_deadline_frame_limit_locked(
                             observation_window_sec
                         ),
+                    )
+                if pending_count >= VLM_REQUEST_MIN_IMAGES:
+                    # Deadline slicing must not undo the request contract. A
+                    # quiet cadence can place only one or two observations
+                    # inside the nominal window; extend the chronological
+                    # prefix to four rather than sending a sparse assertion.
+                    frame_limit = min(
+                        pending_count,
+                        max(VLM_REQUEST_MIN_IMAGES, int(frame_limit)),
                     )
             if not ready_by_size and not ready_by_deadline:
                 return
@@ -4540,6 +4598,32 @@ class LuxriotCaptureSession:
         frame_items = [dict(frame) for frame in frames_copy if isinstance(frame, Mapping)]
         if not frame_items:
             return True
+        if len(frame_items) < VLM_REQUEST_MIN_IMAGES:
+            with self.lock:
+                frame_items = self._minimum_summary_context_locked(frame_items)
+        if len(frame_items) < VLM_REQUEST_MIN_IMAGES:
+            # Startup, reconnect, and manual flush are allowed to wait for
+            # context; they are never allowed to turn sparse state into a
+            # one-image VLM assertion.
+            with self.lock:
+                self._record_summary_failure_locked(
+                    "summary deferred: fewer than four evidence frames",
+                    dropped_frames=0,
+                    increment_dropped_batch=False,
+                )
+                if restore_on_failure:
+                    known = {
+                        self._minimum_context_frame_key(frame)
+                        for frame in self.frames
+                    }
+                    self.frames = [
+                        frame
+                        for frame in frame_items
+                        if self._minimum_context_frame_key(frame) not in known
+                    ] + self.frames
+                    if self.frames and self._summary_batch_opened_monotonic is None:
+                        self._summary_batch_opened_monotonic = time.monotonic()
+            return False
         job_meta = dict(metadata or {})
         dispatch_started_at_ms = int(time.time() * 1000.0)
         job_meta.setdefault("summary_dispatch_started_at_ms", dispatch_started_at_ms)
@@ -4733,6 +4817,77 @@ class LuxriotCaptureSession:
             "interval_sec": float(self.interval),
             "session_generation": self.session_generation,
         }
+
+    @classmethod
+    def _minimum_context_frame_key(
+        cls,
+        frame: Mapping[str, Any],
+    ) -> Tuple[int, int, str]:
+        return (
+            int(cls._frame_captured_at(frame) * 1000.0),
+            int(_parse_optional_int(frame.get("source_frame_index")) or 0),
+            str(frame.get("frame_hash") or "")[:40],
+        )
+
+    def _minimum_summary_context_locked(
+        self,
+        selected_frames: Sequence[Mapping[str, Any]],
+    ) -> List[Dict[str, Any]]:
+        """Backfill a sparse attention episode from the bounded recent ring.
+
+        This method is called with ``self.lock`` held.  The exact selected
+        event frames win on key collision; stable recent observations are
+        retained as chronological control/context rather than content-hash
+        deduplicated away.
+        """
+
+        selected = [
+            dict(frame)
+            for frame in selected_frames
+            if isinstance(frame, Mapping)
+            and str(frame.get("thumbnail") or "").strip()
+        ]
+        if len(selected) >= VLM_REQUEST_MIN_IMAGES:
+            return selected
+        selected_by_key = {
+            self._minimum_context_frame_key(frame): frame
+            for frame in selected
+        }
+        candidates = [
+            dict(frame)
+            for frame in self.recent_frames
+            if isinstance(frame, Mapping)
+            and str(frame.get("thumbnail") or "").strip()
+            and self._minimum_context_frame_key(frame) not in selected_by_key
+        ]
+        selected_times = [self._frame_captured_at(frame) for frame in selected]
+        while candidates and len(selected) < VLM_REQUEST_MIN_IMAGES:
+            if selected_times:
+                candidate = max(
+                    candidates,
+                    key=lambda frame: (
+                        min(
+                            abs(self._frame_captured_at(frame) - timestamp)
+                            for timestamp in selected_times
+                        ),
+                        self._frame_captured_at(frame),
+                    ),
+                )
+            else:
+                candidate = candidates[-1]
+            candidates.remove(candidate)
+            roles = [
+                str(role)
+                for role in (candidate.get("attention_roles") or [])
+                if str(role).strip()
+            ]
+            if "context" not in roles:
+                roles.append("context")
+            candidate["attention_roles"] = roles
+            selected.append(candidate)
+            selected_times.append(self._frame_captured_at(candidate))
+        selected.sort(key=self._frame_captured_at)
+        return selected
 
     @staticmethod
     def _summary_source_weight(frame: Mapping[str, Any]) -> int:
@@ -5136,6 +5291,12 @@ class LuxriotCaptureSession:
             if not frames_copy:
                 return False
             frames_copy.sort(key=self._frame_captured_at)
+            frames_copy = self._minimum_summary_context_locked(frames_copy)
+            if len(frames_copy) < VLM_REQUEST_MIN_IMAGES:
+                # The coordinator may identify an event before the recent ring
+                # has enough temporal context (notably at stream startup). Keep
+                # the visual call deferred instead of emitting a one-frame L0.
+                return False
             selected_ids = {
                 str(frame.get("attention_snapshot_id") or "")
                 for frame in frames_copy
@@ -5612,6 +5773,8 @@ class LuxriotManager:
         if text == PREVIOUS_ENGLISH_BATCH_STATE_JSON_PROMPT.strip():
             return DEFAULT_ALERTS_JSON_PROMPT
         if text == PREVIOUS_PRE_ENGLISH_BATCH_STATE_JSON_PROMPT.strip():
+            return DEFAULT_ALERTS_JSON_PROMPT
+        if text == PREVIOUS_BOUNDED_BATCH_STATE_JSON_PROMPT.strip():
             return DEFAULT_ALERTS_JSON_PROMPT
         lowered = text.lower()
         if "batch_state_json:" not in lowered:
@@ -6283,9 +6446,9 @@ class LuxriotManager:
         )
         try:
             self.vlm_max_images_per_request = max(
-                2,
+                VLM_REQUEST_MIN_IMAGES,
                 min(
-                    64,
+                    VLM_REQUEST_MAX_IMAGES,
                     int(
                         getattr(
                             config,
@@ -6296,12 +6459,13 @@ class LuxriotManager:
                 ),
             )
         except (TypeError, ValueError):
-            self.vlm_max_images_per_request = 8
+            self.vlm_max_images_per_request = VLM_REQUEST_MAX_IMAGES
+        self.vlm_min_images_per_request = VLM_REQUEST_MIN_IMAGES
         try:
             self.l0_max_selected_frames = max(
-                2,
+                self.vlm_min_images_per_request,
                 min(
-                    16,
+                    VLM_REQUEST_MAX_IMAGES,
                     self.vlm_max_images_per_request,
                     int(
                         getattr(
@@ -13389,6 +13553,8 @@ class LuxriotManager:
             "fallback_count",
             "single_frame_count",
             "timestamp_unavailable_count",
+            "minimum_frame_contract",
+            "minimum_context_backfill_count",
         ):
             parsed = _parse_optional_int(value.get(key))
             if parsed is not None:
@@ -13774,6 +13940,103 @@ class LuxriotManager:
             }
         )
         return [frame for _index, frame in selected_rows], selection
+
+    @classmethod
+    def _backfill_minimum_attention_frames(
+        cls,
+        source_frames: Sequence[Mapping[str, Any]],
+        selected_frames: Sequence[Mapping[str, Any]],
+        selection: Mapping[str, Any],
+        minimum: int = VLM_REQUEST_MIN_IMAGES,
+    ) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
+        """Keep attention selection without collapsing world context below L0.
+
+        Per-second apex selection is a ranking mechanism, not permission to
+        erase the rest of a short episode.  When several supplied observations
+        share a second (or the attention selector is intentionally sparse), add
+        chronological source observations until the request has the mandatory
+        minimum.  Identical-looking images at different source times remain
+        valid observations; only the exact same source row is de-duplicated.
+        """
+
+        source = [dict(frame) for frame in source_frames if isinstance(frame, Mapping)]
+        selected = [dict(frame) for frame in selected_frames if isinstance(frame, Mapping)]
+        required = max(1, int(minimum))
+        if len(selected) >= required or len(source) <= len(selected):
+            return selected, dict(selection)
+
+        def source_key(frame: Mapping[str, Any], fallback: int) -> Tuple[int, int]:
+            batch_index = _parse_optional_int(frame.get("batch_source_frame_index"))
+            timestamp = cls._batch_frame_timestamp_ms(frame)
+            return (
+                int(batch_index if batch_index is not None else fallback),
+                int(timestamp if timestamp is not None else fallback),
+            )
+
+        selected_keys = {
+            source_key(frame, index + 1)
+            for index, frame in enumerate(selected)
+        }
+        indexed_source: List[Tuple[int, Dict[str, Any], int]] = []
+        for index, raw_frame in enumerate(source, start=1):
+            frame = dict(raw_frame)
+            frame.setdefault("batch_source_frame_index", int(index))
+            frame.setdefault("source_frame_index", int(index))
+            timestamp = int(cls._batch_frame_timestamp_ms(frame) or index)
+            indexed_source.append((index, frame, timestamp))
+
+        chosen_indices = {
+            int(_parse_optional_int(frame.get("batch_source_frame_index")) or 0)
+            for frame in selected
+        }
+        chosen_timestamps = [
+            int(cls._batch_frame_timestamp_ms(frame) or 0)
+            for frame in selected
+        ]
+        candidates = [
+            row
+            for row in indexed_source
+            if source_key(row[1], row[0]) not in selected_keys
+            and row[0] not in chosen_indices
+        ]
+        while candidates and len(selected) < required:
+            if not chosen_timestamps:
+                chosen = candidates[-1]
+            else:
+                chosen = max(
+                    candidates,
+                    key=lambda row: (
+                        min(abs(row[2] - stamp) for stamp in chosen_timestamps),
+                        1 if row[0] in {1, len(indexed_source)} else 0,
+                        row[0],
+                    ),
+                )
+            candidates.remove(chosen)
+            _index, frame, timestamp = chosen
+            frame["selection_source"] = "minimum_context_backfill"
+            frame["selection_apex_available"] = False
+            frame["selection_fallback_reason"] = (
+                "attention_selection_below_four_frame_contract"
+            )
+            selected.append(frame)
+            chosen_timestamps.append(timestamp)
+
+        selected.sort(
+            key=lambda frame: (
+                int(cls._batch_frame_timestamp_ms(frame) or 0),
+                int(_parse_optional_int(frame.get("batch_source_frame_index")) or 0),
+            )
+        )
+        compact = dict(selection)
+        backfilled = max(0, len(selected) - len(selected_frames))
+        compact["selected_frame_count"] = len(selected)
+        compact["minimum_frame_contract"] = required
+        compact["minimum_context_backfill_count"] = backfilled
+        sources = dict(compact.get("selection_sources") or {})
+        if backfilled:
+            sources["minimum_context_backfill"] = backfilled
+        compact["selection_sources"] = sources
+        return selected, cls._compact_frame_selection(compact)
 
     @classmethod
     def _evidence_roles_for_frame(
@@ -19151,6 +19414,60 @@ class LuxriotManager:
         # Episode-update repair only when no structured candidate satisfies an
         # operator criterion.
         matches = policy_matches(candidates)
+        if not matches:
+            # The rich L0 contract duplicates every current alert in an
+            # operator-readable ALERT line.  Recover that explicit line when
+            # a small VLM describes and grounds the match but truncates or
+            # empties its JSON alerts array.  Policy-token matching below and
+            # valid current snapshot references remain mandatory, so this is
+            # a consistency parser rather than a free-form alert generator.
+            max_snapshot_index = int(
+                _parse_optional_int(state.get("snapshot_count")) or 0
+            )
+            plaintext_alert_candidates: List[
+                Tuple[str, Mapping[str, Any]]
+            ] = []
+            if max_snapshot_index > 0:
+                for raw_line in str(summary_text or "").splitlines():
+                    line = self._truncate_text(raw_line, 320)
+                    if not re.match(
+                        r"^\s*(?:[-*]\s*)?ALERT\s*(?:[-—:])",
+                        line,
+                        flags=re.IGNORECASE,
+                    ):
+                        continue
+                    snapshot_indices: List[int] = []
+                    for match in re.finditer(
+                        r"\bsnapshots?\s*(?:#\s*)?"
+                        r"(?P<indices>\d+(?:\s*(?:,|and|&)\s*\d+)*)",
+                        line,
+                        flags=re.IGNORECASE,
+                    ):
+                        for raw_index in re.findall(
+                            r"\d+",
+                            match.group("indices"),
+                        ):
+                            index = _parse_optional_int(raw_index)
+                            if (
+                                index is not None
+                                and 1 <= index <= max_snapshot_index
+                                and index not in snapshot_indices
+                            ):
+                                snapshot_indices.append(int(index))
+                    if not snapshot_indices:
+                        continue
+                    plaintext_alert_candidates.append(
+                        (
+                            "grounded_plaintext_alert",
+                            {
+                                "label": line,
+                                "summary": line,
+                                "state": "new",
+                                "snapshot_indices": snapshot_indices[:16],
+                            },
+                        )
+                    )
+            matches = policy_matches(plaintext_alert_candidates)
         if not matches:
             narrative_candidates: List[Tuple[str, Mapping[str, Any]]] = []
             episode_update = self._extract_markdown_section(
@@ -25067,7 +25384,7 @@ class LuxriotManager:
         prepare_started = time.perf_counter()
         source_frame_items = [dict(frame) for frame in frames if isinstance(frame, Mapping)]
         if not source_frame_items:
-            raise ValueError("summary batch requires at least one frame")
+            raise ValueError("summary batch requires at least one source frame")
         frame_ts_ms: List[int] = []
         for frame in source_frame_items:
             timestamp_ms = self._batch_frame_timestamp_ms(frame)
@@ -25104,9 +25421,14 @@ class LuxriotManager:
             cast(Sequence[Mapping[str, Any]], source_frame_items),
             raw_vector_signal,
         )
+        frame_items, frame_selection = self._backfill_minimum_attention_frames(
+            cast(Sequence[Mapping[str, Any]], source_frame_items),
+            cast(Sequence[Mapping[str, Any]], frame_items),
+            frame_selection,
+        )
         primary_frame_budget = int(self.l0_max_selected_frames)
         reserve_companion_slot = bool(
-            primary_frame_budget > 1
+            primary_frame_budget > self.vlm_min_images_per_request
             and len(frame_items) >= primary_frame_budget
             and any(
                 isinstance(frame.get("burst_companion"), Mapping)
@@ -25328,6 +25650,16 @@ class LuxriotManager:
         ]
         if not frame_items:
             raise ValueError("summary batch has no valid frames")
+        enforce_visual_request_contract = bool(
+            getattr(self.message_builder, "eva_live_visual_contract", False)
+        )
+        if enforce_visual_request_contract and not (
+            self.vlm_min_images_per_request <= len(frame_items)
+        ):
+            raise PromptBudgetError(
+                "L0 visual request frame contract violated before message build "
+                f"({len(frame_items)} below {self.vlm_min_images_per_request})"
+            )
         started = time.time()
         request_build_started = time.perf_counter()
         messages = self.message_builder(
@@ -25361,12 +25693,19 @@ class LuxriotManager:
         image_parts = int(
             _parse_optional_int(message_stats.get("image_parts")) or 0
         )
-        if image_parts > self.vlm_max_images_per_request:
+        if (
+            image_parts > self.vlm_max_images_per_request
+            or (
+                enforce_visual_request_contract
+                and image_parts < self.vlm_min_images_per_request
+            )
+        ):
             llm_input_stats["image_budget_status"] = "rejected"
             raise PromptBudgetError(
-                "L0 request exceeds the configured VLM image limit "
-                f"({image_parts} > {self.vlm_max_images_per_request}); "
-                "the request was rejected before inference"
+                "L0 request violates the VLM image contract "
+                f"({image_parts} not in {self.vlm_min_images_per_request}.."
+                f"{self.vlm_max_images_per_request}); the request was rejected "
+                "before inference"
             )
         llm_input_stats["image_budget_status"] = "within_budget"
         estimated_input_tokens = int(

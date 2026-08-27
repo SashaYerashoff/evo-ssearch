@@ -201,7 +201,7 @@ PORT_ENV = {
     "EVOSSEARCH_VLM_FAST_ALERT_POST_ROLL_SEC": "2.5",
     "EVOSSEARCH_VLM_FAST_ALERT_COOLDOWN_SEC": "12",
     "EVOSSEARCH_VLM_FAST_ALERT_MAX_FRAMES": "6",
-    "EVOSSEARCH_VLM_FAST_ALERT_MAX_TOKENS": "128",
+    "EVOSSEARCH_VLM_FAST_ALERT_MAX_TOKENS": "384",
     "EVOSSEARCH_VLM_FAST_ALERT_WORKERS": "2",
     "EVOSSEARCH_VLM_FAST_ALERT_SEMANTIC_DELTA": "0.22",
     "EVOSSEARCH_VLM_FAST_ALERT_MIN_MOVING_FRACTION": "0.15",
@@ -220,9 +220,9 @@ PORT_ENV = {
     "EVOSSEARCH_LUXRIOT_L0_CONTEXT_WINDOW_TOKENS": "16384",
     "EVOSSEARCH_LUXRIOT_L0_TEXT_BUDGET_TOKENS": "5000",
     "EVOSSEARCH_LUXRIOT_L0_VISION_BUDGET_TOKENS": "5500",
-    "EVOSSEARCH_LUXRIOT_L0_OUTPUT_BUDGET_TOKENS": "512",
-    "EVOSSEARCH_LUXRIOT_L0_HEARTBEAT_OUTPUT_TOKENS": "384",
-    "EVOSSEARCH_LUXRIOT_L0_EVENT_OUTPUT_TOKENS": "512",
+    "EVOSSEARCH_LUXRIOT_L0_OUTPUT_BUDGET_TOKENS": "1024",
+    "EVOSSEARCH_LUXRIOT_L0_HEARTBEAT_OUTPUT_TOKENS": "640",
+    "EVOSSEARCH_LUXRIOT_L0_EVENT_OUTPUT_TOKENS": "896",
     "EVOSSEARCH_LUXRIOT_L0_INCIDENT_BUDGET_TOKENS": "900",
     "EVOSSEARCH_LUXRIOT_L0_VISION_TOKENS_PER_IMAGE_ESTIMATE": "300",
     "EVOSSEARCH_LUXRIOT_ROLLUP_L3_DEEP_ENABLED": "true",
@@ -1763,9 +1763,10 @@ def ensure_accounts_and_dirs(answers: Answers, runner: Runner) -> None:
     )
     runner.run(("mkdir", "-p", *directories))
     runner.run(("chown", "-R", "eva:eva", answers.install_root, answers.data_root))
-    # EVA reads this file on every start and the privileged Settings workflow
-    # atomically replaces it.  The service group therefore needs traversal and
-    # directory write access without exposing credentials to other users.
+    # EVA reads this file on every start and the Settings workflow runs as the
+    # unprivileged ``eva`` service account.  The service group therefore needs
+    # traversal and directory write access for atomic replacement without
+    # exposing credentials to other users.
     runner.run(("chown", "root:eva", answers.config_root))
     runner.run(("chmod", "0755", answers.install_root))
     runner.run(("chmod", "0750", answers.data_root))

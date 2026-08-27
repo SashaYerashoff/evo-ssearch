@@ -266,7 +266,7 @@ class L0BatchDeliveryContractTests(unittest.TestCase):
             self.assertEqual([len(batch) for batch in batches], [16])
             self.assertEqual(session.status()["pending_frames"], 0)
 
-    def test_quiet_frames_form_sparse_packets_on_the_operator_window(self):
+    def test_quiet_packets_never_fall_below_four_on_the_operator_window(self):
         with tempfile.TemporaryDirectory() as temp:
             manager = self._manager(Path(temp))
             session = LuxriotCaptureSession(
@@ -288,13 +288,13 @@ class L0BatchDeliveryContractTests(unittest.TestCase):
                     )
                 session._summarize_if_ready()
 
-            self.assertEqual([len(batch) for batch in batches], [2, 2, 2])
+            self.assertEqual([len(batch) for batch in batches], [6])
             self.assertEqual(
                 [
                     [frame["captured_at"] for frame in batch]
                     for batch in batches
                 ],
-                [[100.0, 110.0], [120.0, 130.0], [140.0, 150.0]],
+                [[100.0, 110.0, 120.0, 130.0, 140.0, 150.0]],
             )
             self.assertEqual(
                 [frame["captured_at"] for frame in session.frames],
@@ -319,7 +319,7 @@ class L0BatchDeliveryContractTests(unittest.TestCase):
             self.assertFalse(status["dispatch_enabled"])
             self.assertFalse(status["scheduler_alive"])
 
-    def test_quiet_deadline_respects_the_operator_observation_window(self):
+    def test_quiet_deadline_waits_when_fewer_than_four_frames_exist(self):
         with tempfile.TemporaryDirectory() as temp:
             manager = self._manager(Path(temp))
             session = LuxriotCaptureSession(
@@ -345,11 +345,11 @@ class L0BatchDeliveryContractTests(unittest.TestCase):
 
             self.assertEqual(
                 [[frame["captured_at"] for frame in batch] for batch in batches],
-                [[100.0]],
+                [],
             )
             self.assertEqual(
                 [frame["captured_at"] for frame in session.frames],
-                [155.0, 161.0],
+                [100.0, 155.0, 161.0],
             )
 
     def test_budget_deferral_compacts_pending_frames_without_a_coverage_gap(self):

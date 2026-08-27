@@ -49,7 +49,9 @@ boundary and `EVOSSEARCH_AUTH_COOKIE_SECURE=true`.
 
 **Capture → description (per channel, in-process loop)**
 1. Pull snapshot at `SNAPSHOT_INTERVAL`; CLIP-embed it (feeds the probe buffer).
-2. When the batch fills (default 12 frames), build a summary batch.
+2. The adaptive controller ranks CV/semantic evidence while retaining at least
+   four chronological observations; it seals a bounded 4–8-image VLM packet
+   without requiring the legacy 12-frame source accumulator to fill.
 3. Dispatch to the VLM (synchronous by default; durable queue available but off).
 4. VLM returns a description plus one `BATCH_STATE_JSON` block containing the
    cover, episode state, memory pass, observations, and zero or more alerts.
