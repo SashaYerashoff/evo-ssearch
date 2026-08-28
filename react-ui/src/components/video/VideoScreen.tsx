@@ -48,6 +48,7 @@ import {
   summaryNarrativeSections,
   summaryPeriodBounds,
   summarySemanticStatus,
+  summaryVisualCoverage,
   type SummaryPeriod,
   type SummaryPeriodBounds,
   type SummaryResolution,
@@ -316,19 +317,16 @@ function SummaryCard({
   const coalesced = Number(entry.coalesced?.batches || 0)
   const itemCount = Number(entry.item_count || 0)
   const frameCount = Number(entry.frame_count || 0)
-  const selectedFrameCount = Number(entry.selected_frame_count || frameCount || 0)
-  const sourceFrameCount = Number(entry.source_frame_count || selectedFrameCount || 0)
-  const partialVisualCoverage = level === 'L0'
-    && sourceFrameCount > 0
-    && selectedFrameCount > 0
-    && selectedFrameCount < sourceFrameCount
+  const visualCoverage = summaryVisualCoverage(entry)
+  const selectedFrameCount = visualCoverage.selectedFrames
+  const sourceFrameCount = visualCoverage.sourceFrames
+  const partialVisualCoverage = level === 'L0' && visualCoverage.state === 'partial'
   const runCount = Array.isArray(entry.run_ids) ? entry.run_ids.length : 0
   const sourceTokens = Number(entry.source_tokens || 0)
   const contentStats = level === 'L0'
     ? [
-        partialVisualCoverage
-          ? `${selectedFrameCount}/${sourceFrameCount} VLM frames`
-          : (selectedFrameCount > 0 ? `${selectedFrameCount} frames` : ''),
+        selectedFrameCount > 0 ? `${selectedFrameCount} VLM frames` : '',
+        sourceFrameCount > selectedFrameCount ? `${sourceFrameCount} observations` : '',
         entry.model ? String(entry.model) : '',
       ].filter(Boolean)
     : [
@@ -387,7 +385,7 @@ function SummaryCard({
           {partialVisualCoverage && (
             <span
               className="vid-meta-chip gap"
-              title="The capture window was wider than the VLM image budget. EVA selected representative frames; omitted intervals were not visible to the model."
+              title={visualCoverage.reason}
             >
               partial visual coverage
             </span>

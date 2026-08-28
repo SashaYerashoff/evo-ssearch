@@ -47,6 +47,13 @@ export interface SummaryEvidenceMeta {
   periodSeconds: number | null
 }
 
+export interface SummaryVisualCoverage {
+  state: 'complete' | 'selected' | 'partial' | 'gap'
+  selectedFrames: number
+  sourceFrames: number
+  reason: string
+}
+
 export type SummaryPeriod =
   | 'live'
   | 'today'
@@ -438,5 +445,55 @@ export function summaryEvidenceMeta(entry: SummaryEntry): SummaryEvidenceMeta {
     frameBudget,
     sourceFrames: Number.isFinite(source) ? Math.max(0, Math.floor(source)) : 0,
     periodSeconds,
+  }
+}
+
+export function summaryVisualCoverage(entry: SummaryEntry): SummaryVisualCoverage {
+  const selected = Number(entry.selected_frame_count || entry.frame_count || 0)
+  const source = Number(entry.source_frame_count || selected || 0)
+  const selectedFrames = Number.isFinite(selected) ? Math.max(0, Math.floor(selected)) : 0
+  const sourceFrames = Number.isFinite(source) ? Math.max(selectedFrames, Math.floor(source)) : selectedFrames
+  const selection = entry.frame_selection && typeof entry.frame_selection === 'object'
+    ? entry.frame_selection as Record<string, unknown>
+    : {}
+  const coverageStatus = String(selection.coverage_status || '').trim().toLowerCase()
+  const uncoveredSalient = Number(
+    selection.uncovered_salient_count
+      ?? selection.omitted_salient_frame_count
+      ?? 0,
+  )
+
+  if (entry.coverage_gap) {
+    return {
+      state: 'gap',
+      selectedFrames,
+      sourceFrames,
+      reason: String(entry.gap_reason || 'The source or processing path contains an explicit coverage gap.'),
+    }
+  }
+  if (
+    ['partial', 'truncated', 'degraded'].includes(coverageStatus)
+    || (Number.isFinite(uncoveredSalient) && uncoveredSalient > 0)
+  ) {
+    return {
+      state: 'partial',
+      selectedFrames,
+      sourceFrames,
+      reason: 'At least one salient source moment was not represented in the bounded VLM evidence packet.',
+    }
+  }
+  if (sourceFrames > selectedFrames && selectedFrames > 0) {
+    return {
+      state: 'selected',
+      selectedFrames,
+      sourceFrames,
+      reason: 'EVA attention-ranked the source observations into a bounded chronological VLM evidence packet.',
+    }
+  }
+  return {
+    state: 'complete',
+    selectedFrames,
+    sourceFrames,
+    reason: 'All captured observations in this evidence window were sent to the VLM.',
   }
 }

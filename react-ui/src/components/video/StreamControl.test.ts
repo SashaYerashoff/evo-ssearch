@@ -18,7 +18,7 @@ describe('VLM sampling contract', () => {
   it('shows the bounded chronological default 12/1 evidence packet', () => {
     expect(describeVlmSampling('12', '1', 8)).toEqual({
       compressed: true,
-      label: 'VLM sees 4–8 chronological images from 12 captured observations · attention-ranked with temporal context backfill · partial coverage · hard cap 8 · seals by ~12s',
+      label: 'VLM sees 4–8 chronological images from 12 captured observations · bounded attention selection with temporal context backfill · hard cap 8 · seals by ~12s',
     })
   })
 
@@ -29,10 +29,10 @@ describe('VLM sampling contract', () => {
     })
   })
 
-  it('marks legacy wider batches as partial attention-selected coverage', () => {
+  it('describes wider batches as bounded selection rather than a coverage failure', () => {
     expect(describeVlmSampling('12', '2', 8)).toEqual({
       compressed: true,
-      label: 'VLM sees 4–8 chronological images from 12 captured observations · attention-ranked with temporal context backfill · partial coverage · hard cap 8 · seals by ~24s',
+      label: 'VLM sees 4–8 chronological images from 12 captured observations · bounded attention selection with temporal context backfill · hard cap 8 · seals by ~24s',
     })
   })
 

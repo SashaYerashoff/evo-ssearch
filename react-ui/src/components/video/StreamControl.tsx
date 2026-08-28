@@ -77,7 +77,7 @@ export function describeVlmSampling(
   return batch > maxSelected
     ? {
         compressed: true,
-        label: `VLM sees 4–${visible} chronological images from ${batch} captured observations · attention-ranked with temporal context backfill · partial coverage · ${caps} · seals by ~${window}s`,
+        label: `VLM sees 4–${visible} chronological images from ${batch} captured observations · bounded attention selection with temporal context backfill · ${caps} · seals by ~${window}s`,
       }
     : {
         compressed: false,

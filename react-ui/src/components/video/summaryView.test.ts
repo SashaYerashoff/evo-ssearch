@@ -9,6 +9,7 @@ import {
   summaryNarrativeSections,
   summaryPeriodBounds,
   summarySemanticStatus,
+  summaryVisualCoverage,
   splitSummaryMachineJson,
 } from './summaryView'
 
@@ -125,6 +126,36 @@ describe('video summary view metadata', () => {
       timestampMs: 12_000,
       snapshotIndices: [4],
     }])
+  })
+
+  it('does not call normal bounded attention selection partial coverage', () => {
+    expect(summaryVisualCoverage({
+      selected_frame_count: 8,
+      source_frame_count: 10,
+      frame_selection: {
+        frame_budget: 8,
+        omitted_selected_frames: 2,
+      },
+    })).toEqual({
+      state: 'selected',
+      selectedFrames: 8,
+      sourceFrames: 10,
+      reason: 'EVA attention-ranked the source observations into a bounded chronological VLM evidence packet.',
+    })
+  })
+
+  it('keeps partial and gap states for explicit evidence loss', () => {
+    expect(summaryVisualCoverage({
+      selected_frame_count: 7,
+      source_frame_count: 10,
+      frame_selection: { uncovered_salient_count: 1 },
+    }).state).toBe('partial')
+    expect(summaryVisualCoverage({
+      selected_frame_count: 0,
+      source_frame_count: 4,
+      coverage_gap: true,
+      gap_reason: 'decoder failed',
+    })).toMatchObject({ state: 'gap', reason: 'decoder failed' })
   })
 
   it('matches the legacy period windows in the browser timezone', () => {
