@@ -420,6 +420,36 @@ class Config:
         ARCHIVE_MAX_RECORDS = 5000000
     ARCHIVE_MAX_RECORDS = max(1000, ARCHIVE_MAX_RECORDS)
     try:
+        ARCHIVE_FAISS_CACHE_MAX_MB = int(
+            os.getenv('EVOSSEARCH_ARCHIVE_FAISS_CACHE_MAX_MB', '256')
+        )
+    except (TypeError, ValueError):
+        ARCHIVE_FAISS_CACHE_MAX_MB = 256
+    ARCHIVE_FAISS_CACHE_MAX_MB = max(
+        16,
+        min(4096, ARCHIVE_FAISS_CACHE_MAX_MB),
+    )
+    try:
+        ARCHIVE_FAISS_CACHE_MAX_SHARDS = int(
+            os.getenv('EVOSSEARCH_ARCHIVE_FAISS_CACHE_MAX_SHARDS', '64')
+        )
+    except (TypeError, ValueError):
+        ARCHIVE_FAISS_CACHE_MAX_SHARDS = 64
+    ARCHIVE_FAISS_CACHE_MAX_SHARDS = max(
+        1,
+        min(1024, ARCHIVE_FAISS_CACHE_MAX_SHARDS),
+    )
+    try:
+        ARCHIVE_FAISS_SEARCH_CONCURRENCY = int(
+            os.getenv('EVOSSEARCH_ARCHIVE_FAISS_SEARCH_CONCURRENCY', '1')
+        )
+    except (TypeError, ValueError):
+        ARCHIVE_FAISS_SEARCH_CONCURRENCY = 1
+    ARCHIVE_FAISS_SEARCH_CONCURRENCY = max(
+        1,
+        min(8, ARCHIVE_FAISS_SEARCH_CONCURRENCY),
+    )
+    try:
         ARCHIVE_ROW_RETENTION_DAYS = float(
             os.getenv('EVOSSEARCH_ARCHIVE_ROW_RETENTION_DAYS', '90')
         )

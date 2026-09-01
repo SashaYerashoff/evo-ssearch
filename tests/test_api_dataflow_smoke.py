@@ -1931,6 +1931,96 @@ class ApiDataflowSmokeTests(unittest.TestCase):
             "hourly_sharded_exact",
         )
 
+    def test_detection_clip_shard_cache_is_byte_bounded_lru(self) -> None:
+        class Store:
+            def shard_version(self, shard, *, embedder):
+                self.last_version_call = (shard, embedder)
+                return (2, shard)
+
+            def load_shard_vectors(self, shard, *, embedder):
+                self.last_load_call = (shard, embedder)
+                return [1, 2], oldapp.np.asarray(
+                    [[1.0, 0.0], [0.0, 1.0]],
+                    dtype=oldapp.np.float32,
+                )
+
+        class Index:
+            def __init__(self, dimension):
+                self.d = dimension
+                self.ntotal = 0
+
+            def add(self, vectors):
+                self.ntotal += int(vectors.shape[0])
+
+        class Faiss:
+            IndexFlatIP = Index
+
+        cache = oldapp._DetectionClipShardCache(
+            Store(),
+            max_bytes=8300,
+            max_entries=2,
+        )
+        with patch("oldapp._get_faiss", return_value=Faiss()):
+            cache.get("a")
+            cache.get("b")
+            cache.get("a")  # Refresh A, so B is now the LRU entry.
+            cache.get("c")
+            after_c = cache.status()
+            cache.get("b")
+
+        status = cache.status()
+        self.assertEqual(after_c["entries"], 2)
+        self.assertEqual(after_c["hits"], 1)
+        self.assertEqual(after_c["evictions"], 1)
+        self.assertEqual(status["builds"], 4)
+        self.assertEqual(status["evictions"], 2)
+        self.assertLessEqual(status["bytes"], status["max_bytes"])
+
+    def test_detection_clip_shard_cache_bypasses_broad_scan_admission(self) -> None:
+        class Store:
+            def shard_version(self, _shard, *, embedder):
+                self.embedder = embedder
+                return (1, 1)
+
+            def load_shard_vectors(self, _shard, *, embedder):
+                self.embedder = embedder
+                return [1], oldapp.np.asarray(
+                    [[1.0, 0.0]],
+                    dtype=oldapp.np.float32,
+                )
+
+        class Index:
+            def __init__(self, dimension):
+                self.d = dimension
+                self.ntotal = 0
+
+            def add(self, vectors):
+                self.ntotal += int(vectors.shape[0])
+
+        class Faiss:
+            IndexFlatIP = Index
+
+        cache = oldapp._DetectionClipShardCache(
+            Store(),
+            max_bytes=32 * 1024,
+            max_entries=8,
+        )
+        self.assertFalse(
+            cache.should_admit_scan(shard_count=5, estimated_bytes=1024)
+        )
+        self.assertFalse(
+            cache.should_admit_scan(shard_count=1, estimated_bytes=20 * 1024)
+        )
+        with patch("oldapp._get_faiss", return_value=Faiss()):
+            index, ids = cache.get("broad-scan", admit=False)
+
+        self.assertIsNotNone(index)
+        self.assertIsNotNone(ids)
+        self.assertEqual(ids.tolist(), [1])
+        status = cache.status()
+        self.assertEqual(status["entries"], 0)
+        self.assertEqual(status["bypasses"], 1)
+
     def test_continuous_clip_search_ranks_every_matching_shard(self) -> None:
         embedding_space = {
             "backend": "siglip2",
@@ -2026,6 +2116,11 @@ class ApiDataflowSmokeTests(unittest.TestCase):
                 oldapp.np.asarray([3, 4], dtype=oldapp.np.int64),
             ),
         }
+        admissions: List[bool] = []
+
+        def load_index(key, *, admit=True):
+            admissions.append(bool(admit))
+            return indexes[key]
 
         def search(index, _query, k):
             if index.name == "ch7":
@@ -2045,7 +2140,12 @@ class ApiDataflowSmokeTests(unittest.TestCase):
             patch.object(
                 oldapp.detection_clip_shard_cache,
                 "get",
-                side_effect=lambda key: indexes[key],
+                side_effect=load_index,
+            ),
+            patch.object(
+                oldapp.detection_clip_shard_cache,
+                "should_admit_scan",
+                return_value=False,
             ),
             patch("oldapp._faiss_search", side_effect=search),
             patch(
@@ -2075,6 +2175,13 @@ class ApiDataflowSmokeTests(unittest.TestCase):
         )
         self.assertEqual(coverage["scanned_candidates"], 4)
         self.assertEqual(coverage["shards_searched"], 2)
+        self.assertEqual(
+            coverage["search_strategy"],
+            "hourly_sharded_streaming_exact",
+        )
+        self.assertLessEqual(coverage["retained_candidate_pool"], 64)
+        self.assertEqual(admissions, [False, False])
+        self.assertFalse(coverage["faiss_cache_admitted"])
         self.assertFalse(coverage["truncated"])
 
     def test_detection_search_falls_back_to_healthy_channels(self) -> None:

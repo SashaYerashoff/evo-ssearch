@@ -50,6 +50,7 @@ import threading
 import time
 import uuid
 import xml.etree.ElementTree as ET
+from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor
 import requests
 from dataclasses import replace
@@ -10467,50 +10468,168 @@ def _archive_item_type(value: Any) -> str:
 
 
 class _DetectionClipShardCache:
-    def __init__(self, store: Any) -> None:
+    """Byte-bounded, scan-resistant cache for exact flat CLIP indexes.
+
+    Semantic snapshot shards contain one vector per second and are hourly.  An
+    unbounded cache therefore turns a broad archive query into permanent RSS.
+    Entries are weighted by their native FAISS vector storage plus id mapping;
+    broad sequential scans can explicitly bypass admission while still using
+    the exact same IndexFlatIP search path.
+    """
+
+    def __init__(
+        self,
+        store: Any,
+        *,
+        max_bytes: Optional[int] = None,
+        max_entries: Optional[int] = None,
+    ) -> None:
         self.store = store
         self.lock = threading.RLock()
-        self._cache: Dict[str, Dict[str, Any]] = {}
+        configured_mb = int(
+            getattr(config, "ARCHIVE_FAISS_CACHE_MAX_MB", 256)
+        )
+        configured_entries = int(
+            getattr(config, "ARCHIVE_FAISS_CACHE_MAX_SHARDS", 64)
+        )
+        self.max_bytes = max(
+            1,
+            int(max_bytes if max_bytes is not None else configured_mb * 1024 * 1024),
+        )
+        self.max_entries = max(
+            1,
+            int(max_entries if max_entries is not None else configured_entries),
+        )
+        self._cache: "OrderedDict[str, Dict[str, Any]]" = OrderedDict()
+        self._bytes = 0
+        self._peak_bytes = 0
+        self._hits = 0
+        self._misses = 0
+        self._builds = 0
+        self._bypasses = 0
+        self._evictions = 0
+        self._invalidations = 0
+
+    @staticmethod
+    def _entry_size_bytes(index: Any, ids: np.ndarray) -> int:
+        dimension = max(0, int(getattr(index, "d", 0) or 0))
+        count = max(0, int(getattr(index, "ntotal", ids.size) or ids.size))
+        # IndexFlatIP owns one float32 vector matrix.  Include the int64 id map
+        # and a small conservative allowance for Python/FAISS object metadata.
+        return max(1, (count * dimension * 4) + int(ids.nbytes) + 4096)
+
+    def _drop_locked(self, shard: str, *, eviction: bool = False) -> None:
+        cached = self._cache.pop(shard, None)
+        if not cached:
+            return
+        self._bytes = max(0, self._bytes - int(cached.get("bytes") or 0))
+        if eviction:
+            self._evictions += 1
+        else:
+            self._invalidations += 1
+
+    def _evict_locked(self) -> None:
+        while self._cache and (
+            len(self._cache) > self.max_entries
+            or self._bytes > self.max_bytes
+        ):
+            oldest = next(iter(self._cache))
+            self._drop_locked(oldest, eviction=True)
 
     def clear(self) -> None:
         with self.lock:
             self._cache.clear()
+            self._bytes = 0
 
-    def get(self, shard_key: str) -> Tuple[Optional[faiss.Index], Optional[np.ndarray]]:
+    def should_admit_scan(
+        self,
+        *,
+        shard_count: int,
+        estimated_bytes: int,
+    ) -> bool:
+        """Keep one broad sequential scan from replacing the useful hot set."""
+
+        return (
+            int(shard_count) <= max(1, self.max_entries // 2)
+            and int(estimated_bytes) <= max(1, self.max_bytes // 2)
+        )
+
+    def status(self) -> Dict[str, Any]:
+        with self.lock:
+            return {
+                "entries": len(self._cache),
+                "bytes": int(self._bytes),
+                "peak_bytes": int(self._peak_bytes),
+                "max_bytes": int(self.max_bytes),
+                "max_entries": int(self.max_entries),
+                "hits": int(self._hits),
+                "misses": int(self._misses),
+                "builds": int(self._builds),
+                "bypasses": int(self._bypasses),
+                "evictions": int(self._evictions),
+                "invalidations": int(self._invalidations),
+            }
+
+    def get(
+        self,
+        shard_key: str,
+        *,
+        admit: bool = True,
+    ) -> Tuple[Optional[faiss.Index], Optional[np.ndarray]]:
         shard = str(shard_key or "").strip()
         if not shard:
             return None, None
         version = self.store.shard_version(shard, embedder="clip")
         if version[0] <= 0:
             with self.lock:
-                self._cache.pop(shard, None)
+                self._drop_locked(shard)
             return None, None
 
         with self.lock:
             cached = self._cache.get(shard)
             if cached and cached.get("version") == version:
+                self._hits += 1
+                self._cache.move_to_end(shard)
                 return cached.get("index"), cached.get("ids")
+            self._misses += 1
+            if cached:
+                self._drop_locked(shard)
 
         ids, vectors = self.store.load_shard_vectors(shard, embedder="clip")
         if not ids or vectors.size == 0:
             with self.lock:
-                self._cache.pop(shard, None)
+                self._drop_locked(shard)
             return None, None
 
         index = _get_faiss().IndexFlatIP(int(vectors.shape[1]))
         _faiss_add_vectors(index, vectors)
         ids_arr = np.asarray(ids, dtype=np.int64)
+        entry_bytes = self._entry_size_bytes(index, ids_arr)
 
         with self.lock:
+            self._builds += 1
+            if not admit or entry_bytes > self.max_bytes:
+                self._bypasses += 1
+                return index, ids_arr
+            # A concurrent request may have populated the same shard while the
+            # vectors were loading.  Replace it atomically and account once.
+            self._drop_locked(shard)
             self._cache[shard] = {
                 "version": version,
                 "index": index,
                 "ids": ids_arr,
+                "bytes": entry_bytes,
             }
+            self._bytes += entry_bytes
+            self._peak_bytes = max(self._peak_bytes, self._bytes)
+            self._evict_locked()
         return index, ids_arr
 
 
 detection_clip_shard_cache = _DetectionClipShardCache(detections_store)
+_archive_faiss_search_slots = threading.BoundedSemaphore(
+    max(1, int(getattr(config, "ARCHIVE_FAISS_SEARCH_CONCURRENCY", 1)))
+)
 
 
 def _thumbnail_to_pil_image(thumbnail_b64: Any) -> Optional[Image.Image]:
@@ -14562,11 +14681,21 @@ def _search_detection_clip_shards(
     seen: Set[int] = set()
     per_shard_k = max(DETECTIONS_SEARCH_SHARD_OVERFETCH, limit * 20)
     query_dim = int(clip_query_vec.shape[0]) if clip_query_vec.ndim == 1 else 0
+    cache_admit = detection_clip_shard_cache.should_admit_scan(
+        shard_count=len(allowed_by_shard),
+        estimated_bytes=(
+            len(candidate_map) * ((query_dim * 4) + 8)
+            + (len(allowed_by_shard) * 4096)
+        ),
+    )
 
     for shard_key, allowed_ids in allowed_by_shard.items():
         if not shard_key:
             continue
-        index_obj, shard_ids = detection_clip_shard_cache.get(shard_key)
+        index_obj, shard_ids = detection_clip_shard_cache.get(
+            shard_key,
+            admit=cache_admit,
+        )
         if index_obj is None or shard_ids is None or shard_ids.size == 0:
             continue
         if query_dim > 0:
@@ -14995,6 +15124,111 @@ def _archive_shard_channel_id(shard_key: Any) -> Optional[int]:
     return int(match.group(1)) if match else None
 
 
+def _search_one_semantic_snapshot_shard(
+    *,
+    shard_key: str,
+    clip_query_vec: np.ndarray,
+    query_dim: int,
+    initial_k: int,
+    limit: int,
+    cache_admit: bool,
+    probe_id: Optional[str],
+    channel_id: Optional[int],
+    channel_ids: Optional[Sequence[int]],
+    since_ms: Optional[int],
+    until_ms: Optional[int],
+    expected_space: Mapping[str, Any],
+) -> Optional[Tuple[List[Tuple[int, float]], Dict[int, Dict[str, Any]]]]:
+    """Search one shard and release its index before the next shard is loaded."""
+
+    # The slot covers loading, native FAISS allocation, search and row
+    # filtering.  Broad simultaneous archive requests therefore cannot each
+    # retain a separate transient shard index at the same time.
+    with _archive_faiss_search_slots:
+        index_obj, shard_ids = detection_clip_shard_cache.get(
+            shard_key,
+            admit=cache_admit,
+        )
+        if index_obj is None or shard_ids is None or shard_ids.size == 0:
+            return None
+        index_dim = _to_optional_int(getattr(index_obj, "d", None))
+        if query_dim <= 0 or (
+            index_dim is not None
+            and index_dim != query_dim
+        ):
+            return None
+
+        size = int(shard_ids.size)
+        k = min(size, initial_k)
+        eligible: Dict[int, Dict[str, Any]] = {}
+        score_by_id: Dict[int, float] = {}
+        requested: Set[int] = set()
+
+        while k > 0:
+            sims, inds = _faiss_search(
+                index_obj,
+                clip_query_vec.reshape(1, -1),
+                k,
+            )
+            new_ids: Set[int] = set()
+            for local_idx, score in zip(inds[0], sims[0]):
+                local_int = int(local_idx)
+                if local_int < 0 or local_int >= size:
+                    continue
+                det_id = int(shard_ids[local_int])
+                score_by_id[det_id] = float(score)
+                if det_id not in requested:
+                    requested.add(det_id)
+                    new_ids.add(det_id)
+
+            fetched_rows = (
+                detections_store.fetch_detections_by_ids(
+                    sorted(new_ids),
+                    include_vectors=False,
+                    include_thumbnail=False,
+                )
+                if new_ids
+                else []
+            )
+            for row in fetched_rows:
+                if not isinstance(row, Mapping):
+                    continue
+                det_id = _to_optional_int(row.get("id"))
+                if det_id is None:
+                    continue
+                if not _detection_row_matches_filters(
+                    row,
+                    probe_id=probe_id,
+                    channel_id=channel_id,
+                    channel_ids=channel_ids,
+                    source="semantic_snapshot",
+                    since_ms=since_ms,
+                    until_ms=until_ms,
+                ):
+                    continue
+                if not _detection_row_matches_embedding_space(
+                    row,
+                    expected_space,
+                ):
+                    continue
+                eligible[det_id] = dict(row)
+
+            if len(eligible) >= limit or k >= size:
+                break
+            k = min(size, max(k + 1, k * 4))
+
+        shard_hits = sorted(
+            (
+                (det_id, score_by_id[det_id])
+                for det_id in eligible
+                if det_id in score_by_id
+            ),
+            key=lambda item: (item[1], item[0]),
+            reverse=True,
+        )[:limit]
+        return shard_hits, eligible
+
+
 def _search_semantic_snapshot_shards(
     *,
     clip_query_vec: np.ndarray,
@@ -15017,6 +15251,7 @@ def _search_semantic_snapshot_shards(
     the newest 20k archive rows.
     """
 
+    shard_inventory_limit = 5000
     try:
         all_shards = detections_store.summarize_shards(
             probe_id=probe_id,
@@ -15025,7 +15260,7 @@ def _search_semantic_snapshot_shards(
             source="semantic_snapshot",
             since_ms=since_ms,
             until_ms=until_ms,
-            limit=5000,
+            limit=shard_inventory_limit,
         )
     except AttributeError:
         return None
@@ -15040,6 +15275,7 @@ def _search_semantic_snapshot_shards(
             expected_space,
         )
     ]
+    inventory_limit_reached = len(all_shards) >= shard_inventory_limit
     excluded_shards = max(0, len(all_shards) - len(shards))
     excluded_vectors = sum(
         max(0, int(item.get("clip_count") or 0))
@@ -15066,6 +15302,13 @@ def _search_semantic_snapshot_shards(
         )
         coverage["search_strategy"] = "hourly_sharded_exact"
         coverage["shards_searched"] = 0
+        coverage["shard_inventory_limit_reached"] = inventory_limit_reached
+        if inventory_limit_reached:
+            coverage["truncated"] = True
+            coverage["must_state_coverage"] = True
+            coverage["note"] = (
+                "Shard inventory reached its safety limit; older matching shards may exist."
+            )
         coverage["embedding_space_excluded_shards"] = excluded_shards
         coverage["embedding_space_excluded_vectors"] = excluded_vectors
         coverage["embedding_space"] = dict(expected_space)
@@ -15077,14 +15320,47 @@ def _search_semantic_snapshot_shards(
         else 0
     )
     initial_k = max(32, int(limit) * 4)
-    states: Dict[str, Dict[str, Any]] = {}
+    estimated_scan_bytes = sum(
+        (max(0, int(item.get("clip_count") or 0)) * ((query_dim * 4) + 8))
+        + 4096
+        for item in shards
+    )
+    cache_admit = detection_clip_shard_cache.should_admit_scan(
+        shard_count=len(shards),
+        estimated_bytes=estimated_scan_bytes,
+    )
     failed_shards: List[str] = []
+    searched_shards = 0
+    retained_hits: Dict[int, float] = {}
+    candidate_map: Dict[int, Dict[str, Any]] = {}
+    # _finalize_detection_search_results examines up to 8x the visible limit
+    # for DINO/fusion and hydrates up to 4x for missing thumbnails.  Retaining
+    # that global pool preserves the exact visible CLIP top-K without keeping
+    # per-shard result maps for the whole archive scan.
+    retained_limit = max(
+        DETECTIONS_SEARCH_DINO_POOL_MIN,
+        int(limit) * DETECTIONS_SEARCH_DINO_POOL_MULTIPLIER,
+        int(limit) * 4,
+    )
     for summary in shards:
         shard_key = str(summary.get("shard_key") or "").strip()
         if not shard_key:
             continue
         try:
-            index_obj, shard_ids = detection_clip_shard_cache.get(shard_key)
+            shard_result = _search_one_semantic_snapshot_shard(
+                shard_key=shard_key,
+                clip_query_vec=clip_query_vec,
+                query_dim=query_dim,
+                initial_k=initial_k,
+                limit=limit,
+                cache_admit=cache_admit,
+                probe_id=probe_id,
+                channel_id=channel_id,
+                channel_ids=channel_ids,
+                since_ms=since_ms,
+                until_ms=until_ms,
+                expected_space=expected_space,
+            )
         except Exception:
             app.logger.warning(
                 "Archive semantic shard unavailable shard=%s",
@@ -15093,114 +15369,48 @@ def _search_semantic_snapshot_shards(
             )
             failed_shards.append(shard_key)
             continue
-        if index_obj is None or shard_ids is None or shard_ids.size == 0:
+        if shard_result is None:
             failed_shards.append(shard_key)
             continue
-        index_dim = _to_optional_int(getattr(index_obj, "d", None))
-        if query_dim <= 0 or (
-            index_dim is not None
-            and index_dim != query_dim
-        ):
-            failed_shards.append(shard_key)
-            continue
-        size = int(shard_ids.size)
-        states[shard_key] = {
-            "index": index_obj,
-            "ids": shard_ids,
-            "size": size,
-            "k": min(size, initial_k),
-            "eligible": {},
-            "complete": False,
-        }
+        searched_shards += 1
+        shard_hits, shard_candidates = shard_result
+        for det_id, score in shard_hits:
+            retained_hits[det_id] = float(score)
+            if det_id in shard_candidates:
+                candidate_map[det_id] = shard_candidates[det_id]
 
-    candidate_map: Dict[int, Dict[str, Any]] = {}
-    score_by_id: Dict[int, float] = {}
-    while True:
-        pending = [
-            (shard_key, state)
-            for shard_key, state in states.items()
-            if not bool(state["complete"])
-        ]
-        if not pending:
-            break
-
-        requested_ids: Set[int] = set()
-        owner_by_id: Dict[int, str] = {}
-        for shard_key, state in pending:
-            sims, inds = _faiss_search(
-                state["index"],
-                clip_query_vec.reshape(1, -1),
-                int(state["k"]),
-            )
-            shard_ids = state["ids"]
-            for local_idx, score in zip(inds[0], sims[0]):
-                local_int = int(local_idx)
-                if local_int < 0 or local_int >= int(shard_ids.size):
-                    continue
-                det_id = int(shard_ids[local_int])
-                score_by_id[det_id] = float(score)
-                if det_id not in candidate_map:
-                    requested_ids.add(det_id)
-                    owner_by_id[det_id] = shard_key
-
-        fetched_rows = detections_store.fetch_detections_by_ids(
-            sorted(requested_ids),
-            include_vectors=False,
-            include_thumbnail=False,
-        ) if requested_ids else []
-        for row in fetched_rows:
-            if not isinstance(row, Mapping):
-                continue
-            det_id = _to_optional_int(row.get("id"))
-            if det_id is None:
-                continue
-            shard_key = owner_by_id.get(det_id)
-            if not shard_key or shard_key not in states:
-                continue
-            if not _detection_row_matches_filters(
-                row,
-                probe_id=probe_id,
-                channel_id=channel_id,
-                channel_ids=channel_ids,
-                source="semantic_snapshot",
-                since_ms=since_ms,
-                until_ms=until_ms,
-            ):
-                continue
-            if not _detection_row_matches_embedding_space(
-                row,
-                expected_space,
-            ):
-                continue
-            item = dict(row)
-            candidate_map[det_id] = item
-            states[shard_key]["eligible"][det_id] = item
-
-        for _shard_key, state in pending:
-            if (
-                len(state["eligible"]) >= limit
-                or int(state["k"]) >= int(state["size"])
-            ):
-                state["complete"] = True
-            else:
-                state["k"] = min(
-                    int(state["size"]),
-                    max(int(state["k"]) + 1, int(state["k"]) * 4),
+        if len(retained_hits) > retained_limit:
+            if sort_by == "time":
+                ranked_ids = sorted(
+                    retained_hits,
+                    key=lambda det_id: (
+                        int(candidate_map.get(det_id, {}).get("timestamp_ms") or 0),
+                        det_id,
+                    ),
+                    reverse=True,
                 )
+            else:
+                ranked_ids = sorted(
+                    retained_hits,
+                    key=lambda det_id: (retained_hits[det_id], det_id),
+                    reverse=True,
+                )
+            keep = set(ranked_ids[:retained_limit])
+            retained_hits = {
+                det_id: retained_hits[det_id]
+                for det_id in keep
+            }
+            candidate_map = {
+                det_id: candidate_map[det_id]
+                for det_id in keep
+                if det_id in candidate_map
+            }
 
-    clip_hits: List[Tuple[int, float]] = []
-    for state in states.values():
-        shard_hits = sorted(
-            (
-                (int(det_id), float(score_by_id[det_id]))
-                for det_id in state["eligible"]
-                if det_id in score_by_id
-            ),
-            key=lambda item: item[1],
-            reverse=True,
-        )
-        clip_hits.extend(shard_hits[:limit])
-    clip_hits.sort(key=lambda item: item[1], reverse=True)
+    clip_hits = sorted(
+        retained_hits.items(),
+        key=lambda item: (item[1], item[0]),
+        reverse=True,
+    )
 
     finalize_stats: Dict[str, int] = {}
     results = _finalize_detection_search_results(
@@ -15212,16 +15422,22 @@ def _search_semantic_snapshot_shards(
         limit=limit,
         stats=finalize_stats,
     )
-    timestamps = [
-        int(item.get("timestamp_ms") or 0)
-        for item in candidate_map.values()
-        if _to_optional_int(item.get("timestamp_ms")) is not None
+    oldest_values = [
+        int(item.get("min_ts") or 0)
+        for item in shards
+        if int(item.get("min_ts") or 0) > 0
     ]
+    newest_values = [
+        int(item.get("max_ts") or 0)
+        for item in shards
+        if int(item.get("max_ts") or 0) > 0
+    ]
+    incomplete = bool(failed_shards or inventory_limit_reached)
     coverage = {
         "candidate_limit": None,
         "scanned_candidates": int(total_candidates),
         "total_candidates": int(total_candidates),
-        "truncated": bool(failed_shards),
+        "truncated": incomplete,
         "result_limit": int(limit),
         "source": "semantic_snapshot",
         "channel_id": channel_id,
@@ -15231,12 +15447,17 @@ def _search_semantic_snapshot_shards(
         ),
         "requested_since_ms": since_ms,
         "requested_until_ms": until_ms,
-        "scanned_oldest_ms": min(timestamps) if timestamps else None,
-        "scanned_newest_ms": max(timestamps) if timestamps else None,
-        "must_state_coverage": bool(failed_shards),
-        "search_strategy": "hourly_sharded_exact",
-        "shards_searched": len(states),
+        "scanned_oldest_ms": min(oldest_values) if oldest_values else None,
+        "scanned_newest_ms": max(newest_values) if newest_values else None,
+        "must_state_coverage": incomplete,
+        "search_strategy": "hourly_sharded_streaming_exact",
+        "shards_searched": searched_shards,
         "shards_failed": failed_shards,
+        "shard_inventory_limit_reached": inventory_limit_reached,
+        "retained_candidate_pool": len(candidate_map),
+        "estimated_scan_bytes": int(estimated_scan_bytes),
+        "faiss_cache_admitted": bool(cache_admit),
+        "faiss_cache": detection_clip_shard_cache.status(),
         "failed_channel_ids": sorted(
             {
                 channel
@@ -15254,9 +15475,12 @@ def _search_semantic_snapshot_shards(
             finalize_stats.get("visual_evidence_excluded") or 0
         ),
         "note": (
-            "Continuous semantic snapshots were ranked across every matching embedding-space shard."
-            if not failed_shards
-            else "Some matching continuous semantic shards could not be searched."
+            "Continuous semantic snapshots were ranked exactly while loading one shard at a time."
+            if not incomplete
+            else (
+                "Some matching continuous semantic shards could not be searched or the shard "
+                "inventory reached its safety limit."
+            )
         ),
     }
     return results, coverage
@@ -21098,6 +21322,7 @@ def detections_diagnostics():
                     "limit": limit,
                 },
                 "storage": _archive_storage_summary(),
+                "faiss_cache": detection_clip_shard_cache.status(),
                 "sources": source_summary,
                 "recent": recent,
                 "recent_total": total,
