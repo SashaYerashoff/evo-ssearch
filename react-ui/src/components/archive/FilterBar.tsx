@@ -13,6 +13,8 @@ import {
 } from '@tabler/icons-react'
 import type { Channel, ArchiveFilters } from '../../api/types'
 import { Dropdown } from '../shell/Dropdown'
+import { ToolbarActionMenu } from '../shell/ToolbarActionMenu'
+import { FloatingPopover } from '../shell/FloatingPopover'
 import { DateRangeModal } from './DateRangeModal'
 import type { ArchiveProbeOption } from '../../api/detections'
 
@@ -44,6 +46,7 @@ function ChannelPicker({
   const [open, setOpen] = useState(false)
   const [query, setQuery] = useState('')
   const rootRef = useRef<HTMLDivElement>(null)
+  const popRef = useRef<HTMLDivElement>(null)
   const selectedSet = useMemo(() => new Set(selected), [selected])
   const selectedChannels = channels.filter((channel) => selectedSet.has(String(channel.id)))
   const filtered = channels.filter((channel) => {
@@ -59,7 +62,8 @@ function ChannelPicker({
   useEffect(() => {
     if (!open) return
     const close = (event: MouseEvent) => {
-      if (!rootRef.current?.contains(event.target as Node)) setOpen(false)
+      const target = event.target as Node
+      if (!rootRef.current?.contains(target) && !popRef.current?.contains(target)) setOpen(false)
     }
     document.addEventListener('mousedown', close)
     return () => document.removeEventListener('mousedown', close)
@@ -87,7 +91,8 @@ function ChannelPicker({
         <IconChevronDown size={13} />
       </button>
       {open && (
-        <div className="archive-channel-picker-pop" role="dialog" aria-label="Select archive streams">
+        <FloatingPopover anchorRef={rootRef} popoverRef={popRef} className="archive-channel-picker-pop floating-popover" offset={7}>
+        <div role="dialog" aria-label="Select archive streams">
           <div className="archive-channel-picker-tools">
             <label>
               <IconSearch size={14} />
@@ -132,6 +137,7 @@ function ChannelPicker({
             <button type="button" className="btn primary compact" onClick={() => setOpen(false)}>Done</button>
           </div>
         </div>
+        </FloatingPopover>
       )}
     </div>
   )
@@ -152,6 +158,8 @@ export function FilterBar({
   const [timeOpen, setTimeOpen] = useState(false)
   const [rangeOpen, setRangeOpen] = useState(false)
   const menuRef = useRef<HTMLDivElement>(null)
+  const timePopRef = useRef<HTMLDivElement>(null)
+  const rangeButtonRef = useRef<HTMLButtonElement>(null)
   const custom = !!(filters.sinceMs || filters.untilMs)
   const timeLabel = custom ? rangeLabel(filters) : (TIMES.find((t) => t.v === (filters.hours || '24'))?.label || 'Last 24h')
   const selectedChannels = filters.channelIds?.length
@@ -160,7 +168,10 @@ export function FilterBar({
 
   useEffect(() => {
     if (!timeOpen) return
-    const onDown = (e: MouseEvent) => { if (!menuRef.current?.contains(e.target as Node)) setTimeOpen(false) }
+    const onDown = (e: MouseEvent) => {
+      const target = e.target as Node
+      if (!menuRef.current?.contains(target) && !timePopRef.current?.contains(target)) setTimeOpen(false)
+    }
     document.addEventListener('mousedown', onDown)
     return () => document.removeEventListener('mousedown', onDown)
   }, [timeOpen])
@@ -169,6 +180,7 @@ export function FilterBar({
     <div className="filter-block">
       <span className="atp-glabel"><IconFilter size={13} /> Filters</span>
       <div className="filter-bar">
+      <div className="toolbar-scroll-rail filter-bar-scroll">
       <ChannelPicker
         channels={channels}
         selected={selectedChannels}
@@ -200,7 +212,7 @@ export function FilterBar({
             <IconClock size={15} /> {timeLabel} <IconChevronDown size={13} />
           </button>
           {timeOpen && (
-            <div className="qf-pop">
+            <FloatingPopover anchorRef={menuRef} popoverRef={timePopRef} className="qf-pop floating-popover" offset={6} matchAnchorWidth>
               {TIMES.map((t) => (
                 <button key={t.v} type="button" className={`qf-opt ${!custom && (filters.hours || '24') === t.v ? 'on' : ''}`}
                   onClick={() => { onChange({ hours: t.v, sinceMs: undefined, untilMs: undefined }); setTimeOpen(false) }}>{t.label}</button>
@@ -212,15 +224,16 @@ export function FilterBar({
               }}>
                 <IconCalendarEvent size={14} /> Custom range…
               </button>
-            </div>
+            </FloatingPopover>
           )}
         </div>
         <span className="qf-divider" />
-        <button type="button" className={`qf-seg qf-icon ${custom ? 'on' : ''}`} onClick={() => setRangeOpen((v) => !v)} title="Pick date range">
+        <button ref={rangeButtonRef} type="button" className={`qf-seg qf-icon ${custom ? 'on' : ''}`} onClick={() => setRangeOpen((v) => !v)} title="Pick date range">
           <IconCalendarEvent size={15} />
         </button>
         {rangeOpen && (
           <DateRangeModal
+            anchorRef={rangeButtonRef}
             sinceMs={filters.sinceMs} untilMs={filters.untilMs}
             onApply={(since, until) => onChange({ sinceMs: since, untilMs: until })}
             onClear={() => onChange({ sinceMs: undefined, untilMs: undefined })}
@@ -231,14 +244,21 @@ export function FilterBar({
 
       <Dropdown variant="chip" icon={<IconArrowsSort size={15} />} value={filters.sortBy || 'similarity'} onChange={(v) => onChange({ sortBy: v })}
         options={[{ value: 'similarity', label: 'Similarity' }, { value: 'time', label: 'Newest' }]} />
+      </div>
 
-      <button className="btn" type="button" onClick={onRefresh} disabled={loading || probesLoading} title="Reload channel and archive probe filters">
-        <IconRefresh size={15} /> Refresh filters
-      </button>
-      <button className="btn primary" type="button" onClick={() => onLoad()} disabled={loading}>
-        {loading ? <IconRefresh size={15} className="spin" /> : <IconDownload size={15} />}
-        Load archive
-      </button>
+      <div className="filter-bar-actions">
+        <ToolbarActionMenu actions={[{
+          id: 'reset',
+          label: 'Reset filters',
+          icon: <IconRefresh className={loading || probesLoading ? 'spin' : ''} size={15} />,
+          onSelect: onRefresh,
+          disabled: loading || probesLoading,
+        }]} />
+        <button className="btn primary" type="button" onClick={() => onLoad()} disabled={loading}>
+          {loading ? <IconRefresh size={15} className="spin" /> : <IconDownload size={15} />}
+          Load archive
+        </button>
+      </div>
       </div>
     </div>
   )

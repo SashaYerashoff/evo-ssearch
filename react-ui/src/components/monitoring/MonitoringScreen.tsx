@@ -24,6 +24,7 @@ import {
 } from '../../api/probes'
 import type { Channel } from '../../api/types'
 import { videoApi } from '../../api/video'
+import { ToolbarActionMenu } from '../shell/ToolbarActionMenu'
 import { ToolTabs } from '../shell/ToolTabs'
 import {
   ProbeCard,
@@ -276,8 +277,6 @@ export function MonitoringScreen({
   const inspectedBookmarkBlocked = canManage
     && probeMutationRequiresBookmarkPermission(inspected, canCreateBookmarks)
   const filtersActive = origins.size > 0 || states.size > 0 || !!query.trim()
-  const runningCount = probes.filter((probe) => statusOf(probe, runtime, semanticRuntime) === 'running').length
-
   const persistView = (next: 'grid' | 'list') => {
     setView(next)
     window.localStorage.setItem(VIEW_STORAGE_KEY, next)
@@ -421,13 +420,14 @@ export function MonitoringScreen({
           id: 'probes',
           icon: <IconRadar2 size={13} />,
           label: 'Probes',
-          summary: `${filtersActive ? `${filtered.length}/${probes.length}` : probes.length} probes · ${runningCount} running`,
         }]}
         active="probes"
         onSelect={() => {}}
         leading={navigation}
+        reserveLeading
       >
         <div className="probe-board-toolbar">
+          <div className="toolbar-scroll-rail probe-toolbar-scroll">
           <div className="mon-search" title="Search names, prompts, channels and parent alerts">
             <IconSearch size={15} />
             <input
@@ -461,45 +461,41 @@ export function MonitoringScreen({
               </button>
             ))}
           </div>
-          <div className="probe-view-toggle">
-            <button className={view === 'grid' ? 'on' : ''} onClick={() => persistView('grid')} title="Card view"><IconLayoutGrid size={15} /></button>
-            <button className={view === 'list' ? 'on' : ''} onClick={() => persistView('list')} title="List view"><IconList size={15} /></button>
           </div>
-          {filtersActive && (
-            <button className="mon-btn sm" onClick={() => { setOrigins(new Set()); setStates(new Set()); setQuery('') }}>
-              Reset
-            </button>
-          )}
-          <button className="mon-btn sm" onClick={refresh} disabled={loading}>
-            <IconRefresh className={loading ? 'spin' : ''} size={15} /> Refresh
-          </button>
-          {canManage && (
-            <>
-              <button className="mon-btn sm" onClick={() => { setGroupError(null); setGroupEditor(null) }}>
-                <IconSettings size={15} /> Groups
-              </button>
+          <div className="mon-toolbar-primary-actions">
+            <ToolbarActionMenu actions={[
+              {
+                id: 'refresh', label: 'Refresh probes',
+                icon: <IconRefresh className={loading ? 'spin' : ''} size={15} />,
+                onSelect: refresh, disabled: loading,
+              },
+              {
+                id: 'grid', label: 'Card view', icon: <IconLayoutGrid size={15} />,
+                onSelect: () => persistView('grid'), active: view === 'grid',
+              },
+              {
+                id: 'list', label: 'List view', icon: <IconList size={15} />,
+                onSelect: () => persistView('list'), active: view === 'list',
+              },
+              ...(filtersActive ? [{
+                id: 'reset', label: 'Reset filters', icon: <IconX size={15} />,
+                onSelect: () => { setOrigins(new Set()); setStates(new Set()); setQuery('') },
+              }] : []),
+              ...(canManage ? [{
+                id: 'groups', label: 'Manage probe groups', icon: <IconSettings size={15} />,
+                onSelect: () => { setGroupError(null); setGroupEditor(null) },
+              }] : []),
+            ]} />
+            {canManage && (
               <button className="mon-btn accent" onClick={() => setEditing({ probe: null })}>
                 <IconPlus size={16} /> New probe
               </button>
-            </>
-          )}
+            )}
+          </div>
         </div>
       </ToolTabs>
 
       <section className="mon-board probe-board">
-        <div className="probe-board-heading">
-          <div>
-            <div className="mon-panel-title">Probe board</div>
-            <div className="mon-panel-sub">
-              Group → channel → probe · operator, approved-agent and background-VLM lineage stay distinct.
-            </div>
-          </div>
-          <div className="probe-board-count">
-            {filtersActive ? `${filtered.length} of ${probes.length}` : `${probes.length}`} visible
-            {counts.temporary_active ? ` · ${counts.temporary_active} temporary` : ''}
-            {counts.temporary_expired_hidden ? ` · ${counts.temporary_expired_hidden} expired hidden` : ''}
-          </div>
-        </div>
         {error && <div className="chat-error"><IconRadar2 size={14} /> {error}</div>}
         {!loading && probes.length === 0 && !error && (
           <div className="empty-state">No probes yet. Create one or let a VLM alert raise a temporary follow-up.</div>
@@ -511,8 +507,6 @@ export function MonitoringScreen({
         <div className={`probe-groups ${view === 'list' ? 'list' : 'grid'}`}>
           {tree.map((group) => {
             const isCollapsed = collapsed.has(group.id)
-            const probeCount = group.channels.reduce((total, channel) => total + channel.probes.length, 0)
-            const groupRunning = group.channels.reduce((total, channel) => total + channel.runningCount, 0)
             const storedGroup = groups.find((candidate) => candidate.id === group.id)
             return (
               <section key={group.id} className={`probe-board-group ${group.synthetic ? 'synthetic' : ''} ${isCollapsed ? 'collapsed' : ''}`}>
@@ -525,7 +519,6 @@ export function MonitoringScreen({
                     <span className="probe-group-chevron">›</span>
                     <b>{group.name}</b>
                   </button>
-                  <span>{group.channels.length} ch · {probeCount} probes · {groupRunning} running</span>
                   {canManage && storedGroup && !storedGroup.read_only && (
                     <button className="pc-ico" title="Edit group" onClick={() => { setGroupError(null); setGroupEditor(storedGroup) }}>
                       <IconSettings size={14} />
@@ -541,7 +534,6 @@ export function MonitoringScreen({
                             <span>Channel {channel.channelId ?? '—'}</span>
                             <b>{channel.label}</b>
                           </div>
-                          <span>{channel.probes.length} probes · {channel.runningCount} running</span>
                         </div>
                         {view === 'grid' ? (
                           <div className="probe-grid">

@@ -1,5 +1,6 @@
-import { useState, useRef, useEffect } from 'react'
+import { useState, useRef, useEffect, type RefObject } from 'react'
 import { IconX, IconChevronLeft, IconChevronRight, IconTrash, IconCheck } from '@tabler/icons-react'
+import { FloatingPopover } from '../shell/FloatingPopover'
 
 const WD = ['Mo', 'Tu', 'We', 'Th', 'Fr', 'Sa', 'Su']
 const pad = (n: number) => String(n).padStart(2, '0')
@@ -37,7 +38,8 @@ function Calendar({ view, onView, selected, onPick }: { view: Date; onView: (d: 
   )
 }
 
-export function DateRangeModal({ sinceMs, untilMs, onApply, onClear, onClose }: {
+export function DateRangeModal({ anchorRef, sinceMs, untilMs, onApply, onClear, onClose }: {
+  anchorRef: RefObject<HTMLElement>
   sinceMs?: string
   untilMs?: string
   onApply: (since?: string, until?: string) => void
@@ -59,12 +61,12 @@ export function DateRangeModal({ sinceMs, untilMs, onApply, onClear, onClose }: 
   // close on outside click — but ignore the calendar toggle button
   useEffect(() => {
     const onDown = (e: MouseEvent) => {
-      const t = e.target as HTMLElement
-      if (ref.current && !ref.current.contains(t) && !t.closest('.qf-icon')) onClose()
+      const target = e.target as Node
+      if (!ref.current?.contains(target) && !anchorRef.current?.contains(target)) onClose()
     }
     document.addEventListener('mousedown', onDown)
     return () => document.removeEventListener('mousedown', onDown)
-  }, [onClose])
+  }, [anchorRef, onClose])
 
   const pickDate = (val: string, setVal: (s: string) => void) => (d: Date) => {
     const cur = val ? new Date(val) : new Date()
@@ -76,7 +78,7 @@ export function DateRangeModal({ sinceMs, untilMs, onApply, onClear, onClose }: 
   }
 
   return (
-    <div className="daterange-pop" ref={ref} onMouseDown={(e) => e.stopPropagation()}>
+    <FloatingPopover anchorRef={anchorRef} popoverRef={ref} className="daterange-pop floating-popover" offset={8}>
       <div className="dr-head">
         <span className="dr-title">Pick date range</span>
         <button className="modal-close" onClick={onClose}><IconX size={16} /></button>
@@ -98,6 +100,6 @@ export function DateRangeModal({ sinceMs, untilMs, onApply, onClear, onClose }: 
         <button className="mon-btn" onClick={() => { onClear(); onClose() }}><IconTrash size={15} /> Clear range</button>
         <button className="mon-btn accent" disabled={invalidRange} onClick={() => { apply(); onClose() }}><IconCheck size={15} /> Apply range</button>
       </div>
-    </div>
+    </FloatingPopover>
   )
 }

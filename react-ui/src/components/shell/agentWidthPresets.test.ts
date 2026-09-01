@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest'
 import {
   agentDragGeometry,
+  agentLayoutViewportWidth,
   archiveColumnsForAgentWidth,
   agentWidthPresets,
   closestAgentWidthPresetIndex,
@@ -24,6 +25,14 @@ describe('agent width presets', () => {
     const presets = agentWidthPresets(2048)
     expect(presets[0].profile).toBe('full-hd')
     expect(presets.map((preset) => preset.archiveColumns)).toEqual([4, 3])
+  })
+
+  it('uses the scaled layout viewport for Big 125% interface presets', () => {
+    const viewportWidth = agentLayoutViewportWidth(1920, 1.25)
+    expect(viewportWidth).toBe(1536)
+    const presets = agentWidthPresets(viewportWidth)
+    expect(presets.map((preset) => preset.archiveColumns)).toEqual([4, 3])
+    expect(presets.map((preset) => preset.width)).toEqual([488, 732])
   })
 
   it('snaps a dragged width to the nearest preset', () => {

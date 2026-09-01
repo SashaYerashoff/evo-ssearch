@@ -16,7 +16,6 @@ export function TopBar({
             <span className="brand-main">EVA AI</span>
             <span className="brand-ver">{appVersion ? `v${appVersion}` : 'version unavailable'}</span>
           </div>
-          <div className="brand-tagline">Smart Image Search and Understanding</div>
         </div>
         <div className="top-section">{section}</div>
       </div>

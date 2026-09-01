@@ -291,7 +291,7 @@ export function SettingsModal({
             {!loading && activeTab?.custom === 'env' && <EnvTab />}
             {!loading && activeTab?.custom === 'audit' && <AuditTab />}
             {!loading && activeTab?.custom === 'diagnostics' && <DiagnosticsTab />}
-            {!loading && activeTab?.custom === 'appearance' && <AppearanceModal embedded onClose={() => {}} />}
+            {!loading && activeTab?.custom === 'appearance' && <AppearanceModal embedded onClose={onClose} />}
             {!loading && activeTab?.custom === 'features' && (
               <div className="set-section set-feature-section">
                 <h3>
@@ -391,15 +391,17 @@ export function SettingsModal({
           </div>
         </div>
 
-        <div className="set-footer">
-          <div className={`set-status ${status ? (status.ok ? 'ok' : 'err') : ''}`}>{status?.msg || ''}</div>
-          {activeTab && !activeTab.custom && canManageSettings && !loading && !settingsLoadError && (
-            <div className="set-actions">
-              <button className="mon-btn" disabled={!sourceWritable} onClick={reset}><IconRotate size={15} /> Reset to defaults</button>
-              <button className="mon-btn accent" disabled={!sourceWritable || saving || dirtyKeys.size === 0} onClick={save}><IconDeviceFloppy size={15} /> {saving ? 'Saving…' : `Save settings${dirtyKeys.size ? ` (${dirtyKeys.size})` : ''}`}</button>
-            </div>
-          )}
-        </div>
+        {activeTab?.custom !== 'appearance' && (
+          <div className="set-footer">
+            <div className={`set-status ${status ? (status.ok ? 'ok' : 'err') : ''}`}>{status?.msg || ''}</div>
+            {activeTab && !activeTab.custom && canManageSettings && !loading && !settingsLoadError && (
+              <div className="set-actions">
+                <button className="mon-btn" disabled={!sourceWritable} onClick={reset}><IconRotate size={15} /> Reset to defaults</button>
+                <button className="mon-btn accent" disabled={!sourceWritable || saving || dirtyKeys.size === 0} onClick={save}><IconDeviceFloppy size={15} /> {saving ? 'Saving…' : `Save settings${dirtyKeys.size ? ` (${dirtyKeys.size})` : ''}`}</button>
+              </div>
+            )}
+          </div>
+        )}
       </div>
     </div>
   )

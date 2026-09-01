@@ -22,6 +22,7 @@ import { recentFrameUrl } from '../../api/video'
 import { Dropdown } from '../shell/Dropdown'
 import { ProbeSparkline } from './ProbeCard'
 import { SemanticPresenceCard } from './SemanticPresenceCard'
+import { InfoTooltip } from '../shell/InfoTooltip'
 
 const SEVERITIES = ['info', 'low', 'normal', 'high', 'critical']
 
@@ -566,7 +567,6 @@ export function ProbeSettingsModal({ probe, channels, busy, canControlCapture, c
                 <div><span>Last snapshot</span><b>{lastLabel}</b></div>
                 <div><span>Matching area</span><b>{roiLabel}</b></div>
               </div>
-              <div className="probe-tech-note"><strong>Prompt pairs</strong> Positive describes what to spot; negative describes a similar scene to suppress.</div>
             </div>
           )}
           </div>{/* /probe-col-scroll */}
@@ -586,7 +586,11 @@ export function ProbeSettingsModal({ probe, channels, busy, canControlCapture, c
               options={channels.map((c) => ({ value: String(c.id), label: c.title }))} />
           </div>
           <div className="probe-detect-card">
-          <div className="mon-heading">What to detect</div>
+          <div className="mon-heading with-info">What to detect
+            <InfoTooltip label="Prompt pairs">
+              Positive describes what to spot. Negative describes a similar-looking scene that should be suppressed.
+            </InfoTooltip>
+          </div>
           <div className="mon-pairs">
             <div className="probe-pair-head"><span>Positive scene</span><span>Negative look-alike</span><span /></div>
             {d.pairs.map((pr, i) => (
@@ -732,26 +736,31 @@ export function ProbeSettingsModal({ probe, channels, busy, canControlCapture, c
           {advOpen && (
             <div className="probe-panel">
               <div className="probe-sub">
-                <div className="probe-block-head">Detection tuning</div>
-                <div className="mon-help">
-                  Active {defaults.embedding_backend || 'embedding'} defaults: P {defaults.pos_floor} · M {defaults.margin}
-                  {defaults.embedding_model ? ` · ${defaults.embedding_model}` : ''}
+                <div className="probe-block-head with-info">Detection tuning
+                  <InfoTooltip label="Detection tuning">
+                    Active {defaults.embedding_backend || 'embedding'} defaults: P {defaults.pos_floor} · M {defaults.margin}
+                    {defaults.embedding_model ? ` · ${defaults.embedding_model}` : ''}.
+                  </InfoTooltip>
                 </div>
                 <div className="wgrid">
-                  <div className="wfield"><label>Positive floor</label>
+                  <div className="wfield"><span className="wfield-label with-info">Positive floor
+                    <InfoTooltip label="Positive floor">Minimum similarity required for a hit, from 0 to 1. Higher values make detection stricter.</InfoTooltip>
+                  </span>
                     <input type="number" step="0.01" value={d.pos_floor} onChange={(e) => set({ pos_floor: Number(e.target.value) })} />
-                    <div className="mon-help">Minimum similarity for a hit (0–1). Higher = stricter.</div>
                   </div>
-                  <div className="wfield"><label>Margin</label>
+                  <div className="wfield"><span className="wfield-label with-info">Margin
+                    <InfoTooltip label="Margin">How much the positive score must exceed the negative look-alike score.</InfoTooltip>
+                  </span>
                     <input type="number" step="0.01" min="0" value={d.margin} onChange={(e) => set({ margin: Number(e.target.value) })} />
-                    <div className="mon-help">How far positive must beat negative.</div>
                   </div>
                 </div>
               </div>
 
               {canCreateBookmarks && (
                 <div className="probe-sub">
-                  <div className="probe-block-head">Bookmarks</div>
+                <div className="probe-block-head with-info">Bookmarks
+                  <InfoTooltip label="Bookmarks">Create a Luxriot bookmark whenever this probe produces a confirmed hit.</InfoTooltip>
+                </div>
                   <label className="mon-check tile"><input type="checkbox" checked={d.bookmark} onChange={(e) => set({ bookmark: e.target.checked })} /> Make bookmarks in Luxriot on hits</label>
                   {d.bookmark && (
                     <>
@@ -772,8 +781,9 @@ export function ProbeSettingsModal({ probe, channels, busy, canControlCapture, c
               )}
 
               <div className="probe-sub">
-                <div className="probe-block-head">Image probe</div>
-                <div className="mon-help">Optional reference image — frames similar to it also count as hits.</div>
+                <div className="probe-block-head with-info">Image probe
+                  <InfoTooltip label="Image probe">Add an optional reference image. Frames visually similar to it will also count as hits.</InfoTooltip>
+                </div>
                 {!d.imgData ? (
                   <label className="mon-btn"><IconPhoto size={14} /> Choose image
                     <input type="file" accept="image/*" style={{ display: 'none' }}
@@ -785,7 +795,9 @@ export function ProbeSettingsModal({ probe, channels, busy, canControlCapture, c
                     <div className="probe-img-side">
                       <div className="probe-img-name" title={d.imgName}>{d.imgName || 'reference.jpg'}</div>
                       <label className="mon-check"><input type="checkbox" checked={d.imgEnabled} onChange={(e) => set({ imgEnabled: e.target.checked })} /> Enabled</label>
-                      <div className="wfield"><label>Min match</label>
+                      <div className="wfield"><span className="wfield-label with-info">Min match
+                        <InfoTooltip label="Minimum image match">Minimum similarity to the reference image required for a hit, from 0 to 1.</InfoTooltip>
+                      </span>
                         <input type="number" step="0.01" min="0" max="1" value={d.imgFloor} onChange={(e) => set({ imgFloor: Number(e.target.value) })} />
                       </div>
                       <div className="probe-img-actions">

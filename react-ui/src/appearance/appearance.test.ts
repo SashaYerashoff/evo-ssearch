@@ -18,6 +18,7 @@ describe('appearance preferences', () => {
       preset: 'day-shift',
       shape: 'soft',
       density: 'compact',
+      scale: 'large',
       motion: 'reduced',
       overrides: {
         canvas: '#abc',
@@ -30,6 +31,7 @@ describe('appearance preferences', () => {
       preset: 'day-shift',
       shape: 'soft',
       density: 'compact',
+      scale: 'large',
       motion: 'reduced',
       overrides: {
         canvas: '#aabbcc',

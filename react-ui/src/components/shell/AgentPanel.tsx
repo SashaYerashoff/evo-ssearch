@@ -6,6 +6,7 @@ import {
   IconMaximize, IconMinimize, IconPlayerStop,
 } from '@tabler/icons-react'
 import type { Channel, ArchiveFilters } from '../../api/types'
+import { useAppearance } from '../../appearance/AppearanceProvider'
 import { agentSubmissionText, streamAgent, agentApi, type AgentEvent, type AgentSession, type AgentSkill } from '../../api/agent'
 import {
   buildAgentConsoleContext,
@@ -23,6 +24,7 @@ import {
   AGENT_WIDTH_PRESET_STORAGE_KEY,
   MIN_AGENT_WIDTH,
   agentDragGeometry,
+  agentLayoutViewportWidth,
   archiveColumnsForAgentWidth,
   agentWidthPresets,
   closestAgentWidthPresetIndex,
@@ -133,6 +135,9 @@ export function AgentPanel({
   onLayoutPresetCommit?: (archiveColumns: number) => void
   canManageSkills: boolean
 }) {
+  const { activePreferences } = useAppearance()
+  const interfaceScale = activePreferences.scale === 'large' ? 1.25 : 1
+  const layoutViewportWidth = agentLayoutViewportWidth(window.innerWidth, interfaceScale)
   const [msgs, setMsgs] = useState<Msg[]>([])
   const [input, setInput] = useState('')
   const [imageB64, setImageB64] = useState<string | null>(null)
@@ -147,7 +152,7 @@ export function AgentPanel({
   const [openMenu, setOpenMenu] = useState<'history' | 'skills' | 'streams' | null>(null)
   const [operatorMode, setOperatorMode] = useState(true)
   const [widthPresetIndex, setWidthPresetIndex] = useState(() => {
-    const presets = agentWidthPresets(window.innerWidth)
+    const presets = agentWidthPresets(layoutViewportWidth)
     const storedValue = localStorage.getItem(AGENT_WIDTH_PRESET_STORAGE_KEY)
     const storedIndex = Number(storedValue)
     if (storedValue != null && Number.isInteger(storedIndex) && storedIndex >= 0 && storedIndex < presets.length) return storedIndex
@@ -157,7 +162,7 @@ export function AgentPanel({
       : 0
   })
   const [halfWidth, setHalfWidth] = useState(() => (
-    agentWidthPresets(window.innerWidth)[widthPresetIndex].width
+    agentWidthPresets(layoutViewportWidth)[widthPresetIndex].width
   ))
   const [resizing, setResizing] = useState(false)
 
@@ -173,18 +178,19 @@ export function AgentPanel({
   useEffect(() => { onBusyChange?.(busy) }, [busy, onBusyChange])
   useEffect(() => () => abortRef.current?.abort(), [])
   useEffect(() => {
-    const presets = agentWidthPresets(window.innerWidth)
+    const presets = agentWidthPresets(layoutViewportWidth)
     const normalizedIndex = validPresetIndex(widthPresetIndex, presets.length)
     const preset = presets[normalizedIndex]
     if (normalizedIndex !== widthPresetIndex) setWidthPresetIndex(normalizedIndex)
     onLayoutPresetChange?.(preset.archiveColumns)
     onLayoutPresetCommit?.(preset.archiveColumns)
-  }, [widthPresetIndex, onLayoutPresetChange, onLayoutPresetCommit])
+  }, [widthPresetIndex, layoutViewportWidth, onLayoutPresetChange, onLayoutPresetCommit])
 
   // Preserve the selected layout when moving between Full HD / 2K or changing OS scaling.
   useEffect(() => {
     const onResize = () => {
-      const presets = agentWidthPresets(window.innerWidth)
+      const viewportWidth = agentLayoutViewportWidth(window.innerWidth, interfaceScale)
+      const presets = agentWidthPresets(viewportWidth)
       const normalizedIndex = validPresetIndex(widthPresetIndex, presets.length)
       const preset = presets[normalizedIndex]
       if (normalizedIndex !== widthPresetIndex) {
@@ -195,9 +201,10 @@ export function AgentPanel({
       onLayoutPresetChange?.(preset.archiveColumns)
       onLayoutPresetCommit?.(preset.archiveColumns)
     }
+    onResize()
     window.addEventListener('resize', onResize)
     return () => window.removeEventListener('resize', onResize)
-  }, [widthPresetIndex, onLayoutPresetChange, onLayoutPresetCommit])
+  }, [interfaceScale, widthPresetIndex, onLayoutPresetChange, onLayoutPresetCommit])
 
   // close strip dropdowns on outside click
   useEffect(() => {
@@ -342,7 +349,7 @@ export function AgentPanel({
   }
 
   function applyWidthPreset(index: number) {
-    const presets = agentWidthPresets(window.innerWidth)
+    const presets = agentWidthPresets(layoutViewportWidth)
     const normalizedIndex = validPresetIndex(index, presets.length)
     const preset = presets[normalizedIndex]
     setWidthPresetIndex(normalizedIndex)
@@ -357,31 +364,31 @@ export function AgentPanel({
   function startResize(e: React.MouseEvent) {
     e.preventDefault()
     const startX = e.clientX
-    const startW = dockRef.current?.getBoundingClientRect().width ?? window.innerWidth * 0.5
+    const startW = halfWidth
     let latestWidth = startW
     setResizing(true)
     const onMove = (ev: MouseEvent) => {
       latestWidth = Math.min(
-        maxAgentPanelWidth(window.innerWidth),
-        Math.max(MIN_AGENT_WIDTH, startW + (startX - ev.clientX)),
+        maxAgentPanelWidth(layoutViewportWidth),
+        Math.max(MIN_AGENT_WIDTH, startW + (startX - ev.clientX) / interfaceScale),
       )
-      const presets = agentWidthPresets(window.innerWidth)
+      const presets = agentWidthPresets(layoutViewportWidth)
       const { layoutWidth } = agentDragGeometry(latestWidth, presets)
       setHalfWidth(latestWidth)
-      onLayoutPresetChange?.(archiveColumnsForAgentWidth(layoutWidth, window.innerWidth))
+      onLayoutPresetChange?.(archiveColumnsForAgentWidth(layoutWidth, layoutViewportWidth))
     }
     const onUp = () => {
       setResizing(false)
       document.removeEventListener('mousemove', onMove)
       document.removeEventListener('mouseup', onUp)
-      const presets = agentWidthPresets(window.innerWidth)
+      const presets = agentWidthPresets(layoutViewportWidth)
       applyWidthPreset(closestAgentWidthPresetIndex(latestWidth, presets))
     }
     document.addEventListener('mousemove', onMove)
     document.addEventListener('mouseup', onUp)
   }
   function cycleWidthPreset() {
-    const presets = agentWidthPresets(window.innerWidth)
+    const presets = agentWidthPresets(layoutViewportWidth)
     const normalizedIndex = validPresetIndex(widthPresetIndex, presets.length)
     applyWidthPreset(nextAgentWidthPresetIndex(normalizedIndex, presets.length))
   }
@@ -575,7 +582,7 @@ export function AgentPanel({
     </section>
   )
 
-  const widthPresets = agentWidthPresets(window.innerWidth)
+  const widthPresets = agentWidthPresets(layoutViewportWidth)
   const activeWidthPresetIndex = validPresetIndex(widthPresetIndex, widthPresets.length)
   const activeWidthPreset = widthPresets[activeWidthPresetIndex]
   const nextWidthPreset = widthPresets[nextAgentWidthPresetIndex(activeWidthPresetIndex, widthPresets.length)]

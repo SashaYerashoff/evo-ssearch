@@ -1,19 +1,57 @@
-import type { ReactNode } from 'react'
+import { useEffect, useRef, type ReactNode } from 'react'
 
 // Folder-style tool tabs: a fixed tab row on top, the active tab's controls
 // open in a panel right below. Tabs never move — the active one lights up.
-export interface ToolTab { id: string; icon: ReactNode; label: string; summary: string; badge?: string }
+export interface ToolTab { id: string; icon: ReactNode; label: string; badge?: string }
 
-export function ToolTabs({ tabs, active, onSelect, leading, children }: {
+const HORIZONTAL_RAIL_SELECTOR = '.toolbar-scroll-rail, .atp-tabrow, .atp-textgroup'
+const VERTICAL_POPOVER_SELECTOR = '.dd-pop, .qf-pop, .daterange-pop, .archive-channel-picker-pop, .toolbar-actions-pop'
+
+function wheelPixels(event: WheelEvent, rail: HTMLElement): number {
+  if (event.deltaMode === WheelEvent.DOM_DELTA_LINE) return event.deltaY * 24
+  if (event.deltaMode === WheelEvent.DOM_DELTA_PAGE) return event.deltaY * rail.clientWidth
+  return event.deltaY
+}
+
+export function ToolTabs({ tabs, active, onSelect, leading, reserveLeading = false, children }: {
   tabs: ToolTab[]
   active: string
   onSelect: (id: string) => void
   leading?: ReactNode
+  reserveLeading?: boolean
   children: ReactNode
 }) {
+  const hasLeadingColumn = Boolean(leading) || reserveLeading
+  const rootRef = useRef<HTMLDivElement>(null)
+
+  useEffect(() => {
+    const root = rootRef.current
+    if (!root) return
+
+    const onWheel = (event: WheelEvent) => {
+      const target = event.target as HTMLElement | null
+      if (!target || target.closest(VERTICAL_POPOVER_SELECTOR)) return
+
+      const rail = target.closest<HTMLElement>(HORIZONTAL_RAIL_SELECTOR)
+      if (!rail || rail.scrollWidth <= rail.clientWidth + 1) return
+      if (Math.abs(event.deltaX) >= Math.abs(event.deltaY) || event.deltaY === 0) return
+
+      const delta = wheelPixels(event, rail)
+      const maxLeft = Math.max(0, rail.scrollWidth - rail.clientWidth)
+      const nextLeft = Math.max(0, Math.min(maxLeft, rail.scrollLeft + delta))
+      if (Math.abs(nextLeft - rail.scrollLeft) < 0.5) return
+
+      rail.scrollLeft = nextLeft
+      event.preventDefault()
+      event.stopPropagation()
+    }
+
+    root.addEventListener('wheel', onWheel, { passive: false })
+    return () => root.removeEventListener('wheel', onWheel)
+  }, [])
+
   return (
-    <div className={`tool-tabs ${leading ? 'with-leading' : ''}`}>
-      {leading && <div className="tool-tabs-leading">{leading}</div>}
+    <div ref={rootRef} className={`tool-tabs ${hasLeadingColumn ? 'with-leading' : ''}`}>
       <div className="atp-tabpanel">
         <div className="atp-tabrow">
           {tabs.map((t) => (
@@ -21,19 +59,20 @@ export function ToolTabs({ tabs, active, onSelect, leading, children }: {
               key={t.id}
               className={`atp-tab ${active === t.id ? 'on' : ''}`}
               onClick={() => onSelect(t.id)}
-              title={`${t.label}${t.summary && t.summary !== '—' ? ` · ${t.summary}` : ''}`}
+              title={t.label}
               aria-pressed={active === t.id}
             >
               <b>
                 {t.icon} {t.label}
                 {t.badge && <em className="atp-tab-badge">{t.badge}</em>}
               </b>
-              <i className="atp-tab-sep" aria-hidden="true" />
-              <span className="atp-tab-summary">{t.summary}</span>
             </button>
           ))}
         </div>
-        <div className="atp-tabpanel-content">{children}</div>
+        <div className="atp-content-row">
+          {hasLeadingColumn && <div className="tool-tabs-leading">{leading}</div>}
+          <div className="atp-tabpanel-content">{children}</div>
+        </div>
       </div>
     </div>
   )
