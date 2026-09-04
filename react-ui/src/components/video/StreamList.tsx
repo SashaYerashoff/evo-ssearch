@@ -46,19 +46,21 @@ export function StreamList({ channels, runtime, activeChannelId, onOpen }: {
   return (
     <div className="stream-list-wrap">
       <div className="stream-search">
-        <IconSearch size={15} />
-        <input
-          value={query}
-          onChange={(event) => setQuery(event.target.value)}
-          placeholder="Search channels — name or number…"
-          aria-label="Search channels"
-        />
-        {query && (
-          <button type="button" className="stream-search-clear" onClick={() => setQuery('')}
-            title="Clear search" aria-label="Clear search">
-            <IconX size={15} />
-          </button>
-        )}
+        <div className="stream-search-field">
+          <IconSearch size={15} />
+          <input
+            value={query}
+            onChange={(event) => setQuery(event.target.value)}
+            placeholder="Search channels — name or number…"
+            aria-label="Search channels"
+          />
+          {query && (
+            <button type="button" className="stream-search-clear" onClick={() => setQuery('')}
+              title="Clear search" aria-label="Clear search">
+              <IconX size={15} />
+            </button>
+          )}
+        </div>
         <span className="stream-search-count">
           {needle ? `${matches.length}/${channels.length}` : `${channels.length}`}
         </span>

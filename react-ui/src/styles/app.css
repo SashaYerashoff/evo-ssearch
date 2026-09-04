@@ -2374,11 +2374,10 @@
 .stream-list-wrap { display: flex; flex-direction: column; gap: 16px; width: 100%; min-width: 0; }
 /* Search sits above the list and filters it as you type; the count reports how
    much of the fleet the query is showing. */
+/* Full-width block on the light road; the field inside it stays a field. */
 .stream-search {
-  display: flex; align-items: center; gap: 8px; min-width: 0;
-  /* a search box, not a page header — capped like the archive query field */
-  width: 460px; max-width: 100%; flex: 0 0 auto; align-self: flex-start;
-  padding: 0 12px; height: 44px; box-sizing: border-box;
+  display: flex; align-items: center; gap: 12px; width: 100%; min-width: 0;
+  padding: 7px 12px; box-sizing: border-box;
   position: relative; isolation: isolate;
   background: color-mix(in srgb, var(--surface) 78%, transparent);
   border: 1px solid color-mix(in srgb, var(--accent-line) 40%, var(--line-2));
@@ -2387,13 +2386,21 @@
     inset 0 1px 0 color-mix(in srgb, var(--text) 7%, transparent),
     0 8px 20px -14px rgba(0, 0, 0, .8);
 }
-.stream-search > svg { color: var(--text-mut); flex: 0 0 auto; }
-.stream-search input {
+.stream-search-field {
+  display: flex; align-items: center; gap: 8px;
+  width: 460px; max-width: 100%; flex: 0 0 auto; min-width: 0;
+  height: 34px; box-sizing: border-box; padding: 0 10px;
+  background: var(--void-tile);
+  border: 1px solid var(--line-2); border-radius: 10px;
+}
+.stream-search-field:focus-within { border-color: var(--accent-line); }
+.stream-search-field > svg { color: var(--text-mut); flex: 0 0 auto; }
+.stream-search-field input {
   flex: 1 1 auto; min-width: 0; height: 100%;
   background: transparent; border: 0; outline: none;
   color: var(--text); font: inherit; font-size: 13px;
 }
-.stream-search input::placeholder { color: var(--text-mut); }
+.stream-search-field input::placeholder { color: var(--text-mut); }
 .stream-search-clear {
   width: 24px; height: 24px; flex: 0 0 auto; padding: 0;
   display: grid; place-items: center; border: 0; border-radius: 7px;
