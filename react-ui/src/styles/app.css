@@ -669,8 +669,8 @@
   flex-direction: row; align-items: center; gap: 0;
 }
 .archive-filters .archive-toolbar-text .atp-text { width: 100%; }
-/* Row 2 reads left→right: the query, its score range, then — pushed to the far
-   end of the rail — how many results it returned and the refinement over them. */
+/* Row 2 reads left→right: the query, its score range and the refinement over
+   its results — then, pushed to the far end of the rail, the counts. */
 .archive-filters-row > .archive-results-summary {
   flex: 0 0 auto; justify-content: flex-end; margin: 0 0 0 auto;
   padding: 0; white-space: nowrap;

@@ -529,6 +529,7 @@ export function ArchiveScreen({
           </span>
         </div>
         {scoreRangeNote}
+        {minMatchControl}
         <div className="archive-results-summary" role="status" aria-live="polite">
           <div className="archive-results-count">
             <strong>{archiveMatchCount.toLocaleString()}</strong>
@@ -548,7 +549,6 @@ export function ArchiveScreen({
             </div>
           )}
         </div>
-        {minMatchControl}
         </div>
       </div>
     </div>
