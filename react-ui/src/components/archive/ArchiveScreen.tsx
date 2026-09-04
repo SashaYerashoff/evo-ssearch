@@ -75,6 +75,16 @@ function agentHoursFromArgs(args: any): string | null {
 
 const DEFAULT_FILTERS: ArchiveFilters = { source: '', hours: '24', sortBy: 'similarity', rows: '24' }
 
+/** Does this scope actually cut the archive down? Sort order and page size do
+ *  not — they change how the same set is presented. */
+function archiveScopeNarrowed(f: ArchiveFilters | null): boolean {
+  if (!f) return false
+  return !!(
+    f.channelIds?.length || f.channelId || f.source || f.probeId || f.sinceMs || f.untilMs
+    || (f.hours ?? DEFAULT_FILTERS.hours) !== DEFAULT_FILTERS.hours
+  )
+}
+
 export function ArchiveScreen({
   navigation, channels, drive, similarDrive, noAnim, canReportFeedback, canReportIncidents, canExport, onFilters, onRefreshChannels,
   onSimilarDriveHandled,
@@ -214,6 +224,30 @@ export function ArchiveScreen({
     setResultMode('list')
     void runLoad(0)
   }, [runLoad])
+
+  // Reset in two beats: put the defaults into state, then load on the commit
+  // that carries them — runLoad closes over `filters`, so loading here would
+  // re-run the scope we just dropped.
+  const [resetTick, setResetTick] = useState(0)
+  const clearAllFilters = useCallback(() => {
+    setTextValue('')
+    setAppliedTextQuery(null)
+    setSearchCoverage(null)
+    setScoreSliderPercent(0)
+    setResultMode('list')
+    setNextOffset(0)
+    requestSeq.current++
+    loadingRef.current = false
+    setFilters(DEFAULT_FILTERS)
+    setResetTick((tick) => tick + 1)
+  }, [])
+  useEffect(() => {
+    if (!resetTick) return
+    void runLoad(0)
+    // runLoad is deliberately not a dependency: this must fire once per reset,
+    // on the commit that already holds the default filters.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [resetTick])
 
   const runImageSearch = useCallback(async (blob: Blob, label: string) => {
     loadingRef.current = true
@@ -400,9 +434,11 @@ export function ArchiveScreen({
   const filtersDirty = !!appliedFilters && JSON.stringify(appliedFilters) !== JSON.stringify(filters)
   const archiveMatchCount = resultMode === 'list' ? total : items.length
   const normalizedTextValue = textValue.trim()
-  // The board is narrowed by any search, not only a typed one: an image search
-  // and "find similar" narrow it just as hard and used to say nothing at all.
-  const resultsFiltered = resultMode === 'search'
+  // The board is narrowed by any search, not only a typed one — an image search
+  // and "find similar" narrow it just as hard — and by the scope filters, which
+  // are the usual reason an operator is looking at an empty board.
+  const scopeNarrowed = archiveScopeNarrowed(appliedFilters ?? filters)
+  const resultsFiltered = resultMode === 'search' || scopeNarrowed
   const textFilterApplied = resultMode === 'search'
     && appliedTextQuery !== null
     && normalizedTextValue === appliedTextQuery
@@ -548,9 +584,9 @@ export function ArchiveScreen({
               <button
                 type="button"
                 className="archive-filtered-clear"
-                title="Clear the search and reload the archive list"
-                aria-label="Clear the search and reload the archive list"
-                onClick={clearAppliedTextSearch}
+                title="Clear the search and filters, and reload the archive list"
+                aria-label="Clear the search and filters, and reload the archive list"
+                onClick={clearAllFilters}
               >
                 <IconX size={12} />
               </button>
