@@ -493,7 +493,8 @@
 /* Layer 1 — the aura: broad, soft colour drifting along the block. */
 .topbar::before,
 .archive-controls::before,
-.archive-filters::before {
+.archive-filters::before,
+.vid-unified-strip::before {
   content: "";
   position: absolute; inset: 0; z-index: -1;
   pointer-events: none;
@@ -519,7 +520,8 @@
 /* Layer 2 — the braid: the thin bright thread that reads as the "road" itself. */
 .topbar::after,
 .archive-controls::after,
-.archive-filters::after {
+.archive-filters::after,
+.vid-unified-strip::after {
   content: "";
   position: absolute; inset: 0; z-index: -1;
   pointer-events: none;
@@ -551,6 +553,10 @@
 .archive-controls::after  { animation-delay: -6s; }
 .archive-filters::before  { animation-delay: -14.6s; }
 .archive-filters::after   { animation-delay: -12s; }
+.vid-camera-strip::before   { animation-delay: -4s; }
+.vid-camera-strip::after    { animation-delay: -9s; }
+.vid-controls-strip::before { animation-delay: -18s; }
+.vid-controls-strip::after  { animation-delay: -3s; }
 
 /* Three top paddings stack above the CONTROLS block: .archive-screen (14px),
    .atp-tabpanel-content (12px) and the block's own (7px). Drop the outer two so
@@ -563,14 +569,18 @@
    panel-level band would only tint the gutter (the panel's own padding) around
    them. Keep that gutter transparent; other sections still use the panel band. */
 .archive-screen .atp-tabpanel-content::before,
-.archive-screen .atp-tabpanel-content::after { content: none; }
+.archive-screen .atp-tabpanel-content::after,
+.vid-cols .atp-tabpanel-content::before,
+.vid-cols .atp-tabpanel-content::after { content: none; }
 
 .no-anim .topbar::before,
 .no-anim .topbar::after,
 .no-anim .archive-controls::before,
 .no-anim .archive-filters::before,
 .no-anim .archive-controls::after,
-.no-anim .archive-filters::after { animation: none; }
+.no-anim .archive-filters::after,
+.no-anim .vid-unified-strip::before,
+.no-anim .vid-unified-strip::after { animation: none; }
 /* The block's own controls take the rest of the line beside its name. */
 .archive-controls > .filter-block { flex: 1 1 auto; flex-direction: row; align-items: center; gap: 12px; }
 .archive-filters-row { flex: 1 1 auto; }
@@ -2299,12 +2309,19 @@
   width: 100%; min-width: 0;
   display: flex; flex-direction: column; gap: 8px;
 }
+/* Same console language as Archive: each strip is its own labelled block on the
+   travelling light road, instead of rows divided by a hairline. */
 .vid-unified-strip {
-  width: 100%; min-width: 0; min-height: 44px; box-sizing: border-box;
-  display: flex; align-items: center; gap: 12px; padding-block: 6px;
-}
-.vid-unified-strip + .vid-unified-strip {
-  border-top: 1px solid color-mix(in srgb, var(--line) 58%, transparent);
+  width: 100%; min-width: 0; box-sizing: border-box;
+  display: flex; align-items: center; gap: 12px;
+  position: relative; isolation: isolate;
+  padding: 7px 12px;
+  background: color-mix(in srgb, var(--surface) 78%, transparent);
+  border: 1px solid color-mix(in srgb, var(--accent-line) 40%, var(--line-2));
+  border-radius: var(--radius);
+  box-shadow:
+    inset 0 1px 0 color-mix(in srgb, var(--text) 7%, transparent),
+    0 8px 20px -14px rgba(0, 0, 0, .8);
 }
 .vid-unified-label {
   width: 82px; flex: 0 0 82px;

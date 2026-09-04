@@ -146,7 +146,6 @@ export function StreamControl(p: {
       onSelect={(id) => p.onTab(id as VideoWorkspaceTab)}
       leading={p.navigation}
       reserveLeading
-      tabsPosition="bottom"
     >
       <div className="vid-unified-toolbar" role="group" aria-label="Video workspace controls">
         <section className="vid-unified-strip vid-camera-strip">
