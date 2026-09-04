@@ -1,5 +1,7 @@
 import {
   IconAlertTriangle,
+  IconArrowBackUp,
+  IconCheck,
   IconChevronsDown,
   IconChevronsUp,
   IconDroplet,
@@ -7,6 +9,7 @@ import {
   IconFileDescription,
   IconPlayerPlay,
   IconPlayerStop,
+  IconRefresh,
   IconReload,
   IconSettings,
   IconVideo,
@@ -14,11 +17,32 @@ import {
 import type { Channel } from '../../api/types'
 import type { ReactNode } from 'react'
 import { Dropdown } from '../shell/Dropdown'
-import { ToolbarActionMenu } from '../shell/ToolbarActionMenu'
 import { ToolTabs } from '../shell/ToolTabs'
 import type { SummaryPeriod, SummaryResolution } from './summaryView'
 import type { IncidentPeriod } from '../incidents/IncidentReview'
 import { useI18n, type TranslationKey } from '../../i18n/I18nProvider'
+
+/** Toolbar action rendered as an icon only — the label lives in the tooltip. */
+function IcoBtn({ title, onClick, disabled, danger, children }: {
+  title: string
+  onClick: () => void
+  disabled?: boolean
+  danger?: boolean
+  children: ReactNode
+}) {
+  return (
+    <button
+      type="button"
+      className={`vid-icobtn${danger ? ' danger' : ''}`}
+      title={title}
+      aria-label={title}
+      onClick={onClick}
+      disabled={disabled}
+    >
+      {children}
+    </button>
+  )
+}
 
 export const PERIODS: Array<{ v: SummaryPeriod; label: string }> = [
   { v: 'live', label: 'Live' },
@@ -182,20 +206,23 @@ export function StreamControl(p: {
                   </div>
                 </div>
                 <div className="vid-tb-actions">
-                  <ToolbarActionMenu actions={[
-                    { id: 'reload-channels', label: t('video.reloadChannels'), icon: <IconReload size={15} />, onSelect: p.onReload },
-                    { id: 'refresh', label: t('video.refresh'), icon: <IconReload size={15} />, onSelect: p.onRefreshFeed },
-                    {
-                      id: 'collapse', label: p.allSummariesCollapsed ? t('video.expandAll') : t('video.collapseAll'),
-                      icon: p.allSummariesCollapsed ? <IconChevronsDown size={15} /> : <IconChevronsUp size={15} />,
-                      onSelect: p.onToggleAllSummaries, disabled: !p.summaryCount,
-                    },
-                    { id: 'preview', label: t('video.openPreview'), icon: <IconEye size={15} />, onSelect: p.onOpenPreview, disabled: p.channelId == null },
-                    ...(p.period === 'custom' ? [{
-                      id: 'apply-range', label: t('video.applyChanges'), icon: <IconReload size={15} />,
-                      onSelect: p.onApplyCustom, disabled: !p.customFrom || !p.customTo,
-                    }] : []),
-                  ]} />
+                  <IcoBtn title={t('video.reloadChannels')} onClick={p.onReload}><IconReload size={16} /></IcoBtn>
+                  <IcoBtn title={t('video.refresh')} onClick={p.onRefreshFeed}><IconRefresh size={16} /></IcoBtn>
+                  <IcoBtn
+                    title={p.allSummariesCollapsed ? t('video.expandAll') : t('video.collapseAll')}
+                    onClick={p.onToggleAllSummaries}
+                    disabled={!p.summaryCount}
+                  >
+                    {p.allSummariesCollapsed ? <IconChevronsDown size={16} /> : <IconChevronsUp size={16} />}
+                  </IcoBtn>
+                  <IcoBtn title={t('video.openPreview')} onClick={p.onOpenPreview} disabled={p.channelId == null}>
+                    <IconEye size={16} />
+                  </IcoBtn>
+                  {p.period === 'custom' && (
+                    <IcoBtn title={t('video.applyChanges')} onClick={p.onApplyCustom} disabled={!p.customFrom || !p.customTo}>
+                      <IconCheck size={16} />
+                    </IcoBtn>
+                  )}
                   <button className="mon-btn accent vid-toggle" onClick={p.onToggleLive}><IconPlayerPlay size={14} /> {p.live ? t('video.liveOn') : t('video.liveOff')}</button>
                 </div>
               </div>
@@ -223,9 +250,15 @@ export function StreamControl(p: {
                   { value: 'all', label: t('incident.allTime') },
                 ]} />
               </div>
-              <button className="mon-btn" onClick={p.onRefreshIncidents} disabled={p.incidentLoading || p.channelId == null}>
-                <IconReload size={14} /> {p.incidentLoading ? t('status.checking') : t('video.refresh')}
-              </button>
+              <div className="vid-tb-actions">
+                <IcoBtn
+                  title={p.incidentLoading ? t('status.checking') : t('video.refresh')}
+                  onClick={p.onRefreshIncidents}
+                  disabled={p.incidentLoading || p.channelId == null}
+                >
+                  <IconRefresh size={16} />
+                </IcoBtn>
+              </div>
             </div>
           </section>
         )}
@@ -235,13 +268,19 @@ export function StreamControl(p: {
             <div className="vid-settings-toolbar">
               <section className="vid-control-group actions">
                 <div className="vid-tb-actions">
-                  <ToolbarActionMenu actions={[
-                    { id: 'reload-channels', label: t('video.reloadChannels'), icon: <IconReload size={15} />, onSelect: p.onReload },
-                    ...(p.canCapture && p.capturing ? [{ id: 'stop', label: t('video.stop'), icon: <IconPlayerStop size={15} />, onSelect: p.onStop, disabled: p.busy, danger: true }] : []),
-                    ...(p.canCapture ? [{ id: 'flush', label: t('video.flush'), icon: <IconDroplet size={15} />, onSelect: p.onFlush, disabled: p.busy || !p.capturing }] : []),
-                    ...(p.canManagePrompts ? [{ id: 'prompts', label: t('video.prompts'), icon: <IconSettings size={15} />, onSelect: p.onPromptSettings }] : []),
-                    ...(p.settingsDirty ? [{ id: 'discard', label: t('video.discard'), icon: <IconReload size={15} />, onSelect: p.onDiscardSettings, disabled: p.busy }] : []),
-                  ]} />
+                  <IcoBtn title={t('video.reloadChannels')} onClick={p.onReload}><IconReload size={16} /></IcoBtn>
+                  {p.canCapture && p.capturing && (
+                    <IcoBtn title={t('video.stop')} onClick={p.onStop} disabled={p.busy} danger><IconPlayerStop size={16} /></IcoBtn>
+                  )}
+                  {p.canCapture && (
+                    <IcoBtn title={t('video.flush')} onClick={p.onFlush} disabled={p.busy || !p.capturing}><IconDroplet size={16} /></IcoBtn>
+                  )}
+                  {p.canManagePrompts && (
+                    <IcoBtn title={t('video.prompts')} onClick={p.onPromptSettings}><IconSettings size={16} /></IcoBtn>
+                  )}
+                  {p.settingsDirty && (
+                    <IcoBtn title={t('video.discard')} onClick={p.onDiscardSettings} disabled={p.busy}><IconArrowBackUp size={16} /></IcoBtn>
+                  )}
                   {p.canCapture && (p.capturing
                     ? <button className="mon-btn accent vid-toggle" disabled={p.busy || !p.settingsDirty || !p.samplingReady} onClick={p.onStart} title="Restart this stream with the edited sampling and inference settings"><IconPlayerPlay size={15} /> {t('video.applyChanges')}</button>
                     : <button className="mon-btn accent vid-toggle" disabled={p.busy || !p.samplingReady} onClick={p.onStart}><IconPlayerPlay size={15} /> {t('video.start')}</button>)}

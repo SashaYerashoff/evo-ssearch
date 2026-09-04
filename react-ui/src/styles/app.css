@@ -2351,9 +2351,13 @@
 .vid-unified-strip .vid-settings-scroll,
 .vid-unified-strip .vid-review-scroll { flex: 0 1 auto; }
 .vid-unified-strip .vid-incident-toolbar { align-items: center; }
-.vid-unified-strip .vid-tb-row,
-.vid-unified-strip .vid-settings-toolbar {
+.vid-unified-strip .vid-tb-row {
   width: auto; flex: 0 1 auto; justify-content: flex-start;
+}
+/* The settings toolbar must span the strip, otherwise there is nothing for the
+   action group's auto-margin to push against. */
+.vid-unified-strip .vid-settings-toolbar {
+  width: auto; flex: 1 1 auto; justify-content: flex-start;
 }
 .vid-unified-strip .vid-incident-toolbar {
   flex-wrap: nowrap; justify-content: flex-start;
@@ -2370,6 +2374,35 @@
 .vid-unified-toolbar .vid-tb-actions > .mon-btn.accent {
   height: 36px; min-height: 36px;
 }
+/* Actions are unpacked from the dropdown into icon-only buttons, pinned to the
+   right edge of the strip. The label lives in the tooltip, so the row stays
+   short regardless of how many actions a tab exposes. */
+.vid-unified-strip .vid-tb-actions {
+  margin-left: auto; padding-left: 12px;
+  display: flex; align-items: center; gap: 6px; flex: 0 0 auto;
+}
+/* On Stream settings the actions sit one level deeper, so the group itself has
+   to be the thing pushed to the edge. */
+.vid-unified-strip .vid-control-group.actions { margin-left: auto; flex: 0 0 auto; }
+.vid-icobtn {
+  width: 36px; height: 36px; min-width: 36px; box-sizing: border-box; flex: 0 0 auto;
+  display: grid; place-items: center; padding: 0;
+  border: 1px solid var(--line-2); border-radius: 9px;
+  background: var(--void-tile); color: var(--text-2); cursor: pointer;
+  transition: color .14s ease, border-color .14s ease, background .14s ease;
+}
+.vid-icobtn:hover:not(:disabled) {
+  color: var(--accent);
+  border-color: color-mix(in srgb, var(--accent-line) 72%, var(--line-2));
+  background: color-mix(in srgb, var(--accent) 10%, var(--void-tile));
+}
+.vid-icobtn.danger:hover:not(:disabled) {
+  color: var(--danger);
+  border-color: color-mix(in srgb, var(--danger) 55%, var(--line-2));
+  background: color-mix(in srgb, var(--danger) 10%, var(--void-tile));
+}
+.vid-icobtn:disabled { opacity: .42; cursor: not-allowed; }
+
 /* Labelled controls: the caption sits above the field, so the rows align on the
    controls' bottom edge instead of centring label+field as one block. */
 .vid-unified-strip .vid-tb-row,
