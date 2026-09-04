@@ -329,15 +329,18 @@
   position: relative; z-index: 3; isolation: isolate; overflow: hidden;
   width: var(--menu-rail-width); height: var(--atp-panel-content-height); padding: 6px 2px;
   display: grid; place-items: center;
-  border: 0; border-radius: 0 11px 11px 0;
+  /* Same surface and contour as the console blocks — the old translucent
+     gradient washed out against the backdrop. Applies in every section. */
+  border: 1px solid color-mix(in srgb, var(--accent-line) 40%, var(--line-2));
+  border-left: 0; border-radius: 0 11px 11px 0;
   background:
-    radial-gradient(ellipse 140% 68% at -18% 50%, color-mix(in srgb, var(--accent) 12%, transparent), transparent 72%),
-    linear-gradient(90deg,
-      color-mix(in srgb, var(--surface-raised) 58%, transparent),
-      color-mix(in srgb, var(--surface-raised) 24%, transparent) 74%,
-      transparent);
+    radial-gradient(ellipse 140% 68% at -18% 50%,
+      color-mix(in srgb, var(--accent) 20%, transparent), transparent 72%),
+    color-mix(in srgb, var(--surface) 88%, transparent);
   backdrop-filter: blur(18px) saturate(1.15); -webkit-backdrop-filter: blur(18px) saturate(1.15);
-  box-shadow: inset -1px 0 0 color-mix(in srgb, var(--accent) 34%, transparent), 8px 0 20px -18px var(--accent);
+  box-shadow:
+    inset -1px 0 0 color-mix(in srgb, var(--accent) 46%, transparent),
+    8px 0 22px -16px var(--accent);
   pointer-events: auto;
 }
 .menu-rail-trigger::after {
@@ -983,17 +986,6 @@
      trigger is exactly as tall as the two blocks it sits beside. NOTE: this is
      coupled to those block heights — revisit if their padding or control heights change. */
   height: calc(50px + 8px + 52px);
-  /* Same surface and contour as those blocks — the old translucent gradient
-     disappeared against the new backdrop. */
-  background:
-    radial-gradient(ellipse 140% 68% at -18% 50%,
-      color-mix(in srgb, var(--accent) 20%, transparent), transparent 72%),
-    color-mix(in srgb, var(--surface) 88%, transparent);
-  border: 1px solid color-mix(in srgb, var(--accent-line) 40%, var(--line-2));
-  border-left: 0;
-  box-shadow:
-    inset -1px 0 0 color-mix(in srgb, var(--accent) 46%, transparent),
-    8px 0 22px -16px var(--accent);
 }
 .body-row:has(.probe-board-screen > .tool-tabs.without-tabs) .menu-shell > .menu-rail-trigger {
   top: var(--workspace-tabs-top-padding);
