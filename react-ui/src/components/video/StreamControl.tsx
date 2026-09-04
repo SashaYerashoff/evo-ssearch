@@ -167,11 +167,13 @@ export function StreamControl(p: {
               <div className="vid-tb-row vid-lens-row">
                 <div className="toolbar-scroll-rail vid-review-scroll">
                   <div className="wfield hist">
+                    <span className="wfield-label">{t('video.period')}</span>
                     <Dropdown variant="chip" title={t('video.period')} value={p.period}
                       onChange={(value) => p.onPeriod(value as SummaryPeriod)}
                       options={periods.map((item) => ({ value: item.v, label: item.label }))} />
                   </div>
                   <div className="wfield resolution">
+                    <span className="wfield-label">{t('video.resolution')}</span>
                     <Dropdown variant="chip" title={t('video.resolution')} value={p.resolution}
                       onChange={(value) => p.onResolution(value as SummaryResolution)}
                       options={resolutions.map((item) => ({ value: item.v, label: item.label }))} />
@@ -208,7 +210,9 @@ export function StreamControl(p: {
         {p.activeTab === 'incidents' && p.showIncidents && (
           <section className="vid-unified-strip vid-controls-strip">
             <div className="vid-incident-toolbar incident-review-filters">
-              <Dropdown variant="chip" title={t('video.period')} value={p.incidentPeriod}
+              <div className="wfield vid-incident-period">
+                <span className="wfield-label">{t('video.period')}</span>
+                <Dropdown variant="chip" title={t('video.period')} value={p.incidentPeriod}
                 onChange={(value) => p.onIncidentPeriod(value as IncidentPeriod)}
                 options={[
                   { value: '24h', label: t('incident.last24h') },
@@ -216,6 +220,7 @@ export function StreamControl(p: {
                   { value: '30d', label: t('period.last30d') },
                   { value: 'all', label: t('incident.allTime') },
                 ]} />
+              </div>
               <button className="mon-btn" onClick={p.onRefreshIncidents} disabled={p.incidentLoading || p.channelId == null}>
                 <IconReload size={14} /> {p.incidentLoading ? t('status.checking') : t('video.refresh')}
               </button>
@@ -232,6 +237,7 @@ export function StreamControl(p: {
                 </span>
                 <section className="vid-control-group inference">
                   <div className="wfield">
+                    <span className="wfield-label">Model</span>
                     <Dropdown variant="chip" title="VLM routing" value={p.routingSelector} onChange={p.onRoutingSelector} options={p.routingOptions} />
                   </div>
                 </section>

@@ -2359,8 +2359,7 @@
 .vid-unified-strip .vid-incident-toolbar {
   flex-wrap: nowrap; justify-content: flex-start;
 }
-.vid-unified-strip .vid-incident-toolbar > .dd:first-child { width: 220px; flex: 0 1 220px; }
-.vid-unified-strip .vid-incident-toolbar > .dd:nth-child(2) { width: 160px; flex: 0 0 160px; }
+.vid-unified-strip .vid-incident-toolbar > .vid-incident-period { width: 220px; flex: 0 0 220px; }
 .vid-unified-toolbar .dd-btn,
 .vid-unified-toolbar .vid-tb-row .dd-btn,
 .vid-unified-toolbar .vid-control-group .dd-btn,
@@ -2379,6 +2378,37 @@
   border: 1px solid var(--line-2); border-radius: 999px;
   color: var(--text-2); background: var(--void-tile); font-size: 11px; white-space: nowrap;
 }
+/* Labelled controls: the caption sits above the field, so the rows align on the
+   controls' bottom edge instead of centring label+field as one block. */
+.vid-unified-strip .vid-tb-row,
+.vid-unified-strip .vid-review-scroll,
+.vid-unified-strip .vid-settings-toolbar,
+.vid-unified-strip .vid-settings-scroll,
+.vid-unified-strip .vid-incident-toolbar { align-items: flex-end; }
+.vid-unified-toolbar .wfield { gap: 3px; }
+.vid-unified-toolbar .wfield-label {
+  font-size: 11px; line-height: 1.2; color: var(--text-2); white-space: nowrap;
+}
+
+/* Fixed slots: picking a longer value must not resize the control or reflow the
+   rail — the label truncates, the control keeps its width. */
+.vid-unified-strip .wfield.hist { width: 168px; flex: 0 0 168px; }
+.vid-unified-strip .wfield.resolution { width: 140px; flex: 0 0 140px; }
+/* inference group is a COLUMN — flex-basis here would set height, not width */
+.vid-unified-strip .vid-control-group.inference .wfield { width: 190px; flex: 0 0 auto; }
+.vid-unified-toolbar .wfield .dd,
+.vid-unified-toolbar .wfield .dd-btn { width: 100%; min-width: 0; }
+.vid-unified-toolbar .dd-val {
+  min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+
+/* Secondary actions share one width, so Actions / Refresh line up with the
+   144px primary button beside them. */
+.vid-unified-toolbar .toolbar-actions-trigger,
+.vid-unified-strip .vid-incident-toolbar > .mon-btn {
+  width: 128px; min-width: 128px; justify-content: center;
+}
+
 .vid-unified-strip .vid-control-group.inference { gap: 0; }
 .vid-unified-strip .vid-lens-custom { padding-top: 6px; }
 
