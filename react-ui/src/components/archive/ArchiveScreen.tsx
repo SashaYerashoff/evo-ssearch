@@ -492,25 +492,6 @@ export function ArchiveScreen({
       <div className="archive-filters" role="group" aria-label="Archive query">
         <span className="atp-glabel is-icon-only" title="Filters" aria-label="Filters"><IconFilter size={14} /></span>
         <div className="archive-filters-row">
-        <div className="archive-results-summary" role="status" aria-live="polite">
-          <div className="archive-results-count">
-            <strong>{archiveMatchCount.toLocaleString()}</strong>
-            <span>{archiveMatchCount === 1 ? 'archive match' : 'archive matches'}</span>
-          </div>
-          <span className="archive-results-separator" aria-hidden="true">·</span>
-          <div className="archive-results-count">
-            <strong>{items.length.toLocaleString()}</strong>
-            <span>loaded</span>
-          </div>
-          {textResultsFiltered && <span className="archive-filtered-flag">Filtered</span>}
-          {(textSearchPending || showArchiveNote) && (
-            <div className="archive-results-context">
-              {textSearchPending
-                ? '· Searching archive…'
-                : (showArchiveNote ? `· ${note}` : '')}
-            </div>
-          )}
-        </div>
         <div className="atp-group atp-textgroup archive-toolbar-text" aria-busy={textSearchPending}>
           <form className="atp-text" onSubmit={(e) => {
             e.preventDefault()
@@ -548,6 +529,25 @@ export function ArchiveScreen({
           </span>
         </div>
         {scoreRangeNote}
+        <div className="archive-results-summary" role="status" aria-live="polite">
+          <div className="archive-results-count">
+            <strong>{archiveMatchCount.toLocaleString()}</strong>
+            <span>{archiveMatchCount === 1 ? 'archive match' : 'archive matches'}</span>
+          </div>
+          <span className="archive-results-separator" aria-hidden="true">·</span>
+          <div className="archive-results-count">
+            <strong>{items.length.toLocaleString()}</strong>
+            <span>loaded</span>
+          </div>
+          {textResultsFiltered && <span className="archive-filtered-flag">Filtered</span>}
+          {(textSearchPending || showArchiveNote) && (
+            <div className="archive-results-context">
+              {textSearchPending
+                ? '· Searching archive…'
+                : (showArchiveNote ? `· ${note}` : '')}
+            </div>
+          )}
+        </div>
         {minMatchControl}
         </div>
       </div>

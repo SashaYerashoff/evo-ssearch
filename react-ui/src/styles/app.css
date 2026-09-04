@@ -669,12 +669,11 @@
   flex-direction: row; align-items: center; gap: 0;
 }
 .archive-filters .archive-toolbar-text .atp-text { width: 100%; }
-/* Row 2 reads right→left from the search: the counts are pushed right so they
-   sit against the field that produced them, then the query, its score range and
-   the refinement over it. */
+/* Row 2 reads left→right: the query, its score range, then — pushed to the far
+   end of the rail — how many results it returned and the refinement over them. */
 .archive-filters-row > .archive-results-summary {
-  flex: 1 1 auto; justify-content: flex-end;
-  margin: 0; padding: 0; white-space: nowrap;
+  flex: 0 0 auto; justify-content: flex-end; margin: 0 0 0 auto;
+  padding: 0; white-space: nowrap;
 }
 .archive-filters-row > .atp-min { flex: 0 0 auto; width: 216px; min-width: 180px; }
 /* idle = no scored query yet: visible (the rail keeps its shape) but muted */
