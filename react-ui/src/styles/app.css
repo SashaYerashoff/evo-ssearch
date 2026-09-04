@@ -316,11 +316,19 @@
   /* One menu-trigger size for every section, so the button never changes
      shape as the operator moves between Archive, Summaries and Probes. */
   --menu-rail-height: 110px;
+  /* 20% off the old 232px drawer — the labels still fit on one line. */
+  --menu-drawer-width: 186px;
   --workspace-tabs-top-padding: 14px;
   --atp-tabrow-height: 30px;
   --atp-panel-content-height: 80px;
   --archive-card-width: calc((100cqw - var(--rail-w) - 132px) / 6);
   flex: 1; display: flex; min-height: 0; position: relative;
+}
+/* Pinned, the drawer is layout, not an overlay: the workspace gives up a gutter
+   its exact width, and the 28px trigger column collapses with the trigger. */
+.body-row.menu-pinned {
+  padding-left: calc(var(--menu-drawer-width) + 10px);
+  --menu-rail-width: 0px;
 }
 .shell.agent-full .status-console { display: none; }
 .shell.agent-full .center { visibility: hidden; pointer-events: none; }
@@ -396,7 +404,7 @@
 }
 .menu-drawer {
   position: absolute; left: 0; top: 12px; bottom: 12px; z-index: 2;
-  width: min(232px, calc(100cqw - 28px)); padding: 18px 18px 16px 28px;
+  width: min(var(--menu-drawer-width), calc(100cqw - 28px)); padding: 18px 16px 16px 28px;
   display: flex; flex-direction: column; gap: 4px; overflow: hidden;
   border: 0; border-radius: 0 22px 22px 0;
   background:
@@ -412,8 +420,10 @@
   pointer-events: auto;
 }
 .menu-shell.open .menu-drawer { transform: translateX(0); opacity: 1; visibility: visible; transition-delay: 0s; }
+/* No trigger to clear on the left, so the drawer reclaims that padding. */
+.menu-shell.pinned .menu-drawer { padding-left: 16px; }
 .menu-title {
-  display: flex; align-items: center; gap: 10px; padding: 1px 10px 11px;
+  display: flex; align-items: center; gap: 10px; padding: 1px 4px 11px 10px;
   color: var(--text-mut); font-family: var(--mono); font-size: 9px;
   font-weight: 700; letter-spacing: .14em; text-transform: uppercase;
 }
@@ -454,6 +464,21 @@
 }
 .menu-label { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 12.5px; font-weight: 650; letter-spacing: .02em; }
 .menu-sep { height: 1px; margin: 7px 10px; background: linear-gradient(90deg, var(--line), transparent); }
+/* Pin sits at the end of the title row (order pushes it past the rule line), so
+   the control that governs the drawer lives at the top of the drawer. */
+.menu-pin {
+  order: 1; flex: 0 0 auto;
+  width: 24px; height: 24px; display: grid; place-items: center; padding: 0;
+  border: 1px solid transparent; border-radius: 7px;
+  color: var(--text-mut); background: transparent; cursor: pointer;
+  transition: color .14s ease, border-color .14s ease, background .14s ease;
+}
+.menu-pin:hover { color: var(--text); border-color: var(--line-2); background: var(--void-tile); }
+.menu-pin.on {
+  color: var(--accent);
+  border-color: color-mix(in srgb, var(--accent-line) 70%, var(--line-2));
+  background: color-mix(in srgb, var(--accent) 12%, transparent);
+}
 
 /* ---- agent ear (flush-right) ---- */
 .agent-ear-wrap { flex: 0 0 auto; display: flex; align-items: center; }

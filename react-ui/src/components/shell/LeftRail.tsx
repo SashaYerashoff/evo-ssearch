@@ -2,6 +2,8 @@ import {
   IconFileDescription,
   IconLogout,
   IconPhotoSearch,
+  IconPin,
+  IconPinnedOff,
   IconSettings,
   IconTargetArrow,
 } from '@tabler/icons-react'
@@ -55,7 +57,9 @@ export function LeftRail({
   showSettings,
   showTrigger,
   open,
+  pinned,
   onOpenChange,
+  onPinnedChange,
   onNavigate,
   onSettings,
   onLogout,
@@ -65,39 +69,64 @@ export function LeftRail({
   showSettings: boolean
   showTrigger: boolean
   open: boolean
+  /** Pinned: the drawer is part of the layout, not an overlay that dismisses. */
+  pinned: boolean
   onOpenChange: (open: boolean) => void
+  onPinnedChange: (pinned: boolean) => void
   onNavigate: (section: SectionId) => void
   onSettings: () => void
   onLogout: () => void
 }) {
   const { t } = useI18n()
+  const expanded = pinned || open
   useEffect(() => {
-    if (!open) return
+    if (!open || pinned) return
     const closeOnEscape = (event: KeyboardEvent) => {
       if (event.key === 'Escape') onOpenChange(false)
     }
     window.addEventListener('keydown', closeOnEscape)
     return () => window.removeEventListener('keydown', closeOnEscape)
-  }, [open, onOpenChange])
+  }, [open, pinned, onOpenChange])
 
   const items = NAV.filter(({ id }) => visibleSections.includes(id))
   const navigate = (section: SectionId) => {
     onNavigate(section)
-    onOpenChange(false)
+    // A pinned drawer stays put — collapsing it on every click is exactly what
+    // the operators who pin it are trying to avoid.
+    if (!pinned) onOpenChange(false)
   }
+  const dismiss = () => { if (!pinned) onOpenChange(false) }
 
   return (
-    <aside className={`menu-shell ${open ? 'open' : ''}`}>
-      {open && <button className="menu-dismiss" onClick={() => onOpenChange(false)} aria-label={t('nav.closeMenu')} />}
-      {showTrigger && (
+    <aside className={`menu-shell ${expanded ? 'open' : ''} ${pinned ? 'pinned' : ''}`}>
+      {open && !pinned && <button className="menu-dismiss" onClick={() => onOpenChange(false)} aria-label={t('nav.closeMenu')} />}
+      {showTrigger && !pinned && (
         <MenuRailTrigger
           open={open}
           onToggle={() => onOpenChange(!open)}
         />
       )}
 
-      <nav className="menu-drawer" id="eva-main-menu" aria-hidden={!open}>
-        <div className="menu-title">{t('nav.navigation')}</div>
+      <nav className="menu-drawer" id="eva-main-menu" aria-hidden={!expanded}>
+        <div className="menu-title">
+          <span>{t('nav.navigation')}</span>
+          <button
+            type="button"
+            className={`menu-pin ${pinned ? 'on' : ''}`}
+            aria-pressed={pinned}
+            title={pinned ? t('nav.unpinMenu') : t('nav.pinMenu')}
+            aria-label={pinned ? t('nav.unpinMenu') : t('nav.pinMenu')}
+            onClick={() => {
+              const next = !pinned
+              onPinnedChange(next)
+              // Unpinning turns the drawer back into an overlay; leaving it open
+              // there would just be an overlay nobody asked for.
+              onOpenChange(false)
+            }}
+          >
+            {pinned ? <IconPinnedOff size={15} /> : <IconPin size={15} />}
+          </button>
+        </div>
         {items.map(({ id, labelKey, Icon }) => (
           <button key={id} className={`menu-item ${active === id ? 'on' : ''}`} onClick={() => navigate(id)}>
             <span className="ricon"><Icon size={22} stroke={1.8} /></span>
@@ -107,13 +136,13 @@ export function LeftRail({
         {showSettings && (
           <>
             <div className="menu-sep" />
-            <button className="menu-item" onClick={() => { onSettings(); onOpenChange(false) }}>
+            <button className="menu-item" onClick={() => { onSettings(); dismiss() }}>
               <span className="ricon"><IconSettings size={21} stroke={1.8} /></span>
               <span className="menu-label">{t('nav.settings')}</span>
             </button>
           </>
         )}
-        <button className="menu-item danger" onClick={() => { onOpenChange(false); onLogout() }}>
+        <button className="menu-item danger" onClick={() => { dismiss(); onLogout() }}>
           <span className="ricon"><IconLogout size={21} stroke={1.8} /></span>
           <span className="menu-label">{t('nav.logout')}</span>
         </button>

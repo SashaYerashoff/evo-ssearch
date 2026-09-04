@@ -49,6 +49,11 @@ export interface StatusData {
   agent: 'idle' | 'working'
 }
 
+/* The menu starts pinned: operators asked for a nav that is simply always there.
+   Only the collapsed choice is stored, so a fresh browser gets the pinned one. */
+const MENU_PINNED_KEY = 'eva.ui.menuPinned.v1'
+const readMenuPinned = (): boolean => { try { return localStorage.getItem(MENU_PINNED_KEY) !== '0' } catch { return true } }
+
 const REMEMBER_KEY = 'eva.auth.remember'
 const REMEMBER_USER_KEY = 'eva.auth.user'
 const readRemember = (): boolean => { try { return localStorage.getItem(REMEMBER_KEY) === '1' } catch { return false } }
@@ -122,6 +127,7 @@ export default function App() {
   const [agentOpen, setAgentOpen] = useState(false)
   const [agentFull, setAgentFull] = useState(false)
   const [menuOpen, setMenuOpen] = useState(false)
+  const [menuPinned, setMenuPinned] = useState(readMenuPinned)
   const [agentArchiveColumns, setAgentArchiveColumns] = useState(4)
   const [agentCommittedArchiveColumns, setAgentCommittedArchiveColumns] = useState(4)
   const [settingsOpen, setSettingsOpen] = useState(false)
@@ -401,7 +407,7 @@ export default function App() {
       />
       {forbiddenNotice && <div className="global-notice" role="alert">{forbiddenNotice}</div>}
       <div
-        className={`body-row ${agentOpen ? 'agent-open' : ''} ${agentPresetGrid ? 'agent-preset-grid' : ''}`}
+        className={`body-row ${agentOpen ? 'agent-open' : ''} ${agentPresetGrid ? 'agent-preset-grid' : ''} ${menuPinned ? 'menu-pinned' : ''}`}
         style={agentPresetGrid
           ? ({
               '--archive-grid-columns': agentArchiveColumns,
@@ -415,7 +421,15 @@ export default function App() {
           showSettings={settingsAllowed}
           showTrigger
           open={menuOpen}
+          pinned={menuPinned}
           onOpenChange={setMenuOpen}
+          onPinnedChange={(next) => {
+            setMenuPinned(next)
+            try {
+              if (next) localStorage.removeItem(MENU_PINNED_KEY)
+              else localStorage.setItem(MENU_PINNED_KEY, '0')
+            } catch { /* private mode */ }
+          }}
           onNavigate={setSection}
           onSettings={() => setSettingsOpen(true)}
           onLogout={handleLogout}
