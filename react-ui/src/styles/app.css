@@ -307,6 +307,9 @@
 /* ---- body ---- */
 .body-row {
   --menu-rail-width: 28px;
+  /* One menu-trigger size for every section, so the button never changes
+     shape as the operator moves between Archive, Summaries and Probes. */
+  --menu-rail-height: 110px;
   --workspace-tabs-top-padding: 14px;
   --atp-tabrow-height: 30px;
   --atp-panel-content-height: 80px;
@@ -327,7 +330,7 @@
 }
 .menu-rail-trigger {
   position: relative; z-index: 3; isolation: isolate; overflow: hidden;
-  width: var(--menu-rail-width); height: var(--atp-panel-content-height); padding: 6px 2px;
+  width: var(--menu-rail-width); height: var(--menu-rail-height); padding: 6px 2px;
   display: grid; place-items: center;
   /* Same surface and contour as the console blocks — the old translucent
      gradient washed out against the backdrop. Applies in every section. */
@@ -383,7 +386,7 @@
 }
 .menu-shell > .menu-rail-trigger {
   position: absolute; left: 0;
-  top: calc(var(--workspace-tabs-top-padding) + var(--atp-tabrow-height));
+  top: var(--workspace-tabs-top-padding);
 }
 .menu-drawer {
   position: absolute; left: 0; top: 12px; bottom: 12px; z-index: 2;
@@ -979,16 +982,6 @@
 }
 .archive-screen > .tool-tabs.without-tabs .atp-textgroup .atp-text {
   width: auto; flex: 1 1 auto;
-}
-.body-row:has(.archive-screen > .tool-tabs.without-tabs) .menu-shell > .menu-rail-trigger {
-  top: var(--workspace-tabs-top-padding);
-  /* Span the whole console: CONTROLS (50) + gap (8) + FILTERS (52), so the
-     trigger is exactly as tall as the two blocks it sits beside. NOTE: this is
-     coupled to those block heights — revisit if their padding or control heights change. */
-  height: calc(50px + 8px + 52px);
-}
-.body-row:has(.probe-board-screen > .tool-tabs.without-tabs) .menu-shell > .menu-rail-trigger {
-  top: var(--workspace-tabs-top-padding);
 }
 @container (max-width: 760px) {
   .archive-screen > .tool-tabs.without-tabs .atp-tabpanel-content { padding-block: 10px; }
@@ -2292,9 +2285,6 @@
 
 .tool-tabs.tabs-bottom .atp-tabrow {
   margin-top: 6px; padding-top: 0;
-}
-.body-row:has(.vid-cols > .tool-tabs.tabs-bottom) .menu-shell > .menu-rail-trigger {
-  top: var(--workspace-tabs-top-padding);
 }
 
 .vid-unified-toolbar {
