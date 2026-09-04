@@ -400,7 +400,9 @@ export function ArchiveScreen({
   const filtersDirty = !!appliedFilters && JSON.stringify(appliedFilters) !== JSON.stringify(filters)
   const archiveMatchCount = resultMode === 'list' ? total : items.length
   const normalizedTextValue = textValue.trim()
-  const textResultsFiltered = resultMode === 'search' && appliedTextQuery !== null
+  // The board is narrowed by any search, not only a typed one: an image search
+  // and "find similar" narrow it just as hard and used to say nothing at all.
+  const resultsFiltered = resultMode === 'search'
   const textFilterApplied = resultMode === 'search'
     && appliedTextQuery !== null
     && normalizedTextValue === appliedTextQuery
@@ -540,7 +542,20 @@ export function ArchiveScreen({
             <strong>{items.length.toLocaleString()}</strong>
             <span>loaded</span>
           </div>
-          {textResultsFiltered && <span className="archive-filtered-flag">Filtered</span>}
+          {resultsFiltered && (
+            <span className="archive-filtered-flag">
+              Filtered
+              <button
+                type="button"
+                className="archive-filtered-clear"
+                title="Clear the search and reload the archive list"
+                aria-label="Clear the search and reload the archive list"
+                onClick={clearAppliedTextSearch}
+              >
+                <IconX size={12} />
+              </button>
+            </span>
+          )}
           {(textSearchPending || showArchiveNote) && (
             <div className="archive-results-context">
               {textSearchPending

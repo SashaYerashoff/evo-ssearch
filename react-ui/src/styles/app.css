@@ -1176,8 +1176,21 @@
    9px it was a footnote nobody saw. */
 .archive-filtered-flag {
   order: -1; align-self: baseline; margin-right: 2px; color: var(--accent);
+  display: inline-flex; align-items: center; gap: 4px;
   font-family: var(--mono); font-size: 12px; font-weight: 700;
   letter-spacing: .07em; line-height: inherit; text-transform: uppercase;
+}
+/* Leaving a search was only possible from inside the field, and only for a
+   typed one — an image search had no way back to the plain list. */
+.archive-filtered-clear {
+  width: 17px; height: 17px; flex: 0 0 auto; display: grid; place-items: center;
+  padding: 0; border: 1px solid color-mix(in srgb, var(--accent-line) 55%, transparent);
+  border-radius: 50%; color: var(--accent); background: transparent; cursor: pointer;
+  transition: color .14s ease, border-color .14s ease, background .14s ease;
+}
+.archive-filtered-clear:hover {
+  color: var(--danger); border-color: color-mix(in srgb, var(--danger) 60%, transparent);
+  background: color-mix(in srgb, var(--danger) 12%, transparent);
 }
 .archive-results-context { color: var(--text-mut); font-size: 11px; }
 .archive-coverage-notice {
