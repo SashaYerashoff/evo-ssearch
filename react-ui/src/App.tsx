@@ -131,6 +131,8 @@ export default function App() {
   const [probeDrive, setProbeDrive] = useState<ConsoleDrive | null>(null)
   const [videoDrive, setVideoDrive] = useState<ConsoleDrive | null>(null)
   const [archiveFilters, setArchiveFilters] = useState<ArchiveFilters | null>(null)
+  // Where the operator is inside the active section, shown as a top-bar crumb.
+  const [subsection, setSubsection] = useState<string | null>(null)
   const [forbiddenNotice, setForbiddenNotice] = useState('')
   const [appVersion, setAppVersion] = useState('')
   const [featurePreferences, setFeaturePreferences] = useState<FeaturePreferences>(readFeaturePreferences)
@@ -394,6 +396,7 @@ export default function App() {
       <TopBar
         appVersion={appVersion}
         section={t(SECTION_LABEL_KEYS[section])}
+        subsection={subsection}
         onBrand={() => setSection('archive')}
       />
       {forbiddenNotice && <div className="global-notice" role="alert">{forbiddenNotice}</div>}
@@ -444,6 +447,7 @@ export default function App() {
           )}
           {section === 'video' && (
             <VideoScreen
+              onSubsection={setSubsection}
               channels={channels}
               drive={videoDrive}
               onDriveHandled={handleVideoDriveHandled}

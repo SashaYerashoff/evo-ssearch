@@ -71,6 +71,12 @@
 }
 .brand { display: flex; align-items: center; gap: 11px; }
 /* current section name — right of the logo */
+/* Breadcrumb: the section, then where the operator is inside it. The trail is
+   dimmed so the current level still reads as the heading. */
+.top-section .top-crumb { color: inherit; }
+.top-section .top-crumb:not(.current) { color: var(--text-mut); }
+.top-section .top-crumb-sep { margin: 0 7px; color: var(--text-mut); font-weight: 400; }
+
 .top-section {
   margin-left: 14px; padding: 7px 11px 7px 16px;
   border-left: 1px solid var(--line-2); border-radius: 0 9px 9px 0;

@@ -496,6 +496,7 @@ export function VideoScreen({
   canExport,
   onReviewSummary,
   showIncidents,
+  onSubsection,
 }: {
   navigation?: ReactNode
   channels: Channel[]
@@ -510,6 +511,8 @@ export function VideoScreen({
   canExport: boolean
   onReviewSummary?: (entry: SummaryEntry) => void
   showIncidents: boolean
+  /** Reports where inside the section the operator is, for the top-bar crumb. */
+  onSubsection?: (label: string | null) => void
 }) {
   const { locale, t } = useI18n()
   const [activeTab, setActiveTab] = useState<VideoWorkspaceTab>('review')
@@ -778,6 +781,15 @@ export function VideoScreen({
     setFeed([])
     setCollapsedSummaries(new Set())
   }, [reviewChannelId])
+  useEffect(() => {
+    if (!onSubsection) return
+    if (!streamOpen) { onSubsection(null); return }
+    onSubsection(activeTab === 'incidents' ? t('incident.review')
+      : activeTab === 'settings' ? t('video.settings')
+      : t('video.review'))
+  }, [streamOpen, activeTab, onSubsection, t])
+  useEffect(() => () => onSubsection?.(null), [onSubsection])
+
   useEffect(() => { if (activeTab === 'review') void loadFeed() }, [activeTab, loadFeed])
   useEffect(() => {
     try { window.localStorage.setItem(INCIDENT_PERIOD_STORAGE_KEY, incidentPeriod) } catch { /* optional */ }
