@@ -584,12 +584,14 @@
 .probe-filters::before      { animation-delay: -20s; }
 .probe-filters::after       { animation-delay: -8s; }
 
-/* Three top paddings stack above the CONTROLS block: .archive-screen (14px),
-   .atp-tabpanel-content (12px) and the block's own (7px). Drop the outer two so
-   the console sits right under the header; the block keeps its own padding.
-   Scoped to Archive — other sections keep their panel spacing. */
-.center-scroll.archive-screen { padding-top: 0; }
-.archive-screen .atp-tabpanel-content { padding-top: 0; }
+/* Three top paddings stack above the CONTROLS block: the screen's own (14px),
+   .atp-tabpanel-content's and the block's (7px). Drop the outer two so the
+   console sits right under the header; the block keeps its own padding. Scoped
+   to the two-block consoles — other sections keep their panel spacing. */
+.center-scroll.archive-screen,
+.mon-cols.probe-board-screen { padding-top: 0; }
+.archive-screen .atp-tabpanel-content,
+.probe-board-screen .atp-tabpanel-content { padding-top: 0; }
 
 /* In Archive the two console blocks carry the light road themselves, so the
    panel-level band would only tint the gutter (the panel's own padding) around
@@ -3331,7 +3333,7 @@
   display: flex; align-items: center; gap: 10px;
 }
 .probe-board-screen > .tool-tabs .atp-tabpanel-content {
-  min-height: 0; padding-block: 7px;
+  min-height: 0; padding-block: 0 7px;
 }
 .probe-board-toolbar .mon-search {
   width: 320px; flex: 0 0 320px; height: 32px; min-height: 32px;
