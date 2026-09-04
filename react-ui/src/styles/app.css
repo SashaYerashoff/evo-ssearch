@@ -2349,13 +2349,12 @@
 .vid-unified-strip .vid-review-scroll,
 .vid-unified-strip .vid-settings-toolbar,
 .vid-unified-strip .vid-settings-scroll,
+.vid-unified-strip .vid-review-scroll { flex: 0 1 auto; }
 .vid-unified-strip .vid-incident-toolbar { align-items: center; }
 .vid-unified-strip .vid-tb-row,
 .vid-unified-strip .vid-settings-toolbar {
   width: auto; flex: 0 1 auto; justify-content: flex-start;
 }
-.vid-unified-strip .vid-review-scroll,
-.vid-unified-strip .vid-settings-scroll { flex: 0 1 auto; }
 .vid-unified-strip .vid-incident-toolbar {
   flex-wrap: nowrap; justify-content: flex-start;
 }
@@ -2387,8 +2386,6 @@
    rail — the label truncates, the control keeps its width. */
 .vid-unified-strip .wfield.hist { width: 168px; flex: 0 0 168px; }
 .vid-unified-strip .wfield.resolution { width: 140px; flex: 0 0 140px; }
-/* inference group is a COLUMN — flex-basis here would set height, not width */
-.vid-unified-strip .vid-control-group.inference .wfield { width: 190px; flex: 0 0 auto; }
 .vid-unified-toolbar .wfield .dd,
 .vid-unified-toolbar .wfield .dd-btn { width: 100%; min-width: 0; }
 .vid-unified-toolbar .dd-val {
@@ -2402,7 +2399,6 @@
   width: 128px; min-width: 128px; justify-content: center;
 }
 
-.vid-unified-strip .vid-control-group.inference { gap: 0; }
 .vid-unified-strip .vid-lens-custom { padding-top: 6px; }
 
 /* video tool-tab content rows (Stream review / Stream settings) */

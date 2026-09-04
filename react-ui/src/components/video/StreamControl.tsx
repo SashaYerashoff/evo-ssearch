@@ -99,6 +99,8 @@ export function StreamControl(p: {
   maxSelectedFrames: number
   maxVlmImages: number
   every: string; onEvery: (v: string) => void
+  /* Routing is still applied on start (VideoScreen sends `model: routingSelector`);
+     the picker is currently not exposed in the toolbar. */
   routingSelector: string
   onRoutingSelector: (v: string) => void
   routingOptions: Array<{ value: string; label: string }>
@@ -231,14 +233,6 @@ export function StreamControl(p: {
         {p.activeTab === 'settings' && (
           <section className="vid-unified-strip vid-controls-strip">
             <div className="vid-settings-toolbar">
-              <div className="toolbar-scroll-rail vid-settings-scroll">
-                <section className="vid-control-group inference">
-                  <div className="wfield">
-                    <span className="wfield-label">Model</span>
-                    <Dropdown variant="chip" title="VLM routing" value={p.routingSelector} onChange={p.onRoutingSelector} options={p.routingOptions} />
-                  </div>
-                </section>
-              </div>
               <section className="vid-control-group actions">
                 <div className="vid-tb-actions">
                   <ToolbarActionMenu actions={[
