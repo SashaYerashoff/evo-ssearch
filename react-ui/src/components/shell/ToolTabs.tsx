@@ -5,7 +5,7 @@ import { useEffect, useRef, type ReactNode } from 'react'
 export interface ToolTab { id: string; icon: ReactNode; label: string; badge?: string }
 
 const HORIZONTAL_RAIL_SELECTOR = '.toolbar-scroll-rail, .atp-tabrow, .atp-textgroup'
-const VERTICAL_POPOVER_SELECTOR = '.dd-pop, .qf-pop, .daterange-pop, .archive-channel-picker-pop, .toolbar-actions-pop'
+const VERTICAL_POPOVER_SELECTOR = '.dd-pop, .qf-pop, .daterange-pop, .archive-channel-picker-pop'
 
 function wheelPixels(event: WheelEvent, rail: HTMLElement): number {
   if (event.deltaMode === WheelEvent.DOM_DELTA_LINE) return event.deltaY * 24

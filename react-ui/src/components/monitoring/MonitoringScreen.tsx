@@ -451,29 +451,6 @@ export function MonitoringScreen({
                   <IconPlus size={16} /> New probe
                 </button>
               )}
-              {/* Actions unpacked from the dropdown into an icon rail on the right
-                  edge — the label lives in the tooltip. */}
-              <div className="probe-tb-actions">
-                <IcoBtn title="Refresh probes" onClick={refresh} disabled={loading}>
-                  <IconRefresh className={loading ? 'spin' : ''} size={16} />
-                </IcoBtn>
-                <IcoBtn title="Card view" onClick={() => persistView('grid')} active={view === 'grid'}>
-                  <IconLayoutGrid size={16} />
-                </IcoBtn>
-                <IcoBtn title="List view" onClick={() => persistView('list')} active={view === 'list'}>
-                  <IconList size={16} />
-                </IcoBtn>
-                {filtersActive && (
-                  <IcoBtn title="Reset filters" onClick={() => { setOrigins(new Set()); setStates(new Set()); setQuery('') }}>
-                    <IconFilterOff size={16} />
-                  </IcoBtn>
-                )}
-                {canManage && (
-                  <IcoBtn title="Manage probe groups" onClick={() => { setGroupError(null); setGroupEditor(null) }}>
-                    <IconSettings size={16} />
-                  </IcoBtn>
-                )}
-              </div>
             </div>
           </div>
 
@@ -504,10 +481,28 @@ export function MonitoringScreen({
                   </button>
                 ))}
               </div>
-              <div className="probe-count" role="status" aria-live="polite">
-                <strong>{filtered.length.toLocaleString()}</strong>
-                <span>{filtered.length === 1 ? 'probe' : 'probes'}</span>
-                {filtersActive && <em>of {probes.length.toLocaleString()}</em>}
+              {/* Actions unpacked from the dropdown into an icon rail on the right
+                  edge of the FILTERS block — the label lives in the tooltip. */}
+              <div className="probe-tb-actions">
+                <IcoBtn title="Refresh probes" onClick={refresh} disabled={loading}>
+                  <IconRefresh className={loading ? 'spin' : ''} size={16} />
+                </IcoBtn>
+                <IcoBtn title="Card view" onClick={() => persistView('grid')} active={view === 'grid'}>
+                  <IconLayoutGrid size={16} />
+                </IcoBtn>
+                <IcoBtn title="List view" onClick={() => persistView('list')} active={view === 'list'}>
+                  <IconList size={16} />
+                </IcoBtn>
+                {filtersActive && (
+                  <IcoBtn title="Reset filters" onClick={() => { setOrigins(new Set()); setStates(new Set()); setQuery('') }}>
+                    <IconFilterOff size={16} />
+                  </IcoBtn>
+                )}
+                {canManage && (
+                  <IcoBtn title="Manage probe groups" onClick={() => { setGroupError(null); setGroupEditor(null) }}>
+                    <IconSettings size={16} />
+                  </IcoBtn>
+                )}
               </div>
             </div>
           </div>

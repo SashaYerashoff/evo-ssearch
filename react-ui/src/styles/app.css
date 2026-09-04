@@ -1107,44 +1107,11 @@
 .btn.primary { color: var(--primary-text); background: linear-gradient(135deg, var(--accent), var(--accent-2)); border: none; box-shadow: var(--glow); }
 .btn:disabled { opacity: .45; }
 .btn.compact { min-height: 28px; padding: 4px 9px; border-radius: 8px; font-size: 10.5px; white-space: nowrap; }
-/* Every dense toolbar keeps one bright primary operation visible. Less frequent
-   commands live in the same compact, right-aligned action menu on every screen. */
-.toolbar-action-menu { position: relative; display: inline-flex; flex: 0 0 auto; }
-.toolbar-actions-trigger {
-  width: 112px; height: 38px; min-height: 38px; box-sizing: border-box;
-  display: inline-flex; align-items: center; justify-content: center; gap: 7px;
-  padding: 0 10px; border: 1px solid var(--line-2); border-radius: var(--control-radius);
-  color: var(--text-2); background: var(--control); font: 600 12.5px/1 var(--font);
-  white-space: nowrap; cursor: pointer;
-}
-.toolbar-actions-trigger:hover,
-.toolbar-actions-trigger.on { color: var(--text); border-color: var(--accent-line); background: var(--space-0); }
-.toolbar-action-single {
-  width: auto; min-width: 112px; padding-inline: 14px;
-}
 .floating-popover { margin: 0; }
-.toolbar-action-single.active { color: var(--accent); border-color: var(--accent-line); background: var(--accent-soft); }
-.toolbar-action-single.danger { color: var(--danger); }
-.toolbar-actions-pop {
-  position: absolute; z-index: 80; top: calc(100% + 6px); right: 0; min-width: 230px;
-  display: flex; flex-direction: column; gap: 2px; padding: 6px;
-  border: 1px solid var(--line-2); border-radius: 11px; background: var(--panel-solid);
-  box-shadow: 0 14px 38px rgb(0 0 0 / 38%);
-}
-.toolbar-actions-pop button {
-  width: 100%; min-height: 34px; display: flex; align-items: center; gap: 9px;
-  padding: 7px 9px; border: 0; border-radius: 7px; color: var(--text-2); background: transparent;
-  font: 600 12px/1.2 var(--font); text-align: left; white-space: nowrap; cursor: pointer;
-}
-.toolbar-actions-pop button:hover:not(:disabled) { color: var(--text); background: var(--control); }
-.toolbar-actions-pop button.active { color: var(--accent); background: var(--accent-soft); }
-.toolbar-actions-pop button.danger { color: var(--danger); }
-.toolbar-actions-pop button:disabled { opacity: .42; cursor: default; }
 
 /* Primary toolbar operations share one stable geometry across Archive, Stream
-   review/settings and Probes. This keeps each Actions + primary pair centred. */
+   review/settings and Probes, so every console block's primary is one size. */
 .archive-controls-load,
-.mon-toolbar-primary-actions > .mon-btn.accent,
 .vid-tb-actions > .mon-btn.accent,
 .atp-image {
   width: 144px; min-width: 144px; height: 38px; min-height: 38px; box-sizing: border-box;
@@ -1848,15 +1815,6 @@
   align-content: start;
   gap: 14px; padding: 14px 16px; overflow-y: auto; overflow-x: hidden;
 }
-.mon-toolbar-actions { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
-.mon-toolbar-primary-actions {
-  position: relative; z-index: 2; display: flex; align-items: center; gap: 8px;
-  flex: 0 0 auto; margin-left: 0; padding-left: 10px;
-  /* The animated light river belongs to the whole ATP panel. Keep the pinned
-     action group transparent so it remains continuous between and under the
-     buttons instead of being cut by an opaque scroll-edge mask. */
-  background: transparent;
-}
 /* probe channel filter — fixed width, same height as the buttons beside it */
 .mon-ch-filter { width: 250px; flex: 0 0 auto; }
 .mon-ch-filter .dd-btn { height: 38px; box-sizing: border-box; padding-top: 0; padding-bottom: 0; }
@@ -2376,7 +2334,6 @@
 .vid-unified-toolbar .vid-tb-row .dd-btn,
 .vid-unified-toolbar .vid-control-group .dd-btn,
 .vid-unified-toolbar .mon-btn,
-.vid-unified-toolbar .toolbar-actions-trigger,
 .vid-unified-toolbar .vid-lens-custom input {
   height: 36px; min-height: 36px; box-sizing: border-box;
 }
@@ -2583,9 +2540,7 @@
   min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
 }
 
-/* Secondary actions share one width, so Actions / Refresh line up with the
-   144px primary button beside them. */
-.vid-unified-toolbar .toolbar-actions-trigger,
+/* Refresh on Incident review lines up with the 144px primary beside it. */
 .vid-unified-strip .vid-incident-toolbar > .mon-btn {
   width: 128px; min-width: 128px; justify-content: center;
 }
@@ -3384,21 +3339,12 @@
 .probe-board-toolbar .mon-btn.accent.probe-primary {
   height: 32px; min-height: 32px; flex: 0 0 auto;
 }
-/* The action rail is pinned to the block's right edge, so adding an action
-   never reflows the search field or the primary. */
+/* The action rail lives on the FILTERS block, pinned to its right edge, so
+   adding an action never reflows the chip sets. */
 .probe-tb-actions {
   margin-left: auto; padding-left: 12px;
   display: flex; align-items: center; gap: 6px; flex: 0 0 auto;
 }
-/* The headline count sits at the far right of the FILTERS block, the way the
-   channel count does on the stream list. */
-.probe-count {
-  margin-left: auto; padding-left: 12px; flex: 0 0 auto;
-  display: inline-flex; align-items: baseline; gap: 6px; white-space: nowrap;
-}
-.probe-count strong { color: var(--text); font-size: 15px; font-weight: 700; letter-spacing: .01em; }
-.probe-count span { color: var(--text-2); font-size: 11px; text-transform: uppercase; letter-spacing: .06em; }
-.probe-count em { color: var(--text-mut); font-size: 11px; font-style: normal; }
 .probe-filter-set {
   height: 32px; box-sizing: border-box;
   display: inline-flex; align-items: center; gap: 4px; padding: 2px;
