@@ -13,6 +13,15 @@ export function streamState(runtime: ChannelRuntime | undefined): StreamState {
   return video.summarization_enabled === false ? 'capturing' : 'describing'
 }
 
+/** The list is the section's home screen, so the operator lands on it every time
+   they close a channel. A filter that reset on every return would have to be
+   re-ticked constantly, so it outlives the mount. */
+const ONLY_LIVE_STORAGE_KEY = 'eva.video.streamList.onlyLive.v1'
+
+function readOnlyLive(): boolean {
+  try { return window.localStorage.getItem(ONLY_LIVE_STORAGE_KEY) === '1' } catch { return false }
+}
+
 const STATE_LABEL: Record<StreamState, string> = {
   describing: 'Live description',
   capturing: 'Capturing · no description',
@@ -28,7 +37,15 @@ export function StreamList({ channels, runtime, activeChannelId, onOpen }: {
 }) {
   const byChannel = new Map(runtime.map((entry) => [entry.channelId, entry]))
   const [query, setQuery] = useState('')
-  const [onlyLive, setOnlyLive] = useState(false)
+  const [onlyLive, setOnlyLive] = useState(readOnlyLive)
+
+  function changeOnlyLive(next: boolean) {
+    setOnlyLive(next)
+    try {
+      if (next) window.localStorage.setItem(ONLY_LIVE_STORAGE_KEY, '1')
+      else window.localStorage.removeItem(ONLY_LIVE_STORAGE_KEY)
+    } catch { /* private mode */ }
+  }
 
   // Filter on the live list, so rows keep updating their state while a query is
   // active instead of freezing on a snapshot.
@@ -63,7 +80,7 @@ export function StreamList({ channels, runtime, activeChannelId, onOpen }: {
           )}
         </div>
         <label className="stream-filter" title="Show only channels being described right now">
-          <input type="checkbox" checked={onlyLive} onChange={(event) => setOnlyLive(event.target.checked)} />
+          <input type="checkbox" checked={onlyLive} onChange={(event) => changeOnlyLive(event.target.checked)} />
           <span>Show only live on</span>
         </label>
 
