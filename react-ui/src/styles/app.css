@@ -2304,6 +2304,16 @@
   border-bottom: 0;
 }
 
+/* Stream summaries is the only screen that shows the tab row, and it sat adrift:
+   28px below the header and 12px above the camera strip it labels. The screen's
+   14px shrinks to 6 (the tool-tabs' -14px margin cannot claim it back: the row
+   is sticky, so it clamps to the scrollport's padding edge) and the row gives up
+   its own vertical padding. The 6px stays so the channel list, which has no tab
+   row, does not butt against the header. */
+.vid-cols { padding-top: 6px; }
+.vid-cols > .tool-tabs.with-leading { padding-block: 0; }
+.vid-cols .atp-tabpanel-content { padding-top: 4px; }
+
 .tool-tabs.tabs-bottom .atp-tabrow {
   margin-top: 6px; padding-top: 0;
 }
