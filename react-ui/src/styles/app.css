@@ -2375,8 +2375,10 @@
 /* Search sits above the list and filters it as you type; the count reports how
    much of the fleet the query is showing. */
 .stream-search {
-  display: flex; align-items: center; gap: 8px; width: 100%; min-width: 0;
-  padding: 0 12px; height: 48px; box-sizing: border-box;
+  display: flex; align-items: center; gap: 8px; min-width: 0;
+  /* a search box, not a page header — capped like the archive query field */
+  width: 460px; max-width: 100%; flex: 0 0 auto; align-self: flex-start;
+  padding: 0 12px; height: 44px; box-sizing: border-box;
   position: relative; isolation: isolate;
   background: color-mix(in srgb, var(--surface) 78%, transparent);
   border: 1px solid color-mix(in srgb, var(--accent-line) 40%, var(--line-2));
