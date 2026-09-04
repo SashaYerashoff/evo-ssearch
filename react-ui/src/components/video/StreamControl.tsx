@@ -206,6 +206,9 @@ export function StreamControl(p: {
                       options={resolutions.map((item) => ({ value: item.v, label: item.label }))} />
                   </div>
                 </div>
+                <button className="mon-btn accent vid-toggle vid-primary" onClick={p.onToggleLive}>
+                  <IconPlayerPlay size={14} /> {p.live ? t('video.liveOn') : t('video.liveOff')}
+                </button>
                 <div className="vid-tb-actions">
                   <IcoBtn title={t('video.reloadChannels')} onClick={p.onReload}><IconReload size={16} /></IcoBtn>
                   <IcoBtn title={t('video.refresh')} onClick={p.onRefreshFeed}><IconRefresh size={16} /></IcoBtn>
@@ -224,7 +227,6 @@ export function StreamControl(p: {
                       <IconCheck size={16} />
                     </IcoBtn>
                   )}
-                  <button className="mon-btn accent vid-toggle" onClick={p.onToggleLive}><IconPlayerPlay size={14} /> {p.live ? t('video.liveOn') : t('video.liveOff')}</button>
                 </div>
               </div>
               {p.period === 'custom' && (
@@ -267,26 +269,24 @@ export function StreamControl(p: {
         {p.activeTab === 'settings' && (
           <section className="vid-unified-strip vid-controls-strip">
             <div className="vid-settings-toolbar">
-              <section className="vid-control-group actions">
-                <div className="vid-tb-actions">
-                  <IcoBtn title={t('video.reloadChannels')} onClick={p.onReload}><IconReload size={16} /></IcoBtn>
-                  {p.canCapture && p.capturing && (
-                    <IcoBtn title={t('video.stop')} onClick={p.onStop} disabled={p.busy} danger><IconPlayerStop size={16} /></IcoBtn>
-                  )}
-                  {p.canCapture && (
-                    <IcoBtn title={t('video.flush')} onClick={p.onFlush} disabled={p.busy || !p.capturing}><IconDroplet size={16} /></IcoBtn>
-                  )}
-                  {p.canManagePrompts && (
-                    <IcoBtn title={t('video.prompts')} onClick={p.onPromptSettings}><IconSettings size={16} /></IcoBtn>
-                  )}
-                  {p.settingsDirty && (
-                    <IcoBtn title={t('video.discard')} onClick={p.onDiscardSettings} disabled={p.busy}><IconArrowBackUp size={16} /></IcoBtn>
-                  )}
-                  {p.canCapture && (p.capturing
-                    ? <button className="mon-btn accent vid-toggle" disabled={p.busy || !p.settingsDirty || !p.samplingReady} onClick={p.onStart} title="Restart this stream with the edited sampling and inference settings"><IconPlayerPlay size={15} /> {t('video.applyChanges')}</button>
-                    : <button className="mon-btn accent vid-toggle" disabled={p.busy || !p.samplingReady} onClick={p.onStart}><IconPlayerPlay size={15} /> {t('video.start')}</button>)}
-                </div>
-              </section>
+              {p.canCapture && (p.capturing
+                ? <button className="mon-btn accent vid-toggle vid-primary" disabled={p.busy || !p.settingsDirty || !p.samplingReady} onClick={p.onStart} title="Restart this stream with the edited sampling and inference settings"><IconPlayerPlay size={15} /> {t('video.applyChanges')}</button>
+                : <button className="mon-btn accent vid-toggle vid-primary" disabled={p.busy || !p.samplingReady} onClick={p.onStart}><IconPlayerPlay size={15} /> {t('video.start')}</button>)}
+              <div className="vid-tb-actions">
+                <IcoBtn title={t('video.reloadChannels')} onClick={p.onReload}><IconReload size={16} /></IcoBtn>
+                {p.canCapture && p.capturing && (
+                  <IcoBtn title={t('video.stop')} onClick={p.onStop} disabled={p.busy} danger><IconPlayerStop size={16} /></IcoBtn>
+                )}
+                {p.canCapture && (
+                  <IcoBtn title={t('video.flush')} onClick={p.onFlush} disabled={p.busy || !p.capturing}><IconDroplet size={16} /></IcoBtn>
+                )}
+                {p.canManagePrompts && (
+                  <IcoBtn title={t('video.prompts')} onClick={p.onPromptSettings}><IconSettings size={16} /></IcoBtn>
+                )}
+                {p.settingsDirty && (
+                  <IcoBtn title={t('video.discard')} onClick={p.onDiscardSettings} disabled={p.busy}><IconArrowBackUp size={16} /></IcoBtn>
+                )}
+              </div>
             </div>
           </section>
         )}
