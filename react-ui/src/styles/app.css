@@ -2563,32 +2563,13 @@
   background: color-mix(in srgb, var(--accent) 14%, var(--void-tile));
 }
 
-/* Labelled controls: the caption sits above the field, so the rows align on the
-   controls' bottom edge instead of centring label+field as one block. */
 .vid-unified-strip .vid-tb-row,
 .vid-unified-strip .vid-review-scroll,
 .vid-unified-strip .vid-settings-toolbar,
 .vid-unified-strip .vid-settings-scroll,
 .vid-unified-strip .vid-incident-toolbar { align-items: flex-end; }
-/* .vid-tb-row/.vid-control-group zero this gap for the old label-less fields;
-   now that the fields carry captions they need the breathing room back. */
-.vid-unified-toolbar .wfield,
-.vid-unified-toolbar .vid-tb-row .wfield,
-.vid-unified-toolbar .vid-control-group .wfield { gap: 5px; }
-/* The caption is indented to the control's inner text, not to its box edge —
-   flush-left it hung 10px to the left of the value it names. Small caps keep it
-   reading as a label rather than as content. */
-.vid-unified-toolbar .wfield-label {
-  padding-left: 13px;
-  font-size: 10px; font-weight: 700; line-height: 1;
-  letter-spacing: .055em; text-transform: uppercase;
-  color: var(--text); white-space: nowrap;
-}
 /* the primary action sits with the fields it applies to, on the left */
 .vid-unified-strip .vid-primary { flex: 0 0 auto; margin-left: 4px; }
-/* Fields are bottom-aligned so their controls line up under the captions, but a
-   button has no caption above it — bottom-aligning it too parks it low in the
-   strip. Buttons centre on the strip instead. */
 .vid-unified-strip .vid-primary,
 .vid-unified-strip .vid-tb-actions { align-self: center; }
 
