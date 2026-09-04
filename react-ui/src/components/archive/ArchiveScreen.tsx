@@ -446,13 +446,16 @@ export function ArchiveScreen({
         disabled={!scoreRange.hasSpread}
         onChange={(e) => setScoreSliderPercent(Number(e.target.value))}
       />
-      {scoreRange.hasScores && (
-        <span className="atp-score-range">
-          {displayed.length}/{items.length} · range {formatArchiveScore(scoreRange.min)}–{formatArchiveScore(scoreRange.max)}
-        </span>
-      )}
     </div>
   )
+
+  // The range reads as a footnote to the query, not to the slider, so it sits
+  // beside the search field instead of under the track.
+  const scoreRangeNote = scoreRange.hasScores ? (
+    <span className="atp-score-range">
+      {displayed.length}/{items.length} · range {formatArchiveScore(scoreRange.min)}–{formatArchiveScore(scoreRange.max)}
+    </span>
+  ) : null
 
   // Two distinct rails. Row 1 scopes the archive (filters + the Load they feed);
   // row 2 queries inside that scope (text / reference image).
@@ -544,6 +547,7 @@ export function ArchiveScreen({
             {textSearchPending ? 'Semantic archive search in progress.' : ''}
           </span>
         </div>
+        {scoreRangeNote}
         {minMatchControl}
         </div>
       </div>

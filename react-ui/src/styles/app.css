@@ -669,10 +669,12 @@
   flex-direction: row; align-items: center; gap: 0;
 }
 .archive-filters .archive-toolbar-text .atp-text { width: 100%; }
-/* Row 2 reads left→right: how many results, the query that produced them, and
-   the refinement over them. */
+/* Row 2 reads right→left from the search: the counts are pushed right so they
+   sit against the field that produced them, then the query, its score range and
+   the refinement over it. */
 .archive-filters-row > .archive-results-summary {
-  flex: 0 0 auto; margin: 0; padding: 0; white-space: nowrap;
+  flex: 1 1 auto; justify-content: flex-end;
+  margin: 0; padding: 0; white-space: nowrap;
 }
 .archive-filters-row > .atp-min { flex: 0 0 auto; width: 216px; min-width: 180px; }
 /* idle = no scored query yet: visible (the rail keeps its shape) but muted */
@@ -952,6 +954,10 @@
 .atp-min input[type=range] { width: 100%; accent-color: var(--accent); }
 .atp-min input[type=range]:disabled { opacity: .42; }
 .atp-score-range { color: var(--text-mut); font-family: var(--mono); font-size: 9px; white-space: nowrap; }
+/* Beside the search field it is a standalone note, not a caption under a track. */
+.archive-filters-row > .atp-score-range {
+  flex: 0 0 auto; align-self: center; font-size: 10px; line-height: 1.3;
+}
 .atp-dt { display: flex; flex-direction: column; gap: 5px; font-size: 11.5px; color: var(--text-mut); }
 .atp-dt input { background: var(--void-tile); border: 1px solid var(--line-2); border-radius: 9px; color: var(--text); padding: 7px 9px; font-size: 12.5px; outline: none; }
 
@@ -1165,10 +1171,12 @@
 .archive-results-count { display: inline-flex; align-items: baseline; gap: 7px; color: var(--text-2); font-size: 12.5px; }
 .archive-results-count strong { color: var(--accent); font-size: 20px; font-weight: 700; font-variant-numeric: tabular-nums; }
 .archive-results-separator { color: var(--text-mut); font-size: 12px; }
+/* The flag qualifies the numbers, so it reads before them, not after — and at
+   9px it was a footnote nobody saw. */
 .archive-filtered-flag {
-  align-self: baseline; margin-left: 3px; color: var(--accent);
-  font-family: var(--mono); font-size: 9px; font-weight: 700;
-  letter-spacing: .09em; line-height: inherit; text-transform: uppercase;
+  order: -1; align-self: baseline; margin-right: 2px; color: var(--accent);
+  font-family: var(--mono); font-size: 12px; font-weight: 700;
+  letter-spacing: .07em; line-height: inherit; text-transform: uppercase;
 }
 .archive-results-context { color: var(--text-mut); font-size: 11px; }
 .archive-coverage-notice {
