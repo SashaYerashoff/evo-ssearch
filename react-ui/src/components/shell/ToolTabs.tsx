@@ -1,7 +1,7 @@
 import { useEffect, useRef, type ReactNode } from 'react'
 
-// Folder-style tool tabs: a fixed tab row on top, the active tab's controls
-// open in a panel right below. Tabs never move — the active one lights up.
+// Folder-style tool tabs around a shared control panel. Most screens keep tabs
+// above the panel; workspace screens may place them below when controls are global.
 export interface ToolTab { id: string; icon: ReactNode; label: string; badge?: string }
 
 const HORIZONTAL_RAIL_SELECTOR = '.toolbar-scroll-rail, .atp-tabrow, .atp-textgroup'
@@ -13,12 +13,14 @@ function wheelPixels(event: WheelEvent, rail: HTMLElement): number {
   return event.deltaY
 }
 
-export function ToolTabs({ tabs, active, onSelect, leading, reserveLeading = false, children }: {
+export function ToolTabs({ tabs, active, onSelect, leading, reserveLeading = false, hideTabs = false, tabsPosition = 'top', children }: {
   tabs: ToolTab[]
   active: string
   onSelect: (id: string) => void
   leading?: ReactNode
   reserveLeading?: boolean
+  hideTabs?: boolean
+  tabsPosition?: 'top' | 'bottom'
   children: ReactNode
 }) {
   const hasLeadingColumn = Boolean(leading) || reserveLeading
@@ -50,29 +52,34 @@ export function ToolTabs({ tabs, active, onSelect, leading, reserveLeading = fal
     return () => root.removeEventListener('wheel', onWheel)
   }, [])
 
+  const tabRow = hideTabs ? null : (
+    <div className="atp-tabrow">
+      {tabs.map((t) => (
+        <button
+          key={t.id}
+          className={`atp-tab ${active === t.id ? 'on' : ''}`}
+          onClick={() => onSelect(t.id)}
+          title={t.label}
+          aria-pressed={active === t.id}
+        >
+          <b>
+            {t.icon} {t.label}
+            {t.badge && <em className="atp-tab-badge">{t.badge}</em>}
+          </b>
+        </button>
+      ))}
+    </div>
+  )
+
   return (
-    <div ref={rootRef} className={`tool-tabs ${hasLeadingColumn ? 'with-leading' : ''}`}>
+    <div ref={rootRef} className={`tool-tabs ${hasLeadingColumn ? 'with-leading' : ''} ${hideTabs ? 'without-tabs' : ''} ${tabsPosition === 'bottom' ? 'tabs-bottom' : ''}`}>
       <div className="atp-tabpanel">
-        <div className="atp-tabrow">
-          {tabs.map((t) => (
-            <button
-              key={t.id}
-              className={`atp-tab ${active === t.id ? 'on' : ''}`}
-              onClick={() => onSelect(t.id)}
-              title={t.label}
-              aria-pressed={active === t.id}
-            >
-              <b>
-                {t.icon} {t.label}
-                {t.badge && <em className="atp-tab-badge">{t.badge}</em>}
-              </b>
-            </button>
-          ))}
-        </div>
+        {tabsPosition === 'top' && tabRow}
         <div className="atp-content-row">
           {hasLeadingColumn && <div className="tool-tabs-leading">{leading}</div>}
           <div className="atp-tabpanel-content">{children}</div>
         </div>
+        {tabsPosition === 'bottom' && tabRow}
       </div>
     </div>
   )

@@ -425,72 +425,75 @@ export function MonitoringScreen({
         onSelect={() => {}}
         leading={navigation}
         reserveLeading
+        hideTabs
       >
         <div className="probe-board-toolbar">
-          <div className="toolbar-scroll-rail probe-toolbar-scroll">
-          <div className="mon-search" title="Search names, prompts, channels and parent alerts">
-            <IconSearch size={15} />
-            <input
-              placeholder="Search probes…"
-              value={query}
-              onChange={(event) => setQuery(event.target.value)}
-            />
-            {query && <button className="mon-search-clear" onClick={() => setQuery('')}><IconX size={13} /></button>}
+          <div className="toolbar-scroll-rail probe-toolbar-row probe-toolbar-primary">
+            <div className="mon-search" title="Search names, prompts, channels and parent alerts">
+              <IconSearch size={15} />
+              <input
+                placeholder="Search probes…"
+                value={query}
+                onChange={(event) => setQuery(event.target.value)}
+              />
+              {query && <button className="mon-search-clear" onClick={() => setQuery('')}><IconX size={13} /></button>}
+            </div>
+            <div className="mon-toolbar-primary-actions">
+              <ToolbarActionMenu actions={[
+                {
+                  id: 'refresh', label: 'Refresh probes',
+                  icon: <IconRefresh className={loading ? 'spin' : ''} size={15} />,
+                  onSelect: refresh, disabled: loading,
+                },
+                {
+                  id: 'grid', label: 'Card view', icon: <IconLayoutGrid size={15} />,
+                  onSelect: () => persistView('grid'), active: view === 'grid',
+                },
+                {
+                  id: 'list', label: 'List view', icon: <IconList size={15} />,
+                  onSelect: () => persistView('list'), active: view === 'list',
+                },
+                ...(filtersActive ? [{
+                  id: 'reset', label: 'Reset filters', icon: <IconX size={15} />,
+                  onSelect: () => { setOrigins(new Set()); setStates(new Set()); setQuery('') },
+                }] : []),
+                ...(canManage ? [{
+                  id: 'groups', label: 'Manage probe groups', icon: <IconSettings size={15} />,
+                  onSelect: () => { setGroupError(null); setGroupEditor(null) },
+                }] : []),
+              ]} />
+              {canManage && (
+                <button className="mon-btn accent" onClick={() => setEditing({ probe: null })}>
+                  <IconPlus size={16} /> New probe
+                </button>
+              )}
+            </div>
           </div>
-          <div className="probe-filter-set" aria-label="Filter by author">
-            {ORIGINS.map((origin) => (
-              <button
-                key={origin.value}
-                className={`probe-filter-chip origin-${origin.value} ${origins.has(origin.value) ? 'on' : ''}`}
-                aria-pressed={origins.has(origin.value)}
-                onClick={() => toggleFilter(origin.value, setOrigins)}
-              >
-                <i />{origin.label}<b>{counts.by_origin?.[origin.value] ?? probes.filter((probe) => probeOrigin(probe) === origin.value).length}</b>
-              </button>
-            ))}
-          </div>
-          <div className="probe-filter-set state-set" aria-label="Filter by state">
-            {STATES.map((state) => (
-              <button
-                key={state}
-                className={`probe-filter-chip ${states.has(state) ? 'on' : ''}`}
-                aria-pressed={states.has(state)}
-                onClick={() => toggleFilter(state, setStates)}
-              >
-                {state}
-              </button>
-            ))}
-          </div>
-          </div>
-          <div className="mon-toolbar-primary-actions">
-            <ToolbarActionMenu actions={[
-              {
-                id: 'refresh', label: 'Refresh probes',
-                icon: <IconRefresh className={loading ? 'spin' : ''} size={15} />,
-                onSelect: refresh, disabled: loading,
-              },
-              {
-                id: 'grid', label: 'Card view', icon: <IconLayoutGrid size={15} />,
-                onSelect: () => persistView('grid'), active: view === 'grid',
-              },
-              {
-                id: 'list', label: 'List view', icon: <IconList size={15} />,
-                onSelect: () => persistView('list'), active: view === 'list',
-              },
-              ...(filtersActive ? [{
-                id: 'reset', label: 'Reset filters', icon: <IconX size={15} />,
-                onSelect: () => { setOrigins(new Set()); setStates(new Set()); setQuery('') },
-              }] : []),
-              ...(canManage ? [{
-                id: 'groups', label: 'Manage probe groups', icon: <IconSettings size={15} />,
-                onSelect: () => { setGroupError(null); setGroupEditor(null) },
-              }] : []),
-            ]} />
-            {canManage && (
-              <button className="mon-btn accent" onClick={() => setEditing({ probe: null })}>
-                <IconPlus size={16} /> New probe
-              </button>
-            )}
+          <div className="toolbar-scroll-rail probe-toolbar-row probe-toolbar-filters">
+            <div className="probe-filter-set" aria-label="Filter by author">
+              {ORIGINS.map((origin) => (
+                <button
+                  key={origin.value}
+                  className={`probe-filter-chip origin-${origin.value} ${origins.has(origin.value) ? 'on' : ''}`}
+                  aria-pressed={origins.has(origin.value)}
+                  onClick={() => toggleFilter(origin.value, setOrigins)}
+                >
+                  <i />{origin.label}<b>{counts.by_origin?.[origin.value] ?? probes.filter((probe) => probeOrigin(probe) === origin.value).length}</b>
+                </button>
+              ))}
+            </div>
+            <div className="probe-filter-set state-set" aria-label="Filter by state">
+              {STATES.map((state) => (
+                <button
+                  key={state}
+                  className={`probe-filter-chip ${states.has(state) ? 'on' : ''}`}
+                  aria-pressed={states.has(state)}
+                  onClick={() => toggleFilter(state, setStates)}
+                >
+                  {state}
+                </button>
+              ))}
+            </div>
           </div>
         </div>
       </ToolTabs>

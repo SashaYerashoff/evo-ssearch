@@ -119,27 +119,24 @@ function defaultCustomRange(): { inputs: { from: string; to: string }; bounds: S
 const REVIEW_CHANNEL_STORAGE_KEY = 'eva.video.reviewChannelId'
 const SETTINGS_CHANNEL_STORAGE_KEY = 'eva.video.settingsChannelId'
 const INCIDENT_CHANNEL_STORAGE_KEY = 'eva.video.incidentChannelId'
+const VIDEO_CHANNEL_STORAGE_KEY = 'eva.video.channelId'
 const INCIDENT_PERIOD_STORAGE_KEY = 'eva.video.incidentPeriod'
 
-function initialChannelId(channels: Channel[], storageKey: string): number | null {
+function initialSharedChannelId(channels: Channel[]): number | null {
   try {
-    const stored = Number(window.localStorage.getItem(storageKey))
-    if (Number.isInteger(stored) && channels.some((channel) => channel.id === stored)) return stored
+    for (const storageKey of [
+      VIDEO_CHANNEL_STORAGE_KEY,
+      REVIEW_CHANNEL_STORAGE_KEY,
+      SETTINGS_CHANNEL_STORAGE_KEY,
+      INCIDENT_CHANNEL_STORAGE_KEY,
+    ]) {
+      const stored = Number(window.localStorage.getItem(storageKey))
+      if (Number.isInteger(stored) && channels.some((channel) => channel.id === stored)) return stored
+    }
   } catch {
-    // Browser storage is an optional convenience; channel selection still works without it.
+    // Browser storage is optional; fall through to the first available camera.
   }
   return channels[0]?.id ?? null
-}
-
-function initialIncidentChannelId(channels: Channel[]): string {
-  try {
-    const stored = String(window.localStorage.getItem(INCIDENT_CHANNEL_STORAGE_KEY) || '').trim()
-    if (stored === 'all') return stored
-    if (channels.some((channel) => String(channel.id) === stored)) return stored
-  } catch {
-    // Browser storage is optional; default to one bounded stream below.
-  }
-  return channels[0] ? String(channels[0].id) : ''
 }
 
 function initialIncidentPeriod(): IncidentPeriod {
@@ -515,9 +512,10 @@ export function VideoScreen({
 }) {
   const { locale, t } = useI18n()
   const [activeTab, setActiveTab] = useState<VideoWorkspaceTab>('review')
-  const [reviewChannelId, setReviewChannelId] = useState<number | null>(() => initialChannelId(channels, REVIEW_CHANNEL_STORAGE_KEY))
-  const [settingsChannelId, setSettingsChannelId] = useState<number | null>(() => initialChannelId(channels, SETTINGS_CHANNEL_STORAGE_KEY))
-  const [incidentChannelId, setIncidentChannelId] = useState(() => initialIncidentChannelId(channels))
+  const [channelId, setChannelId] = useState<number | null>(() => initialSharedChannelId(channels))
+  const reviewChannelId = channelId
+  const settingsChannelId = channelId
+  const incidentChannelId = channelId == null ? '' : String(channelId)
   const [incidentPeriod, setIncidentPeriod] = useState<IncidentPeriod>(initialIncidentPeriod)
   const [incidentVisited, setIncidentVisited] = useState(false)
   const [incidentRefreshKey, setIncidentRefreshKey] = useState(0)
@@ -637,15 +635,6 @@ export function VideoScreen({
     }
     return options
   }, [lmCatalog, routingSelector])
-  const assignedRoutingProfile = effectiveCaptureRouting?.assignedProfileId
-    || String(settingsRt?.video?.assigned_profile_id || settingsRt?.video?.model || '').trim()
-    || null
-  const routingStatus = [
-    effectiveCaptureRouting?.mode === 'auto' ? 'Auto' : effectiveCaptureRouting?.mode === 'legacy_pinned' ? 'Legacy pinned' : 'Manual',
-    assignedRoutingProfile ? `assigned ${assignedRoutingProfile}` : 'not assigned yet',
-    effectiveCaptureRouting?.capacity ? `capacity ${effectiveCaptureRouting.capacity}` : '',
-    effectiveCaptureRouting?.reason ? effectiveCaptureRouting.reason.replace(/_/g, ' ') : '',
-  ].filter(Boolean).join(' · ')
   const lastLatency = settingsRt?.video?.last_latency_trace || {}
   const lastInputStats = settingsRt?.video?.last_llm_input_stats || {}
   const lastResponseStats = settingsRt?.video?.last_lm_response_stats || {}
@@ -740,10 +729,10 @@ export function VideoScreen({
       : null
     const promptAction = action === 'open_prompt_settings' || action === 'show_prompt_preview'
     if (promptAction) {
-      if (validNextChannel != null) setSettingsChannelId(validNextChannel)
+      if (validNextChannel != null) setChannelId(validNextChannel)
       setActiveTab('settings')
     } else {
-      if (validNextChannel != null) setReviewChannelId(validNextChannel)
+      if (validNextChannel != null) setChannelId(validNextChannel)
       setActiveTab('review')
     }
     const nextDepth = String(payload.depth || '').toUpperCase()
@@ -765,40 +754,28 @@ export function VideoScreen({
     onDriveHandled?.(drive.seq)
   }, [drive?.seq, channels, canManagePrompts, loadStreams, onDriveHandled])
   useEffect(() => {
-    setReviewChannelId((current) => (
+    setChannelId((current) => (
       current != null && channels.some((channel) => channel.id === current)
         ? current
         : (channels[0]?.id ?? null)
-    ))
-    setSettingsChannelId((current) => (
-      current != null && channels.some((channel) => channel.id === current)
-        ? current
-        : (channels[0]?.id ?? null)
-    ))
-    setIncidentChannelId((current) => (
-      current === 'all' || channels.some((channel) => String(channel.id) === current)
-        ? current
-        : (channels[0] ? String(channels[0].id) : '')
     ))
   }, [channels])
   useEffect(() => {
-    if (reviewChannelId == null) return
-    try { window.localStorage.setItem(REVIEW_CHANNEL_STORAGE_KEY, String(reviewChannelId)) } catch { /* optional */ }
-  }, [reviewChannelId])
+    if (channelId == null) return
+    try {
+      const value = String(channelId)
+      window.localStorage.setItem(VIDEO_CHANNEL_STORAGE_KEY, value)
+      window.localStorage.setItem(REVIEW_CHANNEL_STORAGE_KEY, value)
+      window.localStorage.setItem(SETTINGS_CHANNEL_STORAGE_KEY, value)
+      window.localStorage.setItem(INCIDENT_CHANNEL_STORAGE_KEY, value)
+    } catch { /* optional */ }
+  }, [channelId])
   useEffect(() => {
     feedRequestRef.current += 1
     setFeed([])
     setCollapsedSummaries(new Set())
   }, [reviewChannelId])
   useEffect(() => { if (activeTab === 'review') void loadFeed() }, [activeTab, loadFeed])
-  useEffect(() => {
-    if (settingsChannelId == null) return
-    try { window.localStorage.setItem(SETTINGS_CHANNEL_STORAGE_KEY, String(settingsChannelId)) } catch { /* optional */ }
-  }, [settingsChannelId])
-  useEffect(() => {
-    if (!incidentChannelId) return
-    try { window.localStorage.setItem(INCIDENT_CHANNEL_STORAGE_KEY, incidentChannelId) } catch { /* optional */ }
-  }, [incidentChannelId])
   useEffect(() => {
     try { window.localStorage.setItem(INCIDENT_PERIOD_STORAGE_KEY, incidentPeriod) } catch { /* optional */ }
   }, [incidentPeriod])
@@ -1060,8 +1037,8 @@ export function VideoScreen({
     if (nextTab === 'incidents') setIncidentVisited(true)
     setActiveTab(nextTab)
   }, [])
-  const requestSettingsChannel = useCallback((channelId: number, openSettings = false) => {
-    if (channelId === settingsChannelId) {
+  const requestChannel = useCallback((nextChannelId: number, openSettings = false) => {
+    if (nextChannelId === channelId) {
       if (openSettings) {
         setReviewPreviewOpen(false)
         setActiveTab('settings')
@@ -1069,15 +1046,15 @@ export function VideoScreen({
       return
     }
     if (settingsDirty) {
-      setPendingSettingsSwitch({ channelId, openSettings })
+      setPendingSettingsSwitch({ channelId: nextChannelId, openSettings })
       return
     }
-    setSettingsChannelId(channelId)
+    setChannelId(nextChannelId)
     if (openSettings) {
       setReviewPreviewOpen(false)
       setActiveTab('settings')
     }
-  }, [settingsChannelId, settingsDirty])
+  }, [channelId, settingsDirty])
   const updateBatch = useCallback((value: string) => {
     setBatch(value)
     setSettingsDirty(true)
@@ -1177,8 +1154,7 @@ export function VideoScreen({
         navigation={navigation}
         channels={channels}
         activeTab={activeTab} onTab={selectWorkspaceTab}
-        settingsChannelId={settingsChannelId} onSettingsChannel={(channelId) => requestSettingsChannel(channelId)}
-        reviewChannelId={reviewChannelId} onReviewChannel={setReviewChannelId}
+        channelId={channelId} onChannel={requestChannel}
         onReload={reloadChannels}
         batch={batch} onBatch={updateBatch}
         allowedBatchSizes={(streams.capture_defaults?.allowed_batch_sizes || []).map(String)}
@@ -1186,7 +1162,7 @@ export function VideoScreen({
         maxVlmImages={Number(streams.capture_defaults?.max_vlm_images_per_request || 8)}
         every={every} onEvery={updateEvery}
         routingSelector={routingSelector} onRoutingSelector={updateRoutingSelector}
-        routingOptions={routingOptions} routingStatus={routingStatus}
+        routingOptions={routingOptions}
         canCapture={canCapture} canManagePrompts={canManagePrompts} samplingReady={Boolean(batch && every && routingSelector)}
         capturing={capturing} busy={busy} onStart={start} onStop={stop} onFlush={flush}
         onPromptSettings={() => setPromptOpen(true)}
@@ -1198,8 +1174,6 @@ export function VideoScreen({
         onOpenPreview={() => setReviewPreviewOpen(true)}
         settingsDirty={settingsDirty}
         onDiscardSettings={discardSettingsDraft}
-        incidentChannelId={incidentChannelId}
-        onIncidentChannel={setIncidentChannelId}
         incidentPeriod={incidentPeriod}
         onIncidentPeriod={setIncidentPeriod}
         incidentLoading={incidentLoading}
@@ -1339,7 +1313,7 @@ export function VideoScreen({
                 onClick={() => {
                   const target = pendingSettingsSwitch
                   setPendingSettingsSwitch(null)
-                  setSettingsChannelId(target.channelId)
+                  setChannelId(target.channelId)
                   if (target.openSettings) {
                     setReviewPreviewOpen(false)
                     setActiveTab('settings')

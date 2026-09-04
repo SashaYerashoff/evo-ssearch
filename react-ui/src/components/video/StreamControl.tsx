@@ -91,10 +91,8 @@ export function StreamControl(p: {
   channels: Channel[]
   activeTab: VideoWorkspaceTab
   onTab: (tab: VideoWorkspaceTab) => void
-  settingsChannelId: number | null
-  onSettingsChannel: (id: number) => void
-  reviewChannelId: number | null
-  onReviewChannel: (id: number) => void
+  channelId: number | null
+  onChannel: (id: number) => void
   onReload: () => void
   batch: string; onBatch: (v: string) => void
   allowedBatchSizes: string[]
@@ -104,7 +102,6 @@ export function StreamControl(p: {
   routingSelector: string
   onRoutingSelector: (v: string) => void
   routingOptions: Array<{ value: string; label: string }>
-  routingStatus: string
   canCapture: boolean
   canManagePrompts: boolean
   samplingReady: boolean
@@ -124,8 +121,6 @@ export function StreamControl(p: {
   onOpenPreview: () => void
   settingsDirty: boolean
   onDiscardSettings: () => void
-  incidentChannelId: string
-  onIncidentChannel: (id: string) => void
   incidentPeriod: IncidentPeriod
   onIncidentPeriod: (period: IncidentPeriod) => void
   incidentLoading: boolean
@@ -151,164 +146,115 @@ export function StreamControl(p: {
       onSelect={(id) => p.onTab(id as VideoWorkspaceTab)}
       leading={p.navigation}
       reserveLeading
+      tabsPosition="bottom"
     >
-      {p.activeTab === 'settings' ? (
-        <div className="vid-settings-toolbar">
-          <div className="toolbar-scroll-rail vid-settings-scroll">
-          <section className="vid-control-group source">
-            <div className="wfield ch">
-              <div className="vid-row">
-                <Dropdown variant="chip" title={t('video.channel')} value={String(p.settingsChannelId ?? '')} onChange={(v) => p.onSettingsChannel(Number(v))}
-                  options={p.channels.map((c) => ({ value: String(c.id), label: c.title }))} />
-              </div>
-            </div>
-          </section>
-          <section className="vid-control-group sampling">
-            <div className="vid-control-group-title">Evidence policy</div>
-            <div className="vid-sampling-contract">
-              Adaptive chronological 4–8-frame VLM evidence. CV and semantic signals rank frames; the backend preserves temporal context and controls cadence.
-            </div>
-          </section>
-          <section className="vid-control-group inference">
-            <div className="vid-control-group-title">VLM inference</div>
-            <div className="wfield"><label>Routing</label>
-              <Dropdown
-                value={p.routingSelector}
-                onChange={p.onRoutingSelector}
-                options={p.routingOptions}
-              />
-            </div>
-            <div className="vid-routing-status" title={p.routingStatus}>{p.routingStatus}</div>
-          </section>
-          </div>
-          <section className="vid-control-group actions">
-            <div className="vid-tb-actions">
-              <ToolbarActionMenu actions={[
-                {
-                  id: 'reload-channels', label: t('video.reloadChannels'), icon: <IconReload size={15} />,
-                  onSelect: p.onReload,
-                },
-                ...(p.canCapture && p.capturing ? [{
-                  id: 'stop', label: t('video.stop'), icon: <IconPlayerStop size={15} />,
-                  onSelect: p.onStop, disabled: p.busy, danger: true,
-                }] : []),
-                ...(p.canCapture ? [{
-                  id: 'flush', label: t('video.flush'), icon: <IconDroplet size={15} />,
-                  onSelect: p.onFlush, disabled: p.busy || !p.capturing,
-                }] : []),
-                ...(p.canManagePrompts ? [{
-                  id: 'prompts', label: t('video.prompts'), icon: <IconSettings size={15} />,
-                  onSelect: p.onPromptSettings,
-                }] : []),
-                ...(p.settingsDirty ? [{
-                  id: 'discard', label: t('video.discard'), icon: <IconReload size={15} />,
-                  onSelect: p.onDiscardSettings, disabled: p.busy,
-                }] : []),
-              ]} />
-              {p.canCapture && (p.capturing
-                ? <button className="mon-btn accent vid-toggle" disabled={p.busy || !p.settingsDirty || !p.samplingReady} onClick={p.onStart} title="Restart this stream with the edited sampling and inference settings"><IconPlayerPlay size={15} /> {t('video.applyChanges')}</button>
-                : <button className="mon-btn accent vid-toggle" disabled={p.busy || !p.samplingReady} onClick={p.onStart}><IconPlayerPlay size={15} /> {t('video.start')}</button>)}
-            </div>
-          </section>
-        </div>
-      ) : p.activeTab === 'incidents' ? (
-        <div className="vid-incident-toolbar incident-review-filters">
-          <div className="vid-incident-tab-note">
-            <IconAlertTriangle size={16} />
-            <span><b>Feature in progress.</b> Disable “Show incidents (FiP)” in Settings → Features if the result is not operationally useful.</span>
-          </div>
-          <label>
-            {t('video.channel')}
+      <div className="vid-unified-toolbar" role="group" aria-label="Video workspace controls">
+        <section className="vid-unified-strip vid-camera-strip">
+          <div className="vid-unified-label"><IconVideo size={13} /> Camera</div>
+          <div className="wfield ch vid-shared-camera">
             <Dropdown
-              value={p.incidentChannelId}
-              onChange={p.onIncidentChannel}
-              options={[
-                { value: 'all', label: t('incident.allChannels') },
-                ...p.channels.map((channel) => ({ value: String(channel.id), label: channel.title })),
-              ]}
+              variant="chip"
+              title={t('video.channel')}
+              value={String(p.channelId ?? '')}
+              onChange={(value) => p.onChannel(Number(value))}
+              options={p.channels.map((channel) => ({ value: String(channel.id), label: channel.title }))}
             />
-          </label>
-          <label>
-            {t('video.period')}
-            <Dropdown
-              value={p.incidentPeriod}
-              onChange={(value) => p.onIncidentPeriod(value as IncidentPeriod)}
-              options={[
-                { value: '24h', label: t('incident.last24h') },
-                { value: '7d', label: t('period.last7d') },
-                { value: '30d', label: t('period.last30d') },
-                { value: 'all', label: t('incident.allTime') },
-              ]}
-            />
-          </label>
-          <button className="mon-btn" onClick={p.onRefreshIncidents} disabled={p.incidentLoading || !p.incidentChannelId}>
-            <IconReload size={14} /> {p.incidentLoading ? t('status.checking') : t('video.refresh')}
-          </button>
-        </div>
-      ) : (
-        <div className="vid-lens-stack">
-          <div className="vid-tb-row vid-lens-row">
-            <div className="toolbar-scroll-rail vid-review-scroll">
-            <div className="wfield ch">
-              <div className="vid-row">
-                <Dropdown variant="chip" title={t('video.channel')} value={String(p.reviewChannelId ?? '')} onChange={(v) => p.onReviewChannel(Number(v))}
-                  options={p.channels.map((c) => ({ value: String(c.id), label: c.title }))} />
-              </div>
-            </div>
-            <div className="wfield hist">
-              <Dropdown
-                variant="chip"
-                title={t('video.period')}
-                value={p.period}
-                onChange={(value) => p.onPeriod(value as SummaryPeriod)}
-                options={periods.map((item) => ({ value: item.v, label: item.label }))}
-              />
-            </div>
-            <div className="wfield resolution">
-              <Dropdown
-                variant="chip"
-                title={t('video.resolution')}
-                value={p.resolution}
-                onChange={(value) => p.onResolution(value as SummaryResolution)}
-                options={resolutions.map((item) => ({ value: item.v, label: item.label }))}
-              />
-            </div>
-            </div>
-            <div className="vid-tb-actions">
-              <ToolbarActionMenu actions={[
-                { id: 'reload-channels', label: t('video.reloadChannels'), icon: <IconReload size={15} />, onSelect: p.onReload },
-                { id: 'refresh', label: t('video.refresh'), icon: <IconReload size={15} />, onSelect: p.onRefreshFeed },
-                {
-                  id: 'collapse',
-                  label: p.allSummariesCollapsed ? t('video.expandAll') : t('video.collapseAll'),
-                  icon: p.allSummariesCollapsed ? <IconChevronsDown size={15} /> : <IconChevronsUp size={15} />,
-                  onSelect: p.onToggleAllSummaries,
-                  disabled: !p.summaryCount,
-                },
-                {
-                  id: 'preview', label: t('video.openPreview'), icon: <IconEye size={15} />,
-                  onSelect: p.onOpenPreview, disabled: p.reviewChannelId == null,
-                },
-                ...(p.period === 'custom' ? [{
-                  id: 'apply-range', label: t('video.applyChanges'), icon: <IconReload size={15} />,
-                  onSelect: p.onApplyCustom, disabled: !p.customFrom || !p.customTo,
-                }] : []),
-              ]} />
-              <button className="mon-btn accent vid-toggle" onClick={p.onToggleLive}><IconPlayerPlay size={14} /> {p.live ? t('video.liveOn') : t('video.liveOff')}</button>
-            </div>
           </div>
-          {p.period === 'custom' && (
-            <div className="vid-lens-custom">
-              <div className="wfield">
-                <input aria-label={t('video.from')} title={t('video.from')} type="datetime-local" value={p.customFrom} onChange={(event) => p.onCustomFrom(event.target.value)} />
+        </section>
+
+        {p.activeTab === 'review' && (
+          <section className="vid-unified-strip vid-controls-strip">
+            <div className="vid-lens-stack">
+              <div className="vid-tb-row vid-lens-row">
+                <div className="toolbar-scroll-rail vid-review-scroll">
+                  <div className="wfield hist">
+                    <Dropdown variant="chip" title={t('video.period')} value={p.period}
+                      onChange={(value) => p.onPeriod(value as SummaryPeriod)}
+                      options={periods.map((item) => ({ value: item.v, label: item.label }))} />
+                  </div>
+                  <div className="wfield resolution">
+                    <Dropdown variant="chip" title={t('video.resolution')} value={p.resolution}
+                      onChange={(value) => p.onResolution(value as SummaryResolution)}
+                      options={resolutions.map((item) => ({ value: item.v, label: item.label }))} />
+                  </div>
+                </div>
+                <div className="vid-tb-actions">
+                  <ToolbarActionMenu actions={[
+                    { id: 'reload-channels', label: t('video.reloadChannels'), icon: <IconReload size={15} />, onSelect: p.onReload },
+                    { id: 'refresh', label: t('video.refresh'), icon: <IconReload size={15} />, onSelect: p.onRefreshFeed },
+                    {
+                      id: 'collapse', label: p.allSummariesCollapsed ? t('video.expandAll') : t('video.collapseAll'),
+                      icon: p.allSummariesCollapsed ? <IconChevronsDown size={15} /> : <IconChevronsUp size={15} />,
+                      onSelect: p.onToggleAllSummaries, disabled: !p.summaryCount,
+                    },
+                    { id: 'preview', label: t('video.openPreview'), icon: <IconEye size={15} />, onSelect: p.onOpenPreview, disabled: p.channelId == null },
+                    ...(p.period === 'custom' ? [{
+                      id: 'apply-range', label: t('video.applyChanges'), icon: <IconReload size={15} />,
+                      onSelect: p.onApplyCustom, disabled: !p.customFrom || !p.customTo,
+                    }] : []),
+                  ]} />
+                  <button className="mon-btn accent vid-toggle" onClick={p.onToggleLive}><IconPlayerPlay size={14} /> {p.live ? t('video.liveOn') : t('video.liveOff')}</button>
+                </div>
               </div>
-              <div className="wfield">
-                <input aria-label={t('video.to')} title={t('video.to')} type="datetime-local" value={p.customTo} onChange={(event) => p.onCustomTo(event.target.value)} />
-              </div>
+              {p.period === 'custom' && (
+                <div className="vid-lens-custom">
+                  <div className="wfield"><input aria-label={t('video.from')} title={t('video.from')} type="datetime-local" value={p.customFrom} onChange={(event) => p.onCustomFrom(event.target.value)} /></div>
+                  <div className="wfield"><input aria-label={t('video.to')} title={t('video.to')} type="datetime-local" value={p.customTo} onChange={(event) => p.onCustomTo(event.target.value)} /></div>
+                </div>
+              )}
             </div>
-          )}
-        </div>
-      )}
+          </section>
+        )}
+
+        {p.activeTab === 'incidents' && p.showIncidents && (
+          <section className="vid-unified-strip vid-controls-strip">
+            <div className="vid-incident-toolbar incident-review-filters">
+              <Dropdown variant="chip" title={t('video.period')} value={p.incidentPeriod}
+                onChange={(value) => p.onIncidentPeriod(value as IncidentPeriod)}
+                options={[
+                  { value: '24h', label: t('incident.last24h') },
+                  { value: '7d', label: t('period.last7d') },
+                  { value: '30d', label: t('period.last30d') },
+                  { value: 'all', label: t('incident.allTime') },
+                ]} />
+              <button className="mon-btn" onClick={p.onRefreshIncidents} disabled={p.incidentLoading || p.channelId == null}>
+                <IconReload size={14} /> {p.incidentLoading ? t('status.checking') : t('video.refresh')}
+              </button>
+            </div>
+          </section>
+        )}
+
+        {p.activeTab === 'settings' && (
+          <section className="vid-unified-strip vid-controls-strip">
+            <div className="vid-settings-toolbar">
+              <div className="toolbar-scroll-rail vid-settings-scroll">
+                <span className="vid-evidence-chip" title="Adaptive chronological 4–8-frame VLM evidence. CV and semantic signals rank frames; the backend preserves temporal context and controls cadence.">
+                  Evidence 4–8
+                </span>
+                <section className="vid-control-group inference">
+                  <div className="wfield">
+                    <Dropdown variant="chip" title="VLM routing" value={p.routingSelector} onChange={p.onRoutingSelector} options={p.routingOptions} />
+                  </div>
+                </section>
+              </div>
+              <section className="vid-control-group actions">
+                <div className="vid-tb-actions">
+                  <ToolbarActionMenu actions={[
+                    { id: 'reload-channels', label: t('video.reloadChannels'), icon: <IconReload size={15} />, onSelect: p.onReload },
+                    ...(p.canCapture && p.capturing ? [{ id: 'stop', label: t('video.stop'), icon: <IconPlayerStop size={15} />, onSelect: p.onStop, disabled: p.busy, danger: true }] : []),
+                    ...(p.canCapture ? [{ id: 'flush', label: t('video.flush'), icon: <IconDroplet size={15} />, onSelect: p.onFlush, disabled: p.busy || !p.capturing }] : []),
+                    ...(p.canManagePrompts ? [{ id: 'prompts', label: t('video.prompts'), icon: <IconSettings size={15} />, onSelect: p.onPromptSettings }] : []),
+                    ...(p.settingsDirty ? [{ id: 'discard', label: t('video.discard'), icon: <IconReload size={15} />, onSelect: p.onDiscardSettings, disabled: p.busy }] : []),
+                  ]} />
+                  {p.canCapture && (p.capturing
+                    ? <button className="mon-btn accent vid-toggle" disabled={p.busy || !p.settingsDirty || !p.samplingReady} onClick={p.onStart} title="Restart this stream with the edited sampling and inference settings"><IconPlayerPlay size={15} /> {t('video.applyChanges')}</button>
+                    : <button className="mon-btn accent vid-toggle" disabled={p.busy || !p.samplingReady} onClick={p.onStart}><IconPlayerPlay size={15} /> {t('video.start')}</button>)}
+                </div>
+              </section>
+            </div>
+          </section>
+        )}
+      </div>
     </ToolTabs>
   )
 }
