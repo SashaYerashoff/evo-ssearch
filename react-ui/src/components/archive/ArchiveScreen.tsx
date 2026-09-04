@@ -588,7 +588,7 @@ export function ArchiveScreen({
                 aria-label="Clear the search and filters, and reload the archive list"
                 onClick={clearAllFilters}
               >
-                <IconX size={12} />
+                <IconX size={16} />
               </button>
             </span>
           )}

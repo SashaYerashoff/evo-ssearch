@@ -1183,7 +1183,7 @@
 /* Leaving a search was only possible from inside the field, and only for a
    typed one — an image search had no way back to the plain list. */
 .archive-filtered-clear {
-  width: 17px; height: 17px; flex: 0 0 auto; display: grid; place-items: center;
+  width: 23px; height: 23px; flex: 0 0 auto; display: grid; place-items: center;
   padding: 0; border: 1px solid color-mix(in srgb, var(--accent-line) 55%, transparent);
   border-radius: 50%; color: var(--accent); background: transparent; cursor: pointer;
   transition: color .14s ease, border-color .14s ease, background .14s ease;
