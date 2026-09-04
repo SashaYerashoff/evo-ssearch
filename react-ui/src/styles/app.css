@@ -2313,6 +2313,9 @@
    its own vertical padding. The 6px stays so the channel list, which has no tab
    row, does not butt against the header. */
 .vid-cols { padding-top: 6px; }
+/* The channel list has no tab row to lift, so it keeps the section-standard gap
+   under the header that Archive and Probes use. */
+.vid-cols.vid-cols-list { padding-top: var(--workspace-tabs-top-padding); }
 .vid-cols > .tool-tabs.with-leading { padding-block: 0; }
 .vid-cols .atp-tabpanel-content { padding-top: 4px; }
 
