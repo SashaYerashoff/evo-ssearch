@@ -7,6 +7,7 @@ import {
 } from '@tabler/icons-react'
 import type { Channel, ArchiveFilters } from '../../api/types'
 import { useAppearance } from '../../appearance/AppearanceProvider'
+import { INTERFACE_SCALE_FACTORS } from '../../appearance/appearance'
 import { agentSubmissionText, streamAgent, agentApi, type AgentEvent, type AgentSession, type AgentSkill } from '../../api/agent'
 import {
   buildAgentConsoleContext,
@@ -136,7 +137,7 @@ export function AgentPanel({
   canManageSkills: boolean
 }) {
   const { activePreferences } = useAppearance()
-  const interfaceScale = activePreferences.scale === 'large' ? 1.25 : 1
+  const interfaceScale = INTERFACE_SCALE_FACTORS[activePreferences.scale] ?? 1
   const layoutViewportWidth = agentLayoutViewportWidth(window.innerWidth, interfaceScale)
   const [msgs, setMsgs] = useState<Msg[]>([])
   const [input, setInput] = useState('')

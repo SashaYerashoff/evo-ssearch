@@ -2,10 +2,11 @@ import { useEffect, useState, useCallback, useMemo, useRef, type ReactNode } fro
 import {
   IconAdjustmentsHorizontal,
   IconAlertTriangle,
+  IconDownload,
   IconFilter,
-  IconLetterT,
   IconLoader2,
   IconPhoto,
+  IconRefresh,
   IconSearch,
   IconSparkles,
   IconX,
@@ -37,7 +38,6 @@ import {
 import { archiveCoverageMessages } from './archiveCoverage'
 
 export type ArchiveTool = null | 'filters' | 'search' | 'text' | 'image'
-type Tool = Exclude<ArchiveTool, null>
 
 // tools whose returned frames get rendered into the archive grid
 const VIEW_TOOLS = new Set(['search_archive', 'search_text', 'search_detections', 'search_folder', 'get_detections', 'get_video_summaries'])
@@ -112,8 +112,6 @@ export function ArchiveScreen({
   const [probeOptions, setProbeOptions] = useState<ArchiveProbeOption[]>([])
   const [probesLoading, setProbesLoading] = useState(false)
   const [filterRefresh, setFilterRefresh] = useState(0)
-  // horizontal accordion: exactly one tool block is expanded, the rest collapse to summary chips
-  const [openTool, setOpenTool] = useState<'filters' | 'text' | 'image'>('filters')
   const typeToken = useRef(0)
   const requestSeq = useRef(0)
   const probeRequestSeq = useRef(0)
@@ -324,22 +322,6 @@ export function ArchiveScreen({
     filterRefresh,
   ])
 
-  const refreshFilters = useCallback(async () => {
-    requestSeq.current++
-    probeRequestSeq.current++
-    loadingRef.current = false
-    setLoading(false)
-    setTextSearchPending(false)
-    setSearchCoverage(null)
-    setError(null)
-    setNextOffset(0)
-    setFilters({ ...DEFAULT_FILTERS })
-    setProbeOptions([])
-    setProbesLoading(false)
-    await onRefreshChannels?.()
-    setFilterRefresh((n) => n + 1)
-  }, [onRefreshChannels])
-
   // mirror each agent action onto the working console, and render view-tool results into the grid
   useEffect(() => {
     if (!drive) return
@@ -367,9 +349,6 @@ export function ArchiveScreen({
         const ps = [12, 24, 36, 48]; const n = Number(args.limit)
         patch({ rows: String(ps.reduce((b, p) => (Math.abs(p - n) < Math.abs(b - n) ? p : b), ps[0])) })
       }
-      if (done && (args?.channel_id != null || Array.isArray(args?.channel_ids) || args?.source || h != null || args?.sort_by || args?.limit != null)) {
-        setOpenTool('filters')
-      }
     }
     if (!done) {
       sawAgentProgress.current = true
@@ -377,8 +356,7 @@ export function ArchiveScreen({
       if (VIEW_TOOLS.has(name)) {
         // agent drives the console controls: channel / source / time / sort / rows visibly change
         const q = String(args?.query || args?.event_query || args?.positive_query || args?.text || '').trim()
-        if (TYPING_TOOLS.has(name) && q) { setOpenTool('text'); animateTyping(q) }
-        else if (args?.channel_id != null || Array.isArray(args?.channel_ids) || args?.source || args?.sort_by || args?.limit != null) setOpenTool('filters')
+        if (TYPING_TOOLS.has(name) && q) animateTyping(q)
       }
       return
     }
@@ -455,119 +433,63 @@ export function ArchiveScreen({
       : scoreThreshold > 0
         ? `≥ ${formatArchiveScore(scoreThreshold)}`
         : 'All'
-  const TOOL_META: Record<typeof openTool, { Icon: any; label: string }> = {
-    filters: { Icon: IconFilter, label: 'Filters' },
-    text: { Icon: IconLetterT, label: 'Text query' },
-    image: { Icon: IconPhoto, label: 'Image' },
-  }
+  // Refines the current result set. Always rendered so the rail keeps a stable
+  // shape; it simply reads "No scores" and disables until a scored query runs.
+  const minMatchControl = (
+    <div className={`atp-min ${scoreRange.hasScores ? '' : 'is-idle'}`}>
+      <label title="The slider is normalized to the score range returned by this query">
+        <IconAdjustmentsHorizontal size={12} /> Min match · {scoreLabel}
+      </label>
+      <input
+        type="range" min={0} max={100} step={1}
+        value={scoreRange.hasSpread ? scoreSliderPercent : 0}
+        disabled={!scoreRange.hasSpread}
+        onChange={(e) => setScoreSliderPercent(Number(e.target.value))}
+      />
+      {scoreRange.hasScores && (
+        <span className="atp-score-range">
+          {displayed.length}/{items.length} · range {formatArchiveScore(scoreRange.min)}–{formatArchiveScore(scoreRange.max)}
+        </span>
+      )}
+    </div>
+  )
 
-  // active tool's controls, shown to the right of the fixed tab strip
-  const expanded = () => {
-    if (openTool === 'filters') return (
-      <div className="atp-open" key="filters">
+  // Two distinct rails. Row 1 scopes the archive (filters + the Load they feed);
+  // row 2 queries inside that scope (text / reference image).
+  const archiveTools = (
+    <div className="archive-toolbar" role="group" aria-label="Archive tools">
+      <div className="archive-controls">
         <FilterBar
           filters={filters}
           channels={channels}
           probes={probeOptions}
           probesLoading={probesLoading}
           onChange={patch}
-          onLoad={() => runLoad(0)}
-          onRefresh={refreshFilters}
-          loading={loading}
+          action={(
+            <>
+              <button className="btn primary archive-controls-load" type="button" onClick={() => runLoad(0)} disabled={loading}>
+                {loading ? <IconRefresh size={15} className="spin" /> : <IconDownload size={15} />}
+                Load archive
+              </button>
+              {filtersDirty && (
+                <span className="archive-dirty-hint" role="status">Filters changed — load to apply</span>
+              )}
+            </>
+          )}
+          trailing={(
+            <label className="btn atp-image archive-toolbar-image" title="Upload a reference image — visual similarity search">
+              <IconPhoto size={15} /> Image
+              <input type="file" accept="image/*" style={{ display: 'none' }}
+                onChange={(e) => { const file = e.target.files?.[0]; if (file) runImageSearch(file, file.name); e.currentTarget.value = '' }} />
+            </label>
+          )}
         />
       </div>
-    )
-    if (openTool === 'text') return (
-      <div className="atp-open atp-group atp-textgroup" key="text" aria-busy={textSearchPending}>
-        <span className="atp-glabel"><IconLetterT size={13} /> Text query</span>
-        <form className="atp-text" onSubmit={(e) => {
-          e.preventDefault()
-          if (normalizedTextValue && !textSearchPending && !textFilterApplied) {
-            void runText(normalizedTextValue)
-          }
-        }}>
-          <input placeholder="describe an archived scene…" aria-label="Text query — press Enter to search" autoFocus={!agentTyping}
-            value={textValue} readOnly={agentTyping || textSearchPending} className={agentTyping ? 'agent-caret' : ''}
-            onChange={(e) => {
-              const nextValue = e.target.value
-              if (!nextValue.trim() && appliedTextQuery !== null && resultMode === 'search') {
-                clearAppliedTextSearch()
-                return
-              }
-              setTextValue(nextValue)
-            }} />
-          <button
-            type={textFilterApplied ? 'button' : 'submit'}
-            className={`atp-query-submit${textFilterApplied ? ' clear' : ''}`}
-            disabled={agentTyping || textSearchPending || (!textFilterApplied && !normalizedTextValue)}
-            aria-label={textSearchPending ? 'Searching archive' : textFilterApplied ? 'Clear text search' : 'Search archive'}
-            title={textSearchPending ? 'Searching archive…' : textFilterApplied ? 'Clear text search' : 'Search archive (Enter)'}
-            onClick={textFilterApplied ? clearAppliedTextSearch : undefined}
-          >
-            {textSearchPending
-              ? <IconLoader2 className="spin" size={16} />
-              : textFilterApplied
-                ? <IconX size={17} />
-                : <IconSearch size={16} />}
-          </button>
-        </form>
-        <span className="sr-only" role="status" aria-live="polite">
-          {textSearchPending ? 'Semantic archive search in progress.' : ''}
-        </span>
-        {/* similarity threshold for the text-query results — filters out weak matches */}
-        <div className="atp-min">
-          <label title="The slider is normalized to the score range returned by this query">
-            <IconAdjustmentsHorizontal size={12} /> Min match · {scoreLabel}
-          </label>
-          <input
-            type="range" min={0} max={100} step={1}
-            value={scoreRange.hasSpread ? scoreSliderPercent : 0}
-            disabled={!scoreRange.hasSpread}
-            onChange={(e) => setScoreSliderPercent(Number(e.target.value))}
-          />
-          {scoreRange.hasScores && (
-            <span className="atp-score-range">
-              {displayed.length}/{items.length} · range {formatArchiveScore(scoreRange.min)}–{formatArchiveScore(scoreRange.max)}
-            </span>
-          )}
-        </div>
-      </div>
-    )
-    return (
-      <div className="atp-open atp-group" key="image">
-        <span className="atp-glabel"><IconPhoto size={13} /> Image query</span>
-        <label className="btn primary atp-image" title="Upload a reference image — visual similarity search">
-          <IconPhoto size={15} /> Choose image
-          <input type="file" accept="image/*" style={{ display: 'none' }}
-            onChange={(e) => { const file = e.target.files?.[0]; if (file) runImageSearch(file, file.name); e.currentTarget.value = '' }} />
-        </label>
-      </div>
-    )
-  }
 
-  return (
-    <div className="center-scroll archive-screen">
-      {(agentStep || agentTyping) && (
-        <div className="agent-driving">
-          <span className="ad-dot" /><IconSparkles size={15} />
-          <span>Agent is <b>{agentStep || 'searching the archive'}</b> — watch the console</span>
-        </div>
-      )}
-      <ToolTabs
-        tabs={(['filters', 'text', 'image'] as const).map((t) => {
-          const { Icon, label } = TOOL_META[t]
-          return { id: t, icon: <Icon size={13} />, label }
-        })}
-        active={openTool}
-        onSelect={(id) => setOpenTool(id as typeof openTool)}
-        leading={navigation}
-        reserveLeading
-      >
-        {expanded()}
-      </ToolTabs>
-
-      <div className="archive-results-head" role="status" aria-live="polite">
-        <div className="archive-results-summary">
+      <div className="archive-filters" role="group" aria-label="Archive query">
+        <span className="atp-glabel is-icon-only" title="Filters" aria-label="Filters"><IconFilter size={14} /></span>
+        <div className="archive-filters-row">
+        <div className="archive-results-summary" role="status" aria-live="polite">
           <div className="archive-results-count">
             <strong>{archiveMatchCount.toLocaleString()}</strong>
             <span>{archiveMatchCount === 1 ? 'archive match' : 'archive matches'}</span>
@@ -578,16 +500,74 @@ export function ArchiveScreen({
             <span>loaded</span>
           </div>
           {textResultsFiltered && <span className="archive-filtered-flag">Filtered</span>}
-          {(textSearchPending || showArchiveNote || filtersDirty) && (
+          {(textSearchPending || showArchiveNote) && (
             <div className="archive-results-context">
               {textSearchPending
                 ? '· Searching archive…'
                 : (showArchiveNote ? `· ${note}` : '')}
-              {filtersDirty ? ' · Filters changed — load to apply' : ''}
             </div>
           )}
         </div>
+        <div className="atp-group atp-textgroup archive-toolbar-text" aria-busy={textSearchPending}>
+          <form className="atp-text" onSubmit={(e) => {
+            e.preventDefault()
+            if (normalizedTextValue && !textSearchPending && !textFilterApplied) {
+              void runText(normalizedTextValue)
+            }
+          }}>
+            <input placeholder="Text search — describe an archived scene…" aria-label="Text query — press Enter to search" autoFocus={!agentTyping}
+              value={textValue} readOnly={agentTyping || textSearchPending} className={agentTyping ? 'agent-caret' : ''}
+              onChange={(e) => {
+                const nextValue = e.target.value
+                if (!nextValue.trim() && appliedTextQuery !== null && resultMode === 'search') {
+                  clearAppliedTextSearch()
+                  return
+                }
+                setTextValue(nextValue)
+              }} />
+            <button
+              type={textFilterApplied ? 'button' : 'submit'}
+              className={`atp-query-submit${textFilterApplied ? ' clear' : ''}`}
+              disabled={agentTyping || textSearchPending || (!textFilterApplied && !normalizedTextValue)}
+              aria-label={textSearchPending ? 'Searching archive' : textFilterApplied ? 'Clear text search' : 'Search archive'}
+              title={textSearchPending ? 'Searching archive…' : textFilterApplied ? 'Clear text search' : 'Search archive (Enter)'}
+              onClick={textFilterApplied ? clearAppliedTextSearch : undefined}
+            >
+              {textSearchPending
+                ? <IconLoader2 className="spin" size={16} />
+                : textFilterApplied
+                  ? <IconX size={17} />
+                  : <IconSearch size={16} />}
+            </button>
+          </form>
+          <span className="sr-only" role="status" aria-live="polite">
+            {textSearchPending ? 'Semantic archive search in progress.' : ''}
+          </span>
+        </div>
+        {minMatchControl}
+        </div>
       </div>
+    </div>
+  )
+
+  return (
+    <div className="center-scroll archive-screen">
+      {(agentStep || agentTyping) && (
+        <div className="agent-driving">
+          <span className="ad-dot" /><IconSparkles size={15} />
+          <span>Agent is <b>{agentStep || 'searching the archive'}</b> — watch the console</span>
+        </div>
+      )}
+      <ToolTabs
+        tabs={[]}
+        active=""
+        onSelect={() => undefined}
+        leading={navigation}
+        reserveLeading
+        hideTabs
+      >
+        {archiveTools}
+      </ToolTabs>
 
       <div
         ref={resultsScrollRef}

@@ -24,7 +24,6 @@ import { MonitoringScreen } from './components/monitoring/MonitoringScreen'
 import { VideoScreen } from './components/video/VideoScreen'
 import { videoApi, type SummaryEntry } from './api/video'
 import { SettingsModal } from './components/settings/SettingsModal'
-import { HomeScreen } from './components/home/HomeScreen'
 import { NeuralBackground } from './components/shell/NeuralBackground'
 import { useAppearance } from './appearance/AppearanceProvider'
 import type { ConsoleUiEffect } from './ui-effects/consoleEffects'
@@ -119,7 +118,7 @@ export default function App() {
     probes: 0,
     agent: 'idle',
   })
-  const [section, setSection] = useState<SectionId>('home')
+  const [section, setSection] = useState<SectionId>('archive')
   const [agentOpen, setAgentOpen] = useState(false)
   const [agentFull, setAgentFull] = useState(false)
   const [menuOpen, setMenuOpen] = useState(false)
@@ -134,12 +133,11 @@ export default function App() {
   const [archiveFilters, setArchiveFilters] = useState<ArchiveFilters | null>(null)
   const [forbiddenNotice, setForbiddenNotice] = useState('')
   const [appVersion, setAppVersion] = useState('')
-  const [serverStartedAtMs, setServerStartedAtMs] = useState<number | null>(null)
   const [featurePreferences, setFeaturePreferences] = useState<FeaturePreferences>(readFeaturePreferences)
   const seqRef = useRef(0)
   const summaryReviewOriginRef = useRef<HTMLElement | null>(null)
   const appliedEffectIds = useRef(new Set<string>())
-  const visibleSections = (['home', 'archive', 'video', 'monitoring'] as SectionId[])
+  const visibleSections = (['archive', 'video', 'monitoring'] as SectionId[])
     .filter((candidate) => canViewSection(user, candidate))
   const settingsAllowed = canOpenSettings(user)
 
@@ -317,12 +315,8 @@ export default function App() {
     try {
       const health = await api.get('/health')
       setAppVersion(String(health?.version || ''))
-      const uptimeSec = Number(health?.uptime_sec)
-      if (Number.isFinite(uptimeSec) && uptimeSec >= 0) {
-        setServerStartedAtMs(Date.now() - uptimeSec * 1000)
-      }
     } catch {
-      // Keep the last known server epoch while the backend is temporarily unavailable.
+      // Version stays at its last known value while the backend is unavailable.
     }
   }, [])
 
@@ -330,7 +324,7 @@ export default function App() {
     const expired = () => {
       setUser(null)
       setChannels([])
-      setSection('home')
+      setSection('archive')
       setSettingsOpen(false)
       setAgentOpen(false)
       setStatus({
@@ -383,7 +377,7 @@ export default function App() {
 
   useEffect(() => {
     if (!user) return
-    if (!canViewSection(user, section)) setSection('home')
+    if (!canViewSection(user, section)) setSection('archive')
     if (!settingsAllowed) setSettingsOpen(false)
     if (!hasPermission(user, PERMISSION.agentUse)) setAgentOpen(false)
   }, [user, section, settingsAllowed])
@@ -400,7 +394,7 @@ export default function App() {
       <TopBar
         appVersion={appVersion}
         section={t(SECTION_LABEL_KEYS[section])}
-        onBrand={() => setSection('home')}
+        onBrand={() => setSection('archive')}
       />
       {forbiddenNotice && <div className="global-notice" role="alert">{forbiddenNotice}</div>}
       <div
@@ -424,7 +418,6 @@ export default function App() {
           onLogout={handleLogout}
         />
         <div className="center">
-          <HomeScreen active={section === 'home'} serverStartedAtMs={serverStartedAtMs} />
           {section === 'archive' && (
             <ArchiveScreen
               channels={channels}
@@ -465,7 +458,7 @@ export default function App() {
               showIncidents={featurePreferences.showIncidents && hasPermission(user, PERMISSION.reportsView)}
             />
           )}
-          {section !== 'home' && section !== 'archive' && section !== 'monitoring' && section !== 'video' && (
+          {section !== 'archive' && section !== 'monitoring' && section !== 'video' && (
             <div className="empty-state">
               <div style={{ fontSize: 15, color: 'var(--text-2)' }}>{section[0].toUpperCase() + section.slice(1)}</div>
               <div>This section is not part of the prototype yet.</div>

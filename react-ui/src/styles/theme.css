@@ -119,12 +119,27 @@ html, body, #root { height: 100%; margin: 0; }
   container-type: size;
 }
 
-/* Big interface reproduces a 125% browser zoom while preserving a full-screen
-   application viewport for fixed panels, drawers, and modal overlays. */
+/* Interface scale reproduces a browser zoom while preserving a full-screen
+   application viewport for fixed panels, drawers, and modal overlays: the root
+   is sized to 100/scale % and then scaled back down/up to fill the window.
+   "compact" (75%) is the default; "normal" (100%) needs no transform.
+   Keep these factors in sync with INTERFACE_SCALE_FACTORS in appearance/appearance.ts. */
+html[data-interface-scale="compact"] #root {
+  width: 133.3333%;
+  height: 133.3333%;
+  transform: scale(0.75);
+  transform-origin: top left;
+}
 html[data-interface-scale="large"] #root {
   width: 80%;
   height: 80%;
   transform: scale(1.25);
+  transform-origin: top left;
+}
+html[data-interface-scale="xlarge"] #root {
+  width: 66.6667%;
+  height: 66.6667%;
+  transform: scale(1.5);
   transform-origin: top left;
 }
 

@@ -4,16 +4,14 @@ import {
   IconCalendarEvent,
   IconCheck,
   IconChevronDown,
+  IconAdjustments,
   IconClock,
-  IconDownload,
   IconFilter,
-  IconRefresh,
   IconSearch,
   IconVideo,
 } from '@tabler/icons-react'
 import type { Channel, ArchiveFilters } from '../../api/types'
 import { Dropdown } from '../shell/Dropdown'
-import { ToolbarActionMenu } from '../shell/ToolbarActionMenu'
 import { FloatingPopover } from '../shell/FloatingPopover'
 import { DateRangeModal } from './DateRangeModal'
 import type { ArchiveProbeOption } from '../../api/detections'
@@ -144,16 +142,17 @@ function ChannelPicker({
 }
 
 export function FilterBar({
-  filters, channels, probes, probesLoading, onChange, onLoad, onRefresh, loading,
+  filters, channels, probes, probesLoading, onChange, action, trailing,
 }: {
   filters: ArchiveFilters
   channels: Channel[]
   probes: ArchiveProbeOption[]
   probesLoading: boolean
   onChange: (f: Partial<ArchiveFilters>) => void
-  onLoad: () => void
-  onRefresh: () => void
-  loading: boolean
+  /** Slot directly after the filter chips — the primary action they feed (Load archive). */
+  action?: React.ReactNode
+  /** Right-aligned slot on the filter rail — currently the Min-match refinement. */
+  trailing?: React.ReactNode
 }) {
   const [timeOpen, setTimeOpen] = useState(false)
   const [rangeOpen, setRangeOpen] = useState(false)
@@ -178,7 +177,7 @@ export function FilterBar({
 
   return (
     <div className="filter-block">
-      <span className="atp-glabel"><IconFilter size={13} /> Filters</span>
+      <span className="atp-glabel is-icon-only" title="Controls" aria-label="Controls"><IconAdjustments size={14} /></span>
       <div className="filter-bar">
       <div className="toolbar-scroll-rail filter-bar-scroll">
       <ChannelPicker
@@ -246,19 +245,8 @@ export function FilterBar({
         options={[{ value: 'similarity', label: 'Similarity' }, { value: 'time', label: 'Newest' }]} />
       </div>
 
-      <div className="filter-bar-actions">
-        <ToolbarActionMenu actions={[{
-          id: 'reset',
-          label: 'Reset filters',
-          icon: <IconRefresh className={loading || probesLoading ? 'spin' : ''} size={15} />,
-          onSelect: onRefresh,
-          disabled: loading || probesLoading,
-        }]} />
-        <button className="btn primary" type="button" onClick={() => onLoad()} disabled={loading}>
-          {loading ? <IconRefresh size={15} className="spin" /> : <IconDownload size={15} />}
-          Load archive
-        </button>
-      </div>
+      {action && <div className="filter-bar-action">{action}</div>}
+      {trailing && <div className="filter-bar-trailing">{trailing}</div>}
       </div>
     </div>
   )

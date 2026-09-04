@@ -12,6 +12,8 @@
 .neural-bg {
   position: fixed;
   inset: 0;
+  width: 100% !important;
+  height: 100% !important;
   z-index: -1;
   pointer-events: none;
   opacity: 0.85;
@@ -58,10 +60,14 @@
   justify-content: space-between;
   gap: 14px;
   padding: 10px 16px;
-  background: transparent;
-  border-bottom: 0;
-  backdrop-filter: none;
-  -webkit-backdrop-filter: none;
+  /* The header is its own band: a themed surface plus a hairline, so it reads as
+     chrome and never blends into the console rails below it. It carries the same
+     travelling "light road" as those rails — see the shared ::before/::after. */
+  position: relative; isolation: isolate;
+  background: linear-gradient(180deg, var(--topbar-start), var(--topbar-end));
+  border-bottom: 1px solid color-mix(in srgb, var(--accent-line) 40%, var(--line-2));
+  backdrop-filter: blur(10px);
+  -webkit-backdrop-filter: blur(10px);
 }
 .brand { display: flex; align-items: center; gap: 11px; }
 /* current section name — right of the logo */
@@ -452,16 +458,225 @@
 
 /* ---- center ---- */
 .center { flex: 1; min-width: 0; display: flex; flex-direction: column; min-height: 0; }
-.center-scroll { flex: 1; overflow-y: auto; padding: 14px 16px 20px; display: flex; flex-direction: column; gap: 14px; }
+.center-scroll { flex: 1; overflow-y: auto; overflow-x: hidden; padding: 14px 16px 20px; display: flex; flex-direction: column; gap: 14px; }
 .archive-screen { overflow: hidden; padding-bottom: 0; }
 .archive-results-scroll {
   flex: 1 1 auto; min-height: 0; overflow-y: auto; overflow-x: hidden;
   display: flex; flex-direction: column; gap: 14px; padding-bottom: 20px;
   scrollbar-gutter: stable;
 }
-/* single full-width toolbar: filters | text query | search controls | image query */
-.archive-toolbar { display: flex; align-items: stretch; gap: 16px; flex-wrap: wrap; padding: 12px 14px; border: 1px solid var(--line); border-radius: 12px; background: var(--panel); }
-.archive-toolbar .filter-block { align-self: stretch; }
+/* Archive console — two self-contained blocks, never one strip:
+   CONTROLS scopes the archive (streams, evidence, period, sort → Load / Image),
+   FILTERS  works on the result set (match counts, text query, min match).
+   Each is a labelled card on its own surface, so the two roles stay distinct. */
+.archive-toolbar {
+  display: flex; flex-direction: column; align-items: stretch;
+  gap: 8px; width: 100%; min-width: 0;
+}
+.archive-controls,
+.archive-filters {
+  display: flex; flex-direction: row; align-items: center; gap: 12px;
+  width: 100%; min-width: 0;
+  padding: 7px 12px;
+  /* "Light road": the travelling aurora band is the surface of each block, with
+     an explicit contour so it reads as a panel instead of melting into the
+     backdrop. The glow is painted with plain gradients (no filter: blur) so it
+     stays inside the rounded rect — a blur would bleed past the border again. */
+  position: relative; isolation: isolate;
+  background: color-mix(in srgb, var(--surface) 78%, transparent);
+  border: 1px solid color-mix(in srgb, var(--accent-line) 40%, var(--line-2));
+  border-radius: var(--radius);
+  box-shadow:
+    inset 0 1px 0 color-mix(in srgb, var(--text) 7%, transparent),
+    0 8px 20px -14px rgba(0, 0, 0, .8);
+}
+/* Layer 1 — the aura: broad, soft colour drifting along the block. */
+.topbar::before,
+.archive-controls::before,
+.archive-filters::before {
+  content: "";
+  position: absolute; inset: 0; z-index: -1;
+  pointer-events: none;
+  background:
+    radial-gradient(ellipse at 18% 42%, color-mix(in srgb, var(--accent) 16%, transparent) 0%, transparent 66%),
+    radial-gradient(ellipse at 54% 62%, color-mix(in srgb, #789dff 12%, transparent) 0%, transparent 68%),
+    radial-gradient(ellipse at 84% 44%, color-mix(in srgb, #a77cff 9%, transparent) 0%, transparent 66%),
+    linear-gradient(90deg,
+      color-mix(in srgb, var(--accent) 4%, transparent),
+      color-mix(in srgb, #77a8ff 5%, transparent) 36%,
+      color-mix(in srgb, #a77cff 4%, transparent) 68%,
+      color-mix(in srgb, #e8b86b 3%, transparent));
+  background-size: 880px 100%, 880px 100%, 880px 100%, 100% 100%;
+  background-repeat: repeat-x, repeat-x, repeat-x, no-repeat;
+  background-position: 0 50%, 290px 50%, 580px 50%, 0 0;
+  filter: blur(18px) saturate(1.08);
+  opacity: .9;
+  /* clip-path (not overflow:hidden) contains the blur inside the rounded rect
+     without creating a clipping ancestor that would cut off the dropdowns */
+  clip-path: inset(0 round var(--radius));
+  animation: atp-bifrost-aura 22s linear infinite;
+}
+/* Layer 2 — the braid: the thin bright thread that reads as the "road" itself. */
+.topbar::after,
+.archive-controls::after,
+.archive-filters::after {
+  content: "";
+  position: absolute; inset: 0; z-index: -1;
+  pointer-events: none;
+  background:
+    radial-gradient(ellipse 56% 42% at 50% 2%,
+      transparent 51%, color-mix(in srgb, var(--accent) 34%, transparent) 57%, transparent 65%) 0 48% / 560px 100% repeat-x,
+    radial-gradient(ellipse 56% 42% at 50% 98%,
+      transparent 51%, color-mix(in srgb, #8d86ff 28%, transparent) 57%, transparent 65%) 280px 52% / 560px 100% repeat-x,
+    linear-gradient(90deg,
+      transparent,
+      color-mix(in srgb, #8edfff 12%, transparent) 28%,
+      color-mix(in srgb, #a77cff 10%, transparent) 58%,
+      color-mix(in srgb, #e8b86b 7%, transparent) 76%,
+      transparent);
+  filter: blur(5px) saturate(1.12);
+  opacity: .8;
+  clip-path: inset(0 round var(--radius));
+  animation: atp-bifrost-braid 18s linear infinite;
+}
+/* The header carries the same road, but square: it is a full-width band, so the
+   glow is clipped to a plain rect instead of the blocks' rounded corners. */
+.topbar::before,
+.topbar::after { clip-path: inset(0); }
+
+/* Desynchronise the three bands. Negative delays offset each one immediately
+   (no dead wait), spread across the 22s aura / 18s braid cycles, so the header
+   and the two console blocks never travel in lockstep. */
+.archive-controls::before { animation-delay: -7.3s; }
+.archive-controls::after  { animation-delay: -6s; }
+.archive-filters::before  { animation-delay: -14.6s; }
+.archive-filters::after   { animation-delay: -12s; }
+
+/* Three top paddings stack above the CONTROLS block: .archive-screen (14px),
+   .atp-tabpanel-content (12px) and the block's own (7px). Drop the outer two so
+   the console sits right under the header; the block keeps its own padding.
+   Scoped to Archive — other sections keep their panel spacing. */
+.center-scroll.archive-screen { padding-top: 0; }
+.archive-screen .atp-tabpanel-content { padding-top: 0; }
+
+/* In Archive the two console blocks carry the light road themselves, so the
+   panel-level band would only tint the gutter (the panel's own padding) around
+   them. Keep that gutter transparent; other sections still use the panel band. */
+.archive-screen .atp-tabpanel-content::before,
+.archive-screen .atp-tabpanel-content::after { content: none; }
+
+.no-anim .topbar::before,
+.no-anim .topbar::after,
+.no-anim .archive-controls::before,
+.no-anim .archive-filters::before,
+.no-anim .archive-controls::after,
+.no-anim .archive-filters::after { animation: none; }
+/* The block's own controls take the rest of the line beside its name. */
+.archive-controls > .filter-block { flex: 1 1 auto; flex-direction: row; align-items: center; gap: 12px; }
+.archive-filters-row { flex: 1 1 auto; }
+
+/* Both blocks are marked by an icon only, inline at the far left. Same icon size
+   in both, so their content still starts on one column — with no dead slot. */
+.atp-tabpanel .archive-toolbar .atp-glabel {
+  display: inline-flex; align-items: center; justify-content: flex-start;
+  /* white, not muted — over the light road a dim icon disappears */
+  color: var(--text);
+  flex: 0 0 auto; width: auto;
+}
+
+/* Bottom-aligned: labels float above, while the counter, the query field and the
+   Min-match slider all sit on one shared line. */
+.archive-filters-row {
+  display: flex; align-items: center; gap: 10px; width: 100%; min-width: 0;
+}
+/* The query field is capped: a search box the width of the whole console reads
+   as a page header, not as one control among several. */
+.atp-tabpanel .archive-filters .archive-toolbar-text {
+  flex: 0 1 460px; min-width: 240px;
+  /* the field names itself through its placeholder — no label row above it */
+  flex-direction: row; align-items: center; gap: 0;
+}
+.archive-filters .archive-toolbar-text .atp-text { width: 100%; }
+/* Row 2 reads left→right: how many results, the query that produced them, and
+   the refinement over them. */
+.archive-filters-row > .archive-results-summary {
+  flex: 0 0 auto; margin: 0; padding: 0; white-space: nowrap;
+}
+.archive-filters-row > .atp-min { flex: 0 0 auto; width: 216px; min-width: 180px; }
+/* idle = no scored query yet: visible (the rail keeps its shape) but muted */
+.atp-min.is-idle { opacity: .55; }
+/* Image + Load archive inherit the shared 144×38 toolbar geometry (see the
+   "Primary toolbar operations" rule), so the rail lines up with other screens. */
+.filter-bar-action > .archive-toolbar-image,
+.filter-bar-action > .archive-controls-load { flex: 0 0 auto; }
+.archive-toolbar-text .atp-text input {
+  height: 32px; box-sizing: border-box; padding-block: 0;
+}
+.archive-toolbar-text .atp-query-submit {
+  width: 24px; height: 24px; right: 4px; border-radius: 7px;
+}
+/* compact field label — it names the control, it is not content */
+.archive-filters .atp-min > label { font-size: 11px; line-height: 1.2; }
+.archive-filters .atp-min { gap: 2px; }
+
+/* row 2 — filters; the min-match refinement is pinned to the right of the rail */
+.archive-controls .filter-block { width: 100%; }
+.archive-controls .filter-bar-scroll { flex: 0 1 auto; align-items: center; }
+/* Load archive inherits the shared 144x38 toolbar geometry; inside this rail it
+   follows the text-search field instead, so every control is one height. */
+.archive-controls .archive-controls-load { height: 32px; min-height: 32px; }
+
+/* Every control on the CONTROLS rail shares one height and a FIXED width slot,
+   so selecting a longer value (a channel name, a custom date range, "Newest")
+   never resizes the control or reflows the rail. Long labels ellipsis instead. */
+.archive-controls .filter-bar-scroll > * { flex: 0 0 auto; height: 32px; }
+.archive-controls .filter-bar-scroll > .archive-channel-picker { width: 172px; }
+.archive-controls .filter-bar-scroll > .dd { width: 152px; }
+.archive-controls .filter-bar-scroll > .qf-split { width: 176px; display: flex; align-items: center; }
+
+/* the interactive element fills its fixed slot */
+.archive-controls .filter-bar-scroll .archive-channel-picker-toggle,
+.archive-controls .filter-bar-scroll .dd-btn {
+  width: 100%; height: 100%; min-width: 0; max-width: none;
+}
+.archive-controls .filter-bar-scroll .qf-menu { flex: 1 1 auto; min-width: 0; height: 100%; }
+.archive-controls .filter-bar-scroll .qf-seg {
+  height: 100%; min-height: 0; min-width: 0; overflow: hidden;
+  box-sizing: border-box;
+}
+.archive-controls .filter-bar-scroll .qf-menu > .qf-seg { width: 100%; }
+.archive-controls .filter-bar-scroll .qf-icon { flex: 0 0 auto; }
+
+/* The label owns the space between the leading icon and the trailing chevron and
+   is centred in it, so a short value does not sit off to the left of its slot.
+   Icons keep their size; only the label truncates. */
+.archive-controls .filter-bar-scroll .archive-channel-picker-toggle > span,
+.archive-controls .filter-bar-scroll .dd-val {
+  flex: 1 1 auto; min-width: 0; text-align: center;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.archive-controls .filter-bar-scroll .qf-menu > .qf-seg { justify-content: center; }
+.archive-controls .filter-bar-scroll svg { flex: 0 0 auto; }
+/* Dirty-filter hint: it explains the Load button, so it lives beside it rather
+   than buried in the result counters. Readable weight and colour — the muted
+   micro-text it used to be was effectively invisible. */
+.archive-dirty-hint {
+  flex: 0 0 auto; white-space: nowrap;
+  font-size: 12.5px; font-weight: 500; color: var(--text);
+}
+
+/* the actions sit immediately after the chips they act on */
+.filter-bar-action { flex: 0 0 auto; display: flex; align-items: center; gap: 8px; }
+/* pinned to the far right of the filter rail */
+.filter-bar-trailing {
+  flex: 0 0 auto; margin-left: auto; padding-left: 14px;
+  display: flex; align-items: center;
+}
+/* "Image" carries a one-word label — the shared 144px action width leaves it
+   looking half-empty next to the filled controls, so it sizes to its content. */
+.filter-bar-trailing > .archive-toolbar-image {
+  width: 112px; min-width: 112px; height: 32px; min-height: 32px;
+}
 
 /* Archive result-card bodies are positioned stacking contexts of their own. Keep
    the filter console in a higher context so every dropdown can cross the results
@@ -488,48 +703,7 @@
 }
 .atp-tabrow::-webkit-scrollbar { display: none; }
 .tool-tabs.with-leading .atp-tabrow { margin-left: calc(var(--menu-rail-width) + 8px); }
-.atp-tab {
-  position: relative; top: 0; z-index: 2;
-  display: flex; align-items: center; gap: 7px; padding: 6px 11px;
-  min-width: 96px; max-width: 310px; flex: 0 0 auto;
-  text-align: left; cursor: pointer; overflow: hidden;
-  background: color-mix(in srgb, var(--surface-raised) 22%, transparent);
-  border: 1px solid color-mix(in srgb, var(--line) 46%, transparent);
-  border-radius: 9px;
-  backdrop-filter: blur(5px); -webkit-backdrop-filter: blur(5px);
-  transition: color .15s ease, background .15s ease, border-color .15s ease, box-shadow .15s ease;
-}
-.atp-tab:hover {
-  background: color-mix(in srgb, var(--surface-raised) 40%, transparent);
-  border-color: color-mix(in srgb, var(--accent-line) 62%, var(--line));
-}
-.atp-tab.on {
-  background: color-mix(in srgb, var(--accent) 9%, var(--surface-raised));
-  border-color: color-mix(in srgb, var(--accent-line) 72%, var(--line));
-  box-shadow: inset 0 -2px var(--accent);
-}
-.atp-tab b { display: inline-flex; align-items: center; gap: 6px; flex: 0 0 auto; color: var(--text-mut); font-size: 10.5px; font-weight: 700; text-transform: uppercase; letter-spacing: .06em; white-space: nowrap; }
-.atp-tab.on b { color: var(--accent); }
-.atp-tab-badge {
-  padding: 2px 5px; border: 1px solid color-mix(in srgb, var(--warning) 55%, var(--line));
-  border-radius: 999px; background: var(--warning-bg); color: var(--warning);
-  font: 700 8px/1 var(--mono); letter-spacing: .04em; text-transform: uppercase;
-}
-.atp-tabpanel {
-  position: relative; z-index: 1;
-  display: flex; flex-direction: column; align-items: stretch; min-width: 0;
-  min-height: 80px;   /* uniform height across tabs; grows gracefully if a squeezed row wraps */
-  background: transparent; border: 0; border-radius: 0;
-  padding: 0; overflow: visible;
-}
-.atp-tabpanel-content {
-  position: relative; isolation: isolate; overflow: visible;
-  flex: 1 1 auto; min-width: 0; min-height: var(--atp-panel-content-height);
-  display: flex; align-items: center; padding: 12px 14px;
-  background: transparent; border: 0; border-radius: 18px 0 0 18px;
-  backdrop-filter: none; -webkit-backdrop-filter: none;
-  box-shadow: none;
-}
+.tool-tabs.without-tabs .atp-tabpanel-content { min-height: var(--atp-panel-content-height); }
 .atp-tabpanel-content::before {
   content: "";
   position: absolute; z-index: 0; pointer-events: none;
@@ -584,6 +758,48 @@
   clip-path: inset(0 2.85% round 18px);
   will-change: background-position;
   animation: atp-bifrost-braid 18s linear infinite;
+}
+.atp-tab {
+  position: relative; top: 0; z-index: 2;
+  display: flex; align-items: center; gap: 7px; padding: 6px 11px;
+  min-width: 96px; max-width: 310px; flex: 0 0 auto;
+  text-align: left; cursor: pointer; overflow: hidden;
+  background: color-mix(in srgb, var(--surface-raised) 22%, transparent);
+  border: 1px solid color-mix(in srgb, var(--line) 46%, transparent);
+  border-radius: 9px;
+  backdrop-filter: blur(5px); -webkit-backdrop-filter: blur(5px);
+  transition: color .15s ease, background .15s ease, border-color .15s ease, box-shadow .15s ease;
+}
+.atp-tab:hover {
+  background: color-mix(in srgb, var(--surface-raised) 40%, transparent);
+  border-color: color-mix(in srgb, var(--accent-line) 62%, var(--line));
+}
+.atp-tab.on {
+  background: color-mix(in srgb, var(--accent) 9%, var(--surface-raised));
+  border-color: color-mix(in srgb, var(--accent-line) 72%, var(--line));
+  box-shadow: inset 0 -2px var(--accent);
+}
+.atp-tab b { display: inline-flex; align-items: center; gap: 6px; flex: 0 0 auto; color: var(--text-mut); font-size: 10.5px; font-weight: 700; text-transform: uppercase; letter-spacing: .06em; white-space: nowrap; }
+.atp-tab.on b { color: var(--accent); }
+.atp-tab-badge {
+  padding: 2px 5px; border: 1px solid color-mix(in srgb, var(--warning) 55%, var(--line));
+  border-radius: 999px; background: var(--warning-bg); color: var(--warning);
+  font: 700 8px/1 var(--mono); letter-spacing: .04em; text-transform: uppercase;
+}
+.atp-tabpanel {
+  position: relative; z-index: 1;
+  display: flex; flex-direction: column; align-items: stretch; min-width: 0;
+  min-height: 80px;   /* uniform height across tabs; grows gracefully if a squeezed row wraps */
+  background: transparent; border: 0; border-radius: 0;
+  padding: 0; overflow: visible;
+}
+.atp-tabpanel-content {
+  position: relative; isolation: isolate; overflow: visible;
+  flex: 1 1 auto; min-width: 0; min-height: var(--atp-panel-content-height);
+  display: flex; align-items: center; padding: 12px 14px;
+  background: transparent; border: 0; border-radius: 18px 0 0 18px;
+  backdrop-filter: none; -webkit-backdrop-filter: none;
+  box-shadow: none;
 }
 .atp-tabpanel-content > * { position: relative; z-index: 1; }
 @keyframes atp-bifrost-aura {
@@ -744,13 +960,36 @@
 .filter-block { display: flex; flex-direction: column; gap: 8px; width: 100%; min-width: 0; }
 .filter-bar { display: flex; align-items: center; gap: 10px; flex-wrap: nowrap; width: 100%; min-width: 0; }
 .filter-bar-scroll > * { flex: 0 0 auto; }
-.filter-bar-actions {
-  position: relative; z-index: 2; display: flex; align-items: center; gap: 8px;
-  flex: 0 0 auto; margin-left: 0; padding-left: 10px;
-  /* The Bifrost layer is painted by the full ATP content panel. Any local
-     surface/mask here creates visible holes beneath and between the pinned
-     Actions + primary action pair. */
-  background: transparent;
+
+.archive-screen > .tool-tabs.without-tabs .atp-textgroup {
+  display: flex; overflow-x: auto; gap: 10px;
+}
+.archive-screen > .tool-tabs.without-tabs .atp-textgroup .atp-text {
+  width: auto; flex: 1 1 auto;
+}
+.body-row:has(.archive-screen > .tool-tabs.without-tabs) .menu-shell > .menu-rail-trigger {
+  top: var(--workspace-tabs-top-padding);
+  /* Span the whole console: CONTROLS (50) + gap (8) + FILTERS (52), so the
+     trigger is exactly as tall as the two blocks it sits beside. NOTE: this is
+     coupled to those block heights — revisit if their padding or control heights change. */
+  height: calc(50px + 8px + 52px);
+  /* Same surface and contour as those blocks — the old translucent gradient
+     disappeared against the new backdrop. */
+  background:
+    radial-gradient(ellipse 140% 68% at -18% 50%,
+      color-mix(in srgb, var(--accent) 20%, transparent), transparent 72%),
+    color-mix(in srgb, var(--surface) 88%, transparent);
+  border: 1px solid color-mix(in srgb, var(--accent-line) 40%, var(--line-2));
+  border-left: 0;
+  box-shadow:
+    inset -1px 0 0 color-mix(in srgb, var(--accent) 46%, transparent),
+    8px 0 22px -16px var(--accent);
+}
+.body-row:has(.probe-board-screen > .tool-tabs.without-tabs) .menu-shell > .menu-rail-trigger {
+  top: var(--workspace-tabs-top-padding);
+}
+@container (max-width: 760px) {
+  .archive-screen > .tool-tabs.without-tabs .atp-tabpanel-content { padding-block: 10px; }
 }
 .archive-channel-picker { position: relative; display: inline-flex; }
 .archive-channel-picker-toggle {
@@ -880,7 +1119,7 @@
 
 /* Primary toolbar operations share one stable geometry across Archive, Stream
    review/settings and Probes. This keeps each Actions + primary pair centred. */
-.filter-bar-actions > .btn.primary,
+.archive-controls-load,
 .mon-toolbar-primary-actions > .mon-btn.accent,
 .vid-tb-actions > .mon-btn.accent,
 .atp-image {
@@ -903,25 +1142,8 @@
 .agent-preset-grid .card-grid {
   grid-template-columns: repeat(var(--archive-grid-columns), var(--archive-card-width));
 }
-.archive-results-head {
-  display: flex; align-items: center; justify-content: center;
-  min-height: 48px; padding: 5px 16px; text-align: center;
-}
-/* Keep the result summary centred over the last committed card layout.
-   Live Agent dragging may preview another grid, but this field moves only on snap. */
-.agent-preset-grid .archive-results-head {
-  display: grid;
-  grid-template-columns: repeat(var(--archive-results-columns), var(--archive-card-width));
-  column-gap: 20px;
-  align-self: flex-start;
-  padding-inline: 0;
-  transition: grid-template-columns .24s cubic-bezier(.4,0,.2,1);
-}
-.agent-preset-grid .archive-results-head > * {
-  grid-column: 1 / -1;
-  justify-self: center;
-}
-.archive-results-summary { display: inline-flex; align-items: baseline; justify-content: center; gap: 7px; white-space: nowrap; }
+/* The result summary now lives on the Search rail, left-aligned before the query. */
+.archive-results-summary { display: inline-flex; align-items: baseline; gap: 7px; white-space: nowrap; }
 .archive-results-count { display: inline-flex; align-items: baseline; gap: 7px; color: var(--text-2); font-size: 12.5px; }
 .archive-results-count strong { color: var(--accent); font-size: 20px; font-weight: 700; font-variant-numeric: tabular-nums; }
 .archive-results-separator { color: var(--text-mut); font-size: 12px; }
@@ -1323,7 +1545,7 @@
 .ag-drop-note { font-size: 11px; color: var(--text-mut); padding: 4px 8px 6px; }
 .ag-drop .ag-model { padding: 4px 6px 6px; }
 .ag-messages {
-  flex: 1; overflow-y: auto; padding: 14px 28px 24px; display: flex; flex-direction: column; gap: 22px;
+  flex: 1; overflow-y: auto; overflow-x: hidden; padding: 14px 28px 24px; display: flex; flex-direction: column; gap: 22px;
   background:
     radial-gradient(ellipse 52% 28% at 8% 46%, color-mix(in srgb, var(--accent) 3%, transparent), transparent 76%);
 }
@@ -1600,7 +1822,7 @@
   --mon-accent: var(--accent); --mon-line: var(--accent-line);
   flex: 1; min-height: 0; display: grid; grid-template-columns: minmax(0,1fr);
   align-content: start;
-  gap: 14px; padding: 14px 16px; overflow-y: auto;
+  gap: 14px; padding: 14px 16px; overflow-y: auto; overflow-x: hidden;
 }
 .mon-toolbar-actions { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
 .mon-toolbar-primary-actions {
@@ -2052,7 +2274,7 @@
 .vid-cols {
   --mon-accent: var(--accent); --mon-line: var(--accent-line); --vid-accent: var(--accent);
   flex: 1; min-height: 0; display: flex; flex-direction: column;
-  gap: 14px; padding: 14px 16px; overflow-y: auto;
+  gap: 14px; padding: 14px 16px; overflow-y: auto; overflow-x: hidden;
 }
 
 /* Workspace navigation, section tabs and filters are one pinned header. The compact
@@ -2065,6 +2287,83 @@
   background: transparent;
   border-bottom: 0;
 }
+
+.tool-tabs.tabs-bottom .atp-tabrow {
+  margin-top: 6px; padding-top: 0;
+}
+.body-row:has(.vid-cols > .tool-tabs.tabs-bottom) .menu-shell > .menu-rail-trigger {
+  top: var(--workspace-tabs-top-padding);
+}
+
+.vid-unified-toolbar {
+  width: 100%; min-width: 0;
+  display: flex; flex-direction: column; gap: 8px;
+}
+.vid-unified-strip {
+  width: 100%; min-width: 0; min-height: 44px; box-sizing: border-box;
+  display: flex; align-items: center; gap: 12px; padding-block: 6px;
+}
+.vid-unified-strip + .vid-unified-strip {
+  border-top: 1px solid color-mix(in srgb, var(--line) 58%, transparent);
+}
+.vid-unified-label {
+  width: 82px; flex: 0 0 82px;
+  display: inline-flex; align-items: center; gap: 5px;
+  color: var(--text-mut); font-size: 9.5px; font-weight: 750;
+  letter-spacing: .055em; text-transform: uppercase; white-space: nowrap;
+}
+.vid-unified-label svg { color: var(--accent); flex: 0 0 auto; }
+.vid-unified-label em {
+  padding: 2px 4px; border: 1px solid color-mix(in srgb, var(--warning) 55%, var(--line));
+  border-radius: 999px; color: var(--warning); font: 700 7px/1 var(--mono); font-style: normal;
+}
+.vid-camera-strip {
+  flex-direction: column; align-items: flex-start; gap: 6px;
+}
+.vid-camera-strip .vid-unified-label { width: auto; flex-basis: auto; }
+.vid-shared-camera { width: 240px; max-width: 100%; }
+.vid-shared-camera .dd,
+.vid-shared-camera .dd-btn { width: 100%; }
+.vid-controls-strip { min-height: 51px; padding-left: 0; }
+.vid-unified-strip > .vid-lens-stack,
+.vid-unified-strip > .vid-settings-toolbar,
+.vid-unified-strip > .vid-incident-toolbar { flex: 1 1 auto; min-width: 0; }
+.vid-unified-strip .vid-tb-row,
+.vid-unified-strip .vid-review-scroll,
+.vid-unified-strip .vid-settings-toolbar,
+.vid-unified-strip .vid-settings-scroll,
+.vid-unified-strip .vid-incident-toolbar { align-items: center; }
+.vid-unified-strip .vid-tb-row,
+.vid-unified-strip .vid-settings-toolbar {
+  width: auto; flex: 0 1 auto; justify-content: flex-start;
+}
+.vid-unified-strip .vid-review-scroll,
+.vid-unified-strip .vid-settings-scroll { flex: 0 1 auto; }
+.vid-unified-strip .vid-incident-toolbar {
+  flex-wrap: nowrap; justify-content: flex-start;
+}
+.vid-unified-strip .vid-incident-toolbar > .dd:first-child { width: 220px; flex: 0 1 220px; }
+.vid-unified-strip .vid-incident-toolbar > .dd:nth-child(2) { width: 160px; flex: 0 0 160px; }
+.vid-unified-toolbar .dd-btn,
+.vid-unified-toolbar .vid-tb-row .dd-btn,
+.vid-unified-toolbar .vid-control-group .dd-btn,
+.vid-unified-toolbar .mon-btn,
+.vid-unified-toolbar .toolbar-actions-trigger,
+.vid-unified-toolbar .vid-evidence-chip,
+.vid-unified-toolbar .vid-lens-custom input {
+  height: 36px; min-height: 36px; box-sizing: border-box;
+}
+.vid-unified-toolbar .vid-tb-actions > .mon-btn.accent {
+  height: 36px; min-height: 36px;
+}
+.vid-evidence-chip {
+  box-sizing: border-box; flex: 0 0 auto;
+  display: inline-flex; align-items: center; padding: 0 11px;
+  border: 1px solid var(--line-2); border-radius: 999px;
+  color: var(--text-2); background: var(--void-tile); font-size: 11px; white-space: nowrap;
+}
+.vid-unified-strip .vid-control-group.inference { gap: 0; }
+.vid-unified-strip .vid-lens-custom { padding-top: 6px; }
 
 /* video tool-tab content rows (Stream review / Stream settings) */
 .vid-tb-row { display: flex; align-items: flex-end; gap: 12px; flex-wrap: nowrap; flex: 1 1 auto; min-width: 0; }
@@ -2158,7 +2457,7 @@
 .vid-review-preview-drawer .vid-preview-card { background: var(--panel-solid); backdrop-filter: blur(18px); }
 .vid-settings-main {
   flex: 1; min-height: 0; display: grid; grid-template-columns: minmax(380px, 1fr) minmax(420px, 1.1fr);
-  gap: 28px; align-items: start; padding: 6px 8px 24px; overflow-y: auto;
+  gap: 28px; align-items: start; padding: 6px 8px 24px; overflow-y: auto; overflow-x: hidden;
 }
 .vid-settings-preview { min-width: 0; }
 .vid-settings-preview .vid-preview-card {
@@ -2506,7 +2805,7 @@
 .set-navitem.on::before { height: 18px; opacity: .88; box-shadow: 0 0 12px -2px var(--accent); }
 .set-navitem:focus-visible { outline: 1px solid var(--accent-line); outline-offset: -1px; }
 .set-content {
-  position: relative; flex: 1; min-width: 0; overflow-y: auto;
+  position: relative; flex: 1; min-width: 0; overflow-y: auto; overflow-x: hidden;
   padding: 14px 24px 22px; display: flex; flex-direction: column; gap: 8px;
   background:
     radial-gradient(ellipse 70% 46% at 24% 8%, color-mix(in srgb, var(--accent) 4%, transparent), transparent 76%),
@@ -2808,7 +3107,7 @@
 .agent-badge.lg { width: 46px; height: 46px; border-radius: 14px; margin: 0 auto; }
 .agent-title { font-size: 15px; font-weight: 600; }
 
-.agent-body { flex: 1; overflow-y: auto; padding: 18px 14px; display: flex; flex-direction: column; gap: 18px; }
+.agent-body { flex: 1; overflow-y: auto; overflow-x: hidden; padding: 18px 14px; display: flex; flex-direction: column; gap: 18px; }
 .agent-hello { display: flex; flex-direction: column; align-items: center; gap: 8px; text-align: center; padding: 28px 6px 6px; }
 .agent-suggest { display: flex; flex-direction: column; gap: 8px; }
 /* prompt assist relocated to the centre on a fresh session */
@@ -2841,17 +3140,33 @@
 
 /* ===== Probes board — group → channel → probe, with explicit lineage ===== */
 .probe-board-toolbar {
-  display: flex; align-items: center; flex-wrap: nowrap; gap: 8px;
+  display: flex; flex-direction: column; align-items: flex-start; gap: 5px;
   width: 100%; min-width: 0;
 }
-.probe-toolbar-scroll { align-items: center; }
+.probe-toolbar-row {
+  width: max-content; max-width: 100%; flex: 0 1 auto;
+  align-items: center; justify-content: flex-start;
+}
+.probe-toolbar-primary .mon-toolbar-primary-actions {
+  margin-left: 0; padding-left: 0;
+}
+.probe-board-screen > .tool-tabs .atp-tabpanel-content {
+  min-height: 0; padding-block: 7px;
+}
+.probe-board-toolbar .mon-search,
+.probe-board-toolbar .toolbar-actions-trigger,
+.probe-board-toolbar .mon-toolbar-primary-actions > .mon-btn.accent {
+  height: 32px; min-height: 32px;
+}
 .probe-filter-set {
-  display: inline-flex; align-items: center; gap: 4px; padding: 3px;
+  height: 32px; box-sizing: border-box;
+  display: inline-flex; align-items: center; gap: 4px; padding: 2px;
   border: 1px solid var(--line); border-radius: 10px; background: var(--space-0);
 }
 .probe-filter-chip {
-  min-height: 30px; display: inline-flex; align-items: center; gap: 6px;
-  padding: 4px 8px; border: 1px solid transparent; border-radius: 7px;
+  height: 26px; min-height: 26px; box-sizing: border-box;
+  display: inline-flex; align-items: center; gap: 6px;
+  padding: 2px 8px; border: 1px solid transparent; border-radius: 7px;
   background: transparent; color: var(--text-mut); font-size: 11px; cursor: pointer;
 }
 .probe-filter-chip:hover { color: var(--text); background: var(--void-tile); }

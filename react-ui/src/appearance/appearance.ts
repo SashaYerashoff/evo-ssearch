@@ -4,7 +4,16 @@ export const CUSTOM_APPEARANCE_PRESETS_STORAGE_KEY = 'eva.ui.appearance.custom-p
 export type ThemePresetId = 'eva-deep' | 'graphite' | 'day-shift' | 'amber-watch'
 export type ControlShape = 'precise' | 'balanced' | 'soft'
 export type InterfaceDensity = 'compact' | 'comfortable'
-export type InterfaceScale = 'normal' | 'large'
+export type InterfaceScale = 'compact' | 'normal' | 'large' | 'xlarge'
+
+/** Rendered zoom factor per scale step. Keep in sync with the
+ *  `html[data-interface-scale="…"] #root` rules in theme.css. */
+export const INTERFACE_SCALE_FACTORS: Record<InterfaceScale, number> = {
+  compact: 0.75,
+  normal: 1,
+  large: 1.25,
+  xlarge: 1.5,
+}
 export type MotionPreference = 'system' | 'full' | 'reduced'
 export type CustomColorKey = 'canvas' | 'surface' | 'control' | 'text' | 'accent'
 
@@ -141,14 +150,14 @@ export const DEFAULT_APPEARANCE: AppearancePreferences = {
   overrides: {},
   shape: 'balanced',
   density: 'comfortable',
-  scale: 'normal',
+  scale: 'compact',
   motion: 'system',
 }
 
 const PRESET_IDS = new Set(THEME_PRESETS.map((preset) => preset.id))
 const SHAPES = new Set<ControlShape>(['precise', 'balanced', 'soft'])
 const DENSITIES = new Set<InterfaceDensity>(['compact', 'comfortable'])
-const SCALES = new Set<InterfaceScale>(['normal', 'large'])
+const SCALES = new Set<InterfaceScale>(['compact', 'normal', 'large', 'xlarge'])
 const MOTION = new Set<MotionPreference>(['system', 'full', 'reduced'])
 const CUSTOM_COLOR_KEYS: readonly CustomColorKey[] = ['canvas', 'surface', 'control', 'text', 'accent']
 
