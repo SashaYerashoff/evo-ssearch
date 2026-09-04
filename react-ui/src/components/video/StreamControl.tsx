@@ -178,13 +178,14 @@ export function StreamControl(p: {
     >
       <div className="vid-unified-toolbar" role="group" aria-label="Video workspace controls">
         <section className="vid-unified-strip vid-camera-strip">
-          <button type="button" className="vid-back" onClick={p.onBackToList} title="Back to all channels">
-            <IconArrowLeft size={16} />
+          <button type="button" className="vid-back" onClick={p.onBackToList}
+            title="Back to all channels" aria-label="Back to all channels">
+            <IconArrowLeft size={22} />
           </button>
-          <div className="vid-open-channel">
-            <IconVideo size={13} />
+          <h2 className="vid-open-channel">
+            <IconVideo size={18} />
             <span>{p.channels.find((channel) => channel.id === p.channelId)?.title ?? t('video.channel')}</span>
-          </div>
+          </h2>
         </section>
 
         {p.activeTab === 'review' && (

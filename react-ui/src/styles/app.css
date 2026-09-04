@@ -2322,13 +2322,11 @@
   padding: 2px 4px; border: 1px solid color-mix(in srgb, var(--warning) 55%, var(--line));
   border-radius: 999px; color: var(--warning); font: 700 7px/1 var(--mono); font-style: normal;
 }
+/* Now a header row — back affordance beside the channel title, not the old
+   stacked label-over-dropdown. */
 .vid-camera-strip {
-  flex-direction: column; align-items: flex-start; gap: 6px;
+  flex-direction: row; align-items: center; gap: 12px;
 }
-.vid-camera-strip .vid-unified-label { width: auto; flex-basis: auto; }
-.vid-shared-camera { width: 240px; max-width: 100%; }
-.vid-shared-camera .dd,
-.vid-shared-camera .dd-btn { width: 100%; }
 .vid-controls-strip { min-height: 51px; padding-left: 0; }
 .vid-unified-strip > .vid-lens-stack,
 .vid-unified-strip > .vid-settings-toolbar,
@@ -2470,17 +2468,23 @@
 .stream-dot.paused { background: var(--warning); }
 
 /* back to the channel list, where the camera picker used to sit */
+/* Opening a channel is a step down a level, so the strip reads as that level's
+   header: a real back affordance and the channel as the title beside it. */
 .vid-back {
-  width: 32px; height: 32px; flex: 0 0 auto;
+  width: 42px; height: 42px; flex: 0 0 auto;
   display: grid; place-items: center; padding: 0;
-  border: 1px solid var(--line-2); border-radius: 9px;
+  border: 1px solid var(--line-2); border-radius: 11px;
   background: var(--void-tile); color: var(--text-2); cursor: pointer;
-  transition: color .14s ease, border-color .14s ease;
+  transition: color .14s ease, border-color .14s ease, background .14s ease;
 }
-.vid-back:hover { color: var(--accent); border-color: var(--accent-line); }
+.vid-back:hover {
+  color: var(--accent); border-color: var(--accent-line);
+  background: color-mix(in srgb, var(--accent) 10%, var(--void-tile));
+}
 .vid-open-channel {
-  display: inline-flex; align-items: center; gap: 7px; min-width: 0;
-  font-size: 13px; font-weight: 600; color: var(--text);
+  display: inline-flex; align-items: center; gap: 10px; min-width: 0;
+  margin: 0; font-size: 19px; font-weight: 700; letter-spacing: -.01em;
+  color: var(--text);
 }
 .vid-open-channel svg { color: var(--accent); flex: 0 0 auto; }
 .vid-open-channel span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
