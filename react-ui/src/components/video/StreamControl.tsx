@@ -232,9 +232,6 @@ export function StreamControl(p: {
           <section className="vid-unified-strip vid-controls-strip">
             <div className="vid-settings-toolbar">
               <div className="toolbar-scroll-rail vid-settings-scroll">
-                <span className="vid-evidence-chip" title="Adaptive chronological 4–8-frame VLM evidence. CV and semantic signals rank frames; the backend preserves temporal context and controls cadence.">
-                  Evidence 4–8
-                </span>
                 <section className="vid-control-group inference">
                   <div className="wfield">
                     <span className="wfield-label">Model</span>

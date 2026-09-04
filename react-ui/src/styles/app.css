@@ -2365,18 +2365,11 @@
 .vid-unified-toolbar .vid-control-group .dd-btn,
 .vid-unified-toolbar .mon-btn,
 .vid-unified-toolbar .toolbar-actions-trigger,
-.vid-unified-toolbar .vid-evidence-chip,
 .vid-unified-toolbar .vid-lens-custom input {
   height: 36px; min-height: 36px; box-sizing: border-box;
 }
 .vid-unified-toolbar .vid-tb-actions > .mon-btn.accent {
   height: 36px; min-height: 36px;
-}
-.vid-evidence-chip {
-  box-sizing: border-box; flex: 0 0 auto;
-  display: inline-flex; align-items: center; padding: 0 11px;
-  border: 1px solid var(--line-2); border-radius: 999px;
-  color: var(--text-2); background: var(--void-tile); font-size: 11px; white-space: nowrap;
 }
 /* Labelled controls: the caption sits above the field, so the rows align on the
    controls' bottom edge instead of centring label+field as one block. */
