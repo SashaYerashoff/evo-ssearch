@@ -1,6 +1,7 @@
 import {
   IconAlertTriangle,
   IconArrowBackUp,
+  IconArrowLeft,
   IconCheck,
   IconChevronsDown,
   IconChevronsUp,
@@ -115,6 +116,8 @@ export function StreamControl(p: {
   channels: Channel[]
   activeTab: VideoWorkspaceTab
   onTab: (tab: VideoWorkspaceTab) => void
+  /** Leaves the stream workspace and shows the channel list again. */
+  onBackToList: () => void
   channelId: number | null
   onChannel: (id: number) => void
   onReload: () => void
@@ -175,15 +178,12 @@ export function StreamControl(p: {
     >
       <div className="vid-unified-toolbar" role="group" aria-label="Video workspace controls">
         <section className="vid-unified-strip vid-camera-strip">
-          <div className="vid-unified-label"><IconVideo size={13} /> Camera</div>
-          <div className="wfield ch vid-shared-camera">
-            <Dropdown
-              variant="chip"
-              title={t('video.channel')}
-              value={String(p.channelId ?? '')}
-              onChange={(value) => p.onChannel(Number(value))}
-              options={p.channels.map((channel) => ({ value: String(channel.id), label: channel.title }))}
-            />
+          <button type="button" className="vid-back" onClick={p.onBackToList} title="Back to all channels">
+            <IconArrowLeft size={16} />
+          </button>
+          <div className="vid-open-channel">
+            <IconVideo size={13} />
+            <span>{p.channels.find((channel) => channel.id === p.channelId)?.title ?? t('video.channel')}</span>
           </div>
         </section>
 

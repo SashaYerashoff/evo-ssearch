@@ -32,6 +32,7 @@ import {
 } from '../../api/video'
 import { renderMarkdown } from '../agent/markdown'
 import { resolveVideoWorkspaceTab, StreamControl, type VideoWorkspaceTab } from './StreamControl'
+import { StreamList } from './StreamList'
 import { PromptSettingsModal } from './PromptSettingsModal'
 import { IncidentModal } from '../incidents/IncidentModal'
 import { IncidentReview, type IncidentPeriod } from '../incidents/IncidentReview'
@@ -513,6 +514,8 @@ export function VideoScreen({
   const { locale, t } = useI18n()
   const [activeTab, setActiveTab] = useState<VideoWorkspaceTab>('review')
   const [channelId, setChannelId] = useState<number | null>(() => initialSharedChannelId(channels))
+  // The section opens on the channel list; picking a row opens that stream.
+  const [streamOpen, setStreamOpen] = useState(false)
   const reviewChannelId = channelId
   const settingsChannelId = channelId
   const incidentChannelId = channelId == null ? '' : String(channelId)
@@ -1148,9 +1151,25 @@ export function VideoScreen({
     </div>
   )
 
+  if (!streamOpen) {
+    return (
+      <div className="vid-cols vid-cols-list">
+        {navigation}
+        {error && <div className="chat-error"><IconAlertTriangle size={14} /> {error}</div>}
+        <StreamList
+          channels={channels}
+          runtime={runtime}
+          activeChannelId={channelId}
+          onOpen={(id) => { requestChannel(id); setStreamOpen(true) }}
+        />
+      </div>
+    )
+  }
+
   return (
     <div className="vid-cols">
       <StreamControl
+        onBackToList={() => setStreamOpen(false)}
         navigation={navigation}
         channels={channels}
         activeTab={activeTab} onTab={selectWorkspaceTab}
