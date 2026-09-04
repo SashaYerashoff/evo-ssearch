@@ -1,4 +1,5 @@
-import { IconChevronRight, IconPlayerPlay, IconVideo } from '@tabler/icons-react'
+import { useMemo, useState } from 'react'
+import { IconChevronRight, IconPlayerPlay, IconSearch, IconVideo, IconX } from '@tabler/icons-react'
 import type { Channel } from '../../api/types'
 import type { ChannelRuntime } from '../../api/video'
 
@@ -26,14 +27,49 @@ export function StreamList({ channels, runtime, activeChannelId, onOpen }: {
   onOpen: (channelId: number) => void
 }) {
   const byChannel = new Map(runtime.map((entry) => [entry.channelId, entry]))
+  const [query, setQuery] = useState('')
+
+  // Filter on the live list, so rows keep updating their state while a query is
+  // active instead of freezing on a snapshot.
+  const needle = query.trim().toLowerCase()
+  const matches = useMemo(() => (
+    needle
+      ? channels.filter((channel) =>
+          channel.title.toLowerCase().includes(needle) || String(channel.id).includes(needle))
+      : channels
+  ), [channels, needle])
 
   if (!channels.length) {
     return <div className="empty-state"><IconVideo size={30} /><div>No channels available.</div></div>
   }
 
   return (
+    <div className="stream-list-wrap">
+      <div className="stream-search">
+        <IconSearch size={15} />
+        <input
+          value={query}
+          onChange={(event) => setQuery(event.target.value)}
+          placeholder="Search channels — name or number…"
+          aria-label="Search channels"
+        />
+        {query && (
+          <button type="button" className="stream-search-clear" onClick={() => setQuery('')}
+            title="Clear search" aria-label="Clear search">
+            <IconX size={15} />
+          </button>
+        )}
+        <span className="stream-search-count">
+          {needle ? `${matches.length}/${channels.length}` : `${channels.length}`}
+        </span>
+      </div>
+
+      {matches.length === 0 && (
+        <div className="empty-state">No channel matches “{query}”.</div>
+      )}
+
     <div className="stream-list" role="list" aria-label="Channels">
-      {channels.map((channel) => {
+      {matches.map((channel) => {
         const entry = byChannel.get(channel.id)
         const state = streamState(entry)
         const video = entry?.video
@@ -66,6 +102,7 @@ export function StreamList({ channels, runtime, activeChannelId, onOpen }: {
           </button>
         )
       })}
+    </div>
     </div>
   )
 }

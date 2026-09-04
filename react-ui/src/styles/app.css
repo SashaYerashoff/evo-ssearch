@@ -2377,6 +2377,34 @@
 /* Channel list — the section's home view. One row per camera, its live state
    readable without opening anything; the row opens that stream's summaries. */
 .vid-cols-list { display: flex; flex-direction: column; gap: 10px; min-width: 0; }
+.stream-list-wrap { display: flex; flex-direction: column; gap: 8px; width: 100%; min-width: 0; }
+/* Search sits above the list and filters it as you type; the count reports how
+   much of the fleet the query is showing. */
+.stream-search {
+  display: flex; align-items: center; gap: 8px; width: 100%; min-width: 0;
+  padding: 0 12px; height: 38px; box-sizing: border-box;
+  background: color-mix(in srgb, var(--surface) 78%, transparent);
+  border: 1px solid color-mix(in srgb, var(--accent-line) 40%, var(--line-2));
+  border-radius: var(--radius);
+}
+.stream-search > svg { color: var(--text-mut); flex: 0 0 auto; }
+.stream-search input {
+  flex: 1 1 auto; min-width: 0; height: 100%;
+  background: transparent; border: 0; outline: none;
+  color: var(--text); font: inherit; font-size: 13px;
+}
+.stream-search input::placeholder { color: var(--text-mut); }
+.stream-search-clear {
+  width: 24px; height: 24px; flex: 0 0 auto; padding: 0;
+  display: grid; place-items: center; border: 0; border-radius: 7px;
+  background: transparent; color: var(--text-mut); cursor: pointer;
+}
+.stream-search-clear:hover { color: var(--accent); background: var(--accent-bg); }
+.stream-search-count {
+  flex: 0 0 auto; font-size: 11.5px; color: var(--text-mut);
+  font-variant-numeric: tabular-nums; white-space: nowrap;
+}
+
 .stream-list { display: flex; flex-direction: column; gap: 6px; width: 100%; min-width: 0; }
 .stream-row {
   display: flex; align-items: center; gap: 12px; width: 100%; min-width: 0;
