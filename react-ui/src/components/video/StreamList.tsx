@@ -28,16 +28,17 @@ export function StreamList({ channels, runtime, activeChannelId, onOpen }: {
 }) {
   const byChannel = new Map(runtime.map((entry) => [entry.channelId, entry]))
   const [query, setQuery] = useState('')
+  const [onlyLive, setOnlyLive] = useState(false)
 
   // Filter on the live list, so rows keep updating their state while a query is
   // active instead of freezing on a snapshot.
   const needle = query.trim().toLowerCase()
-  const matches = useMemo(() => (
-    needle
-      ? channels.filter((channel) =>
-          channel.title.toLowerCase().includes(needle) || String(channel.id).includes(needle))
-      : channels
-  ), [channels, needle])
+  const matches = useMemo(() => channels.filter((channel) => {
+    if (onlyLive && streamState(byChannel.get(channel.id)) !== 'describing') return false
+    if (!needle) return true
+    return channel.title.toLowerCase().includes(needle) || String(channel.id).includes(needle)
+  }), [channels, needle, onlyLive, runtime])   // eslint-disable-line react-hooks/exhaustive-deps
+  const filtered = Boolean(needle) || onlyLive
 
   if (!channels.length) {
     return <div className="empty-state"><IconVideo size={30} /><div>No channels available.</div></div>
@@ -61,13 +62,21 @@ export function StreamList({ channels, runtime, activeChannelId, onOpen }: {
             </button>
           )}
         </div>
+        <label className="stream-filter" title="Show only channels being described right now">
+          <input type="checkbox" checked={onlyLive} onChange={(event) => setOnlyLive(event.target.checked)} />
+          <span>Show only live on</span>
+        </label>
+
         <span className="stream-search-count">
-          {needle ? `${matches.length}/${channels.length}` : `${channels.length}`}
+          <strong>{filtered ? `${matches.length}/${channels.length}` : channels.length}</strong>
+          <span>channels</span>
         </span>
       </div>
 
       {matches.length === 0 && (
-        <div className="empty-state">No channel matches “{query}”.</div>
+        <div className="empty-state">
+          {onlyLive && !needle ? 'No channel is being described right now.' : `No channel matches “${query}”.`}
+        </div>
       )}
 
     <div className="stream-list" role="list" aria-label="Channels">
