@@ -2333,7 +2333,7 @@
 .vid-camera-strip {
   flex-direction: row; align-items: center; gap: 12px;
 }
-.vid-controls-strip { min-height: 51px; padding-left: 0; }
+.vid-controls-strip { min-height: 51px; padding-left: 14px; }
 .vid-unified-strip > .vid-lens-stack,
 .vid-unified-strip > .vid-settings-toolbar,
 .vid-unified-strip > .vid-incident-toolbar { flex: 1 1 auto; min-width: 0; }
@@ -2540,10 +2540,15 @@
   padding-left: 13px;
   font-size: 10px; font-weight: 700; line-height: 1;
   letter-spacing: .055em; text-transform: uppercase;
-  color: var(--text-mut); white-space: nowrap;
+  color: var(--text); white-space: nowrap;
 }
 /* the primary action sits with the fields it applies to, on the left */
 .vid-unified-strip .vid-primary { flex: 0 0 auto; margin-left: 4px; }
+/* Fields are bottom-aligned so their controls line up under the captions, but a
+   button has no caption above it — bottom-aligning it too parks it low in the
+   strip. Buttons centre on the strip instead. */
+.vid-unified-strip .vid-primary,
+.vid-unified-strip .vid-tb-actions { align-self: center; }
 
 /* Fixed slots: picking a longer value must not resize the control or reflow the
    rail — the label truncates, the control keeps its width. */
