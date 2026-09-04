@@ -1,5 +1,8 @@
 import { useCallback, useEffect, useMemo, useState, type ReactNode } from 'react'
 import {
+  IconAdjustments,
+  IconFilter,
+  IconFilterOff,
   IconLayoutGrid,
   IconList,
   IconPlus,
@@ -24,8 +27,8 @@ import {
 } from '../../api/probes'
 import type { Channel } from '../../api/types'
 import { videoApi } from '../../api/video'
-import { ToolbarActionMenu } from '../shell/ToolbarActionMenu'
 import { ToolTabs } from '../shell/ToolTabs'
+import { IcoBtn } from '../shell/IcoBtn'
 import {
   ProbeCard,
   ProbeOriginBadge,
@@ -427,72 +430,85 @@ export function MonitoringScreen({
         reserveLeading
         hideTabs
       >
-        <div className="probe-board-toolbar">
-          <div className="toolbar-scroll-rail probe-toolbar-row probe-toolbar-primary">
-            <div className="mon-search" title="Search names, prompts, channels and parent alerts">
-              <IconSearch size={15} />
-              <input
-                placeholder="Search probes…"
-                value={query}
-                onChange={(event) => setQuery(event.target.value)}
-              />
-              {query && <button className="mon-search-clear" onClick={() => setQuery('')}><IconX size={13} /></button>}
-            </div>
-            <div className="mon-toolbar-primary-actions">
-              <ToolbarActionMenu actions={[
-                {
-                  id: 'refresh', label: 'Refresh probes',
-                  icon: <IconRefresh className={loading ? 'spin' : ''} size={15} />,
-                  onSelect: refresh, disabled: loading,
-                },
-                {
-                  id: 'grid', label: 'Card view', icon: <IconLayoutGrid size={15} />,
-                  onSelect: () => persistView('grid'), active: view === 'grid',
-                },
-                {
-                  id: 'list', label: 'List view', icon: <IconList size={15} />,
-                  onSelect: () => persistView('list'), active: view === 'list',
-                },
-                ...(filtersActive ? [{
-                  id: 'reset', label: 'Reset filters', icon: <IconX size={15} />,
-                  onSelect: () => { setOrigins(new Set()); setStates(new Set()); setQuery('') },
-                }] : []),
-                ...(canManage ? [{
-                  id: 'groups', label: 'Manage probe groups', icon: <IconSettings size={15} />,
-                  onSelect: () => { setGroupError(null); setGroupEditor(null) },
-                }] : []),
-              ]} />
+        {/* Two blocks, same split as the Archive console: CONTROLS acts on the
+            board (search, create, view mode, refresh), FILTERS narrows what it
+            shows. Each is its own labelled card so the roles stay distinct. */}
+        <div className="probe-board-toolbar" role="group" aria-label="Probe tools">
+          <div className="probe-controls">
+            <span className="atp-glabel is-icon-only" title="Controls" aria-label="Controls"><IconAdjustments size={14} /></span>
+            <div className="probe-controls-row">
+              <div className="mon-search" title="Search names, prompts, channels and parent alerts">
+                <IconSearch size={15} />
+                <input
+                  placeholder="Search probes…"
+                  value={query}
+                  onChange={(event) => setQuery(event.target.value)}
+                />
+                {query && <button className="mon-search-clear" onClick={() => setQuery('')}><IconX size={13} /></button>}
+              </div>
               {canManage && (
-                <button className="mon-btn accent" onClick={() => setEditing({ probe: null })}>
+                <button className="mon-btn accent probe-primary" onClick={() => setEditing({ probe: null })}>
                   <IconPlus size={16} /> New probe
                 </button>
               )}
+              {/* Actions unpacked from the dropdown into an icon rail on the right
+                  edge — the label lives in the tooltip. */}
+              <div className="probe-tb-actions">
+                <IcoBtn title="Refresh probes" onClick={refresh} disabled={loading}>
+                  <IconRefresh className={loading ? 'spin' : ''} size={16} />
+                </IcoBtn>
+                <IcoBtn title="Card view" onClick={() => persistView('grid')} active={view === 'grid'}>
+                  <IconLayoutGrid size={16} />
+                </IcoBtn>
+                <IcoBtn title="List view" onClick={() => persistView('list')} active={view === 'list'}>
+                  <IconList size={16} />
+                </IcoBtn>
+                {filtersActive && (
+                  <IcoBtn title="Reset filters" onClick={() => { setOrigins(new Set()); setStates(new Set()); setQuery('') }}>
+                    <IconFilterOff size={16} />
+                  </IcoBtn>
+                )}
+                {canManage && (
+                  <IcoBtn title="Manage probe groups" onClick={() => { setGroupError(null); setGroupEditor(null) }}>
+                    <IconSettings size={16} />
+                  </IcoBtn>
+                )}
+              </div>
             </div>
           </div>
-          <div className="toolbar-scroll-rail probe-toolbar-row probe-toolbar-filters">
-            <div className="probe-filter-set" aria-label="Filter by author">
-              {ORIGINS.map((origin) => (
-                <button
-                  key={origin.value}
-                  className={`probe-filter-chip origin-${origin.value} ${origins.has(origin.value) ? 'on' : ''}`}
-                  aria-pressed={origins.has(origin.value)}
-                  onClick={() => toggleFilter(origin.value, setOrigins)}
-                >
-                  <i />{origin.label}<b>{counts.by_origin?.[origin.value] ?? probes.filter((probe) => probeOrigin(probe) === origin.value).length}</b>
-                </button>
-              ))}
-            </div>
-            <div className="probe-filter-set state-set" aria-label="Filter by state">
-              {STATES.map((state) => (
-                <button
-                  key={state}
-                  className={`probe-filter-chip ${states.has(state) ? 'on' : ''}`}
-                  aria-pressed={states.has(state)}
-                  onClick={() => toggleFilter(state, setStates)}
-                >
-                  {state}
-                </button>
-              ))}
+
+          <div className="probe-filters" role="group" aria-label="Probe filters">
+            <span className="atp-glabel is-icon-only" title="Filters" aria-label="Filters"><IconFilter size={14} /></span>
+            <div className="probe-filters-row">
+              <div className="probe-filter-set" aria-label="Filter by author">
+                {ORIGINS.map((origin) => (
+                  <button
+                    key={origin.value}
+                    className={`probe-filter-chip origin-${origin.value} ${origins.has(origin.value) ? 'on' : ''}`}
+                    aria-pressed={origins.has(origin.value)}
+                    onClick={() => toggleFilter(origin.value, setOrigins)}
+                  >
+                    <i />{origin.label}<b>{counts.by_origin?.[origin.value] ?? probes.filter((probe) => probeOrigin(probe) === origin.value).length}</b>
+                  </button>
+                ))}
+              </div>
+              <div className="probe-filter-set state-set" aria-label="Filter by state">
+                {STATES.map((state) => (
+                  <button
+                    key={state}
+                    className={`probe-filter-chip ${states.has(state) ? 'on' : ''}`}
+                    aria-pressed={states.has(state)}
+                    onClick={() => toggleFilter(state, setStates)}
+                  >
+                    {state}
+                  </button>
+                ))}
+              </div>
+              <div className="probe-count" role="status" aria-live="polite">
+                <strong>{filtered.length.toLocaleString()}</strong>
+                <span>{filtered.length === 1 ? 'probe' : 'probes'}</span>
+                {filtersActive && <em>of {probes.length.toLocaleString()}</em>}
+              </div>
             </div>
           </div>
         </div>

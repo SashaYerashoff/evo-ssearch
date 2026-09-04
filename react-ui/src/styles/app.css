@@ -486,7 +486,9 @@
   gap: 8px; width: 100%; min-width: 0;
 }
 .archive-controls,
-.archive-filters {
+.archive-filters,
+.probe-controls,
+.probe-filters {
   display: flex; flex-direction: row; align-items: center; gap: 12px;
   width: 100%; min-width: 0;
   padding: 7px 12px;
@@ -506,6 +508,8 @@
 .topbar::before,
 .archive-controls::before,
 .archive-filters::before,
+.probe-controls::before,
+.probe-filters::before,
 .vid-unified-strip::before,
 .stream-search::before {
   content: "";
@@ -534,6 +538,8 @@
 .topbar::after,
 .archive-controls::after,
 .archive-filters::after,
+.probe-controls::after,
+.probe-filters::after,
 .vid-unified-strip::after,
 .stream-search::after {
   content: "";
@@ -572,7 +578,11 @@
 .vid-controls-strip::before { animation-delay: -18s; }
 .vid-controls-strip::after  { animation-delay: -3s; }
 .stream-search::before      { animation-delay: -11s; }
-.stream-search::after       { animation-delay: -15s; }
+.stream-search::after        { animation-delay: -15s; }
+.probe-controls::before     { animation-delay: -2s; }
+.probe-controls::after      { animation-delay: -16s; }
+.probe-filters::before      { animation-delay: -20s; }
+.probe-filters::after       { animation-delay: -8s; }
 
 /* Three top paddings stack above the CONTROLS block: .archive-screen (14px),
    .atp-tabpanel-content (12px) and the block's own (7px). Drop the outer two so
@@ -587,7 +597,9 @@
 .archive-screen .atp-tabpanel-content::before,
 .archive-screen .atp-tabpanel-content::after,
 .vid-cols .atp-tabpanel-content::before,
-.vid-cols .atp-tabpanel-content::after { content: none; }
+.vid-cols .atp-tabpanel-content::after,
+.probe-board-screen .atp-tabpanel-content::before,
+.probe-board-screen .atp-tabpanel-content::after { content: none; }
 
 .no-anim .topbar::before,
 .no-anim .topbar::after,
@@ -598,14 +610,19 @@
 .no-anim .vid-unified-strip::before,
 .no-anim .vid-unified-strip::after,
 .no-anim .stream-search::before,
-.no-anim .stream-search::after { animation: none; }
+.no-anim .stream-search::after,
+.no-anim .probe-controls::before,
+.no-anim .probe-controls::after,
+.no-anim .probe-filters::before,
+.no-anim .probe-filters::after { animation: none; }
 /* The block's own controls take the rest of the line beside its name. */
 .archive-controls > .filter-block { flex: 1 1 auto; flex-direction: row; align-items: center; gap: 12px; }
 .archive-filters-row { flex: 1 1 auto; }
 
 /* Both blocks are marked by an icon only, inline at the far left. Same icon size
    in both, so their content still starts on one column — with no dead slot. */
-.atp-tabpanel .archive-toolbar .atp-glabel {
+.atp-tabpanel .archive-toolbar .atp-glabel,
+.atp-tabpanel .probe-board-toolbar .atp-glabel {
   display: inline-flex; align-items: center; justify-content: flex-start;
   /* white, not muted — over the light road a dim icon disappears */
   color: var(--text);
@@ -2502,24 +2519,30 @@
   margin-left: auto; padding-left: 12px;
   display: flex; align-items: center; gap: 6px; flex: 0 0 auto;
 }
-.vid-icobtn {
+.icobtn {
   width: 36px; height: 36px; min-width: 36px; box-sizing: border-box; flex: 0 0 auto;
   display: grid; place-items: center; padding: 0;
   border: 1px solid var(--line-2); border-radius: 9px;
   background: var(--void-tile); color: var(--text-2); cursor: pointer;
   transition: color .14s ease, border-color .14s ease, background .14s ease;
 }
-.vid-icobtn:hover:not(:disabled) {
+.icobtn:hover:not(:disabled) {
   color: var(--accent);
   border-color: color-mix(in srgb, var(--accent-line) 72%, var(--line-2));
   background: color-mix(in srgb, var(--accent) 10%, var(--void-tile));
 }
-.vid-icobtn.danger:hover:not(:disabled) {
+.icobtn.danger:hover:not(:disabled) {
   color: var(--danger);
   border-color: color-mix(in srgb, var(--danger) 55%, var(--line-2));
   background: color-mix(in srgb, var(--danger) 10%, var(--void-tile));
 }
-.vid-icobtn:disabled { opacity: .42; cursor: not-allowed; }
+.icobtn:disabled { opacity: .42; cursor: not-allowed; }
+/* Current view mode (card / list) — a persistent state, not a hover. */
+.icobtn.on {
+  color: var(--accent);
+  border-color: color-mix(in srgb, var(--accent-line) 80%, var(--line-2));
+  background: color-mix(in srgb, var(--accent) 14%, var(--void-tile));
+}
 
 /* Labelled controls: the caption sits above the field, so the rows align on the
    controls' bottom edge instead of centring label+field as one block. */
@@ -3340,25 +3363,42 @@
 .agent-send.agent-stop { color: #fff; background: var(--danger); box-shadow: 0 0 16px -4px var(--danger); }
 
 /* ===== Probes board — group → channel → probe, with explicit lineage ===== */
+/* Same two-block console as Archive: CONTROLS acts on the board, FILTERS
+   narrows it. Stretch, not flex-start — each block owns the full width so its
+   light road reads as a band rather than a tag. */
 .probe-board-toolbar {
-  display: flex; flex-direction: column; align-items: flex-start; gap: 5px;
+  display: flex; flex-direction: column; align-items: stretch; gap: 8px;
   width: 100%; min-width: 0;
 }
-.probe-toolbar-row {
-  width: max-content; max-width: 100%; flex: 0 1 auto;
-  align-items: center; justify-content: flex-start;
-}
-.probe-toolbar-primary .mon-toolbar-primary-actions {
-  margin-left: 0; padding-left: 0;
+.probe-controls-row,
+.probe-filters-row {
+  flex: 1 1 auto; min-width: 0;
+  display: flex; align-items: center; gap: 10px;
 }
 .probe-board-screen > .tool-tabs .atp-tabpanel-content {
   min-height: 0; padding-block: 7px;
 }
-.probe-board-toolbar .mon-search,
-.probe-board-toolbar .toolbar-actions-trigger,
-.probe-board-toolbar .mon-toolbar-primary-actions > .mon-btn.accent {
-  height: 32px; min-height: 32px;
+.probe-board-toolbar .mon-search {
+  width: 320px; flex: 0 0 320px; height: 32px; min-height: 32px;
 }
+.probe-board-toolbar .mon-btn.accent.probe-primary {
+  height: 32px; min-height: 32px; flex: 0 0 auto;
+}
+/* The action rail is pinned to the block's right edge, so adding an action
+   never reflows the search field or the primary. */
+.probe-tb-actions {
+  margin-left: auto; padding-left: 12px;
+  display: flex; align-items: center; gap: 6px; flex: 0 0 auto;
+}
+/* The headline count sits at the far right of the FILTERS block, the way the
+   channel count does on the stream list. */
+.probe-count {
+  margin-left: auto; padding-left: 12px; flex: 0 0 auto;
+  display: inline-flex; align-items: baseline; gap: 6px; white-space: nowrap;
+}
+.probe-count strong { color: var(--text); font-size: 15px; font-weight: 700; letter-spacing: .01em; }
+.probe-count span { color: var(--text-2); font-size: 11px; text-transform: uppercase; letter-spacing: .06em; }
+.probe-count em { color: var(--text-mut); font-size: 11px; font-style: normal; }
 .probe-filter-set {
   height: 32px; box-sizing: border-box;
   display: inline-flex; align-items: center; gap: 4px; padding: 2px;

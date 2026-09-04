@@ -19,31 +19,10 @@ import type { Channel } from '../../api/types'
 import type { ReactNode } from 'react'
 import { Dropdown } from '../shell/Dropdown'
 import { ToolTabs } from '../shell/ToolTabs'
+import { IcoBtn } from '../shell/IcoBtn'
 import type { SummaryPeriod, SummaryResolution } from './summaryView'
 import type { IncidentPeriod } from '../incidents/IncidentReview'
 import { useI18n, type TranslationKey } from '../../i18n/I18nProvider'
-
-/** Toolbar action rendered as an icon only — the label lives in the tooltip. */
-function IcoBtn({ title, onClick, disabled, danger, children }: {
-  title: string
-  onClick: () => void
-  disabled?: boolean
-  danger?: boolean
-  children: ReactNode
-}) {
-  return (
-    <button
-      type="button"
-      className={`vid-icobtn${danger ? ' danger' : ''}`}
-      title={title}
-      aria-label={title}
-      onClick={onClick}
-      disabled={disabled}
-    >
-      {children}
-    </button>
-  )
-}
 
 export const PERIODS: Array<{ v: SummaryPeriod; label: string }> = [
   { v: 'live', label: 'Live' },
